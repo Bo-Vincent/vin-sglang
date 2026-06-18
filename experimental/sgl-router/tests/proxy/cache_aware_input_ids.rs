@@ -17,6 +17,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::{json, Value};
 use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
+use sgl_router::policies::engine_load::EngineLoadTable;
 use sgl_router::policies::factory::build_registry;
 use sgl_router::policies::kv_events::{BlockSizeOracle, HashTree};
 use sgl_router::proxy::Proxy;
@@ -54,6 +55,7 @@ fn build_ctx(url: String) -> Arc<AppContext> {
             Arc::new(HashTree::new()),
             Arc::clone(&tokenizers),
             BlockSizeOracle::new(),
+            EngineLoadTable::new(),
         )
         .unwrap(),
     );
