@@ -213,6 +213,7 @@ def build_kv_cache(
         enable_kv_cache_events=enable_kv_cache_events,
         enable_mamba_extra_buffer=server_args.enable_mamba_extra_buffer(),
         enable_mamba_extra_buffer_lazy=server_args.enable_mamba_extra_buffer_lazy(),
+        max_mamba_ancestors=getattr(server_args, "max_mamba_ancestors", None),
         pp_rank=ps.pp_rank,
         pp_size=ps.pp_size,
         chunked_prefill_size=effective_chunked_prefill_size,

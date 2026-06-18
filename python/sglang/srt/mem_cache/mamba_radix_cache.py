@@ -432,6 +432,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         self.enable_kv_cache_events = params.enable_kv_cache_events
         self.enable_mamba_extra_buffer = params.enable_mamba_extra_buffer
         self.enable_mamba_extra_buffer_lazy = params.enable_mamba_extra_buffer_lazy
+        self.max_mamba_ancestors = getattr(params, "max_mamba_ancestors", None)
         self.kv_event_queue = []
 
         if not self.enable_mamba_extra_buffer:
@@ -589,6 +590,8 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
                 )
             )
             mamba_exist = result.mamba_exist
+            if not mamba_exist:
+                self._prune_ancestor_mamba(req.last_node)
         else:
             self.token_to_kv_pool_allocator.free(kv_indices[req.cache_protected_len :])
             mamba_exist = True
@@ -684,6 +687,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         if not mamba_exist:
             assert torch.equal(new_last_node.mamba_value, mamba_value_donated)
+            self._prune_ancestor_mamba(new_last_node)
 
         assert (
             req.cache_protected_len <= len(new_indices) + self.page_size - 1
@@ -1212,6 +1216,27 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         self.full_evictable_size_ -= len(node.key)
         self.mamba_evictable_size_ -= len(node.mamba_value)
+
+    def _prune_ancestor_mamba(self, node: TreeNode) -> int:
+        """Walk up the parent chain from node and tombstone Mamba states
+        beyond max_mamba_ancestors, keeping only the most recent N ancestor
+        checkpoints. Returns number of Mamba slots freed."""
+        if self.max_mamba_ancestors is None:
+            return 0
+        current = node.parent
+        mamba_ancestors_found = 0
+        freed = 0
+        while current is not None and current != self.root_node:
+            if current.mamba_value is not None:
+                mamba_ancestors_found += 1
+                if mamba_ancestors_found >= self.max_mamba_ancestors and current.mamba_lock_ref == 0:
+                    if len(current.children) > 0:
+                        self.req_to_token_pool.mamba_allocator.free(current.mamba_value)
+                        self.mamba_lru_list.remove_node(current)
+                        self._tombstone_internal_node(current)
+                        freed += 1
+            current = current.parent
+        return freed
 
     def _tombstone_internal_node(self, node: TreeNode) -> None:
         assert len(node.children) != 0, f"Cannot tombstone a leaf node, {node.id=}"
