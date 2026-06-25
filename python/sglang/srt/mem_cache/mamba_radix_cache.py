@@ -432,6 +432,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         self.enable_kv_cache_events = params.enable_kv_cache_events
         self.enable_mamba_extra_buffer = params.enable_mamba_extra_buffer
         self.enable_mamba_extra_buffer_lazy = params.enable_mamba_extra_buffer_lazy
+        self.max_mamba_checkpoints = params.max_mamba_checkpoints
         self.kv_event_queue = []
 
         if not self.enable_mamba_extra_buffer:
@@ -622,6 +623,12 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         self.dec_lock_ref(req.last_node)
 
+        if self.max_mamba_checkpoints is not None and is_insert and not mamba_exist:
+            match = self.match_prefix(
+                MatchPrefixParams(key=RadixKey(token_ids[:page_aligned_len], req.extra_key))
+            )
+            self._evict_session_mamba(match.last_device_node)
+
     def cache_unfinished_req(self, req: Req, chunked=False) -> None:
         """Cache request when it is unfinished."""
 
@@ -730,6 +737,9 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         self.dec_lock_ref(req.last_node)
         self.inc_lock_ref(new_last_node)
 
+        if self.max_mamba_checkpoints is not None:
+            self._evict_session_mamba(new_last_node)
+
         # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
         # NOTE: this is needed for both page_size == 1 and page_size > 1
         req.prefix_indices = torch.cat(
@@ -793,6 +803,37 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         return EvictResult(
             num_tokens_evicted=full_num_evicted, mamba_num_evicted=mamba_num_evicted
         )
+
+    def _evict_session_mamba(self, node: TreeNode) -> int:
+        """Evict old mamba checkpoints on this node's ancestor chain (per-session).
+        Skips shared nodes (those with multiple children) to avoid breaking other sessions."""
+        ancestors_with_mamba = []
+        cur = node
+        while cur is not None and cur != self.root_node:
+            if (cur.mamba_value is not None and cur.mamba_lock_ref == 0
+                    and len(cur.children) <= 1):
+                ancestors_with_mamba.append(cur)
+            cur = cur.parent
+
+        excess = len(ancestors_with_mamba) - self.max_mamba_checkpoints
+        if excess <= 0:
+            return 0
+
+        # ancestors_with_mamba is ordered leaf→root; evict from the end (oldest/root-side)
+        to_evict = ancestors_with_mamba[-excess:]
+        evicted = 0
+        for x in to_evict:
+            if x.mamba_value is None:
+                continue
+            if len(x.children) > 0:
+                self.req_to_token_pool.mamba_pool.free(x.mamba_value)
+                evicted += len(x.mamba_value)
+                self.mamba_lru_list.remove_node(x)
+                self._tombstone_internal_node(x)
+            else:
+                _, mamba_delta, _, _ = self._evict_leaf_node(x, True)
+                evicted += mamba_delta
+        return evicted
 
     def evict_mamba(self, mamba_num: int) -> int:
         """Evict mamba states. Returns the number of mamba states evicted."""

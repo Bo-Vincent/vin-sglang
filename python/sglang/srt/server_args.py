@@ -1796,6 +1796,12 @@ class ServerArgs:
             choices=MAMBA_RADIX_CACHE_STRATEGY_CHOICES,
         ),
     ] = "auto"
+    max_mamba_checkpoints: A[
+        Optional[int],
+        "Maximum number of evictable mamba checkpoints to keep in the radix cache. "
+        "When set, excess checkpoints are evicted after each cache insert to bound SSM memory growth. "
+        "If None (default), no eviction is performed.",
+    ] = None
     mamba_track_interval: A[
         int,
         "The interval to track the mamba state during decode.",
