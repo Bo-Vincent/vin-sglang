@@ -3236,6 +3236,11 @@ class ServerArgs:
         "Save model weights (both main model and draft model, if any) to CPU memory during release_weights_occupation and resume_weights_occupation",
         NS("exec.features"),
     ] = False
+    enable_weight_runtime_manifest: A[
+        bool,
+        "Enable the experimental runtime weight manifest exporter.",
+        NS("exec.features"),
+    ] = False
     enable_draft_weights_cpu_backup: A[
         bool,
         "Save draft model weights to CPU memory during release_weights_occupation and resume_weights_occupation",
