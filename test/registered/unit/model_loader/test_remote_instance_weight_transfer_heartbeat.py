@@ -10,6 +10,9 @@ if importlib.util.find_spec("requests") is None:
     sys.modules["requests"] = requests
 
 from sglang.srt.model_loader import remote_instance_weight_loader_utils as utils
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 def test_begin_preserves_server_lease_timeout(monkeypatch) -> None:

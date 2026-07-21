@@ -13,6 +13,9 @@ from sglang.srt.model_executor.model_runner_components.remote_instance_weight_tr
     RemoteInstanceWeightTransporter,
 )
 from sglang.srt.model_loader import remote_instance_weight_loader_utils as loader_utils
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class _FakeEngine:

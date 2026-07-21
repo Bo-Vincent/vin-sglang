@@ -88,10 +88,6 @@ from sglang.srt.model_loader.utils import (
 )
 from sglang.srt.utils.common import is_cuda_alike
 
-# Constants for memory management
-DEFAULT_GPU_MEMORY_FRACTION_FOR_CALIBRATION = (
-    0.8  # Reserve 20% GPU memory headroom for ModelOpt calibration
-)
 from sglang.srt.environ import envs
 from sglang.srt.model_loader.weight_utils import (
     buffered_multi_thread_safetensors_weights_iterator,
@@ -122,6 +118,11 @@ from sglang.srt.utils import (
     set_weight_attrs,
 )
 from sglang.srt.utils.common import temp_set_env
+
+# Constants for memory management
+DEFAULT_GPU_MEMORY_FRACTION_FOR_CALIBRATION = (
+    0.8  # Reserve 20% GPU memory headroom for ModelOpt calibration
+)
 
 if TYPE_CHECKING:
     from sglang.srt.configs.device_config import DeviceConfig
@@ -471,7 +472,7 @@ class DefaultModelLoader(BaseModelLoader):
             allow_patterns = ["*.bin"]
         elif load_format == LoadFormat.DUMMY:
             raise ValueError(
-                f"DUMMY load_format should use DummyModelLoader and not call _prepare_weights"
+                "DUMMY load_format should use DummyModelLoader and not call _prepare_weights"
             )
         else:
             raise ValueError(f"Unknown load_format: {load_format}")
@@ -2539,13 +2540,14 @@ class RemoteInstanceModelLoader(BaseModelLoader):
                 seed_url, transfer_session.transfer_id
             )
 
-        if not transfer_success or not release_success:
-            if transfer_success and not release_success:
-                logger.error(
-                    "Loaded weights but failed to release source transfer session %s",
-                    transfer_session.transfer_id,
-                )
+        if not transfer_success:
             return False
+        if not release_success:
+            logger.warning(
+                "Loaded weights but failed to release source transfer session %s; "
+                "the source lease will expire automatically",
+                transfer_session.transfer_id,
+            )
 
         logger.info(
             "Loaded heterogeneous remote-instance weights: bytes=%d, "
