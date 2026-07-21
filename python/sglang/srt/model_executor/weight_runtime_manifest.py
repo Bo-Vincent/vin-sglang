@@ -98,6 +98,7 @@ class LogicalTensorView(msgspec.Struct, frozen=True, kw_only=True):
     layer_id: int | None
     expert_id: int | None
     layout_fingerprint: str
+    shard_dims: tuple[int, ...] | None = None
 
 
 class RuntimeWeightTensor(msgspec.Struct, frozen=True, kw_only=True):
@@ -111,6 +112,7 @@ class RuntimeWeightTensor(msgspec.Struct, frozen=True, kw_only=True):
     dtype: str
     itemsize: int
     partition_dim: int | None
+    shard_dims: tuple[int, ...]
     layer_id: int | None
     expert_id: int | None
     layout_fingerprint: str
@@ -134,7 +136,7 @@ class WeightRuntimeManifest(msgspec.Struct, frozen=True, kw_only=True):
     generation: int
     lease_id: str
     tensors: tuple[RuntimeWeightTensor, ...]
-    format_version: int = 1
+    format_version: int = 2
 
 
 class WeightSemanticsAdapter(Protocol):
@@ -230,6 +232,24 @@ def _inspect_parameter(
     )
 
 
+def _view_shard_dims(view: LogicalTensorView) -> tuple[int, ...]:
+    if view.shard_dims is None:
+        return () if view.partition_dim is None else (view.partition_dim,)
+    shard_dims = view.shard_dims
+    if (
+        not isinstance(shard_dims, tuple)
+        or any(type(dim) is not int for dim in shard_dims)
+        or tuple(sorted(shard_dims)) != shard_dims
+        or len(set(shard_dims)) != len(shard_dims)
+    ):
+        raise WeightManifestError(f"invalid shard axes for {view.tensor_id}")
+    if view.partition_dim is not None and shard_dims != (view.partition_dim,):
+        raise WeightManifestError(
+            f"partition axis conflicts with shard axes for {view.tensor_id}"
+        )
+    return shard_dims
+
+
 def _validate_view(view: LogicalTensorView, physical: _PhysicalParameter) -> int:
     ndim = len(view.global_shape)
     if (
@@ -241,13 +261,25 @@ def _validate_view(view: LogicalTensorView, physical: _PhysicalParameter) -> int
         raise WeightManifestError(
             f"invalid logical view for {physical.names[0]}: {view.tensor_id}"
         )
-    if view.partition_dim is not None and not 0 <= view.partition_dim < ndim:
+    if view.partition_dim is not None and (
+        type(view.partition_dim) is not int or not 0 <= view.partition_dim < ndim
+    ):
         raise WeightManifestError(f"invalid partition axis for {view.tensor_id}")
+    shard_dims = _view_shard_dims(view)
+    if any(dim < 0 or dim >= ndim for dim in shard_dims):
+        raise WeightManifestError(f"invalid shard axes for {view.tensor_id}")
     for offset, extent, total in zip(
         view.global_offset, view.local_shape, view.global_shape
     ):
         if offset < 0 or extent <= 0 or offset + extent > total:
             raise WeightManifestError(f"view is out of bounds: {view.tensor_id}")
+    for dim, (offset, extent, total) in enumerate(
+        zip(view.global_offset, view.local_shape, view.global_shape)
+    ):
+        if dim not in shard_dims and (offset != 0 or extent != total):
+            raise WeightManifestError(
+                f"view uses a non-shard axis: {view.tensor_id}: {dim}"
+            )
     nbytes = prod(view.local_shape) * physical.itemsize
     if (
         view.byte_offset < 0
@@ -575,6 +607,7 @@ class WeightRuntimeManifestManager:
                         dtype=item.dtype,
                         itemsize=item.itemsize,
                         partition_dim=view.partition_dim,
+                        shard_dims=_view_shard_dims(view),
                         layer_id=view.layer_id,
                         expert_id=view.expert_id,
                         layout_fingerprint=view.layout_fingerprint,

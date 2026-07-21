@@ -206,6 +206,59 @@ def qwen_multimodal_config(**overrides):
     return SimpleNamespace(**values)
 
 
+@pytest.mark.parametrize(
+    ("partition_dim", "shard_dims", "global_offset", "local_shape", "message"),
+    [
+        (True, None, (0, 0), (2, 4), "partition"),
+        (None, (0, 0), (0, 0), (2, 4), "shard"),
+        (None, (1, 0), (0, 0), (2, 4), "shard"),
+        (None, (2,), (0, 0), (2, 4), "shard"),
+        (0, (1,), (0, 0), (2, 4), "shard"),
+        (0, (0,), (0, 1), (2, 3), "non-shard"),
+    ],
+)
+def test_runtime_manifest_rejects_invalid_shard_box_semantics(
+    partition_dim,
+    shard_dims,
+    global_offset,
+    local_shape,
+    message,
+) -> None:
+    class StaticAdapter:
+        def describe_parameter(self, *, names, parameter, topology):
+            del parameter, topology
+            return (
+                LogicalTensorView(
+                    tensor_id=names[0],
+                    global_shape=(4, 4),
+                    global_offset=global_offset,
+                    local_shape=local_shape,
+                    partition_dim=partition_dim,
+                    byte_offset=0,
+                    layer_id=None,
+                    expert_id=None,
+                    layout_fingerprint="test:shard-box:v2",
+                    shard_dims=shard_dims,
+                ),
+            )
+
+    manager = WeightRuntimeManifestManager(
+        model=FakeModel([("weight", FakeTensor((4, 4)))]),
+        adapter=StaticAdapter(),
+        topology=topology(),
+        allowed_devices=("cpu",),
+    )
+
+    with pytest.raises(WeightManifestError, match=message):
+        manager.snapshot(
+            model_id="model",
+            revision="revision",
+            instance_id="instance",
+            worker_id="worker",
+            endpoint="worker:12345",
+        )
+
+
 def test_snapshot_keeps_aliases_and_rotates_generation_when_pointer_changes() -> None:
     """A replaced Parameter must invalidate plans even when its names stay stable."""
     tensor = FakeTensor((4, 2), address=0x10000)
@@ -617,7 +670,7 @@ def test_qwen_rejects_stacked_shared_expert_gate_up_layout() -> None:
 
 
 def test_qwen_moe_views_split_ep_ownership_and_expert_tp() -> None:
-    """A fused local expert tensor must become canonical per-expert TP views."""
+    """Each fused expert allocation maps into one family logical coordinate."""
     adapter = Qwen35WeightSemanticsAdapter(
         config=qwen_config(model_type="qwen3_5_moe_text")
     )
@@ -634,19 +687,23 @@ def test_qwen_moe_views_split_ep_ownership_and_expert_tp() -> None:
         ),
     )
 
-    assert [view.expert_id for view in views] == [2, 2, 3, 3]
+    assert [view.expert_id for view in views] == [None, None, None, None]
     assert [view.tensor_id for view in views] == [
-        "layers.2.mlp.experts.2.gate_proj.weight",
-        "layers.2.mlp.experts.2.up_proj.weight",
-        "layers.2.mlp.experts.3.gate_proj.weight",
-        "layers.2.mlp.experts.3.up_proj.weight",
+        "layers.2.mlp.experts.gate_proj.weight",
+        "layers.2.mlp.experts.up_proj.weight",
+        "layers.2.mlp.experts.gate_proj.weight",
+        "layers.2.mlp.experts.up_proj.weight",
     ]
+    assert {view.global_shape for view in views} == {(8, 8, 8)}
     assert [view.global_offset for view in views] == [
-        (4, 0),
-        (4, 0),
-        (4, 0),
-        (4, 0),
+        (2, 4, 0),
+        (2, 4, 0),
+        (3, 4, 0),
+        (3, 4, 0),
     ]
+    assert {view.local_shape for view in views} == {(1, 4, 8)}
+    assert {view.partition_dim for view in views} == {None}
+    assert {view.shard_dims for view in views} == {(0, 1)}
     assert [view.byte_offset for view in views] == [0, 64, 128, 192]
 
     manager = WeightRuntimeManifestManager(
@@ -668,8 +725,44 @@ def test_qwen_moe_views_split_ep_ownership_and_expert_tp() -> None:
         endpoint="worker-0:12345",
     )
 
-    assert manifest.tensors[1].stride == (8, 1)
-    assert manifest.tensors[1].storage_offset == 32
+    assert manifest.format_version == 2
+    up_expert_2 = next(
+        tensor
+        for tensor in manifest.tensors
+        if tensor.tensor_id == "layers.2.mlp.experts.up_proj.weight"
+        and tensor.global_offset[0] == 2
+    )
+    assert up_expert_2.stride == (32, 8, 1)
+    assert up_expert_2.storage_offset == 32
+
+
+def test_qwen_moe_down_uses_expert_and_input_logical_axes() -> None:
+    adapter = Qwen35WeightSemanticsAdapter(
+        config=qwen_config(model_type="qwen3_5_moe_text")
+    )
+
+    views = adapter.describe_parameter(
+        names=("layers.2.mlp.experts.w2_weight",),
+        parameter=FakeTensor((2, 8, 4), itemsize=2),
+        topology=topology(
+            ep_rank=1,
+            ep_size=4,
+            moe_tp_rank=1,
+            moe_tp_size=2,
+        ),
+    )
+
+    assert [view.tensor_id for view in views] == [
+        "layers.2.mlp.experts.down_proj.weight",
+        "layers.2.mlp.experts.down_proj.weight",
+    ]
+    assert [view.global_shape for view in views] == [(8, 8, 8), (8, 8, 8)]
+    assert [view.global_offset for view in views] == [(2, 0, 4), (3, 0, 4)]
+    assert [view.local_shape for view in views] == [(1, 8, 4), (1, 8, 4)]
+    assert [view.shard_dims for view in views] == [(0, 2), (0, 2)]
+    assert [view.partition_dim for view in views] == [None, None]
+    assert [view.expert_id for view in views] == [None, None]
+    assert [view.byte_offset for view in views] == [0, 64]
 
 
 def test_qwen_moe_factory_reads_w31_component_order_from_runtime_module() -> None:
@@ -693,10 +786,13 @@ def test_qwen_moe_factory_reads_w31_component_order_from_runtime_module() -> Non
         worker_id="worker-0",
         endpoint="worker-0:12345",
     )
-    addresses = {tensor.tensor_id: tensor.address for tensor in manifest.tensors}
+    addresses = {
+        (tensor.tensor_id, tensor.global_offset[0]): tensor.address
+        for tensor in manifest.tensors
+    }
 
-    assert addresses["layers.2.mlp.experts.2.up_proj.weight"] == 0x40000
-    assert addresses["layers.2.mlp.experts.2.gate_proj.weight"] == 0x40000 + 64
+    assert addresses[("layers.2.mlp.experts.up_proj.weight", 2)] == 0x40000
+    assert addresses[("layers.2.mlp.experts.gate_proj.weight", 2)] == 0x40000 + 64
     manager.release(manifest.lease_id)
 
 
@@ -733,6 +829,7 @@ def test_qwen3_next_factory_uses_grouped_gdn_runtime_semantics() -> None:
     assert tensor.global_offset == (2, 0, 0)
     assert tensor.local_shape == (2, 12, 8)
     assert tensor.partition_dim == 0
+    assert tensor.shard_dims == (0,)
     assert tensor.nbytes == parameter.numel() * parameter.element_size()
     assert tensor.layout_fingerprint == "sglang:qwen3-next:gdn-qkvz-grouped:v1"
     manager.release(manifest.lease_id)
@@ -803,13 +900,25 @@ def test_qwen3_next_describes_fused_shared_expert_slot() -> None:
         topology=topology(ep_rank=0, ep_size=4, moe_tp_rank=0, moe_tp_size=2),
     )
 
-    assert [view.expert_id for view in w13_views] == [0, 0, 1, 1, None, None]
+    assert [view.expert_id for view in w13_views] == [None] * 6
+    assert [view.tensor_id for view in w13_views[:4]] == [
+        "layers.0.mlp.experts.gate_proj.weight",
+        "layers.0.mlp.experts.up_proj.weight",
+        "layers.0.mlp.experts.gate_proj.weight",
+        "layers.0.mlp.experts.up_proj.weight",
+    ]
+    assert [view.shard_dims for view in w13_views[:4]] == [(0, 1)] * 4
     assert [view.tensor_id for view in w13_views[-2:]] == [
         "layers.0.mlp.shared_expert.gate_proj.weight",
         "layers.0.mlp.shared_expert.up_proj.weight",
     ]
     assert [view.byte_offset for view in w13_views] == [0, 64, 128, 192, 256, 320]
-    assert [view.expert_id for view in w2_views] == [0, 1, None]
+    assert [view.expert_id for view in w2_views] == [None, None, None]
+    assert [view.tensor_id for view in w2_views[:2]] == [
+        "layers.0.mlp.experts.down_proj.weight",
+        "layers.0.mlp.experts.down_proj.weight",
+    ]
+    assert [view.shard_dims for view in w2_views[:2]] == [(0, 2), (0, 2)]
     assert w2_views[-1].tensor_id == (
         "layers.0.mlp.shared_expert.down_proj.weight"
     )
@@ -862,6 +971,7 @@ def test_qwen3_next_fused_and_unfused_shared_expert_semantics_match() -> None:
             view.global_offset,
             view.local_shape,
             view.partition_dim,
+            view.shard_dims,
             view.expert_id,
             view.layout_fingerprint,
         )
