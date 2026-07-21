@@ -8,6 +8,9 @@ import torch
 from sglang.srt.layers.layernorm import GemmaRMSNorm
 from sglang.srt.model_loader import loader as loader_module
 from sglang.srt.model_loader.loader import RemoteInstanceModelLoader
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
 
 @pytest.fixture(autouse=True)
@@ -19,8 +22,10 @@ def _runtime_server_args(monkeypatch):
     )
 
 
+@pytest.mark.parametrize("release_success", [True, False])
 def test_heterogeneous_loader_builds_local_plan_and_reads_from_source(
     monkeypatch,
+    release_success,
 ) -> None:
     calls = {}
     source_inventory = {
@@ -95,12 +100,15 @@ def test_heterogeneous_loader_builds_local_plan_and_reads_from_source(
         "RemoteInstanceWeightTransferHeartbeat",
         FakeHeartbeat,
     )
+
+    def release_source_snapshot(seed_url, transfer_id):
+        calls["released"] = (seed_url, transfer_id)
+        return release_success
+
     monkeypatch.setattr(
         loader_module,
         "release_remote_instance_weight_transfer",
-        lambda seed_url, transfer_id: calls.setdefault(
-            "released", (seed_url, transfer_id)
-        ),
+        release_source_snapshot,
     )
     monkeypatch.setattr(
         loader_module.current_platform,
@@ -299,8 +307,9 @@ def test_heterogeneous_loader_fails_closed_when_heartbeat_fails_during_transfer(
     monkeypatch.setattr(
         loader_module,
         "release_remote_instance_weight_transfer",
-        lambda seed_url, transfer_id: state["released"].append((seed_url, transfer_id))
-        or True,
+        lambda seed_url, transfer_id: (
+            state["released"].append((seed_url, transfer_id)) or True
+        ),
     )
     monkeypatch.setattr(loader_module.current_platform, "synchronize", lambda: None)
     monkeypatch.setattr(loader_module, "_post_load_weights", lambda model: None)

@@ -100,6 +100,96 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_RUNTIME_TENSOR_SEMANTIC_FIELDS = (
+    "tensor_id",
+    "aliases",
+    "global_shape",
+    "global_offset",
+    "local_shape",
+    "dtype",
+    "itemsize",
+    "partition_dim",
+    "layer_id",
+    "expert_id",
+    "layout_fingerprint",
+    "nbytes",
+    "byte_offset",
+    "stride",
+    "storage_offset",
+    "device",
+    "is_contiguous",
+)
+
+
+def _freeze_runtime_manifest_value(value):
+    if isinstance(value, dict):
+        return tuple(
+            sorted(
+                (key, _freeze_runtime_manifest_value(item))
+                for key, item in value.items()
+            )
+        )
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_runtime_manifest_value(item) for item in value)
+    return value
+
+
+def _runtime_manifest_group_signature(manifests) -> tuple:
+    signatures = []
+    for manifest in manifests:
+        tensors = manifest.get("tensors") or ()
+        tensor_signatures = []
+        for tensor in tensors:
+            rank = tensor.get("rank") or {}
+            tensor_signatures.append(
+                (
+                    tuple(
+                        _freeze_runtime_manifest_value(tensor.get(field))
+                        for field in _RUNTIME_TENSOR_SEMANTIC_FIELDS
+                    ),
+                    tuple(rank.get(axis) for axis in ("tp", "pp", "ep")),
+                )
+            )
+        signatures.append(
+            (
+                manifest.get("model_id"),
+                manifest.get("revision"),
+                manifest.get("generation"),
+                manifest.get("format_version"),
+                tuple(sorted(tensor_signatures)),
+            )
+        )
+    return tuple(sorted(signatures))
+
+
+def _merge_runtime_manifest_groups(groups) -> list:
+    if not groups or any(not group for group in groups):
+        raise RuntimeError("source workers returned no runtime manifests")
+    expected_signature = _runtime_manifest_group_signature(groups[0])
+    if any(
+        _runtime_manifest_group_signature(group) != expected_signature
+        for group in groups[1:]
+    ):
+        raise RuntimeError(
+            "source DP replicas returned semantically inconsistent runtime manifests"
+        )
+
+    manifests = [manifest for group in groups for manifest in group]
+    worker_ids = []
+    for manifest in manifests:
+        manifest_worker_ids = {
+            tensor.get("worker_id") for tensor in manifest.get("tensors") or ()
+        }
+        if None in manifest_worker_ids or len(manifest_worker_ids) != 1:
+            raise RuntimeError(
+                "each source runtime manifest must describe exactly one worker"
+            )
+        worker_ids.append(next(iter(manifest_worker_ids)))
+    if len(set(worker_ids)) != len(worker_ids):
+        raise RuntimeError("source runtime manifest worker IDs are not unique")
+    return manifests
+
+
 # Declarative spec: (attr_name_prefix, response_type[, mode])
 # Each entry creates self.{prefix}_communicator and registers
 # response_type -> communicator.handle_recv in the dispatch table.
@@ -542,13 +632,12 @@ class TokenizerControlMixin:
         if not results:
             failures.append("source workers returned no transfer responses")
         elif not failures:
-            manifests = results[0].manifests
-            if not manifests:
-                failures.append("source workers returned no runtime manifests")
-            elif any(result.manifests != manifests for result in results[1:]):
-                failures.append(
-                    "source workers returned inconsistent runtime manifests"
+            try:
+                manifests = _merge_runtime_manifest_groups(
+                    [result.manifests for result in results]
                 )
+            except RuntimeError as error:
+                failures.append(str(error))
         if failures:
             try:
                 await TokenizerControlMixin.release_remote_instance_weight_transfer(
