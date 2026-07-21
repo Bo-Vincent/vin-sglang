@@ -157,23 +157,26 @@ class Qwen3NextWeightSemanticsAdapter(Qwen35WeightSemanticsAdapter):
             else ("gate_proj", "up_proj")
         )
         views = []
+        num_experts = int(self._config.num_experts)
         for local_index, expert_id in enumerate(expert_ids):
             base = local_index * expert_bytes
             for component_index, component in enumerate(components):
                 views.append(
                     _view(
-                        tensor_id=(f"{prefix}experts.{expert_id}.{component}.weight"),
-                        global_shape=(intermediate, shape[2]),
+                        tensor_id=f"{prefix}experts.{component}.weight",
+                        global_shape=(num_experts, intermediate, shape[2]),
                         global_offset=(
+                            expert_id,
                             topology.moe_tp_rank * local_intermediate,
                             0,
                         ),
-                        local_shape=(local_intermediate, shape[2]),
-                        partition_dim=0,
+                        local_shape=(1, local_intermediate, shape[2]),
+                        partition_dim=None,
                         byte_offset=base + component_index * component_bytes,
                         layer_id=layer_id,
-                        expert_id=expert_id,
+                        expert_id=None,
                         layout="moe-w13",
+                        shard_dims=(0, 1),
                     )
                 )
         shared_base = len(expert_ids) * expert_bytes
@@ -223,20 +226,23 @@ class Qwen3NextWeightSemanticsAdapter(Qwen35WeightSemanticsAdapter):
             )
         prefix = name[: -len("experts.w2_weight")]
         expert_bytes = prod(shape[1:]) * _itemsize(parameter)
+        num_experts = int(self._config.num_experts)
         views = [
             _view(
-                tensor_id=f"{prefix}experts.{expert_id}.down_proj.weight",
-                global_shape=(shape[1], intermediate),
+                tensor_id=f"{prefix}experts.down_proj.weight",
+                global_shape=(num_experts, shape[1], intermediate),
                 global_offset=(
+                    expert_id,
                     0,
                     topology.moe_tp_rank * local_intermediate,
                 ),
-                local_shape=(shape[1], local_intermediate),
-                partition_dim=1,
+                local_shape=(1, shape[1], local_intermediate),
+                partition_dim=None,
                 byte_offset=local_index * expert_bytes,
                 layer_id=layer_id,
-                expert_id=expert_id,
+                expert_id=None,
                 layout="moe-w2",
+                shard_dims=(0, 2),
             )
             for local_index, expert_id in enumerate(expert_ids)
         ]
@@ -298,6 +304,7 @@ class Qwen3NextWeightSemanticsAdapter(Qwen35WeightSemanticsAdapter):
                 layer_id=_layer_id(name),
                 expert_id=None,
                 layout_fingerprint=f"sglang:qwen3-next:{layout}:v1",
+                shard_dims=(0,),
             ),
         )
 

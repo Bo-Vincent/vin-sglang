@@ -56,6 +56,7 @@ def _view(
     layer_id: int | None,
     expert_id: int | None = None,
     layout: str,
+    shard_dims: tuple[int, ...] | None = None,
 ) -> LogicalTensorView:
     return LogicalTensorView(
         tensor_id=tensor_id,
@@ -67,6 +68,11 @@ def _view(
         layer_id=layer_id,
         expert_id=expert_id,
         layout_fingerprint=f"sglang:qwen3.5:{layout}:v1",
+        shard_dims=(
+            shard_dims
+            if shard_dims is not None
+            else (() if partition_dim is None else (partition_dim,))
+        ),
     )
 
 
@@ -588,23 +594,26 @@ class Qwen35WeightSemanticsAdapter:
             else ("gate_proj", "up_proj")
         )
         result = []
+        num_experts = int(self._config.num_experts)
         for local_index, expert_id in enumerate(expert_ids):
             base = local_index * expert_bytes
             for component_index, component in enumerate(components):
                 result.append(
                     _view(
-                        tensor_id=(f"{prefix}experts.{expert_id}.{component}.weight"),
-                        global_shape=(intermediate, shape[2]),
+                        tensor_id=f"{prefix}experts.{component}.weight",
+                        global_shape=(num_experts, intermediate, shape[2]),
                         global_offset=(
+                            expert_id,
                             topology.moe_tp_rank * local_intermediate,
                             0,
                         ),
-                        local_shape=(local_intermediate, shape[2]),
-                        partition_dim=0,
+                        local_shape=(1, local_intermediate, shape[2]),
+                        partition_dim=None,
                         byte_offset=base + component_index * component_bytes,
                         layer_id=layer_id,
-                        expert_id=expert_id,
+                        expert_id=None,
                         layout="moe-w13",
+                        shard_dims=(0, 1),
                     )
                 )
         return tuple(result)
@@ -625,20 +634,23 @@ class Qwen35WeightSemanticsAdapter:
             )
         prefix = name[: -len("experts.w2_weight")]
         expert_bytes = prod(shape[1:]) * _itemsize(parameter)
+        num_experts = int(self._config.num_experts)
         return tuple(
             _view(
-                tensor_id=f"{prefix}experts.{expert_id}.down_proj.weight",
-                global_shape=(shape[1], intermediate),
+                tensor_id=f"{prefix}experts.down_proj.weight",
+                global_shape=(num_experts, shape[1], intermediate),
                 global_offset=(
+                    expert_id,
                     0,
                     topology.moe_tp_rank * local_intermediate,
                 ),
-                local_shape=(shape[1], local_intermediate),
-                partition_dim=1,
+                local_shape=(1, shape[1], local_intermediate),
+                partition_dim=None,
                 byte_offset=local_index * expert_bytes,
                 layer_id=layer_id,
-                expert_id=expert_id,
+                expert_id=None,
                 layout="moe-w2",
+                shard_dims=(0, 2),
             )
             for local_index, expert_id in enumerate(expert_ids)
         )

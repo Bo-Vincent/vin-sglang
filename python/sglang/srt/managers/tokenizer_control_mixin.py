@@ -109,6 +109,7 @@ _RUNTIME_TENSOR_SEMANTIC_FIELDS = (
     "dtype",
     "itemsize",
     "partition_dim",
+    "shard_dims",
     "layer_id",
     "expert_id",
     "layout_fingerprint",
