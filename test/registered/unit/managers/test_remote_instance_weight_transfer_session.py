@@ -4,17 +4,25 @@ import time
 from types import SimpleNamespace
 
 import pytest
+import torch
 
+from sglang.srt.constants import GPU_MEMORY_TYPE_WEIGHTS
 from sglang.srt.managers.io_struct import (
     BeginRemoteInstanceWeightTransferReqInput,
     BeginRemoteInstanceWeightTransferReqOutput,
+    ReleaseMemoryOccupationReqInput,
     ReleaseRemoteInstanceWeightTransferReqInput,
+    ResumeMemoryOccupationReqInput,
     RenewRemoteInstanceWeightTransferReqInput,
 )
 from sglang.srt.managers.scheduler_components.weight_updater import (
     SchedulerWeightUpdaterManager,
 )
 from sglang.srt.managers.tokenizer_control_mixin import TokenizerControlMixin
+from sglang.srt.model_executor.weight_runtime_manifest import (
+    WeightManifestError,
+    WeightSnapshotCoordinator,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
@@ -222,6 +230,92 @@ def test_runtime_revision_commit_ignores_workers_without_manifest_support() -> N
     SchedulerWeightUpdaterManager._commit_weight_runtime_revision(
         SimpleNamespace(model_runner=SimpleNamespace())
     )
+
+
+def test_weight_memory_release_is_rejected_while_snapshot_lease_is_active(
+    monkeypatch,
+) -> None:
+    events = []
+    coordinator = WeightSnapshotCoordinator()
+    lease_id, _ = coordinator.acquire_snapshot()
+    runner = SimpleNamespace(
+        model=object(),
+        weight_snapshot_coordinator=coordinator,
+    )
+    manager = _manager(runner)
+    manager.memory_saver_adapter = SimpleNamespace(
+        pause=lambda tag: events.append(("pause", tag))
+    )
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group: 1)
+    monkeypatch.setattr(
+        torch.distributed,
+        "all_gather_object",
+        lambda outputs, value, group: outputs.__setitem__(0, value),
+    )
+
+    with pytest.raises(WeightManifestError, match="snapshot lease is active"):
+        manager.release_memory_occupation(
+            ReleaseMemoryOccupationReqInput(tags=[GPU_MEMORY_TYPE_WEIGHTS])
+        )
+
+    assert events == []
+    assert manager.offload_tags == set()
+    coordinator.release_snapshot(lease_id)
+
+
+def test_weight_memory_release_and_resume_advance_snapshot_generation(
+    monkeypatch,
+) -> None:
+    events = []
+    coordinator = WeightSnapshotCoordinator()
+    runner = SimpleNamespace(
+        model=object(),
+        weight_snapshot_coordinator=coordinator,
+    )
+    manager = _manager(runner)
+    manager.memory_saver_adapter = SimpleNamespace(
+        pause=lambda tag: events.append(("pause", tag)),
+        resume=lambda tag: events.append(("resume", tag)),
+    )
+    monkeypatch.setattr(
+        "sglang.srt.managers.scheduler_components.weight_updater._export_static_state",
+        lambda model: {"buffers": []},
+    )
+    monkeypatch.setattr(
+        "sglang.srt.managers.scheduler_components.weight_updater._import_static_state",
+        lambda model, state: events.append(("restore", state)),
+    )
+    monkeypatch.setattr(torch.distributed, "barrier", lambda group: None)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group: 1)
+    monkeypatch.setattr(
+        torch.distributed,
+        "all_gather_object",
+        lambda outputs, value, group: outputs.__setitem__(0, value),
+    )
+    monkeypatch.setattr(
+        torch,
+        "get_device_module",
+        lambda: SimpleNamespace(synchronize=lambda: None),
+    )
+
+    manager.release_memory_occupation(
+        ReleaseMemoryOccupationReqInput(tags=[GPU_MEMORY_TYPE_WEIGHTS])
+    )
+    with pytest.raises(WeightManifestError, match="revision commit"):
+        coordinator.acquire_snapshot()
+
+    manager.resume_memory_occupation(
+        ResumeMemoryOccupationReqInput(tags=[GPU_MEMORY_TYPE_WEIGHTS])
+    )
+    lease_id, generation = coordinator.acquire_snapshot()
+
+    assert generation == 3
+    assert events == [
+        ("pause", GPU_MEMORY_TYPE_WEIGHTS),
+        ("resume", GPU_MEMORY_TYPE_WEIGHTS),
+        ("restore", {"buffers": []}),
+    ]
+    coordinator.release_snapshot(lease_id)
 
 
 def test_release_keeps_snapshot_lease_available_for_retry(monkeypatch) -> None:
