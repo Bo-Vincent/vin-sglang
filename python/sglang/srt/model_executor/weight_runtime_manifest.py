@@ -353,6 +353,13 @@ class WeightSnapshotCoordinator:
             self._last_update_success = bool(success)
             self._update_token = None
 
+    def cancel_update(self, token: str) -> None:
+        """Cancel a reservation before any local weight mutation starts."""
+        with self._lock:
+            if not token or token != self._update_token:
+                raise WeightManifestError("weight update token does not match")
+            self._update_token = None
+
     def commit_revision(self) -> int:
         with self._lock:
             self._prune_expired_leases_locked()
@@ -795,9 +802,7 @@ def create_weight_runtime_manifest_manager(
             config=config,
             dynamic_expert_placement=dynamic_expert_placement,
             up_first_w13_parameter_ids=up_first_w13_parameters,
-            num_fused_shared_experts=int(
-                getattr(model, "num_fused_shared_experts", 0)
-            ),
+            num_fused_shared_experts=int(getattr(model, "num_fused_shared_experts", 0)),
         )
     else:
         adapter = Qwen35WeightSemanticsAdapter(

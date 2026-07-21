@@ -7,7 +7,7 @@ import logging
 import threading
 import time
 from dataclasses import dataclass
-from typing import List
+from typing import Any, List
 
 import requests
 
@@ -65,6 +65,12 @@ class RemoteInstanceWeightTransferHeartbeat:
     def start(self) -> None:
         if self._thread is not None:
             raise RuntimeError("remote weight transfer heartbeat was already started")
+        if not renew_remote_instance_weight_transfer(
+            self.seed_url,
+            self.transfer_id,
+            self.lease_timeout_sec,
+        ):
+            raise RuntimeError("initial source weight transfer lease renew failed")
         self._thread = threading.Thread(
             target=self._run,
             name=f"weight-transfer-heartbeat-{self.transfer_id[:8]}",
@@ -104,6 +110,226 @@ class RemoteInstanceWeightTransferHeartbeat:
         self._thread.join(timeout=35)
         if self._thread.is_alive():
             raise RuntimeError("remote weight transfer heartbeat did not stop")
+
+
+class RemoteInstanceWeightTransferWorldCoordinator:
+    """Share one source snapshot lease across the target model world."""
+
+    def __init__(self, seed_url: str, world_group: Any) -> None:
+        self.seed_url = seed_url
+        self.world_group = world_group
+        self.is_owner = world_group.rank_in_group == 0
+        self.session: RemoteInstanceWeightTransferSession | None = None
+        self.heartbeat: RemoteInstanceWeightTransferHeartbeat | None = None
+        self._acquired = False
+        self._finished = False
+        self._readiness_checked = False
+        self._release_safe = True
+
+    def acquire(self) -> RemoteInstanceWeightTransferSession | None:
+        if self._acquired:
+            raise RuntimeError("remote weight transfer world session already acquired")
+        self._acquired = True
+
+        local_session = None
+        if self.is_owner:
+            try:
+                local_session = begin_remote_instance_weight_transfer(self.seed_url)
+            except Exception:
+                logger.exception("Failed to acquire the source weight transfer session")
+            if local_session is not None:
+                try:
+                    self.heartbeat = RemoteInstanceWeightTransferHeartbeat(
+                        self.seed_url,
+                        local_session.transfer_id,
+                        lease_timeout_sec=local_session.lease_timeout_sec,
+                    )
+                    self.heartbeat.start()
+                except Exception:
+                    logger.exception("Failed to start remote weight transfer heartbeat")
+                    try:
+                        release_remote_instance_weight_transfer(
+                            self.seed_url, local_session.transfer_id
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Failed to clean up the source weight transfer after "
+                            "heartbeat startup; waiting for lease TTL"
+                        )
+                    self.heartbeat = None
+                    local_session = None
+
+        try:
+            self.session = self.world_group.broadcast_object(local_session, src=0)
+        except Exception:
+            self._stop_heartbeat()
+            logger.exception(
+                "Failed to broadcast the source weight transfer session; "
+                "keeping its lease until TTL"
+            )
+            raise
+        return self.session
+
+    def raise_if_failed(self) -> None:
+        if self.heartbeat is not None:
+            self.heartbeat.raise_if_failed()
+
+    def ready_for_transfer(self, local_ready: bool) -> bool:
+        """Run the single target-world gate before any rank starts DMA."""
+        if not self._acquired:
+            raise RuntimeError("remote weight transfer world session was not acquired")
+        if self._finished:
+            raise RuntimeError("remote weight transfer world session already finished")
+        if self._readiness_checked:
+            raise RuntimeError("remote weight transfer readiness was already checked")
+        self._readiness_checked = True
+        if self.session is None:
+            return False
+
+        ready = bool(local_ready)
+        if self.heartbeat is not None:
+            try:
+                self.heartbeat.raise_if_failed()
+            except Exception:
+                ready = False
+                logger.exception(
+                    "Source lease heartbeat failed before the target-world "
+                    "transfer readiness gate"
+                )
+
+        try:
+            gathered_readiness = self.world_group.all_gather_object(ready)
+        except Exception:
+            self._release_safe = False
+            logger.exception(
+                "Failed to gather target transfer readiness; keeping the source "
+                "lease until TTL"
+            )
+            return False
+
+        readiness_valid = len(
+            gathered_readiness
+        ) == self.world_group.world_size and all(
+            isinstance(value, bool) for value in gathered_readiness
+        )
+        if not readiness_valid:
+            self._release_safe = False
+            logger.error(
+                "Target world returned invalid transfer readiness; keeping the "
+                "source lease until TTL"
+            )
+            return False
+        return all(gathered_readiness)
+
+    def finish(
+        self,
+        *,
+        local_success: bool,
+        local_release_safe: bool = True,
+    ) -> tuple[bool, bool]:
+        if not self._acquired:
+            raise RuntimeError("remote weight transfer world session was not acquired")
+        if self._finished:
+            raise RuntimeError("remote weight transfer world session already finished")
+        self._finished = True
+        if self.session is None:
+            return False, True
+
+        local_release_safe = bool(local_release_safe) and self._release_safe
+
+        if self.heartbeat is not None:
+            try:
+                self.heartbeat.raise_if_failed()
+            except Exception:
+                local_success = False
+                logger.exception(
+                    "Remote weight transfer heartbeat failed before world sync"
+                )
+
+        try:
+            gathered_outcomes = self.world_group.all_gather_object(
+                (bool(local_success), bool(local_release_safe))
+            )
+        except Exception:
+            self._stop_heartbeat()
+            logger.exception(
+                "Failed to gather target transfer outcomes; keeping the source "
+                "lease until TTL"
+            )
+            return False, False
+
+        outcomes_valid = len(gathered_outcomes) == self.world_group.world_size and all(
+            isinstance(outcome, tuple)
+            and len(outcome) == 2
+            and isinstance(outcome[0], bool)
+            and isinstance(outcome[1], bool)
+            for outcome in gathered_outcomes
+        )
+        if not outcomes_valid:
+            self._stop_heartbeat()
+            logger.error(
+                "Target world returned invalid transfer outcomes; keeping the "
+                "source lease until TTL"
+            )
+            return False, False
+
+        release_safe = all(outcome[1] for outcome in gathered_outcomes)
+        world_success = release_safe and all(
+            outcome[0] for outcome in gathered_outcomes
+        )
+        release_success = True
+        if self.is_owner:
+            if not self._stop_heartbeat():
+                world_success = False
+            if release_safe:
+                try:
+                    release_success = release_remote_instance_weight_transfer(
+                        self.seed_url, self.session.transfer_id
+                    )
+                except Exception:
+                    release_success = False
+                    logger.exception(
+                        "Failed to release source weight transfer %s; waiting for "
+                        "lease TTL",
+                        self.session.transfer_id,
+                    )
+            else:
+                release_success = False
+                logger.error(
+                    "Keeping source weight transfer %s leased until TTL because "
+                    "a target rank could not confirm transfer completion",
+                    self.session.transfer_id,
+                )
+
+        try:
+            outcome = self.world_group.broadcast_object(
+                (world_success, release_success) if self.is_owner else None,
+                src=0,
+            )
+        except Exception:
+            logger.exception("Failed to broadcast the target transfer outcome")
+            return False, False
+        if (
+            not isinstance(outcome, tuple)
+            or len(outcome) != 2
+            or not all(isinstance(value, bool) for value in outcome)
+        ):
+            logger.error("Target world returned an invalid weight transfer outcome")
+            return False, False
+        return outcome
+
+    def _stop_heartbeat(self) -> bool:
+        if self.heartbeat is None:
+            return True
+        try:
+            self.heartbeat.stop()
+            self.heartbeat.raise_if_failed()
+        except Exception:
+            logger.exception("Remote weight transfer heartbeat failed while stopping")
+            return False
+        finally:
+            self.heartbeat = None
+        return True
 
 
 def trigger_init_weights_send_group_for_remote_instance_request(
