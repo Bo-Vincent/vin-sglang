@@ -23,7 +23,7 @@ import tempfile
 import threading
 import time
 from abc import ABC, abstractmethod
-from contextlib import contextmanager, suppress
+from contextlib import ExitStack, contextmanager, suppress
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -44,11 +44,9 @@ import torch
 from sglang.srt.constants import GIB_BYTES
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     RemoteInstanceWeightLoaderBackend,
-    RemoteInstanceWeightTransferHeartbeat,
-    begin_remote_instance_weight_transfer,
+    RemoteInstanceWeightTransferWorldCoordinator,
     get_remote_instance_transfer_engine_info_per_rank,
     register_memory_region,
-    release_remote_instance_weight_transfer,
 )
 from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils import get_available_gpu_memory
@@ -80,6 +78,7 @@ from sglang.srt.connector.utils import parse_model_name
 from sglang.srt.distributed import (
     model_parallel_is_initialized,
 )
+from sglang.srt.distributed.parallel_state import get_world_group
 from sglang.srt.layers.modelopt_utils import QUANT_CFG_CHOICES
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
@@ -3298,64 +3297,114 @@ class RemoteInstanceModelLoader(BaseModelLoader):
                 "--torchao-config because source and target layouts differ."
             )
             return False
-        transfer_session = begin_remote_instance_weight_transfer(seed_url)
-        if transfer_session is None:
-            logger.error("Cannot acquire remote weight transfer session.")
-            return False
-        inventories = transfer_session.manifests
-        started = time.perf_counter()
-        transfer_success = False
-        release_success = False
-        heartbeat = None
-        receipts = ()
         try:
-            heartbeat = RemoteInstanceWeightTransferHeartbeat(
-                seed_url,
-                transfer_session.transfer_id,
-                lease_timeout_sec=getattr(transfer_session, "lease_timeout_sec", 300),
-            )
-            heartbeat.start()
-            heartbeat.raise_if_failed()
             from mooncake.weight_transfer import (
                 MemoryRegistrationLease,
                 MooncakeTransferEngineReader,
                 RuntimeManifest,
+                TransferEngineError,
                 plan_runtime_transfer_to_local_target,
             )
+        except Exception:
+            logger.exception("Cannot import Mooncake heterogeneous weight transfer")
+            return False
 
-            source_manifests = tuple(
-                RuntimeManifest.from_runtime_inventory(inventory)
-                for inventory in inventories
-            )
-            heartbeat.raise_if_failed()
-            source = source_manifests[0]
-            with target_manifest_builder(
-                model=model,
-                model_id=source.model_id,
-                revision=source.revision,
-                instance_id=f"sglang:{local_session_id}",
-                endpoint=local_session_id,
-            ) as target_inventory:
-                target_manifest = RuntimeManifest.from_runtime_inventory(
-                    target_inventory
-                )
-                plan = plan_runtime_transfer_to_local_target(
-                    source_manifests, target_manifest
-                )
-                heartbeat.raise_if_failed()
-                source_registrations = tuple(
-                    MemoryRegistrationLease.from_fragment(
-                        fragment,
-                        runtime_lease_id=manifest.lease_id,
+        started = time.perf_counter()
+        phase_seconds = {
+            "acquire": 0.0,
+            "source_manifest": 0.0,
+            "target_manifest": 0.0,
+            "plan": 0.0,
+            "transfer": 0.0,
+            "synchronize": 0.0,
+            "post_load": 0.0,
+            "release": 0.0,
+        }
+        coordinator = RemoteInstanceWeightTransferWorldCoordinator(
+            seed_url, get_world_group()
+        )
+        acquire_started = time.perf_counter()
+        try:
+            transfer_session = coordinator.acquire()
+        except Exception:
+            logger.exception("Cannot acquire remote weight transfer session")
+            return False
+        phase_seconds["acquire"] = time.perf_counter() - acquire_started
+        if transfer_session is None:
+            logger.error("Cannot acquire remote weight transfer session.")
+            return False
+        inventories = transfer_session.manifests
+        transfer_success = False
+        release_safe = True
+        release_success = False
+        receipts = ()
+        plan = None
+        transfer_attempted = False
+        transfer_completion_confirmed = False
+        try:
+            with ExitStack() as transfer_resources:
+                planning_error = None
+                try:
+                    source_manifest_started = time.perf_counter()
+                    source_manifests = tuple(
+                        RuntimeManifest.from_runtime_inventory(inventory)
+                        for inventory in inventories
                     )
-                    for manifest in source_manifests
-                    for fragment in manifest.fragments
-                )
-                target_registrations = tuple(
-                    MemoryRegistrationLease.from_fragment(fragment)
-                    for fragment in target_manifest.fragments
-                )
-                receipts = MooncakeTransferEngineReader(transfer_engine).execute(
+                    phase_seconds["source_manifest"] = (
+                        time.perf_counter() - source_manifest_started
+                    )
+                    source = source_manifests[0]
+                    target_manifest_started = time.perf_counter()
+                    target_inventory = transfer_resources.enter_context(
+                        target_manifest_builder(
+                            model=model,
+                            model_id=source.model_id,
+                            revision=source.revision,
+                            instance_id=f"sglang:{local_session_id}",
+                            endpoint=local_session_id,
+                        )
+                    )
+                    target_manifest = RuntimeManifest.from_runtime_inventory(
+                        target_inventory
+                    )
+                    phase_seconds["target_manifest"] = (
+                        time.perf_counter() - target_manifest_started
+                    )
+                    plan_started = time.perf_counter()
+                    plan = plan_runtime_transfer_to_local_target(
+                        source_manifests, target_manifest
+                    )
+                    phase_seconds["plan"] = time.perf_counter() - plan_started
+                    source_registrations = tuple(
+                        MemoryRegistrationLease.from_fragment(
+                            fragment,
+                            runtime_lease_id=manifest.lease_id,
+                        )
+                        for manifest in source_manifests
+                        for fragment in manifest.fragments
+                    )
+                    target_registrations = tuple(
+                        MemoryRegistrationLease.from_fragment(fragment)
+                        for fragment in target_manifest.fragments
+                    )
+                except Exception as error:
+                    planning_error = error
+
+                world_ready = coordinator.ready_for_transfer(planning_error is None)
+                if planning_error is not None:
+                    raise planning_error
+                if not world_ready:
+                    raise RuntimeError(
+                        "target world is not ready for heterogeneous weight transfer"
+                    )
+
+                transfer_started = time.perf_counter()
+                transfer_attempted = True
+                release_safe = False
+                receipts = MooncakeTransferEngineReader(
+                    transfer_engine,
+                    max_batch_operations=8192,
+                ).execute(
                     plan,
                     source_manifests,
                     target_manifest,
@@ -3364,28 +3413,50 @@ class RemoteInstanceModelLoader(BaseModelLoader):
                     target_pre_registered=True,
                     target_registrations=target_registrations,
                 )
-                heartbeat.raise_if_failed()
+                transfer_completion_confirmed = True
+                release_safe = True
+                phase_seconds["transfer"] = time.perf_counter() - transfer_started
+            synchronize_started = time.perf_counter()
             current_platform.synchronize()
+            phase_seconds["synchronize"] = time.perf_counter() - synchronize_started
+            post_load_started = time.perf_counter()
             _post_load_weights(model)
-            heartbeat.raise_if_failed()
+            phase_seconds["post_load"] = time.perf_counter() - post_load_started
             transfer_success = True
+        except TransferEngineError:
+            release_safe = not transfer_attempted or transfer_completion_confirmed
+            logger.exception(
+                "Heterogeneous remote-instance Transfer Engine loading failed; %s",
+                (
+                    "keeping the source lease until TTL because transfer completion "
+                    "cannot be proven"
+                    if transfer_attempted
+                    else "no transfer was attempted"
+                ),
+            )
         except Exception:
+            release_safe = not transfer_attempted or transfer_completion_confirmed
             logger.exception("Heterogeneous remote-instance weight loading failed")
         finally:
-            if heartbeat is not None:
-                try:
-                    heartbeat.stop()
-                    heartbeat.raise_if_failed()
-                except Exception:
-                    transfer_success = False
-                    logger.exception(
-                        "Remote weight transfer heartbeat failed during loading"
-                    )
-            release_success = release_remote_instance_weight_transfer(
-                seed_url, transfer_session.transfer_id
-            )
+            release_started = time.perf_counter()
+            try:
+                transfer_success, release_success = coordinator.finish(
+                    local_success=transfer_success,
+                    local_release_safe=release_safe,
+                )
+            except Exception:
+                transfer_success = False
+                release_success = False
+                logger.exception("Failed to finish remote weight transfer session")
+            phase_seconds["release"] = time.perf_counter() - release_started
 
         if not transfer_success:
+            logger.error(
+                "Heterogeneous remote-instance loading phases before failure: %s",
+                ", ".join(
+                    f"{name}={seconds:.4f}s" for name, seconds in phase_seconds.items()
+                ),
+            )
             return False
         if not release_success:
             logger.warning(
@@ -3396,10 +3467,15 @@ class RemoteInstanceModelLoader(BaseModelLoader):
 
         logger.info(
             "Loaded heterogeneous remote-instance weights: bytes=%d, "
-            "operations=%d, elapsed=%.4fs",
+            "compact_operations=%d, segments=%d, elapsed=%.4fs; "
+            "phases: %s",
             sum(receipt.nbytes for receipt in receipts),
+            len(plan.operations),
             sum(receipt.operation_count for receipt in receipts),
             time.perf_counter() - started,
+            ", ".join(
+                f"{name}={seconds:.4f}s" for name, seconds in phase_seconds.items()
+            ),
         )
         return True
 

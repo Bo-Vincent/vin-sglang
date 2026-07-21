@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import threading
 import time
 import traceback
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -48,6 +49,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
 )
+from sglang.srt.model_executor.weight_runtime_manifest import WeightManifestError
 
 logger = logging.getLogger(__name__)
 
@@ -94,12 +96,110 @@ class SchedulerWeightUpdaterManager:
     offload_tags: set = field(default_factory=set)
     stashed_model_static_state: Any = None
     remote_weight_transfer_leases: Dict[str, str] = field(default_factory=dict)
+    remote_weight_transfer_deadlines: Dict[str, float] = field(default_factory=dict)
+    remote_weight_transfer_lock: threading.Lock = field(
+        default_factory=threading.Lock, init=False, repr=False
+    )
     remote_weight_transfer_executor: Optional[ThreadPoolExecutor] = field(
         default=None, init=False, repr=False
     )
     remote_weight_transfer_pending: List[Tuple[Future, Any]] = field(
         default_factory=list, init=False, repr=False
     )
+
+    @contextmanager
+    def _coordinate_weight_memory_transition(
+        self,
+        *,
+        enabled: bool,
+        commit_revision: bool,
+    ) -> Iterator[None]:
+        coordinator = getattr(
+            self.tp_worker.model_runner,
+            "weight_snapshot_coordinator",
+            None,
+        )
+        if not enabled or coordinator is None:
+            yield
+            return
+
+        token = None
+        local_error = None
+        try:
+            token = coordinator.begin_update()
+        except Exception as error:
+            local_error = str(error)
+
+        try:
+            world_size = torch.distributed.get_world_size(group=self.world_cpu_group)
+            gathered_errors = [None] * world_size
+            torch.distributed.all_gather_object(
+                gathered_errors,
+                local_error,
+                group=self.world_cpu_group,
+            )
+        except Exception as error:
+            if token is not None:
+                coordinator.cancel_update(token)
+            raise WeightManifestError(
+                f"failed to coordinate weight memory transition: {error}"
+            ) from error
+
+        failures = [
+            f"rank {rank}: {error}"
+            for rank, error in enumerate(gathered_errors)
+            if error is not None
+        ]
+        if failures:
+            if token is not None:
+                coordinator.cancel_update(token)
+            raise WeightManifestError(
+                "weight memory transition reservation failed: " + " | ".join(failures)
+            )
+
+        assert token is not None
+        success = False
+        try:
+            yield
+            success = True
+        finally:
+            coordinator.finish_update(token, success=success)
+            if success and commit_revision:
+                coordinator.commit_revision()
+
+    def _prune_remote_weight_transfer_bookkeeping(self) -> None:
+        now = time.monotonic()
+        with self.remote_weight_transfer_lock:
+            expired = [
+                transfer_id
+                for transfer_id, deadline in self.remote_weight_transfer_deadlines.items()
+                if deadline <= now
+            ]
+            for transfer_id in expired:
+                self.remote_weight_transfer_deadlines.pop(transfer_id, None)
+                self.remote_weight_transfer_leases.pop(transfer_id, None)
+
+    def _get_remote_weight_transfer_lease(self, transfer_id: str) -> str | None:
+        self._prune_remote_weight_transfer_bookkeeping()
+        with self.remote_weight_transfer_lock:
+            return self.remote_weight_transfer_leases.get(transfer_id)
+
+    def _record_remote_weight_transfer_lease(
+        self,
+        transfer_id: str,
+        lease_id: str,
+        lease_timeout_sec: int,
+    ) -> None:
+        with self.remote_weight_transfer_lock:
+            self.remote_weight_transfer_leases[transfer_id] = lease_id
+            self.remote_weight_transfer_deadlines[transfer_id] = (
+                time.monotonic() + lease_timeout_sec
+            )
+
+    def _forget_remote_weight_transfer_lease(self, transfer_id: str) -> None:
+        with self.remote_weight_transfer_lock:
+            self.remote_weight_transfer_leases.pop(transfer_id, None)
+            self.remote_weight_transfer_deadlines.pop(transfer_id, None)
 
     @contextmanager
     def _observe_weight_load(self, source: str) -> Iterator[None]:
@@ -270,6 +370,7 @@ class SchedulerWeightUpdaterManager:
         return RenewRemoteInstanceWeightTransferReqOutput(**kwargs)
 
     def check_pending_remote_instance_weight_transfers(self):
+        self._prune_remote_weight_transfer_bookkeeping()
         completed = []
         remaining = []
         for future, recv_req in self.remote_weight_transfer_pending:
@@ -298,7 +399,7 @@ class SchedulerWeightUpdaterManager:
         collective_group = self.remote_weight_transfer_cpu_group or self.world_cpu_group
         local_manifest = None
         try:
-            if recv_req.transfer_id in self.remote_weight_transfer_leases:
+            if self._get_remote_weight_transfer_lease(recv_req.transfer_id) is not None:
                 raise RuntimeError(
                     f"remote weight transfer already exists: {recv_req.transfer_id}"
                 )
@@ -372,7 +473,11 @@ class SchedulerWeightUpdaterManager:
             if isinstance(local_manifest, dict)
             else local_manifest.lease_id
         )
-        self.remote_weight_transfer_leases[recv_req.transfer_id] = local_lease_id
+        self._record_remote_weight_transfer_lease(
+            recv_req.transfer_id,
+            local_lease_id,
+            recv_req.lease_timeout_sec,
+        )
         return BeginRemoteInstanceWeightTransferReqOutput(
             transfer_id=recv_req.transfer_id,
             success=True,
@@ -402,7 +507,7 @@ class SchedulerWeightUpdaterManager:
     def renew_remote_instance_weight_transfer(
         self, recv_req: RenewRemoteInstanceWeightTransferReqInput
     ) -> RenewRemoteInstanceWeightTransferReqOutput:
-        lease_id = self.remote_weight_transfer_leases.get(recv_req.transfer_id)
+        lease_id = self._get_remote_weight_transfer_lease(recv_req.transfer_id)
         if lease_id is None:
             local_success = False
             local_message = "Remote weight transfer does not exist or has expired."
@@ -411,6 +516,11 @@ class SchedulerWeightUpdaterManager:
                 self.tp_worker.model_runner.renew_weight_runtime_manifest(
                     lease_id,
                     lease_timeout_sec=recv_req.lease_timeout_sec,
+                )
+                self._record_remote_weight_transfer_lease(
+                    recv_req.transfer_id,
+                    lease_id,
+                    recv_req.lease_timeout_sec,
                 )
                 local_success = True
                 local_message = "Success."
@@ -423,7 +533,7 @@ class SchedulerWeightUpdaterManager:
                     None,
                 )
                 if callable(is_active) and not is_active(lease_id):
-                    self.remote_weight_transfer_leases.pop(recv_req.transfer_id, None)
+                    self._forget_remote_weight_transfer_lease(recv_req.transfer_id)
 
         success, message = self._gather_remote_weight_transfer_status(
             success=local_success,
@@ -469,7 +579,7 @@ class SchedulerWeightUpdaterManager:
     def release_remote_instance_weight_transfer(
         self, recv_req: ReleaseRemoteInstanceWeightTransferReqInput
     ) -> ReleaseRemoteInstanceWeightTransferReqOutput:
-        lease_id = self.remote_weight_transfer_leases.get(recv_req.transfer_id)
+        lease_id = self._get_remote_weight_transfer_lease(recv_req.transfer_id)
         if lease_id is None:
             local_success = True
             local_message = "Remote weight transfer was already released."
@@ -480,7 +590,7 @@ class SchedulerWeightUpdaterManager:
                 None,
             )
             if callable(is_active) and not is_active(lease_id):
-                self.remote_weight_transfer_leases.pop(recv_req.transfer_id, None)
+                self._forget_remote_weight_transfer_lease(recv_req.transfer_id)
                 local_success = True
                 local_message = "Remote weight transfer lease already expired."
             else:
@@ -488,14 +598,12 @@ class SchedulerWeightUpdaterManager:
                     self.tp_worker.model_runner.release_weight_runtime_manifest(
                         lease_id
                     )
-                    self.remote_weight_transfer_leases.pop(recv_req.transfer_id, None)
+                    self._forget_remote_weight_transfer_lease(recv_req.transfer_id)
                     local_success = True
                     local_message = "Success."
                 except Exception as error:
                     if callable(is_active) and not is_active(lease_id):
-                        self.remote_weight_transfer_leases.pop(
-                            recv_req.transfer_id, None
-                        )
+                        self._forget_remote_weight_transfer_lease(recv_req.transfer_id)
                         local_success = True
                         local_message = "Remote weight transfer lease already expired."
                     else:
@@ -514,48 +622,54 @@ class SchedulerWeightUpdaterManager:
         )
 
     def release_memory_occupation(self, recv_req: ReleaseMemoryOccupationReqInput):
-        assert (
-            self.is_fully_idle()
-        ), "release_memory_occupation should be called only when server is idle."
+        assert self.is_fully_idle(), (
+            "release_memory_occupation should be called only when server is idle."
+        )
 
         tags = recv_req.tags
 
         if tags is None or len(tags) == 0:
             tags = GPU_MEMORY_ALL_TYPES
 
-        for tag in tags:
-            self.offload_tags.add(tag)
+        with self._coordinate_weight_memory_transition(
+            enabled=GPU_MEMORY_TYPE_WEIGHTS in tags,
+            commit_revision=False,
+        ):
+            for tag in tags:
+                self.offload_tags.add(tag)
 
-        if GPU_MEMORY_TYPE_KV_CACHE in tags:
-            scheduler = self.scheduler
-            if scheduler is not None:
-                if scheduler.disaggregation_mode == DisaggregationMode.DECODE:
-                    for queue_name in (
-                        "disagg_decode_transfer_queue",
-                        "disagg_decode_prealloc_queue",
-                    ):
-                        queue = getattr(scheduler, queue_name, None)
+            if GPU_MEMORY_TYPE_KV_CACHE in tags:
+                scheduler = self.scheduler
+                if scheduler is not None:
+                    if scheduler.disaggregation_mode == DisaggregationMode.DECODE:
+                        for queue_name in (
+                            "disagg_decode_transfer_queue",
+                            "disagg_decode_prealloc_queue",
+                        ):
+                            queue = getattr(scheduler, queue_name, None)
+                            if queue is not None:
+                                queue.release_memory_occupation()
+                    elif scheduler.disaggregation_mode == DisaggregationMode.PREFILL:
+                        queue = getattr(
+                            scheduler, "disagg_prefill_bootstrap_queue", None
+                        )
                         if queue is not None:
                             queue.release_memory_occupation()
-                elif scheduler.disaggregation_mode == DisaggregationMode.PREFILL:
-                    queue = getattr(scheduler, "disagg_prefill_bootstrap_queue", None)
-                    if queue is not None:
-                        queue.release_memory_occupation()
-            self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_KV_CACHE)
-            self.flush_cache()
+                self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_KV_CACHE)
+                self.flush_cache()
 
-        if GPU_MEMORY_TYPE_WEIGHTS in tags:
-            self._assert_weight_cache_inactive("release_memory_occupation")
-            self.stashed_model_static_state = _export_static_state(
-                self.tp_worker.model_runner.model
-            )
-            torch.distributed.barrier(self.tp_cpu_group)
-            self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_WEIGHTS)
+            if GPU_MEMORY_TYPE_WEIGHTS in tags:
+                self._assert_weight_cache_inactive("release_memory_occupation")
+                self.stashed_model_static_state = _export_static_state(
+                    self.tp_worker.model_runner.model
+                )
+                torch.distributed.barrier(self.tp_cpu_group)
+                self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_WEIGHTS)
 
-        if GPU_MEMORY_TYPE_CUDA_GRAPH in tags:
-            self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_CUDA_GRAPH)
+            if GPU_MEMORY_TYPE_CUDA_GRAPH in tags:
+                self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_CUDA_GRAPH)
 
-        torch.get_device_module().synchronize()
+            torch.get_device_module().synchronize()
 
         return ReleaseMemoryOccupationReqOutput()
 
@@ -565,38 +679,44 @@ class SchedulerWeightUpdaterManager:
         if tags is None or len(tags) == 0:
             tags = GPU_MEMORY_ALL_TYPES
 
-        for tag in tags:
-            self.offload_tags.remove(tag)
+        with self._coordinate_weight_memory_transition(
+            enabled=GPU_MEMORY_TYPE_WEIGHTS in tags,
+            commit_revision=True,
+        ):
+            for tag in tags:
+                self.offload_tags.remove(tag)
 
-        if GPU_MEMORY_TYPE_CUDA_GRAPH in tags:
-            self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_CUDA_GRAPH)
+            if GPU_MEMORY_TYPE_CUDA_GRAPH in tags:
+                self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_CUDA_GRAPH)
 
-        if GPU_MEMORY_TYPE_WEIGHTS in tags:
-            self._assert_weight_cache_inactive("resume_memory_occupation")
-            self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_WEIGHTS)
-            torch.distributed.barrier(self.tp_cpu_group)
-            _import_static_state(
-                self.tp_worker.model_runner.model,
-                self.stashed_model_static_state,
-            )
-            del self.stashed_model_static_state
+            if GPU_MEMORY_TYPE_WEIGHTS in tags:
+                self._assert_weight_cache_inactive("resume_memory_occupation")
+                self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_WEIGHTS)
+                torch.distributed.barrier(self.tp_cpu_group)
+                _import_static_state(
+                    self.tp_worker.model_runner.model,
+                    self.stashed_model_static_state,
+                )
+                del self.stashed_model_static_state
 
-        if GPU_MEMORY_TYPE_KV_CACHE in tags:
-            self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_KV_CACHE)
-            scheduler = self.scheduler
-            if scheduler is not None:
-                if scheduler.disaggregation_mode == DisaggregationMode.DECODE:
-                    for queue_name in (
-                        "disagg_decode_transfer_queue",
-                        "disagg_decode_prealloc_queue",
-                    ):
-                        queue = getattr(scheduler, queue_name, None)
+            if GPU_MEMORY_TYPE_KV_CACHE in tags:
+                self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_KV_CACHE)
+                scheduler = self.scheduler
+                if scheduler is not None:
+                    if scheduler.disaggregation_mode == DisaggregationMode.DECODE:
+                        for queue_name in (
+                            "disagg_decode_transfer_queue",
+                            "disagg_decode_prealloc_queue",
+                        ):
+                            queue = getattr(scheduler, queue_name, None)
+                            if queue is not None:
+                                queue.resume_memory_occupation()
+                    elif scheduler.disaggregation_mode == DisaggregationMode.PREFILL:
+                        queue = getattr(
+                            scheduler, "disagg_prefill_bootstrap_queue", None
+                        )
                         if queue is not None:
                             queue.resume_memory_occupation()
-                elif scheduler.disaggregation_mode == DisaggregationMode.PREFILL:
-                    queue = getattr(scheduler, "disagg_prefill_bootstrap_queue", None)
-                    if queue is not None:
-                        queue.resume_memory_occupation()
 
         return ResumeMemoryOccupationReqOutput()
 
@@ -643,9 +763,9 @@ class SchedulerWeightUpdaterManager:
 
         if self.draft_worker is not None:
             draft_url = params.get("draft_url", None)
-            assert (
-                draft_url is not None
-            ), "draft_url must be provided when draft model is enabled"
+            assert draft_url is not None, (
+                "draft_url must be provided when draft model is enabled"
+            )
             self.draft_worker.model_runner.weight_exporter.save_remote_model(draft_url)
 
     def save_sharded_model(self, params):
