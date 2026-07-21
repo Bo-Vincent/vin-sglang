@@ -24,6 +24,12 @@ from sglang.srt.model_executor.model_runner_components.weight_update_coordinatio
 from sglang.srt.model_executor.weight_semantics.qwen3_5 import (
     Qwen35WeightSemanticsAdapter,
 )
+from sglang.srt.model_executor.weight_semantics.qwen3_next import (
+    Qwen3NextWeightSemanticsAdapter,
+)
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 
 
 class FakeStorage:
@@ -506,6 +512,23 @@ def test_qwen_qkv_views_handle_replicated_kv_heads() -> None:
     assert [view.byte_offset for view in views] == [0, 64, 96]
 
 
+def test_qwen_qkv_replica_ranks_follow_contiguous_tp_groups() -> None:
+    adapter = Qwen35WeightSemanticsAdapter(config=qwen_config(num_key_value_heads=2))
+
+    views = adapter.describe_parameter(
+        names=("layers.0.self_attn.qkv_proj.weight",),
+        parameter=FakeTensor((6, 8), itemsize=2),
+        topology=topology(
+            tp_rank=2,
+            tp_size=4,
+            attention_tp_rank=2,
+            attention_tp_size=4,
+        ),
+    )
+
+    assert [view.global_offset for view in views] == [(4, 0), (2, 0), (2, 0)]
+
+
 def test_qwen_tied_embedding_and_lm_head_publish_both_logical_views() -> None:
     """Tied storage must retain both canonical vocabulary tensor identities."""
     parameter = FakeTensor((16, 8), address=0x20000, itemsize=2)
@@ -675,6 +698,245 @@ def test_qwen_moe_factory_reads_w31_component_order_from_runtime_module() -> Non
     assert addresses["layers.2.mlp.experts.2.up_proj.weight"] == 0x40000
     assert addresses["layers.2.mlp.experts.2.gate_proj.weight"] == 0x40000 + 64
     manager.release(manifest.lease_id)
+
+
+def test_qwen3_next_factory_uses_grouped_gdn_runtime_semantics() -> None:
+    parameter = FakeTensor((24, 8), address=0x50000, itemsize=2)
+    manager = create_weight_runtime_manifest_manager(
+        model=FakeModel(
+            [("model.layers.0.linear_attn.in_proj_qkvz.weight", parameter)]
+        ),
+        config=qwen_config(
+            model_type="qwen3_next",
+            linear_key_head_dim=2,
+            linear_value_head_dim=2,
+            linear_num_key_heads=4,
+            linear_num_value_heads=8,
+        ),
+        topology=topology(attention_tp_rank=1, attention_tp_size=2),
+        allowed_devices=("cpu",),
+        moe_runner_backend="triton",
+    )
+
+    manifest = manager.snapshot(
+        model_id="qwen3-next",
+        revision="step-1",
+        instance_id="instance-0",
+        worker_id="worker-0",
+        endpoint="worker-0:12345",
+    )
+
+    assert len(manifest.tensors) == 1
+    tensor = manifest.tensors[0]
+    assert tensor.tensor_id == "layers.0.linear_attn.in_proj_qkvz.weight"
+    assert tensor.global_shape == (4, 12, 8)
+    assert tensor.global_offset == (2, 0, 0)
+    assert tensor.local_shape == (2, 12, 8)
+    assert tensor.partition_dim == 0
+    assert tensor.nbytes == parameter.numel() * parameter.element_size()
+    assert tensor.layout_fingerprint == "sglang:qwen3-next:gdn-qkvz-grouped:v1"
+    manager.release(manifest.lease_id)
+
+
+def test_qwen3_next_groups_gdn_ba_by_key_head() -> None:
+    adapter = Qwen3NextWeightSemanticsAdapter(
+        config=qwen_config(
+            model_type="qwen3_next",
+            linear_num_key_heads=4,
+            linear_num_value_heads=8,
+        )
+    )
+
+    views = adapter.describe_parameter(
+        names=("model.layers.0.linear_attn.in_proj_ba.weight",),
+        parameter=FakeTensor((8, 8), itemsize=2),
+        topology=topology(attention_tp_rank=1, attention_tp_size=2),
+    )
+
+    assert len(views) == 1
+    assert views[0].global_shape == (4, 4, 8)
+    assert views[0].global_offset == (2, 0, 0)
+    assert views[0].local_shape == (2, 4, 8)
+    assert views[0].layout_fingerprint == "sglang:qwen3-next:gdn-ba-grouped:v1"
+
+
+def test_qwen3_next_retags_full_attention_and_uses_contiguous_kv_replicas() -> None:
+    adapter = Qwen3NextWeightSemanticsAdapter(
+        config=qwen_config(
+            model_type="qwen3_next",
+            num_key_value_heads=2,
+            attn_output_gate=True,
+        )
+    )
+
+    views = adapter.describe_parameter(
+        names=("model.layers.3.self_attn.qkv_proj.weight",),
+        parameter=FakeTensor((8, 8), itemsize=2),
+        topology=topology(
+            tp_rank=2,
+            tp_size=4,
+            attention_tp_rank=2,
+            attention_tp_size=4,
+        ),
+    )
+
+    assert [view.global_offset for view in views] == [(8, 0), (2, 0), (2, 0)]
+    assert {view.layout_fingerprint for view in views} == {"sglang:qwen3-next:qkv:v1"}
+
+
+def test_qwen3_next_describes_fused_shared_expert_slot() -> None:
+    adapter = Qwen3NextWeightSemanticsAdapter(
+        config=qwen_config(
+            model_type="qwen3_next", shared_expert_intermediate_size=8
+        ),
+        num_fused_shared_experts=1,
+    )
+
+    w13_views = adapter.describe_parameter(
+        names=("model.layers.0.mlp.experts.w13_weight",),
+        parameter=FakeTensor((3, 8, 8), itemsize=2),
+        topology=topology(ep_rank=0, ep_size=4, moe_tp_rank=0, moe_tp_size=2),
+    )
+    w2_views = adapter.describe_parameter(
+        names=("model.layers.0.mlp.experts.w2_weight",),
+        parameter=FakeTensor((3, 8, 4), itemsize=2),
+        topology=topology(ep_rank=0, ep_size=4, moe_tp_rank=0, moe_tp_size=2),
+    )
+
+    assert [view.expert_id for view in w13_views] == [0, 0, 1, 1, None, None]
+    assert [view.tensor_id for view in w13_views[-2:]] == [
+        "layers.0.mlp.shared_expert.gate_proj.weight",
+        "layers.0.mlp.shared_expert.up_proj.weight",
+    ]
+    assert [view.byte_offset for view in w13_views] == [0, 64, 128, 192, 256, 320]
+    assert [view.expert_id for view in w2_views] == [0, 1, None]
+    assert w2_views[-1].tensor_id == (
+        "layers.0.mlp.shared_expert.down_proj.weight"
+    )
+    assert w2_views[-1].byte_offset == 128
+
+
+def test_qwen3_next_fused_and_unfused_shared_expert_semantics_match() -> None:
+    config = qwen_config(
+        model_type="qwen3_next", shared_expert_intermediate_size=8
+    )
+    fused = Qwen3NextWeightSemanticsAdapter(
+        config=config,
+        num_fused_shared_experts=1,
+    )
+    unfused = Qwen3NextWeightSemanticsAdapter(config=config)
+    parallel = topology(
+        tp_rank=1,
+        tp_size=2,
+        ep_rank=0,
+        ep_size=4,
+        moe_tp_rank=1,
+        moe_tp_size=2,
+    )
+
+    fused_gate_up = fused.describe_parameter(
+        names=("model.layers.0.mlp.experts.w13_weight",),
+        parameter=FakeTensor((3, 8, 8), itemsize=2),
+        topology=parallel,
+    )[-2:]
+    unfused_gate_up = unfused.describe_parameter(
+        names=("model.layers.0.mlp.shared_expert.gate_up_proj.weight",),
+        parameter=FakeTensor((8, 8), itemsize=2),
+        topology=parallel,
+    )
+    fused_down = fused.describe_parameter(
+        names=("model.layers.0.mlp.experts.w2_weight",),
+        parameter=FakeTensor((3, 8, 4), itemsize=2),
+        topology=parallel,
+    )[-1]
+    unfused_down = unfused.describe_parameter(
+        names=("model.layers.0.mlp.shared_expert.down_proj.weight",),
+        parameter=FakeTensor((8, 4), itemsize=2),
+        topology=parallel,
+    )[0]
+
+    def semantic_key(view):
+        return (
+            view.tensor_id,
+            view.global_shape,
+            view.global_offset,
+            view.local_shape,
+            view.partition_dim,
+            view.expert_id,
+            view.layout_fingerprint,
+        )
+
+    assert [semantic_key(view) for view in fused_gate_up] == [
+        semantic_key(view) for view in unfused_gate_up
+    ]
+    assert semantic_key(fused_down) == semantic_key(unfused_down)
+
+
+def test_qwen3_next_rejects_split_checkpoint_gdn_runtime_layout() -> None:
+    parameter = FakeTensor((24, 8), itemsize=2)
+    parameter._sglang_qwen3_next_gdn_layout = "component"
+    adapter = Qwen3NextWeightSemanticsAdapter(
+        config=qwen_config(
+            model_type="qwen3_next",
+            linear_key_head_dim=2,
+            linear_value_head_dim=2,
+            linear_num_key_heads=4,
+            linear_num_value_heads=8,
+        )
+    )
+
+    with pytest.raises(WeightManifestError, match="split-checkpoint GDN"):
+        adapter.describe_parameter(
+            names=("model.layers.0.linear_attn.in_proj_qkvz.weight",),
+            parameter=parameter,
+            topology=topology(attention_tp_rank=1, attention_tp_size=2),
+        )
+
+
+def test_qwen_expert_manifest_rejects_nontrivial_placement_without_map() -> None:
+    manager = create_weight_runtime_manifest_manager(
+        model=FakeModel(
+            [
+                (
+                    "model.layers.0.mlp.experts.w13_weight",
+                    FakeTensor((2, 8, 8), itemsize=2),
+                )
+            ]
+        ),
+        config=qwen_config(model_type="qwen3_next"),
+        topology=topology(ep_rank=0, ep_size=4, moe_tp_rank=0, moe_tp_size=2),
+        allowed_devices=("cpu",),
+        dynamic_expert_placement=True,
+        moe_runner_backend="triton",
+    )
+
+    with pytest.raises(WeightManifestError, match="explicit expert map"):
+        manager.snapshot(
+            model_id="qwen3-next",
+            revision="step-1",
+            instance_id="instance-0",
+            worker_id="worker-0",
+            endpoint="worker-0:12345",
+        )
+
+
+def test_qwen3_next_factory_rejects_noncanonical_moe_runner_layout() -> None:
+    manager = create_weight_runtime_manifest_manager(
+        model=FakeModel([]),
+        config=qwen_config(model_type="qwen3_next"),
+        topology=topology(),
+        allowed_devices=("cpu",),
+        moe_runner_backend="triton_kernel",
+    )
+
+    with pytest.raises(WeightManifestError, match="MoE runner backend"):
+        manager.snapshot(
+            model_id="qwen3-next",
+            revision="step-1",
+            instance_id="instance-0",
+            worker_id="worker-0",
+            endpoint="worker-0:12345",
+        )
 
 
 def test_qwen_multimodal_factory_describes_tp_sharded_vision_parameters() -> None:
@@ -938,6 +1200,22 @@ def test_model_runner_provider_is_lazy_after_layout_transforms() -> None:
     assert "init_weight_runtime_manifest_manager" not in calls
     assert "maybe_apply_post_load_model_transforms" in calls
     assert "maybe_init_lora_manager" in calls
+
+
+def test_model_runner_rejects_nontrivial_static_expert_placement() -> None:
+    source = Path("python/sglang/srt/model_executor/model_runner.py").read_text()
+
+    assert 'self.server_args.init_expert_location != "trivial"' in source
+    assert "self.server_args.ep_num_redundant_experts > 0" in source
+    assert "moe_runner_backend=self.server_args.moe_runner_backend" in source
+
+
+def test_qwen3_next_loader_records_gdn_runtime_layout() -> None:
+    source = Path("python/sglang/srt/models/qwen3_next.py").read_text()
+
+    assert source.count("_sglang_qwen3_next_gdn_layout") >= 2
+    assert '"grouped"' in source
+    assert '"component"' in source
 
 
 def test_model_runner_wires_all_online_updates_to_snapshot_coordinator() -> None:
