@@ -750,7 +750,10 @@ class ModelRunner:
             dynamic_expert_placement=(
                 self.server_args.enable_eplb
                 or self.server_args.elastic_ep_backend is not None
+                or self.server_args.init_expert_location != "trivial"
+                or self.server_args.ep_num_redundant_experts > 0
             ),
+            moe_runner_backend=self.server_args.moe_runner_backend,
             dp_attention_enabled=self.server_args.enable_dp_attention,
             coordinator=coordinator,
         )

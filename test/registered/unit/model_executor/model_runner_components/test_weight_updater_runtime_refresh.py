@@ -8,6 +8,10 @@ from types import ModuleType, SimpleNamespace
 
 import pytest
 
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+
 REPO_ROOT = Path(__file__).resolve().parents[5]
 LOAD_MODEL_UTILS_PATH = (
     REPO_ROOT

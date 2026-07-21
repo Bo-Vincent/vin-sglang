@@ -658,6 +658,7 @@ def create_sglang_weight_runtime_manifest_manager(
     lora_enabled: bool = False,
     is_multimodal: bool = False,
     dynamic_expert_placement: bool = False,
+    moe_runner_backend: str | None = None,
     dp_attention_enabled: bool = False,
     coordinator: WeightSnapshotCoordinator | None = None,
 ):
@@ -673,6 +674,7 @@ def create_sglang_weight_runtime_manifest_manager(
         lora_enabled=lora_enabled,
         is_multimodal=is_multimodal,
         dynamic_expert_placement=dynamic_expert_placement,
+        moe_runner_backend=moe_runner_backend,
         dp_attention_enabled=dp_attention_enabled,
         coordinator=coordinator,
     )
@@ -688,6 +690,7 @@ def create_weight_runtime_manifest_manager(
     lora_enabled: bool = False,
     is_multimodal: bool = False,
     dynamic_expert_placement: bool = False,
+    moe_runner_backend: str | None = None,
     dp_attention_enabled: bool = False,
     coordinator: WeightSnapshotCoordinator | None = None,
 ):
@@ -704,7 +707,7 @@ def create_weight_runtime_manifest_manager(
             "DP attention weight manifests are unsupported"
         )
     model_type = getattr(config, "model_type", None)
-    text_model_types = ("qwen3_5_text", "qwen3_5_moe_text")
+    text_model_types = ("qwen3_5_text", "qwen3_5_moe_text", "qwen3_next")
     multimodal_model_types = ("qwen3_5", "qwen3_5_moe")
     if is_multimodal and model_type not in multimodal_model_types:
         return UnavailableWeightRuntimeManifestManager(
@@ -714,10 +717,18 @@ def create_weight_runtime_manifest_manager(
         return UnavailableWeightRuntimeManifestManager(
             f"unsupported model type for weight manifests: {model_type}"
         )
+    if model_type == "qwen3_next" and moe_runner_backend != "triton":
+        return UnavailableWeightRuntimeManifestManager(
+            "Qwen3-Next weight manifests require the canonical triton MoE "
+            f"runner backend; got {moe_runner_backend!r}"
+        )
 
     from sglang.srt.model_executor.weight_semantics.qwen3_5 import (
         Qwen35MultimodalWeightSemanticsAdapter,
         Qwen35WeightSemanticsAdapter,
+    )
+    from sglang.srt.model_executor.weight_semantics.qwen3_next import (
+        Qwen3NextWeightSemanticsAdapter,
     )
 
     up_first_w13_parameters = set()
@@ -745,6 +756,15 @@ def create_weight_runtime_manifest_manager(
             vision_config=vision_config,
             dynamic_expert_placement=dynamic_expert_placement,
             up_first_w13_parameter_ids=up_first_w13_parameters,
+        )
+    elif model_type == "qwen3_next":
+        adapter = Qwen3NextWeightSemanticsAdapter(
+            config=config,
+            dynamic_expert_placement=dynamic_expert_placement,
+            up_first_w13_parameter_ids=up_first_w13_parameters,
+            num_fused_shared_experts=int(
+                getattr(model, "num_fused_shared_experts", 0)
+            ),
         )
     else:
         adapter = Qwen35WeightSemanticsAdapter(

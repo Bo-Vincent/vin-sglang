@@ -15,6 +15,9 @@ from sglang.srt.managers.scheduler_components.weight_updater import (
     SchedulerWeightUpdaterManager,
 )
 from sglang.srt.managers.tokenizer_control_mixin import TokenizerControlMixin
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
 
 def _manager(runner, *, remote_weight_transfer_cpu_group=None):
@@ -400,7 +403,7 @@ def test_tokenizer_begin_releases_successful_empty_manifest_response() -> None:
     assert len(released) == 1
 
 
-def test_tokenizer_begin_rejects_inconsistent_fanout_manifests() -> None:
+def test_tokenizer_begin_merges_consistent_dp_replica_manifests() -> None:
     released = []
 
     async def release(request):
@@ -423,7 +426,43 @@ def test_tokenizer_begin_rejects_inconsistent_fanout_manifests() -> None:
         release,
     )
 
-    with pytest.raises(RuntimeError, match="inconsistent runtime manifests"):
+    result = asyncio.run(
+        TokenizerControlMixin.begin_remote_instance_weight_transfer(manager)
+    )
+
+    assert [
+        manifest["tensors"][0]["worker_id"]
+        for manifest in result["weight_runtime_manifests"]
+    ] == ["source/dp0-pp0-ep0-tp0", "source/dp1-pp0-ep0-tp0"]
+    assert released == []
+
+
+def test_tokenizer_begin_rejects_semantically_inconsistent_dp_replica() -> None:
+    released = []
+
+    async def release(request):
+        released.append(request.transfer_id)
+        return [SimpleNamespace(success=True, message="Success.")]
+
+    inconsistent = _manifest(worker_id="source/dp1-pp0-ep0-tp0")
+    inconsistent["generation"] = 2
+    manager = _tokenizer_manager(
+        [
+            SimpleNamespace(
+                success=True,
+                message="Success.",
+                manifests=[_manifest(worker_id="source/dp0-pp0-ep0-tp0")],
+            ),
+            SimpleNamespace(
+                success=True,
+                message="Success.",
+                manifests=[inconsistent],
+            ),
+        ],
+        release,
+    )
+
+    with pytest.raises(RuntimeError, match="semantically inconsistent"):
         asyncio.run(
             TokenizerControlMixin.begin_remote_instance_weight_transfer(manager)
         )

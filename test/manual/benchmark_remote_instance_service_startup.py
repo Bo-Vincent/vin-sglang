@@ -8,16 +8,18 @@ in one of three modes:
 * ``manifest``: use the runtime-manifest path, including heterogeneous TP.
 
 Every deterministic source and target response is appended to
-``responses.jsonl``. The benchmark requires exact equality of generated text,
-input/output token IDs, token counts, and finish reason. Dynamic metadata such
-as request IDs, cache counters, and latency is retained in the raw response but
-is intentionally excluded from the deterministic comparison.
+``responses.jsonl``. Source responses must equal the source baseline; reuse
+targets must equal a cold-loaded target with the same target topology. Both
+comparisons require exact generated text, input/output token IDs, token counts,
+and finish reason, plus input/output token logprobs within explicit tolerances.
+Dynamic metadata such as request IDs, cache counters, and latency is retained in
+the raw response but intentionally excluded.
 
 Homogeneous example (runs all three modes by default):
 
 PYTHONPATH=python python test/manual/benchmark_remote_instance_service_startup.py \
   --model /models/Qwen3.5-0.8B --source-gpus 0,1 --target-gpus 2,3 \
-  --source-tp-size 2 --target-tp-size 2 --drop-page-cache --iterations 3
+  --source-tp-size 2 --target-tp-size 2 --drop-page-cache --iterations 4
 
 Large-model legacy example (runtime-manifest semantics may be model-specific):
 
@@ -52,6 +54,14 @@ import requests
 
 ALL_MODES = ("cold", "legacy", "manifest")
 REUSE_MODES = ("legacy", "manifest")
+MIN_PERCENTILE_SAMPLES = 5
+
+
+def _p95(values: list[float]) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    return ordered[max(0, math.ceil(len(ordered) * 0.95) - 1)]
 
 
 @dataclass
@@ -82,8 +92,15 @@ class ResponseRecorder:
         response: Any,
         deterministic_response: dict[str, Any],
         expected: dict[str, Any] | None,
+        logprob_atol: float,
+        logprob_rtol: float,
     ) -> dict[str, Any]:
-        consistent = expected is None or deterministic_response == expected
+        consistent = expected is None or _responses_match(
+            deterministic_response,
+            expected,
+            atol=logprob_atol,
+            rtol=logprob_rtol,
+        )
         entry = {
             "kind": "response",
             "mode": mode,
@@ -92,7 +109,7 @@ class ResponseRecorder:
             "phase": phase,
             "captured_at_unix_s": time.time(),
             "latency_s": latency_s,
-            "consistent_with_source_baseline": consistent,
+            "consistent_with_expected": consistent,
             "deterministic_response": deterministic_response,
             "raw_response": response,
         }
@@ -166,7 +183,6 @@ class SourceProbe:
         if self._thread.is_alive():
             self.errors.append("source probe thread did not stop before timeout")
         ordered = sorted(self.latencies)
-        p95_index = max(0, math.ceil(len(ordered) * 0.95) - 1)
         return {
             "success_count": len(ordered),
             "error_count": len(self.errors),
@@ -174,7 +190,7 @@ class SourceProbe:
             "errors": self.errors[:5],
             "mismatches": self.mismatches[:5],
             "latency_p50_s": statistics.median(ordered) if ordered else None,
-            "latency_p95_s": ordered[p95_index] if ordered else None,
+            "latency_p95_s": _p95(ordered),
         }
 
     def _run(self) -> None:
@@ -191,7 +207,7 @@ class SourceProbe:
                     recorder=self.recorder,
                 )
                 self.latencies.append(measurement["latency_s"])
-                if not measurement["consistent_with_source_baseline"]:
+                if not measurement["consistent_with_expected"]:
                     self.mismatches.append(
                         {
                             "sequence": measurement["response_sequence"],
@@ -242,6 +258,8 @@ def _server_command(
     is_source = load_mode == "source"
     tp_size = args.source_tp_size if is_source else args.target_tp_size
     pp_size = args.source_pp_size if is_source else args.target_pp_size
+    dp_size = args.source_dp_size if is_source else args.target_dp_size
+    ep_size = args.source_ep_size if is_source else args.target_ep_size
     command = [
         args.python,
         "-m",
@@ -258,6 +276,10 @@ def _server_command(
         str(tp_size),
         "--pp-size",
         str(pp_size),
+        "--dp-size",
+        str(dp_size),
+        "--ep-size",
+        str(ep_size),
         "--mem-fraction-static",
         str(args.mem_fraction_static),
         "--disable-cuda-graph",
@@ -270,6 +292,10 @@ def _server_command(
         command.extend(["--sampling-backend", args.sampling_backend])
     if args.disable_custom_all_reduce:
         command.append("--disable-custom-all-reduce")
+    if args.disable_shared_experts_fusion:
+        command.append("--disable-shared-experts-fusion")
+    if args.moe_runner_backend:
+        command.extend(["--moe-runner-backend", args.moe_runner_backend])
     if is_source:
         command.extend(
             [
@@ -385,6 +411,24 @@ def _token_ids(meta_info: dict[str, Any], field: str) -> list[int]:
     return token_ids
 
 
+def _token_logprobs(meta_info: dict[str, Any], field: str) -> list[float | None]:
+    entries = meta_info.get(field)
+    if not isinstance(entries, list):
+        raise ValueError(f"response meta_info.{field} must be a list")
+    values = []
+    for index, entry in enumerate(entries):
+        if not isinstance(entry, (list, tuple)) or len(entry) < 2:
+            raise ValueError(f"invalid {field}[{index}] entry: {entry!r}")
+        value = entry[0]
+        if value is None:
+            values.append(None)
+        elif isinstance(value, (int, float)) and not isinstance(value, bool):
+            values.append(float(value))
+        else:
+            raise ValueError(f"invalid {field}[{index}] logprob: {value!r}")
+    return values
+
+
 def _deterministic_response(response: Any) -> dict[str, Any]:
     if not isinstance(response, dict) or not isinstance(response.get("text"), str):
         raise ValueError("generate response must be an object with a string text field")
@@ -395,10 +439,44 @@ def _deterministic_response(response: Any) -> dict[str, Any]:
         "text": response["text"],
         "input_token_ids": _token_ids(meta_info, "input_token_logprobs"),
         "output_token_ids": _token_ids(meta_info, "output_token_logprobs"),
+        "input_token_logprobs": _token_logprobs(meta_info, "input_token_logprobs"),
+        "output_token_logprobs": _token_logprobs(meta_info, "output_token_logprobs"),
         "prompt_tokens": meta_info.get("prompt_tokens"),
         "completion_tokens": meta_info.get("completion_tokens"),
         "finish_reason": meta_info.get("finish_reason"),
     }
+
+
+def _responses_match(
+    actual: dict[str, Any],
+    expected: dict[str, Any],
+    *,
+    atol: float,
+    rtol: float,
+) -> bool:
+    logprob_fields = ("input_token_logprobs", "output_token_logprobs")
+    if actual.keys() != expected.keys():
+        return False
+    for key in actual.keys() - set(logprob_fields):
+        if actual[key] != expected[key]:
+            return False
+    for field in logprob_fields:
+        actual_values = actual[field]
+        expected_values = expected[field]
+        if len(actual_values) != len(expected_values):
+            return False
+        for actual_value, expected_value in zip(actual_values, expected_values):
+            if actual_value is None or expected_value is None:
+                if actual_value is not expected_value:
+                    return False
+            elif not math.isclose(
+                actual_value,
+                expected_value,
+                abs_tol=atol,
+                rel_tol=rtol,
+            ):
+                return False
+    return True
 
 
 def _generate(args: argparse.Namespace, port: int) -> tuple[float, Any]:
@@ -444,12 +522,60 @@ def _generate_and_record(
         response=response,
         deterministic_response=deterministic_response,
         expected=expected,
+        logprob_atol=args.logprob_atol,
+        logprob_rtol=args.logprob_rtol,
     )
     return {
         "latency_s": latency_s,
         "response_sequence": record["sequence"],
-        "consistent_with_source_baseline": record["consistent_with_source_baseline"],
+        "consistent_with_expected": record["consistent_with_expected"],
         "deterministic_response": deterministic_response,
+    }
+
+
+def _collect_source_baseline(
+    args: argparse.Namespace, recorder: ResponseRecorder
+) -> dict[str, Any]:
+    warmup = _generate_and_record(
+        args,
+        port=args.source_port,
+        mode="source",
+        iteration=-1,
+        endpoint="source",
+        phase="baseline_warmup",
+        expected=None,
+        recorder=recorder,
+    )
+    expected = warmup["deterministic_response"]
+    measurements = []
+    for sample in range(args.source_baseline_samples):
+        measurement = _generate_and_record(
+            args,
+            port=args.source_port,
+            mode="source",
+            iteration=-1,
+            endpoint="source",
+            phase=f"baseline_sample_{sample}",
+            expected=expected,
+            recorder=recorder,
+        )
+        if not measurement["consistent_with_expected"]:
+            raise RuntimeError(
+                f"source baseline sample {sample} changed deterministic response"
+            )
+        measurements.append(measurement)
+        if sample + 1 < args.source_baseline_samples:
+            time.sleep(args.probe_interval_s)
+    latencies = [measurement["latency_s"] for measurement in measurements]
+    return {
+        "deterministic_response": expected,
+        "warmup_response_sequence": warmup["response_sequence"],
+        "response_sequences": [
+            measurement["response_sequence"] for measurement in measurements
+        ],
+        "sample_count": len(latencies),
+        "latency_p50_s": statistics.median(latencies),
+        "latency_p95_s": _p95(latencies),
     }
 
 
@@ -470,12 +596,15 @@ def _assert_iteration_consistency(
     iteration: int,
     measurements: list[tuple[str, dict[str, Any]]],
     source_probe: dict[str, Any],
+    source_baseline_p95_s: float,
+    max_source_probe_p95_ratio: float,
+    min_source_probe_samples: int,
     responses_path: Path,
 ) -> None:
     failures = [
         label
         for label, measurement in measurements
-        if not measurement["consistent_with_source_baseline"]
+        if not measurement["consistent_with_expected"]
     ]
     if source_probe["success_count"] == 0:
         failures.append("source probe produced no successful inference")
@@ -483,6 +612,19 @@ def _assert_iteration_consistency(
         failures.append(f"source probe errors={source_probe['error_count']}")
     if source_probe["mismatch_count"]:
         failures.append(f"source probe mismatches={source_probe['mismatch_count']}")
+    if source_probe["success_count"] < min_source_probe_samples:
+        failures.append(
+            f"source probe samples={source_probe['success_count']} fewer than "
+            f"{min_source_probe_samples}"
+        )
+    source_probe_p95_s = source_probe.get("latency_p95_s")
+    source_probe_p95_limit_s = source_baseline_p95_s * max_source_probe_p95_ratio
+    if source_probe_p95_s is not None and source_probe_p95_s > source_probe_p95_limit_s:
+        failures.append(
+            "source probe p95 "
+            f"{source_probe_p95_s:.6f}s exceeds "
+            f"{source_probe_p95_limit_s:.6f}s"
+        )
     if failures:
         raise RuntimeError(
             f"{mode} iteration {iteration} failed strict inference consistency: "
@@ -497,6 +639,8 @@ def _run_target(
     iteration: int,
     output_dir: Path,
     source_baseline: dict[str, Any],
+    source_baseline_p95_s: float,
+    target_expected: dict[str, Any] | None,
     recorder: ResponseRecorder,
 ) -> dict[str, Any]:
     if args.drop_page_cache:
@@ -538,7 +682,7 @@ def _run_target(
             iteration=iteration,
             endpoint="target",
             phase="after_target_ready",
-            expected=source_baseline,
+            expected=target_expected,
             recorder=recorder,
         )
         probe_summary = probe.stop()
@@ -561,6 +705,9 @@ def _run_target(
                 ("source after target ready", after),
             ],
             source_probe=probe_summary,
+            source_baseline_p95_s=source_baseline_p95_s,
+            max_source_probe_p95_ratio=args.max_source_probe_p95_ratio,
+            min_source_probe_samples=args.min_source_probe_samples,
             responses_path=recorder.path,
         )
         return {
@@ -568,6 +715,7 @@ def _run_target(
             "iteration": iteration,
             "spawn_to_ready_s": ready_s,
             "first_generation_s": target["latency_s"],
+            "target_deterministic_response": target["deterministic_response"],
             "response_sequences": {
                 "source_before": before["response_sequence"],
                 "target": target["response_sequence"],
@@ -636,24 +784,63 @@ def _eligible_modes(args: argparse.Namespace) -> tuple[list[str], list[dict[str,
     skipped = []
     for mode in args.modes:
         if mode == "legacy" and (
-            args.source_tp_size != args.target_tp_size
+            args.source_dp_size != 1
+            or args.target_dp_size != 1
+            or args.source_tp_size != args.target_tp_size
             or args.source_pp_size != args.target_pp_size
+            or args.source_dp_size != args.target_dp_size
+            or args.source_ep_size != args.target_ep_size
         ):
             skipped.append(
                 {
                     "mode": "legacy",
                     "reason": (
-                        "legacy remote-instance reuse requires homogeneous TP/PP; "
+                        "legacy remote-instance reuse requires homogeneous "
+                        "TP/PP/DP/EP; "
                         f"source_tp_size={args.source_tp_size}, "
                         f"target_tp_size={args.target_tp_size}, "
                         f"source_pp_size={args.source_pp_size}, "
-                        f"target_pp_size={args.target_pp_size}"
+                        f"target_pp_size={args.target_pp_size}, "
+                        f"source_dp_size={args.source_dp_size}, "
+                        f"target_dp_size={args.target_dp_size}, "
+                        f"source_ep_size={args.source_ep_size}, "
+                        f"target_ep_size={args.target_ep_size}"
                     ),
                 }
             )
         else:
             executed.append(mode)
     return executed, skipped
+
+
+def _ordered_modes(modes) -> list[str]:
+    modes = list(modes)
+    return (["cold"] if "cold" in modes else []) + [
+        mode for mode in modes if mode != "cold"
+    ]
+
+
+def _execution_schedule(modes, iterations: int) -> list[list[str]]:
+    ordered = _ordered_modes(modes)
+    prefix = ["cold"] if "cold" in ordered else []
+    reuse = [mode for mode in ordered if mode != "cold"]
+    if not reuse:
+        return [prefix.copy() for _ in range(iterations)]
+    schedule = []
+    for iteration in range(iterations):
+        offset = iteration % len(reuse)
+        schedule.append(prefix + reuse[offset:] + reuse[:offset])
+    return schedule
+
+
+def _target_expected_response(
+    mode: str, cold_target_baseline: dict[str, Any] | None
+) -> dict[str, Any] | None:
+    if mode == "cold":
+        return None
+    if cold_target_baseline is None:
+        raise RuntimeError(f"{mode} requires a cold target baseline")
+    return cold_target_baseline
 
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
@@ -673,31 +860,32 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             log_path=output_dir / "source.log",
         )
         source_ready_s = _wait_ready(source, args.source_port, args.timeout_s)
-        baseline = _generate_and_record(
-            args,
-            port=args.source_port,
-            mode="source",
-            iteration=-1,
-            endpoint="source",
-            phase="baseline",
-            expected=None,
-            recorder=recorder,
-        )
+        baseline = _collect_source_baseline(args, recorder)
         source_baseline = baseline["deterministic_response"]
         executed_modes, skipped_modes = _eligible_modes(args)
+        executed_modes = _ordered_modes(executed_modes)
+        execution_schedule = _execution_schedule(executed_modes, args.iterations)
         records: dict[str, list[dict[str, Any]]] = {mode: [] for mode in executed_modes}
-        for iteration in range(args.iterations):
-            for mode in executed_modes:
-                records[mode].append(
-                    _run_target(
-                        args,
-                        mode=mode,
-                        iteration=iteration,
-                        output_dir=output_dir,
-                        source_baseline=source_baseline,
-                        recorder=recorder,
-                    )
+        cold_target_baselines = []
+        for iteration, iteration_modes in enumerate(execution_schedule):
+            cold_target_baseline = None
+            for mode in iteration_modes:
+                record = _run_target(
+                    args,
+                    mode=mode,
+                    iteration=iteration,
+                    output_dir=output_dir,
+                    source_baseline=source_baseline,
+                    source_baseline_p95_s=baseline["latency_p95_s"],
+                    target_expected=_target_expected_response(
+                        mode, cold_target_baseline
+                    ),
+                    recorder=recorder,
                 )
+                records[mode].append(record)
+                if mode == "cold":
+                    cold_target_baseline = record["target_deterministic_response"]
+                    cold_target_baselines.append(cold_target_baseline)
 
         by_mode = {
             mode: _mode_summary(mode_records) for mode, mode_records in records.items()
@@ -723,11 +911,16 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "target_tp_size": args.target_tp_size,
                 "source_pp_size": args.source_pp_size,
                 "target_pp_size": args.target_pp_size,
+                "source_dp_size": args.source_dp_size,
+                "target_dp_size": args.target_dp_size,
+                "source_ep_size": args.source_ep_size,
+                "target_ep_size": args.target_ep_size,
                 "source_gpus": args.source_gpus,
                 "target_gpus": args.target_gpus,
             },
             "modes_requested": list(args.modes),
             "modes_executed": executed_modes,
+            "mode_execution_schedule": execution_schedule,
             "skipped_modes": skipped_modes,
             "iterations": args.iterations,
             "page_cache_dropped_before_each_target": args.drop_page_cache,
@@ -736,14 +929,28 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "deterministic_inference": {
                 "request": _inference_request(args),
                 "comparison": (
-                    "exact text, input/output token IDs, token counts, and "
-                    "finish reason"
+                    "source responses are compared with the source baseline; "
+                    "reuse targets are compared with the cold target at the "
+                    "same target topology using exact text, token IDs, token "
+                    "counts, and finish reason plus tolerance-bounded token "
+                    "logprobs"
                 ),
-                "source_baseline_response_sequence": baseline["response_sequence"],
+                "logprob_atol": args.logprob_atol,
+                "logprob_rtol": args.logprob_rtol,
+                "source_baseline_warmup_response_sequence": baseline[
+                    "warmup_response_sequence"
+                ],
+                "source_baseline_response_sequences": baseline["response_sequences"],
                 "source_baseline": source_baseline,
+                "cold_target_baselines": cold_target_baselines,
             },
             "source": {
                 "spawn_to_ready_s": source_ready_s,
+                "baseline_sample_count": baseline["sample_count"],
+                "baseline_generation_latency_p50_s": baseline["latency_p50_s"],
+                "baseline_generation_latency_p95_s": baseline["latency_p95_s"],
+                "max_probe_p95_ratio_to_baseline": (args.max_source_probe_p95_ratio),
+                "min_probe_samples_per_target_start": args.min_source_probe_samples,
                 "log": str(source.log_path),
             },
             "records": records,
@@ -794,6 +1001,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--target-tp-size", type=int, required=True)
     parser.add_argument("--source-pp-size", type=int, default=1)
     parser.add_argument("--target-pp-size", type=int, default=1)
+    parser.add_argument("--source-dp-size", type=int, default=1)
+    parser.add_argument("--target-dp-size", type=int, default=1)
+    parser.add_argument("--source-ep-size", type=int, default=1)
+    parser.add_argument("--target-ep-size", type=int, default=1)
     parser.add_argument("--modes", type=_parse_modes, default=ALL_MODES)
     parser.add_argument("--source-port", type=int, default=31000)
     parser.add_argument("--target-port", type=int, default=32000)
@@ -805,14 +1016,29 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mm-attention-backend", default="")
     parser.add_argument("--sampling-backend", default="")
     parser.add_argument("--disable-custom-all-reduce", action="store_true")
-    parser.add_argument("--iterations", type=int, default=3)
+    parser.add_argument("--disable-shared-experts-fusion", action="store_true")
+    parser.add_argument("--moe-runner-backend", default="")
+    parser.add_argument("--iterations", type=int, default=4)
     parser.add_argument("--timeout-s", type=float, default=1200)
     parser.add_argument("--request-timeout-s", type=float, default=120)
     parser.add_argument("--probe-interval-s", type=float, default=0.2)
     parser.add_argument("--inter-run-delay-s", type=float, default=2)
-    parser.add_argument("--prompt", default="The capital of France is")
+    parser.add_argument(
+        "--prompt",
+        default="A deterministic topology test 7319: The next integer after 41 is",
+    )
     parser.add_argument("--max-new-tokens", type=int, default=8)
     parser.add_argument("--sampling-seed", type=int, default=0)
+    parser.add_argument("--source-baseline-samples", type=int, default=5)
+    parser.add_argument("--min-source-probe-samples", type=int, default=5)
+    parser.add_argument("--logprob-atol", type=float, default=1e-4)
+    parser.add_argument("--logprob-rtol", type=float, default=1e-4)
+    parser.add_argument(
+        "--max-source-probe-p95-ratio",
+        type=float,
+        default=3.0,
+        help="Fail when source probe p95 exceeds this multiple of baseline latency.",
+    )
     parser.add_argument(
         "--max-reuse-to-cold-ratio",
         type=float,
@@ -834,16 +1060,26 @@ def parse_args() -> argparse.Namespace:
             args.target_tp_size,
             args.source_pp_size,
             args.target_pp_size,
+            args.source_dp_size,
+            args.target_dp_size,
+            args.source_ep_size,
+            args.target_ep_size,
         )
         <= 0
     ):
-        parser.error("source/target TP and PP sizes must be positive")
-    source_world_size = args.source_tp_size * args.source_pp_size
-    target_world_size = args.target_tp_size * args.target_pp_size
+        parser.error("source/target TP, PP, DP, and EP sizes must be positive")
+    source_world_size = args.source_tp_size * args.source_pp_size * args.source_dp_size
+    target_world_size = args.target_tp_size * args.target_pp_size * args.target_dp_size
     if len(args.source_gpus.split(",")) != source_world_size:
-        parser.error("source-gpus count must equal source-tp-size * source-pp-size")
+        parser.error(
+            "source-gpus count must equal source-tp-size * source-pp-size * "
+            "source-dp-size"
+        )
     if len(args.target_gpus.split(",")) != target_world_size:
-        parser.error("target-gpus count must equal target-tp-size * target-pp-size")
+        parser.error(
+            "target-gpus count must equal target-tp-size * target-pp-size * "
+            "target-dp-size"
+        )
     if set(args.source_gpus.split(",")) & set(args.target_gpus.split(",")):
         parser.error("source and target GPU sets must not overlap")
     if len({args.source_port, args.target_port, args.bootstrap_port}) != 3:
@@ -860,8 +1096,27 @@ def parse_args() -> argparse.Namespace:
         parser.error("probe interval must be positive and inter-run delay nonnegative")
     if args.max_new_tokens <= 0:
         parser.error("max-new-tokens must be positive")
+    if args.source_baseline_samples < MIN_PERCENTILE_SAMPLES:
+        parser.error(
+            f"source-baseline-samples must be at least {MIN_PERCENTILE_SAMPLES}"
+        )
+    if args.min_source_probe_samples < MIN_PERCENTILE_SAMPLES:
+        parser.error(
+            f"min-source-probe-samples must be at least {MIN_PERCENTILE_SAMPLES}"
+        )
+    if args.logprob_atol < 0 or args.logprob_rtol < 0:
+        parser.error("logprob tolerances must be nonnegative")
+    if args.max_source_probe_p95_ratio <= 0:
+        parser.error("max-source-probe-p95-ratio must be positive")
     if not 0 < args.max_reuse_to_cold_ratio <= 1:
         parser.error("max-reuse-to-cold-ratio must be in (0, 1]")
+    eligible_modes, _ = _eligible_modes(args)
+    reuse_mode_count = len(set(eligible_modes) & set(REUSE_MODES))
+    if reuse_mode_count > 1 and args.iterations % reuse_mode_count:
+        parser.error(
+            "iterations must form complete reuse-mode ordering cycles for the "
+            "eligible modes"
+        )
     return args
 
 

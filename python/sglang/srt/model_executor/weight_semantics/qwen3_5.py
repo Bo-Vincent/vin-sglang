@@ -460,6 +460,8 @@ class Qwen35WeightSemanticsAdapter:
         kv_heads = int(self._config.num_key_value_heads)
         kv_extent = kv_heads * head_dim
         kv_partitions = min(topology.attention_tp_size, kv_heads)
+        kv_replicas = topology.attention_tp_size // kv_partitions
+        kv_rank = topology.attention_tp_rank // kv_replicas
         return _split_dim_zero(
             parameter=parameter,
             tensor_ids=(
@@ -470,8 +472,8 @@ class Qwen35WeightSemanticsAdapter:
             global_extents=(q_extent, kv_extent, kv_extent),
             ranks=(
                 topology.attention_tp_rank,
-                topology.attention_tp_rank % kv_partitions,
-                topology.attention_tp_rank % kv_partitions,
+                kv_rank,
+                kv_rank,
             ),
             sizes=(topology.attention_tp_size, kv_partitions, kv_partitions),
             layer_id=layer_id,

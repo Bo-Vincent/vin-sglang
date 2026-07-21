@@ -277,8 +277,12 @@ class Qwen3GatedDeltaNet(nn.Module):
         to the standard MergedColumnParallelLinear loader for split checkpoint
         weights (shard_id=int/tuple)."""
         original_loader = module.weight.weight_loader
+        module.weight._sglang_qwen3_next_gdn_layout = "grouped"
 
         def weight_loader(param, loaded_weight, loaded_shard_id=None):
+            param._sglang_qwen3_next_gdn_layout = (
+                "grouped" if loaded_shard_id is None else "component"
+            )
             if loaded_shard_id is None:
                 # Fused checkpoint: weight is in packed (per-head-group)
                 # format. Do contiguous TP slice like ColumnParallelLinear.
