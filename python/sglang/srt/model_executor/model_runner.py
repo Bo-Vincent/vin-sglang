@@ -20,7 +20,7 @@ import inspect
 import logging
 import time
 from dataclasses import dataclass
-from typing import Optional, Union
+from typing import Any, Optional, Union
 
 import torch
 import torch.distributed as dist
@@ -238,6 +238,29 @@ class ModelRunnerOutput:
     indexer_topk_output: Optional[TopkCaptureOutput] = None
 
 
+@dataclass
+class _RemoteInstanceTargetWeightManifestSession:
+    manager: Any
+    placement: Any
+    instance_id: str
+    worker_id: str
+    endpoint: str
+
+    @contextlib.contextmanager
+    def bind(self):
+        binding = self.manager.snapshot_binding(
+            placement=self.placement,
+            instance_id=self.instance_id,
+            worker_id=self.worker_id,
+            endpoint=self.endpoint,
+        )
+        try:
+            yield binding
+        finally:
+            if self.manager.has_lease(binding.lease_id):
+                self.manager.release(binding.lease_id)
+
+
 class ModelRunner:
     """ModelRunner runs the forward passes of the models."""
 
@@ -388,9 +411,9 @@ class ModelRunner:
         )
 
         if self.ps.pp_size > 1:
-            assert (
-                self.support_pp
-            ), "Pipeline Parallel is not compatible with this model."
+            assert self.support_pp, (
+                "Pipeline Parallel is not compatible with this model."
+            )
 
         # For weight updates
         self.init_weight_updater()
@@ -756,6 +779,33 @@ class ModelRunner:
             moe_runner_backend=self.server_args.moe_runner_backend,
             dp_attention_enabled=self.server_args.enable_dp_attention,
             coordinator=coordinator,
+        )
+
+    @contextlib.contextmanager
+    def build_remote_instance_target_weight_manifest_session(
+        self,
+        *,
+        model,
+        model_id: str,
+        revision: str,
+        instance_id: str,
+        endpoint: str,
+    ):
+        from sglang.srt.model_executor.weight_runtime_manifest import (
+            WeightSnapshotCoordinator,
+        )
+
+        manager = self._create_weight_runtime_manifest_manager(
+            model=model,
+            coordinator=WeightSnapshotCoordinator(),
+        )
+        placement = manager.placement(model_id=model_id, revision=revision)
+        yield _RemoteInstanceTargetWeightManifestSession(
+            manager=manager,
+            placement=placement,
+            instance_id=instance_id,
+            worker_id=self.remote_instance_weight_transporter.worker_id,
+            endpoint=endpoint,
         )
 
     @contextlib.contextmanager
@@ -1158,7 +1208,7 @@ class ModelRunner:
             remote_instance_weight_transporter_engine=self.remote_instance_weight_transporter.engine,
             remote_instance_weight_transporter_session_id=self.remote_instance_weight_transporter.session_id,
             remote_instance_weight_runtime_manifest_builder=(
-                self.build_remote_instance_target_weight_runtime_manifest
+                self.build_remote_instance_target_weight_manifest_session
                 if self.server_args.enable_weight_runtime_manifest
                 and not self.is_draft_worker
                 else None
