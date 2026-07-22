@@ -2510,7 +2510,7 @@ class RemoteInstanceModelLoader(BaseModelLoader):
                     )
                     source = source_manifests[0]
                     target_manifest_started = time.perf_counter()
-                    target_inventory = transfer_resources.enter_context(
+                    target_resource = transfer_resources.enter_context(
                         target_manifest_builder(
                             model=model,
                             model_id=source.model_id,
@@ -2519,17 +2519,54 @@ class RemoteInstanceModelLoader(BaseModelLoader):
                             endpoint=local_session_id,
                         )
                     )
-                    target_manifest = RuntimeManifest.from_runtime_inventory(
-                        target_inventory
-                    )
-                    phase_seconds["target_manifest"] = (
-                        time.perf_counter() - target_manifest_started
-                    )
-                    plan_started = time.perf_counter()
-                    plan = plan_runtime_transfer_to_local_target(
-                        source_manifests, target_manifest
-                    )
-                    phase_seconds["plan"] = time.perf_counter() - plan_started
+                    if hasattr(target_resource, "placement") and callable(
+                        getattr(target_resource, "bind", None)
+                    ):
+                        from mooncake.weight_transfer import (
+                            RuntimeBindingManifest,
+                            TargetPlacementManifest,
+                            bind_logical_transfer_plan,
+                            bind_runtime_manifest,
+                            plan_runtime_transfer_to_local_target_placement,
+                        )
+
+                        target_placement = (
+                            TargetPlacementManifest.from_runtime_inventory(
+                                target_resource.placement
+                            )
+                        )
+                        phase_seconds["target_manifest"] = (
+                            time.perf_counter() - target_manifest_started
+                        )
+                        plan_started = time.perf_counter()
+                        logical_plan = plan_runtime_transfer_to_local_target_placement(
+                            source_manifests, target_placement
+                        )
+                        target_binding_inventory = transfer_resources.enter_context(
+                            target_resource.bind()
+                        )
+                        target_binding = RuntimeBindingManifest.from_runtime_inventory(
+                            target_binding_inventory
+                        )
+                        target_manifest = bind_runtime_manifest(
+                            target_placement, target_binding
+                        )
+                        plan = bind_logical_transfer_plan(
+                            logical_plan, (target_manifest,)
+                        )
+                        phase_seconds["plan"] = time.perf_counter() - plan_started
+                    else:
+                        target_manifest = RuntimeManifest.from_runtime_inventory(
+                            target_resource
+                        )
+                        phase_seconds["target_manifest"] = (
+                            time.perf_counter() - target_manifest_started
+                        )
+                        plan_started = time.perf_counter()
+                        plan = plan_runtime_transfer_to_local_target(
+                            source_manifests, target_manifest
+                        )
+                        phase_seconds["plan"] = time.perf_counter() - plan_started
                     source_registrations = tuple(
                         MemoryRegistrationLease.from_fragment(
                             fragment,

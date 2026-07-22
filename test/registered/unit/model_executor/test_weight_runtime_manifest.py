@@ -15,6 +15,7 @@ from sglang.srt.model_executor.weight_runtime_manifest import (
     WeightParallelTopology,
     WeightRuntimeManifestManager,
     WeightSnapshotCoordinator,
+    compose_weight_runtime_manifest,
     create_sglang_weight_runtime_manifest_manager,
     create_weight_runtime_manifest_manager,
 )
@@ -311,6 +312,130 @@ def test_snapshot_keeps_aliases_and_rotates_generation_when_pointer_changes() ->
     assert second.generation == 2
     assert second.tensors[0].address == 0x20000
     manager.release(second.lease_id)
+
+
+def test_target_placement_has_stable_semantics_without_runtime_location() -> None:
+    tensor = FakeTensor((4, 2), address=0x10000)
+    manager = WeightRuntimeManifestManager(
+        model=FakeModel([("weight", tensor)]),
+        adapter=ReplicatedAdapter(),
+        topology=topology(tp_rank=1, tp_size=2),
+        allowed_devices=("cpu",),
+    )
+
+    placement = manager.placement(model_id="model", revision="revision")
+    payload = msgspec.to_builtins(placement)
+
+    assert placement.format_version == 2
+    assert placement.tensors[0].placement_fragment_id
+    assert placement.tensors[0].rank.tp == 1
+    assert "address" not in payload["tensors"][0]
+    assert "worker_id" not in payload["tensors"][0]
+    assert "endpoint" not in payload["tensors"][0]
+    assert "generation" not in payload
+    assert "lease_id" not in payload
+
+    token = manager.coordinator.begin_update()
+    tensor._address = 0x20000
+    manager.coordinator.finish_update(token, success=True)
+    manager.coordinator.commit_revision()
+    same_layout = manager.placement(model_id="model", revision="revision")
+
+    assert same_layout == placement
+
+
+def test_runtime_binding_refreshes_addresses_and_composes_legacy_snapshot() -> None:
+    tensor = FakeTensor((4, 2), address=0x10000)
+    manager = WeightRuntimeManifestManager(
+        model=FakeModel([("weight", tensor)]),
+        adapter=ReplicatedAdapter(),
+        topology=topology(),
+        allowed_devices=("cpu",),
+    )
+    placement = manager.placement(model_id="model", revision="revision")
+
+    binding = manager.snapshot_binding(
+        placement=placement,
+        instance_id="instance",
+        worker_id="worker",
+        endpoint="endpoint",
+    )
+    composed = compose_weight_runtime_manifest(placement, binding)
+
+    assert binding.fragments[0].address == 0x10000
+    assert binding.fragments[0].placement_fragment_id == (
+        placement.tensors[0].placement_fragment_id
+    )
+    assert composed.tensors[0].address == 0x10000
+    assert composed.tensors[0].fragment_id == binding.fragments[0].fragment_id
+    assert composed.lease_id == binding.lease_id
+    with pytest.raises(WeightManifestError, match="snapshot lease is active"):
+        manager.coordinator.begin_update()
+
+    manager.release(binding.lease_id)
+    legacy = manager.snapshot(
+        model_id="model",
+        revision="revision",
+        instance_id="instance",
+        worker_id="worker",
+        endpoint="endpoint",
+    )
+    composed_payload = msgspec.to_builtins(composed)
+    legacy_payload = msgspec.to_builtins(legacy)
+    composed_payload["lease_id"] = "<lease>"
+    legacy_payload["lease_id"] = "<lease>"
+    assert composed_payload == legacy_payload
+    manager.release(legacy.lease_id)
+
+
+def test_runtime_binding_rejects_a_placement_from_another_manager() -> None:
+    manager = WeightRuntimeManifestManager(
+        model=FakeModel([("weight", FakeTensor((4, 2)))]),
+        adapter=ReplicatedAdapter(),
+        topology=topology(),
+        allowed_devices=("cpu",),
+    )
+    other = WeightRuntimeManifestManager(
+        model=FakeModel([("other", FakeTensor((4, 2)))]),
+        adapter=ReplicatedAdapter(),
+        topology=topology(),
+        allowed_devices=("cpu",),
+    )
+    placement = other.placement(model_id="model", revision="revision")
+
+    with pytest.raises(WeightManifestError, match="placement"):
+        manager.snapshot_binding(
+            placement=placement,
+            instance_id="instance",
+            worker_id="worker",
+            endpoint="endpoint",
+        )
+
+
+def test_runtime_binding_rejects_layout_change_but_releases_snapshot_lease() -> None:
+    tensor = FakeTensor((4, 2), address=0x10000)
+    manager = WeightRuntimeManifestManager(
+        model=FakeModel([("weight", tensor)]),
+        adapter=ReplicatedAdapter(),
+        topology=topology(),
+        allowed_devices=("cpu",),
+    )
+    placement = manager.placement(model_id="model", revision="revision")
+    token = manager.coordinator.begin_update()
+    tensor.shape = (2, 4)
+    manager.coordinator.finish_update(token, success=True)
+    manager.commit_revision()
+
+    with pytest.raises(WeightManifestError, match="layout"):
+        manager.snapshot_binding(
+            placement=placement,
+            instance_id="instance",
+            worker_id="worker",
+            endpoint="endpoint",
+        )
+
+    next_token = manager.coordinator.begin_update()
+    manager.coordinator.finish_update(next_token, success=False)
 
 
 def test_snapshot_lease_blocks_updates_until_explicit_release() -> None:
@@ -883,9 +1008,7 @@ def test_qwen3_next_retags_full_attention_and_uses_contiguous_kv_replicas() -> N
 
 def test_qwen3_next_describes_fused_shared_expert_slot() -> None:
     adapter = Qwen3NextWeightSemanticsAdapter(
-        config=qwen_config(
-            model_type="qwen3_next", shared_expert_intermediate_size=8
-        ),
+        config=qwen_config(model_type="qwen3_next", shared_expert_intermediate_size=8),
         num_fused_shared_experts=1,
     )
 
@@ -919,16 +1042,12 @@ def test_qwen3_next_describes_fused_shared_expert_slot() -> None:
         "layers.0.mlp.experts.down_proj.weight",
     ]
     assert [view.shard_dims for view in w2_views[:2]] == [(0, 2), (0, 2)]
-    assert w2_views[-1].tensor_id == (
-        "layers.0.mlp.shared_expert.down_proj.weight"
-    )
+    assert w2_views[-1].tensor_id == ("layers.0.mlp.shared_expert.down_proj.weight")
     assert w2_views[-1].byte_offset == 128
 
 
 def test_qwen3_next_fused_and_unfused_shared_expert_semantics_match() -> None:
-    config = qwen_config(
-        model_type="qwen3_next", shared_expert_intermediate_size=8
-    )
+    config = qwen_config(model_type="qwen3_next", shared_expert_intermediate_size=8)
     fused = Qwen3NextWeightSemanticsAdapter(
         config=config,
         num_fused_shared_experts=1,

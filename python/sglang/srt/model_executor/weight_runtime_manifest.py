@@ -139,6 +139,57 @@ class WeightRuntimeManifest(msgspec.Struct, frozen=True, kw_only=True):
     format_version: int = 2
 
 
+class WeightPlacementTensor(msgspec.Struct, frozen=True, kw_only=True):
+    placement_fragment_id: str
+    tensor_id: str
+    runtime_name: str
+    aliases: tuple[str, ...]
+    global_shape: tuple[int, ...]
+    global_offset: tuple[int, ...]
+    local_shape: tuple[int, ...]
+    dtype: str
+    itemsize: int
+    partition_dim: int | None
+    shard_dims: tuple[int, ...]
+    layer_id: int | None
+    expert_id: int | None
+    layout_fingerprint: str
+    nbytes: int
+    byte_offset: int
+    rank: WeightParallelRank
+
+
+class WeightTargetPlacementManifest(msgspec.Struct, frozen=True, kw_only=True):
+    model_id: str
+    revision: str
+    placement_id: str
+    tensors: tuple[WeightPlacementTensor, ...]
+    format_version: int = 2
+
+
+class RuntimeWeightBinding(msgspec.Struct, frozen=True, kw_only=True):
+    placement_fragment_id: str
+    fragment_id: str
+    address: int
+    nbytes: int
+    storage_offset: int
+    device: str
+    is_contiguous: bool
+    worker_id: str
+    endpoint: str
+
+
+class WeightRuntimeBindingManifest(msgspec.Struct, frozen=True, kw_only=True):
+    model_id: str
+    revision: str
+    placement_id: str
+    instance_id: str
+    generation: int
+    lease_id: str
+    fragments: tuple[RuntimeWeightBinding, ...]
+    format_version: int = 1
+
+
 class WeightSemanticsAdapter(Protocol):
     def describe_parameter(
         self,
@@ -290,18 +341,167 @@ def _validate_view(view: LogicalTensorView, physical: _PhysicalParameter) -> int
     return nbytes
 
 
-def _fragment_id(
+def _fragment_id_from_placement(
     *,
     instance_id: str,
     worker_id: str,
     generation: int,
-    view: LogicalTensorView,
+    placement: WeightPlacementTensor,
 ) -> str:
     value = (
-        f"{instance_id}|{worker_id}|{generation}|{view.tensor_id}|"
-        f"{view.global_offset}|{view.local_shape}|{view.byte_offset}"
+        f"{instance_id}|{worker_id}|{generation}|{placement.tensor_id}|"
+        f"{placement.global_offset}|{placement.local_shape}|"
+        f"{placement.byte_offset}"
     ).encode()
     return hashlib.sha256(value).hexdigest()[:24]
+
+
+def _placement_fragment_id(
+    *,
+    view: LogicalTensorView,
+    names: tuple[str, ...],
+    dtype: str,
+    itemsize: int,
+    rank: WeightParallelRank,
+) -> str:
+    value = (
+        "weight-placement-v1",
+        view.tensor_id,
+        view.global_shape,
+        view.global_offset,
+        view.local_shape,
+        view.partition_dim,
+        _view_shard_dims(view),
+        view.byte_offset,
+        view.layer_id,
+        view.expert_id,
+        view.layout_fingerprint,
+        names,
+        dtype,
+        itemsize,
+        rank.dp,
+        rank.tp,
+        rank.pp,
+        rank.ep,
+    )
+    return hashlib.sha256(repr(value).encode()).hexdigest()[:24]
+
+
+def _placement_id(
+    *,
+    model_id: str,
+    revision: str,
+    tensors: tuple[WeightPlacementTensor, ...],
+) -> str:
+    identity = (
+        "weight-target-placement-v1",
+        model_id,
+        revision,
+        tensors,
+    )
+    return hashlib.sha256(msgspec.json.encode(identity)).hexdigest()[:32]
+
+
+def _physical_signature(physical: tuple[_PhysicalParameter, ...]) -> tuple:
+    return tuple(
+        (
+            item.names,
+            item.address,
+            item.nbytes,
+            item.shape,
+            item.stride,
+            item.storage_offset,
+            item.dtype,
+            item.device,
+        )
+        for item in physical
+    )
+
+
+def _physical_layout_signature(physical: tuple[_PhysicalParameter, ...]) -> tuple:
+    return tuple(
+        (
+            item.names,
+            item.nbytes,
+            item.shape,
+            item.stride,
+            item.dtype,
+            item.itemsize,
+        )
+        for item in physical
+    )
+
+
+def compose_weight_runtime_manifest(
+    placement: WeightTargetPlacementManifest,
+    binding: WeightRuntimeBindingManifest,
+) -> WeightRuntimeManifest:
+    if placement.model_id != binding.model_id:
+        raise WeightManifestError("placement and runtime binding model_id differ")
+    if placement.revision != binding.revision:
+        raise WeightManifestError("placement and runtime binding revision differ")
+    if placement.placement_id != binding.placement_id:
+        raise WeightManifestError("placement and runtime binding IDs differ")
+
+    binding_by_id = {}
+    for fragment in binding.fragments:
+        if fragment.placement_fragment_id in binding_by_id:
+            raise WeightManifestError(
+                "runtime binding has duplicate placement fragment"
+            )
+        binding_by_id[fragment.placement_fragment_id] = fragment
+    placement_ids = {tensor.placement_fragment_id for tensor in placement.tensors}
+    unknown = set(binding_by_id) - placement_ids
+    missing = placement_ids - set(binding_by_id)
+    if unknown:
+        raise WeightManifestError("runtime binding has an unknown placement fragment")
+    if missing:
+        raise WeightManifestError("runtime binding is missing a placement fragment")
+
+    tensors = []
+    for item in placement.tensors:
+        fragment = binding_by_id[item.placement_fragment_id]
+        if fragment.nbytes != item.nbytes:
+            raise WeightManifestError(
+                "runtime binding byte size differs from placement"
+            )
+        tensors.append(
+            RuntimeWeightTensor(
+                fragment_id=fragment.fragment_id,
+                tensor_id=item.tensor_id,
+                runtime_name=item.runtime_name,
+                aliases=item.aliases,
+                global_shape=item.global_shape,
+                global_offset=item.global_offset,
+                local_shape=item.local_shape,
+                dtype=item.dtype,
+                itemsize=item.itemsize,
+                partition_dim=item.partition_dim,
+                shard_dims=item.shard_dims,
+                layer_id=item.layer_id,
+                expert_id=item.expert_id,
+                layout_fingerprint=item.layout_fingerprint,
+                address=fragment.address,
+                nbytes=fragment.nbytes,
+                byte_offset=item.byte_offset,
+                stride=_contiguous_stride(item.local_shape),
+                storage_offset=fragment.storage_offset,
+                device=fragment.device,
+                is_contiguous=fragment.is_contiguous,
+                worker_id=fragment.worker_id,
+                endpoint=fragment.endpoint,
+                rank=item.rank,
+                lease_generation=binding.generation,
+            )
+        )
+    return WeightRuntimeManifest(
+        model_id=placement.model_id,
+        revision=placement.revision,
+        instance_id=binding.instance_id,
+        generation=binding.generation,
+        lease_id=binding.lease_id,
+        tensors=tuple(tensors),
+    )
 
 
 class WeightSnapshotCoordinator:
@@ -460,6 +660,8 @@ class WeightRuntimeManifestManager:
         self.coordinator = coordinator or WeightSnapshotCoordinator()
         self._last_signature: tuple | None = None
         self._last_generation: int | None = None
+        self._placements: dict[tuple[str, str], WeightTargetPlacementManifest] = {}
+        self._placement_layouts: dict[tuple[str, str], tuple] = {}
         self._lock = threading.Lock()
 
     def invalidate(self) -> None:
@@ -487,59 +689,125 @@ class WeightRuntimeManifestManager:
         endpoint: str,
         lease_timeout_sec: int | None = None,
     ) -> WeightRuntimeManifest:
-        if not all((model_id, revision, instance_id, worker_id, endpoint)):
-            raise WeightManifestError("runtime manifest identifiers must not be empty")
+        placement = self.placement(model_id=model_id, revision=revision)
+        binding = self.snapshot_binding(
+            placement=placement,
+            instance_id=instance_id,
+            worker_id=worker_id,
+            endpoint=endpoint,
+            lease_timeout_sec=lease_timeout_sec,
+        )
+        try:
+            return compose_weight_runtime_manifest(placement, binding)
+        except Exception:
+            if self.coordinator.has_snapshot(binding.lease_id):
+                self.coordinator.release_snapshot(binding.lease_id)
+            raise
+
+    def placement(
+        self,
+        *,
+        model_id: str,
+        revision: str,
+    ) -> WeightTargetPlacementManifest:
+        if not model_id or not revision:
+            raise WeightManifestError("placement identifiers must not be empty")
+        key = (model_id, revision)
+        with self._lock:
+            cached = self._placements.get(key)
+        if cached is not None:
+            return cached
+
+        lease_id, generation = self.coordinator.acquire_snapshot()
+        try:
+            with self._lock:
+                cached = self._placements.get(key)
+                if cached is not None:
+                    return cached
+                physical = self._collect_physical_parameters()
+                self._accept_physical_snapshot(
+                    physical=physical,
+                    lease_id=lease_id,
+                    generation=generation,
+                )
+                tensors = self._build_placement_tensors(physical=physical)
+                placement = WeightTargetPlacementManifest(
+                    model_id=model_id,
+                    revision=revision,
+                    placement_id=_placement_id(
+                        model_id=model_id,
+                        revision=revision,
+                        tensors=tensors,
+                    ),
+                    tensors=tensors,
+                )
+                self._placements[key] = placement
+                self._placement_layouts[key] = _physical_layout_signature(physical)
+                return placement
+        finally:
+            if self.coordinator.has_snapshot(lease_id):
+                self.coordinator.release_snapshot(lease_id)
+
+    def snapshot_binding(
+        self,
+        *,
+        placement: WeightTargetPlacementManifest,
+        instance_id: str,
+        worker_id: str,
+        endpoint: str,
+        lease_timeout_sec: int | None = None,
+    ) -> WeightRuntimeBindingManifest:
+        if not all((instance_id, worker_id, endpoint)):
+            raise WeightManifestError("runtime binding identifiers must not be empty")
+        key = (placement.model_id, placement.revision)
+        with self._lock:
+            expected = self._placements.get(key)
+        if expected is None or expected != placement:
+            raise WeightManifestError(
+                "runtime binding placement was not produced by this manager"
+            )
+
         lease_id, generation = self.coordinator.acquire_snapshot(
             lease_timeout_sec=lease_timeout_sec
         )
         release_on_error = True
         try:
             with self._lock:
+                if self._placements.get(key) != placement:
+                    raise WeightManifestError("runtime binding placement changed")
                 physical = self._collect_physical_parameters()
-                signature = tuple(
-                    (
-                        item.names,
-                        item.address,
-                        item.nbytes,
-                        item.shape,
-                        item.stride,
-                        item.storage_offset,
-                        item.dtype,
-                        item.device,
-                    )
-                    for item in physical
-                )
-                if (
-                    self._last_signature is not None
-                    and signature != self._last_signature
-                    and generation == self._last_generation
+                if self._placement_layouts.get(key) != _physical_layout_signature(
+                    physical
                 ):
-                    self.coordinator.poison_uncoordinated_mutation(lease_id)
-                    release_on_error = False
                     raise WeightManifestError(
-                        "parameter storage changed outside the update coordinator"
+                        "runtime binding physical layout differs from placement"
                     )
-                tensors = self._build_tensors(
+                self._accept_physical_snapshot(
+                    physical=physical,
+                    lease_id=lease_id,
+                    generation=generation,
+                )
+                fragments = self._build_binding_fragments(
+                    placement=placement,
                     physical=physical,
                     instance_id=instance_id,
                     worker_id=worker_id,
                     endpoint=endpoint,
                     generation=generation,
                 )
-                self._last_signature = signature
-                self._last_generation = generation
-                manifest = WeightRuntimeManifest(
-                    model_id=model_id,
-                    revision=revision,
+                binding = WeightRuntimeBindingManifest(
+                    model_id=placement.model_id,
+                    revision=placement.revision,
+                    placement_id=placement.placement_id,
                     instance_id=instance_id,
                     generation=generation,
                     lease_id=lease_id,
-                    tensors=tensors,
+                    fragments=fragments,
                 )
             if not self.coordinator.has_snapshot(lease_id):
                 raise WeightManifestError("weight snapshot lease expired")
             release_on_error = False
-            return manifest
+            return binding
         finally:
             if release_on_error and self.coordinator.has_snapshot(lease_id):
                 self.coordinator.release_snapshot(lease_id)
@@ -563,15 +831,31 @@ class WeightRuntimeManifestManager:
         result.sort(key=lambda item: item.names)
         return tuple(result)
 
-    def _build_tensors(
+    def _accept_physical_snapshot(
         self,
         *,
         physical: tuple[_PhysicalParameter, ...],
-        instance_id: str,
-        worker_id: str,
-        endpoint: str,
+        lease_id: str,
         generation: int,
-    ) -> tuple[RuntimeWeightTensor, ...]:
+    ) -> None:
+        signature = _physical_signature(physical)
+        if (
+            self._last_signature is not None
+            and signature != self._last_signature
+            and generation == self._last_generation
+        ):
+            self.coordinator.poison_uncoordinated_mutation(lease_id)
+            raise WeightManifestError(
+                "parameter storage changed outside the update coordinator"
+            )
+        self._last_signature = signature
+        self._last_generation = generation
+
+    def _build_placement_tensors(
+        self,
+        *,
+        physical: tuple[_PhysicalParameter, ...],
+    ) -> tuple[WeightPlacementTensor, ...]:
         rank = self._topology.rank()
         result = []
         logical_keys = set()
@@ -598,12 +882,13 @@ class WeightRuntimeManifestManager:
                     )
                 logical_keys.add(logical_key)
                 result.append(
-                    RuntimeWeightTensor(
-                        fragment_id=_fragment_id(
-                            instance_id=instance_id,
-                            worker_id=worker_id,
-                            generation=generation,
+                    WeightPlacementTensor(
+                        placement_fragment_id=_placement_fragment_id(
                             view=view,
+                            names=item.names,
+                            dtype=item.dtype,
+                            itemsize=item.itemsize,
+                            rank=rank,
                         ),
                         tensor_id=view.tensor_id,
                         runtime_name=item.names[0],
@@ -618,29 +903,69 @@ class WeightRuntimeManifestManager:
                         layer_id=view.layer_id,
                         expert_id=view.expert_id,
                         layout_fingerprint=view.layout_fingerprint,
-                        address=item.address + view.byte_offset,
                         nbytes=nbytes,
                         byte_offset=view.byte_offset,
-                        stride=_contiguous_stride(view.local_shape),
-                        storage_offset=(
-                            item.storage_offset + view.byte_offset // item.itemsize
-                        ),
-                        device=item.device,
-                        is_contiguous=True,
-                        worker_id=worker_id,
-                        endpoint=endpoint,
                         rank=rank,
-                        lease_generation=generation,
                     )
                 )
         result.sort(
             key=lambda item: (
                 item.tensor_id,
                 item.global_offset,
-                item.fragment_id,
+                item.placement_fragment_id,
             )
         )
         return tuple(result)
+
+    def _build_binding_fragments(
+        self,
+        *,
+        placement: WeightTargetPlacementManifest,
+        physical: tuple[_PhysicalParameter, ...],
+        instance_id: str,
+        worker_id: str,
+        endpoint: str,
+        generation: int,
+    ) -> tuple[RuntimeWeightBinding, ...]:
+        physical_by_names = {item.names: item for item in physical}
+        fragments = []
+        for item in placement.tensors:
+            physical_item = physical_by_names.get(item.aliases)
+            if physical_item is None:
+                raise WeightManifestError(
+                    f"placement parameter no longer exists: {item.runtime_name}"
+                )
+            if (
+                physical_item.dtype != item.dtype
+                or physical_item.itemsize != item.itemsize
+                or item.byte_offset < 0
+                or item.byte_offset + item.nbytes > physical_item.nbytes
+            ):
+                raise WeightManifestError(
+                    f"placement parameter storage changed: {item.runtime_name}"
+                )
+            fragments.append(
+                RuntimeWeightBinding(
+                    placement_fragment_id=item.placement_fragment_id,
+                    fragment_id=_fragment_id_from_placement(
+                        instance_id=instance_id,
+                        worker_id=worker_id,
+                        generation=generation,
+                        placement=item,
+                    ),
+                    address=physical_item.address + item.byte_offset,
+                    nbytes=item.nbytes,
+                    storage_offset=(
+                        physical_item.storage_offset
+                        + item.byte_offset // physical_item.itemsize
+                    ),
+                    device=physical_item.device,
+                    is_contiguous=True,
+                    worker_id=worker_id,
+                    endpoint=endpoint,
+                )
+            )
+        return tuple(fragments)
 
 
 class UnavailableWeightRuntimeManifestManager:
@@ -654,9 +979,21 @@ class UnavailableWeightRuntimeManifestManager:
         del kwargs
         raise WeightManifestError(self._reason)
 
+    def placement(self, **kwargs) -> WeightTargetPlacementManifest:
+        del kwargs
+        raise WeightManifestError(self._reason)
+
+    def snapshot_binding(self, **kwargs) -> WeightRuntimeBindingManifest:
+        del kwargs
+        raise WeightManifestError(self._reason)
+
     def release(self, lease_id: str) -> None:
         del lease_id
         raise WeightManifestError(self._reason)
+
+    def has_lease(self, lease_id: str) -> bool:
+        del lease_id
+        return False
 
     def commit_revision(self) -> int:
         raise WeightManifestError(self._reason)

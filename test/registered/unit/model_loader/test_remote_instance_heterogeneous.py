@@ -166,6 +166,147 @@ def test_heterogeneous_loader_builds_local_plan_and_reads_from_source(
     assert calls["finish"] == (True, True)
 
 
+def test_heterogeneous_loader_plans_placement_before_acquiring_target_binding(
+    monkeypatch,
+) -> None:
+    events = []
+    source_inventory = {
+        "model_id": "Qwen/Qwen3.5-0.8B",
+        "revision": "main@generation-1",
+        "lease_id": "source-runtime-lease",
+        "fragments": [SimpleNamespace(fragment_id="source-fragment")],
+    }
+    placement_inventory = SimpleNamespace(
+        model_id=source_inventory["model_id"],
+        revision=source_inventory["revision"],
+        placement_id="target-placement",
+    )
+    binding_inventory = SimpleNamespace(
+        model_id=source_inventory["model_id"],
+        revision=source_inventory["revision"],
+        placement_id="target-placement",
+        lease_id="target-runtime-lease",
+    )
+    target_runtime = SimpleNamespace(
+        model_id=source_inventory["model_id"],
+        revision=source_inventory["revision"],
+        lease_id="target-runtime-lease",
+        fragments=[SimpleNamespace(fragment_id="target-fragment")],
+    )
+
+    class FakeRuntimeManifest:
+        @classmethod
+        def from_runtime_inventory(cls, inventory):
+            return SimpleNamespace(**inventory)
+
+    class FakeTargetPlacementManifest:
+        @classmethod
+        def from_runtime_inventory(cls, inventory):
+            events.append("placement")
+            return inventory
+
+    class FakeRuntimeBindingManifest:
+        @classmethod
+        def from_runtime_inventory(cls, inventory):
+            events.append("binding")
+            return inventory
+
+    class FakeRegistrationLease:
+        @classmethod
+        def from_fragment(cls, fragment, *, runtime_lease_id=None):
+            return (fragment.fragment_id, runtime_lease_id)
+
+    class FakeReader:
+        def __init__(self, engine, **kwargs):
+            del engine, kwargs
+
+        def execute(self, plan, sources, target, **kwargs):
+            del plan, sources, target, kwargs
+            events.append("execute")
+            return [SimpleNamespace(nbytes=64, operation_count=1, request_count=1)]
+
+    class FakeCoordinator:
+        def __init__(self, seed_url, world_group):
+            del seed_url, world_group
+
+        def acquire(self):
+            return SimpleNamespace(manifests=[source_inventory])
+
+        def ready_for_transfer(self, local_ready):
+            return local_ready
+
+        def finish(self, *, local_success, local_release_safe=True):
+            return local_success, local_release_safe
+
+    fake_weight_transfer = ModuleType("mooncake.weight_transfer")
+    fake_weight_transfer.MemoryRegistrationLease = FakeRegistrationLease
+    fake_weight_transfer.MooncakeTransferEngineReader = FakeReader
+    fake_weight_transfer.RuntimeManifest = FakeRuntimeManifest
+    fake_weight_transfer.RuntimeBindingManifest = FakeRuntimeBindingManifest
+    fake_weight_transfer.TargetPlacementManifest = FakeTargetPlacementManifest
+    fake_weight_transfer.TransferEngineError = _CompletionUnknownError
+    fake_weight_transfer.bind_runtime_manifest = lambda placement, binding: (
+        events.append("runtime-bind") or target_runtime
+    )
+    fake_weight_transfer.plan_runtime_transfer_to_local_target_placement = (
+        lambda sources, placement: events.append("logical-plan") or "logical-plan"
+    )
+    fake_weight_transfer.bind_logical_transfer_plan = lambda logical, targets: (
+        events.append("plan-bind") or SimpleNamespace(operations=("bound-operation",))
+    )
+    fake_weight_transfer.plan_runtime_transfer_to_local_target = (
+        lambda sources, target: (_ for _ in ()).throw(
+            AssertionError("the session path must not use the legacy planner")
+        )
+    )
+    monkeypatch.setitem(sys.modules, "mooncake.weight_transfer", fake_weight_transfer)
+    monkeypatch.setattr(
+        loader_module,
+        "RemoteInstanceWeightTransferWorldCoordinator",
+        FakeCoordinator,
+    )
+    monkeypatch.setattr(loader_module, "get_world_group", lambda: object())
+    monkeypatch.setattr(loader_module.current_platform, "synchronize", lambda: None)
+    monkeypatch.setattr(loader_module, "_post_load_weights", lambda model: None)
+
+    class TargetSession:
+        placement = placement_inventory
+
+        @contextlib.contextmanager
+        def bind(self):
+            events.append("binding-lease-open")
+            try:
+                yield binding_inventory
+            finally:
+                events.append("binding-lease-close")
+
+    @contextlib.contextmanager
+    def target_builder(**kwargs):
+        del kwargs
+        yield TargetSession()
+
+    loader = RemoteInstanceModelLoader.__new__(RemoteInstanceModelLoader)
+    success = loader.load_model_from_remote_instance_by_transfer_engine_heterogeneous(
+        object(),
+        object(),
+        "http://seed:30000",
+        "target-session",
+        target_builder,
+    )
+
+    assert success is True
+    assert events == [
+        "placement",
+        "logical-plan",
+        "binding-lease-open",
+        "binding",
+        "runtime-bind",
+        "plan-bind",
+        "execute",
+        "binding-lease-close",
+    ]
+
+
 def test_post_load_weights_refreshes_gemma_runtime_buffer() -> None:
     norm = GemmaRMSNorm(4)
     norm.weight.data.copy_(torch.tensor([0.5, -0.25, 1.0, 2.0]))
