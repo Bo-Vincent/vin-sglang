@@ -191,6 +191,241 @@ def test_begin_and_release_remote_transfer_snapshot(monkeypatch) -> None:
     assert released == ["lease-0"]
 
 
+def test_duplicate_begin_returns_the_same_snapshot_without_a_second_lease(
+    monkeypatch,
+) -> None:
+    snapshots = []
+    manifest = _manifest()
+
+    def snapshot(**kwargs):
+        snapshots.append(kwargs)
+        return manifest
+
+    runner = SimpleNamespace(
+        get_remote_instance_weight_runtime_manifest=snapshot,
+        release_weight_runtime_manifest=lambda lease_id: None,
+    )
+    manager = _manager(runner)
+    monkeypatch.setattr("torch.distributed.get_world_size", lambda group: 1)
+    monkeypatch.setattr(
+        "torch.distributed.all_gather_object",
+        lambda outputs, value, group: outputs.__setitem__(0, value),
+    )
+    request = BeginRemoteInstanceWeightTransferReqInput(
+        transfer_id="transfer-1",
+        model_id="Qwen/Qwen3.5-0.8B",
+        revision="main",
+    )
+
+    first = manager.begin_remote_instance_weight_transfer(request)
+    second = manager.begin_remote_instance_weight_transfer(request)
+
+    assert first.session_state == "created"
+    assert second.session_state == "reused"
+    assert second.manifests == first.manifests
+    assert len(snapshots) == 1
+    assert manager.remote_weight_transfer_leases == {"transfer-1": "lease-0"}
+
+
+def test_late_begin_after_release_does_not_reacquire_snapshot(monkeypatch) -> None:
+    snapshots = []
+    released = []
+    manifest = _manifest()
+
+    def snapshot(**kwargs):
+        snapshots.append(kwargs)
+        return manifest
+
+    runner = SimpleNamespace(
+        get_remote_instance_weight_runtime_manifest=snapshot,
+        release_weight_runtime_manifest=lambda lease_id: released.append(lease_id),
+    )
+    manager = _manager(runner)
+    monkeypatch.setattr("torch.distributed.get_world_size", lambda group: 1)
+    monkeypatch.setattr(
+        "torch.distributed.all_gather_object",
+        lambda outputs, value, group: outputs.__setitem__(0, value),
+    )
+    request = BeginRemoteInstanceWeightTransferReqInput(
+        transfer_id="transfer-1",
+        model_id="Qwen/Qwen3.5-0.8B",
+        revision="main",
+    )
+
+    assert manager.begin_remote_instance_weight_transfer(request).success is True
+    assert (
+        manager.release_remote_instance_weight_transfer(
+            ReleaseRemoteInstanceWeightTransferReqInput(transfer_id="transfer-1")
+        ).success
+        is True
+    )
+
+    replay = manager.begin_remote_instance_weight_transfer(request)
+
+    assert replay.success is False
+    assert "already released" in replay.message.lower()
+    assert len(snapshots) == 1
+    assert released == ["lease-0"]
+    assert manager.remote_weight_transfer_leases == {}
+
+
+def test_late_begin_after_expired_release_does_not_reacquire_snapshot(
+    monkeypatch,
+) -> None:
+    now = [100.0]
+    snapshots = []
+    released = []
+    manifest = _manifest()
+
+    def snapshot(**kwargs):
+        snapshots.append(kwargs)
+        return manifest
+
+    runner = SimpleNamespace(
+        get_remote_instance_weight_runtime_manifest=snapshot,
+        release_weight_runtime_manifest=lambda lease_id: released.append(lease_id),
+    )
+    manager = _manager(runner)
+    monkeypatch.setattr(weight_updater_module.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr("torch.distributed.get_world_size", lambda group: 1)
+    monkeypatch.setattr(
+        "torch.distributed.all_gather_object",
+        lambda outputs, value, group: outputs.__setitem__(0, value),
+    )
+    request = BeginRemoteInstanceWeightTransferReqInput(
+        transfer_id="transfer-1",
+        model_id="Qwen/Qwen3.5-0.8B",
+        revision="main",
+        lease_timeout_sec=30,
+    )
+
+    assert manager.begin_remote_instance_weight_transfer(request).success is True
+    now[0] = 131.0
+    manager._prune_remote_weight_transfer_bookkeeping()
+    assert manager.remote_weight_transfer_expired == {"transfer-1"}
+    assert (
+        manager.release_remote_instance_weight_transfer(
+            ReleaseRemoteInstanceWeightTransferReqInput(transfer_id="transfer-1")
+        ).success
+        is True
+    )
+
+    replay = manager.begin_remote_instance_weight_transfer(request)
+
+    assert replay.success is False
+    assert "already released" in replay.message.lower()
+    assert len(snapshots) == 1
+    assert released == ["lease-0"]
+    assert manager.remote_weight_transfer_leases == {}
+
+
+def test_released_transfer_tombstones_are_time_and_count_bounded(
+    monkeypatch,
+) -> None:
+    now = [100.0]
+    manager = _manager(SimpleNamespace())
+    monkeypatch.setattr(weight_updater_module.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(
+        weight_updater_module,
+        "_REMOTE_WEIGHT_TRANSFER_TOMBSTONE_TTL_SEC",
+        10.0,
+    )
+    monkeypatch.setattr(
+        weight_updater_module,
+        "_REMOTE_WEIGHT_TRANSFER_TOMBSTONE_LIMIT",
+        2,
+    )
+
+    manager._complete_remote_weight_transfer_session("transfer-1")
+    manager._complete_remote_weight_transfer_session("transfer-2")
+    manager._complete_remote_weight_transfer_session("transfer-3")
+
+    assert list(manager.remote_weight_transfer_tombstones) == [
+        "transfer-2",
+        "transfer-3",
+    ]
+
+    now[0] = 111.0
+    manager._prune_remote_weight_transfer_bookkeeping()
+
+    assert manager.remote_weight_transfer_tombstones == {}
+
+
+def test_duplicate_begin_rejects_transfer_id_parameter_mismatch(monkeypatch) -> None:
+    runner = SimpleNamespace(
+        get_remote_instance_weight_runtime_manifest=lambda **kwargs: _manifest(),
+        release_weight_runtime_manifest=lambda lease_id: None,
+    )
+    manager = _manager(runner)
+    monkeypatch.setattr("torch.distributed.get_world_size", lambda group: 1)
+    monkeypatch.setattr(
+        "torch.distributed.all_gather_object",
+        lambda outputs, value, group: outputs.__setitem__(0, value),
+    )
+    first = BeginRemoteInstanceWeightTransferReqInput(
+        transfer_id="transfer-1",
+        model_id="Qwen/Qwen3.5-0.8B",
+        revision="main",
+    )
+    mismatched = BeginRemoteInstanceWeightTransferReqInput(
+        transfer_id="transfer-1",
+        model_id="Qwen/Qwen3.5-0.8B",
+        revision="different",
+    )
+
+    assert manager.begin_remote_instance_weight_transfer(first).success is True
+    result = manager.begin_remote_instance_weight_transfer(mismatched)
+
+    assert result.success is False
+    assert "different parameters" in result.message
+
+
+def test_begin_rejects_divergent_cached_state_without_acquiring_snapshot(
+    monkeypatch,
+) -> None:
+    snapshots = []
+    runner = SimpleNamespace(
+        get_remote_instance_weight_runtime_manifest=lambda **kwargs: snapshots.append(
+            kwargs
+        ),
+        release_weight_runtime_manifest=lambda lease_id: None,
+    )
+    manager = _manager(runner)
+    request = BeginRemoteInstanceWeightTransferReqInput(
+        transfer_id="transfer-1",
+        model_id="Qwen/Qwen3.5-0.8B",
+        revision="main",
+    )
+    cached = BeginRemoteInstanceWeightTransferReqOutput(
+        transfer_id="transfer-1",
+        success=True,
+        message="Success.",
+        manifests=[_manifest()],
+    )
+    manager._record_remote_weight_transfer_session(request, "lease-0", cached)
+    monkeypatch.setattr("torch.distributed.get_world_size", lambda group: 2)
+
+    def all_gather_object(outputs, value, group):
+        outputs[:] = [
+            value,
+            {
+                "success": True,
+                "message": "Success.",
+                "session_state": "created",
+            },
+        ]
+
+    monkeypatch.setattr("torch.distributed.all_gather_object", all_gather_object)
+
+    result = manager.begin_remote_instance_weight_transfer(request)
+
+    assert result.success is False
+    assert result.session_state == "cleanup_pending"
+    assert "inconsistent session state" in result.message.lower()
+    assert snapshots == []
+    assert manager.remote_weight_transfer_leases == {"transfer-1": "lease-0"}
+
+
 def test_begin_and_release_split_remote_transfer_snapshot(monkeypatch) -> None:
     released = []
     placement = _placement()
@@ -319,6 +554,62 @@ def test_begin_rolls_back_local_snapshot_when_collective_fails(monkeypatch) -> N
     assert result.success is False
     assert "collective failed" in result.message
     assert released == ["lease-0"]
+
+
+def test_begin_keeps_cleanup_pending_lease_when_rollback_release_fails(
+    monkeypatch,
+) -> None:
+    release_attempts = []
+    manifest = _manifest()
+
+    def release(lease_id):
+        release_attempts.append(lease_id)
+        if len(release_attempts) == 1:
+            raise RuntimeError("temporary rollback release failure")
+
+    runner = SimpleNamespace(
+        get_remote_instance_weight_runtime_manifest=lambda **kwargs: manifest,
+        release_weight_runtime_manifest=release,
+    )
+    manager = _manager(runner)
+    monkeypatch.setattr("torch.distributed.get_world_size", lambda group: 2)
+
+    def all_gather_object(outputs, value, group):
+        outputs[:] = [
+            value,
+            {
+                "success": False,
+                "message": "rank 1 failed",
+                "session_state": "failed",
+            },
+        ]
+
+    monkeypatch.setattr("torch.distributed.all_gather_object", all_gather_object)
+    request = BeginRemoteInstanceWeightTransferReqInput(
+        transfer_id="transfer-1",
+        model_id="Qwen/Qwen3.5-0.8B",
+        revision="main",
+    )
+
+    result = manager.begin_remote_instance_weight_transfer(request)
+
+    assert result.success is False
+    assert result.session_state == "cleanup_pending"
+    assert "temporary rollback release failure" in result.message
+    assert manager.remote_weight_transfer_leases == {"transfer-1": "lease-0"}
+
+    monkeypatch.setattr("torch.distributed.get_world_size", lambda group: 1)
+    monkeypatch.setattr(
+        "torch.distributed.all_gather_object",
+        lambda outputs, value, group: outputs.__setitem__(0, value),
+    )
+    released = manager.release_remote_instance_weight_transfer(
+        ReleaseRemoteInstanceWeightTransferReqInput(transfer_id="transfer-1")
+    )
+
+    assert released.success is True
+    assert release_attempts == ["lease-0", "lease-0"]
+    assert manager.remote_weight_transfer_leases == {}
 
 
 def test_runtime_revision_commit_ignores_workers_without_manifest_support() -> None:
@@ -649,7 +940,7 @@ def test_release_keeps_snapshot_lease_available_for_retry(monkeypatch) -> None:
     assert manager.remote_weight_transfer_leases == {}
 
 
-def test_expired_remote_transfer_bookkeeping_renews_original_lease(
+def test_expired_remote_transfer_bookkeeping_rejects_silent_renewal(
     monkeypatch,
 ) -> None:
     now = [100.0]
@@ -677,11 +968,12 @@ def test_expired_remote_transfer_bookkeeping_renews_original_lease(
         )
     )
 
-    assert result.success is True
-    assert renewed == [("lease-0", 60)]
+    assert result.success is False
+    assert "expired" in result.message.lower()
+    assert renewed == []
     assert manager.remote_weight_transfer_leases == {"transfer-1": "lease-0"}
-    assert manager.remote_weight_transfer_deadlines == {"transfer-1": 191.0}
-    assert manager.remote_weight_transfer_expired == set()
+    assert manager.remote_weight_transfer_deadlines == {}
+    assert manager.remote_weight_transfer_expired == {"transfer-1"}
 
 
 def test_expired_remote_transfer_bookkeeping_still_releases_coordinator_lease(
@@ -931,12 +1223,14 @@ def test_tokenizer_begin_rejects_split_dp_generation_mismatch() -> None:
             SimpleNamespace(
                 success=True,
                 message="Success.",
+                session_state="created",
                 placements=[_placement(dp_rank=0)],
                 bindings=[_binding(dp_rank=0, lease_id="lease-dp0")],
             ),
             SimpleNamespace(
                 success=True,
                 message="Success.",
+                session_state="created",
                 placements=[_placement(dp_rank=1)],
                 bindings=[second_binding],
             ),
@@ -952,6 +1246,160 @@ def test_tokenizer_begin_rejects_split_dp_generation_mismatch() -> None:
         )
 
     assert len(released) == 1
+
+
+def test_tokenizer_begin_conflict_does_not_release_existing_session() -> None:
+    released = []
+
+    async def release(request):
+        released.append(request.transfer_id)
+        return [SimpleNamespace(success=True, message="Success.")]
+
+    manager = _tokenizer_manager(
+        [
+            SimpleNamespace(
+                success=False,
+                message="remote weight transfer ID was reused",
+                session_state="conflict",
+            )
+        ],
+        release,
+    )
+
+    with pytest.raises(RuntimeError, match="ID was reused"):
+        asyncio.run(
+            TokenizerControlMixin.begin_remote_instance_weight_transfer(
+                manager,
+                transfer_id="transfer-1",
+            )
+        )
+
+    assert released == []
+
+
+def test_tokenizer_begin_retries_cleanup_for_created_and_failed_dp_results() -> None:
+    release_attempts = []
+
+    async def release(request):
+        release_attempts.append(request.transfer_id)
+        return [
+            SimpleNamespace(
+                success=len(release_attempts) >= 2,
+                message="Success." if len(release_attempts) >= 2 else "retry",
+            )
+        ]
+
+    manager = _tokenizer_manager(
+        [
+            SimpleNamespace(
+                success=True,
+                message="Success.",
+                session_state="created",
+                manifests=[_manifest(worker_id="source/dp0-pp0-ep0-tp0")],
+            ),
+            SimpleNamespace(
+                success=False,
+                message="source rank failed",
+                session_state="failed",
+            ),
+        ],
+        release,
+    )
+
+    with pytest.raises(RuntimeError, match="source rank failed") as raised:
+        asyncio.run(
+            TokenizerControlMixin.begin_remote_instance_weight_transfer(
+                manager,
+                transfer_id="transfer-1",
+            )
+        )
+
+    assert raised.value.transfer_id == "transfer-1"
+    assert raised.value.session_state == "failed"
+    assert release_attempts == ["transfer-1", "transfer-1"]
+
+
+def test_tokenizer_begin_reports_cleanup_pending_when_release_never_succeeds() -> None:
+    release_attempts = []
+
+    async def release(request):
+        release_attempts.append(request.transfer_id)
+        return [SimpleNamespace(success=False, message="still busy")]
+
+    manager = _tokenizer_manager(
+        [
+            SimpleNamespace(
+                success=False,
+                message="snapshot cleanup remains pending",
+                session_state="cleanup_pending",
+            )
+        ],
+        release,
+    )
+
+    with pytest.raises(RuntimeError) as raised:
+        asyncio.run(
+            TokenizerControlMixin.begin_remote_instance_weight_transfer(
+                manager,
+                transfer_id="transfer-1",
+            )
+        )
+
+    assert raised.value.transfer_id == "transfer-1"
+    assert raised.value.session_state == "cleanup_pending"
+    assert release_attempts == ["transfer-1", "transfer-1", "transfer-1"]
+
+
+@pytest.mark.parametrize(
+    "begin_results",
+    [
+        [
+            SimpleNamespace(
+                success=True,
+                message="Success.",
+                session_state="reused",
+                manifests=[_manifest(worker_id="source/dp0-pp0-ep0-tp0")],
+            ),
+            SimpleNamespace(
+                success=False,
+                message="source rank failed",
+                session_state="failed",
+            ),
+        ],
+        [
+            SimpleNamespace(
+                success=False,
+                message="snapshot cleanup remains pending",
+                session_state="cleanup_pending",
+            ),
+            SimpleNamespace(
+                success=False,
+                message="already released",
+                session_state="released",
+            ),
+        ],
+    ],
+)
+def test_tokenizer_begin_cleans_mixed_owned_session_states(begin_results) -> None:
+    released = []
+
+    async def release(request):
+        released.append(request.transfer_id)
+        return [SimpleNamespace(success=True, message="Success.")]
+
+    manager = _tokenizer_manager(begin_results, release)
+
+    with pytest.raises(RuntimeError) as raised:
+        asyncio.run(
+            TokenizerControlMixin.begin_remote_instance_weight_transfer(
+                manager,
+                transfer_id="transfer-1",
+            )
+        )
+
+    assert raised.value.transfer_id == "transfer-1"
+    assert raised.value.session_state == "failed"
+    assert released == ["transfer-1"]
 
 
 def test_tokenizer_begin_rejects_duplicate_split_fragment_ids() -> None:
@@ -970,6 +1418,7 @@ def test_tokenizer_begin_rejects_duplicate_split_fragment_ids() -> None:
             SimpleNamespace(
                 success=True,
                 message="Success.",
+                session_state="created",
                 placements=[placement],
                 bindings=[binding],
             )
@@ -1042,7 +1491,15 @@ def test_tokenizer_begin_releases_successful_empty_manifest_response() -> None:
         return [SimpleNamespace(success=True, message="Success.")]
 
     manager = _tokenizer_manager(
-        [SimpleNamespace(success=True, message="Success.", manifests=[])], release
+        [
+            SimpleNamespace(
+                success=True,
+                message="Success.",
+                session_state="created",
+                manifests=[],
+            )
+        ],
+        release,
     )
 
     with pytest.raises(RuntimeError, match="no runtime manifests"):
@@ -1101,11 +1558,13 @@ def test_tokenizer_begin_rejects_semantically_inconsistent_dp_replica() -> None:
             SimpleNamespace(
                 success=True,
                 message="Success.",
+                session_state="created",
                 manifests=[_manifest(worker_id="source/dp0-pp0-ep0-tp0")],
             ),
             SimpleNamespace(
                 success=True,
                 message="Success.",
+                session_state="created",
                 manifests=[inconsistent],
             ),
         ],
@@ -1133,8 +1592,18 @@ def test_tokenizer_begin_rejects_dp_replica_with_different_shard_dims() -> None:
     second["tensors"][0]["shard_dims"] = [1]
     manager = _tokenizer_manager(
         [
-            SimpleNamespace(success=True, message="Success.", manifests=[first]),
-            SimpleNamespace(success=True, message="Success.", manifests=[second]),
+            SimpleNamespace(
+                success=True,
+                message="Success.",
+                session_state="created",
+                manifests=[first],
+            ),
+            SimpleNamespace(
+                success=True,
+                message="Success.",
+                session_state="created",
+                manifests=[second],
+            ),
         ],
         release,
     )

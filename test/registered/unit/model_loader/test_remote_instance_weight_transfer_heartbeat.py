@@ -3,6 +3,8 @@ import sys
 import threading
 from types import ModuleType, SimpleNamespace
 
+import pytest
+
 if importlib.util.find_spec("requests") is None:
     requests = ModuleType("requests")
     requests.post = None
@@ -13,6 +15,15 @@ from sglang.srt.model_loader import remote_instance_weight_loader_utils as utils
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+
+
+@pytest.fixture(autouse=True)
+def deterministic_transfer_id(monkeypatch) -> None:
+    monkeypatch.setattr(
+        utils.uuid,
+        "uuid4",
+        lambda: SimpleNamespace(hex="transfer-1"),
+    )
 
 
 def test_begin_preserves_server_lease_timeout(monkeypatch) -> None:
@@ -84,6 +95,7 @@ def test_begin_requests_and_parses_split_source_manifest(monkeypatch) -> None:
     assert calls[0][1]["params"] == {
         "lease_timeout_sec": 90,
         "manifest_format": "placement_binding_v1",
+        "transfer_id": "transfer-1",
     }
     assert session.manifests == []
     assert session.source_placements == [{"placement_id": "source-placement"}]
@@ -123,6 +135,7 @@ def test_begin_falls_back_to_runtime_manifest_when_capability_is_missing(
     assert calls[0][1]["params"] == {
         "lease_timeout_sec": 90,
         "manifest_format": "runtime_v1",
+        "transfer_id": "transfer-1",
     }
     assert session.manifests == [{"model_id": "model"}]
     assert session.source_placements is None
@@ -158,7 +171,7 @@ def test_begin_retries_runtime_manifest_once_for_unsupported_split_format(
         @staticmethod
         def json():
             return {
-                "transfer_id": "transfer-runtime",
+                "transfer_id": "transfer-1",
                 "weight_runtime_manifests": [{"model_id": "model"}],
                 "lease_timeout_sec": 90,
             }
@@ -178,7 +191,7 @@ def test_begin_retries_runtime_manifest_once_for_unsupported_split_format(
         "placement_binding_v1",
         "runtime_v1",
     ]
-    assert session.transfer_id == "transfer-runtime"
+    assert session.transfer_id == "transfer-1"
     assert session.manifest_format == "runtime_v1"
 
 
@@ -202,7 +215,7 @@ def test_begin_retries_runtime_manifest_once_for_explicit_conflict_format(
         @staticmethod
         def json():
             return {
-                "transfer_id": "transfer-runtime",
+                "transfer_id": "transfer-1",
                 "weight_runtime_manifests": [{"model_id": "model"}],
                 "lease_timeout_sec": 90,
             }
@@ -222,11 +235,12 @@ def test_begin_retries_runtime_manifest_once_for_explicit_conflict_format(
         "placement_binding_v1",
         "runtime_v1",
     ]
-    assert session.transfer_id == "transfer-runtime"
+    assert session.transfer_id == "transfer-1"
 
 
 def test_begin_does_not_retry_unrelated_conflict(monkeypatch) -> None:
     calls = []
+    released = []
 
     class Response:
         status_code = 409
@@ -242,6 +256,11 @@ def test_begin_does_not_retry_unrelated_conflict(monkeypatch) -> None:
         "post",
         lambda *args, **kwargs: calls.append((args, kwargs)) or Response(),
     )
+    monkeypatch.setattr(
+        utils,
+        "release_remote_instance_weight_transfer",
+        lambda seed_url, transfer_id: released.append((seed_url, transfer_id)) or True,
+    )
 
     assert (
         utils.begin_remote_instance_weight_transfer(
@@ -250,6 +269,78 @@ def test_begin_does_not_retry_unrelated_conflict(monkeypatch) -> None:
         is None
     )
     assert len(calls) == 1
+    assert released == []
+
+
+def test_begin_retries_release_for_structured_cleanup_pending_response(
+    monkeypatch,
+) -> None:
+    release_attempts = []
+
+    class Response:
+        status_code = 409
+        text = "snapshot cleanup remains pending"
+
+        @staticmethod
+        def json():
+            return {
+                "transfer_id": "transfer-1",
+                "session_state": "cleanup_pending",
+                "message": "snapshot cleanup remains pending",
+            }
+
+    def release(seed_url, transfer_id):
+        release_attempts.append((seed_url, transfer_id))
+        return len(release_attempts) >= 2
+
+    monkeypatch.setattr(utils, "supports_mooncake_placement_binding_v1", lambda: False)
+    monkeypatch.setattr(utils.requests, "post", lambda *args, **kwargs: Response())
+    monkeypatch.setattr(utils, "release_remote_instance_weight_transfer", release)
+
+    assert (
+        utils.begin_remote_instance_weight_transfer(
+            "http://source",
+            lease_timeout_sec=90,
+        )
+        is None
+    )
+    assert release_attempts == [
+        ("http://source", "transfer-1"),
+        ("http://source", "transfer-1"),
+    ]
+
+
+def test_begin_does_not_release_structured_conflict_response(monkeypatch) -> None:
+    released = []
+
+    class Response:
+        status_code = 409
+        text = "transfer ID conflict"
+
+        @staticmethod
+        def json():
+            return {
+                "transfer_id": "transfer-1",
+                "session_state": "conflict",
+                "message": "transfer ID conflict",
+            }
+
+    monkeypatch.setattr(utils, "supports_mooncake_placement_binding_v1", lambda: False)
+    monkeypatch.setattr(utils.requests, "post", lambda *args, **kwargs: Response())
+    monkeypatch.setattr(
+        utils,
+        "release_remote_instance_weight_transfer",
+        lambda seed_url, transfer_id: released.append((seed_url, transfer_id)) or True,
+    )
+
+    assert (
+        utils.begin_remote_instance_weight_transfer(
+            "http://source",
+            lease_timeout_sec=90,
+        )
+        is None
+    )
+    assert released == []
 
 
 def test_begin_does_not_retry_split_request_after_server_error(monkeypatch) -> None:
@@ -279,7 +370,7 @@ def test_begin_does_not_retry_split_request_after_server_error(monkeypatch) -> N
     assert len(calls) == 1
 
 
-def test_begin_does_not_retry_unsupported_response_that_owns_a_lease(
+def test_begin_does_not_release_unsupported_response_without_ownership_state(
     monkeypatch,
 ) -> None:
     calls = []
@@ -315,7 +406,7 @@ def test_begin_does_not_retry_unsupported_response_that_owns_a_lease(
         is None
     )
     assert len(calls) == 1
-    assert released == [("http://source", "transfer-rejected")]
+    assert released == []
 
 
 def test_begin_reuses_legacy_runtime_session_returned_for_split_request(
@@ -330,7 +421,7 @@ def test_begin_reuses_legacy_runtime_session_returned_for_split_request(
         @staticmethod
         def json():
             return {
-                "transfer_id": "transfer-legacy",
+                "transfer_id": "transfer-1",
                 "weight_runtime_manifests": [{"model_id": "model"}],
                 "lease_timeout_sec": 90,
             }
@@ -347,7 +438,7 @@ def test_begin_reuses_legacy_runtime_session_returned_for_split_request(
     )
 
     assert len(calls) == 1
-    assert session.transfer_id == "transfer-legacy"
+    assert session.transfer_id == "transfer-1"
     assert session.manifests == [{"model_id": "model"}]
     assert session.manifest_format == "runtime_v1"
 
@@ -365,7 +456,7 @@ def test_begin_releases_invalid_split_session_and_fails_closed(
         @staticmethod
         def json():
             return {
-                "transfer_id": "transfer-invalid",
+                "transfer_id": "transfer-1",
                 "source_weight_placements": [{"placement_id": "source-placement"}],
                 "source_weight_runtime_bindings": [],
                 "lease_timeout_sec": 90,
@@ -387,7 +478,11 @@ def test_begin_releases_invalid_split_session_and_fails_closed(
         "http://source", lease_timeout_sec=90
     )
 
-    assert released == [("http://source", "transfer-invalid")]
+    assert released == [
+        ("http://source", "transfer-1"),
+        ("http://source", "transfer-1"),
+        ("http://source", "transfer-1"),
+    ]
     assert len(calls) == 1
     assert calls[0][1]["params"]["manifest_format"] == "placement_binding_v1"
     assert session is None
@@ -404,7 +499,7 @@ def test_begin_releases_transfer_id_when_payload_validation_fails(
         @staticmethod
         def json():
             return {
-                "transfer_id": "transfer-invalid",
+                "transfer_id": "transfer-1",
                 "weight_runtime_manifests": [],
                 "lease_timeout_sec": 90,
             }
@@ -422,7 +517,91 @@ def test_begin_releases_transfer_id_when_payload_validation_fails(
     )
 
     assert session is None
-    assert released == [("http://source", "transfer-invalid")]
+    assert released == [("http://source", "transfer-1")]
+
+
+def test_begin_retries_response_loss_with_the_same_target_generated_id(
+    monkeypatch,
+) -> None:
+    calls = []
+    released = []
+
+    class Response:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return {
+                "transfer_id": "transfer-1",
+                "weight_runtime_manifests": [{"model_id": "model"}],
+                "lease_timeout_sec": 90,
+            }
+
+    def post(*args, **kwargs):
+        calls.append((args, kwargs))
+        if len(calls) == 1:
+            raise RuntimeError("response lost")
+        return Response()
+
+    monkeypatch.setattr(utils, "supports_mooncake_placement_binding_v1", lambda: False)
+    monkeypatch.setattr(utils.requests, "post", post)
+    monkeypatch.setattr(
+        utils,
+        "release_remote_instance_weight_transfer",
+        lambda seed_url, transfer_id: released.append((seed_url, transfer_id)) or True,
+    )
+
+    session = utils.begin_remote_instance_weight_transfer(
+        "http://source",
+        lease_timeout_sec=90,
+    )
+
+    assert session.transfer_id == "transfer-1"
+    assert len(calls) == 2
+    assert {call[1]["params"]["transfer_id"] for call in calls} == {"transfer-1"}
+    assert released == []
+
+
+def test_begin_releases_known_id_after_repeated_response_loss(monkeypatch) -> None:
+    released = []
+    monkeypatch.setattr(utils, "supports_mooncake_placement_binding_v1", lambda: False)
+    monkeypatch.setattr(
+        utils.requests,
+        "post",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("response lost")),
+    )
+
+    def release(seed_url, transfer_id):
+        released.append((seed_url, transfer_id))
+        return len(released) >= 2
+
+    monkeypatch.setattr(utils, "release_remote_instance_weight_transfer", release)
+
+    assert (
+        utils.begin_remote_instance_weight_transfer(
+            "http://source",
+            lease_timeout_sec=90,
+        )
+        is None
+    )
+    assert released == [
+        ("http://source", "transfer-1"),
+        ("http://source", "transfer-1"),
+    ]
+
+
+def test_begin_rejects_explicit_empty_transfer_id(monkeypatch) -> None:
+    monkeypatch.setattr(
+        utils.requests,
+        "post",
+        lambda *args, **kwargs: pytest.fail("invalid ID must fail before HTTP"),
+    )
+
+    with pytest.raises(ValueError, match="non-empty string"):
+        utils.begin_remote_instance_weight_transfer(
+            "http://source",
+            transfer_id="",
+        )
 
 
 def test_renew_timeout_is_strictly_inside_remaining_lease_window(

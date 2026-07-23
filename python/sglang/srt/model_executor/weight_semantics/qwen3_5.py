@@ -456,12 +456,15 @@ class Qwen35WeightSemanticsAdapter:
             return int(self._config.shared_expert_intermediate_size)
         return int(self._config.intermediate_size)
 
+    def _has_attention_output_gate(self) -> bool:
+        return bool(getattr(self._config, "attn_output_gate", True))
+
     def _qkv(
         self, *, name, parameter, topology, layer_id
     ) -> tuple[LogicalTensorView, ...]:
         head_dim = self._head_dim()
         q_extent = int(self._config.num_attention_heads) * head_dim
-        if getattr(self._config, "attn_output_gate", True):
+        if self._has_attention_output_gate():
             q_extent *= 2
         kv_heads = int(self._config.num_key_value_heads)
         kv_extent = kv_heads * head_dim

@@ -780,8 +780,11 @@ class WeightSnapshotCoordinator:
             lease = self._leases.get(lease_id)
             if lease is None:
                 raise WeightManifestError("weight snapshot lease does not exist")
+            if lease.expired:
+                raise WeightManifestError(
+                    "weight snapshot lease expired and requires explicit release"
+                )
             lease.deadline = self._clock() + lease_timeout_sec
-            lease.expired = False
 
     def has_snapshot(self, lease_id: str) -> bool:
         with self._lock:
@@ -1289,6 +1292,7 @@ def create_sglang_weight_runtime_manifest_manager(
     is_multimodal: bool = False,
     dynamic_expert_placement: bool = False,
     moe_runner_backend: str | None = None,
+    fp8_gemm_backend: str | None = None,
     dp_attention_enabled: bool = False,
     coordinator: WeightSnapshotCoordinator | None = None,
 ):
@@ -1305,6 +1309,7 @@ def create_sglang_weight_runtime_manifest_manager(
         is_multimodal=is_multimodal,
         dynamic_expert_placement=dynamic_expert_placement,
         moe_runner_backend=moe_runner_backend,
+        fp8_gemm_backend=fp8_gemm_backend,
         dp_attention_enabled=dp_attention_enabled,
         coordinator=coordinator,
     )
@@ -1321,10 +1326,11 @@ def create_weight_runtime_manifest_manager(
     is_multimodal: bool = False,
     dynamic_expert_placement: bool = False,
     moe_runner_backend: str | None = None,
+    fp8_gemm_backend: str | None = None,
     dp_attention_enabled: bool = False,
     coordinator: WeightSnapshotCoordinator | None = None,
 ):
-    if quantization is not None:
+    if quantization not in (None, "fp8"):
         return UnavailableWeightRuntimeManifestManager(
             f"quantized weight manifests are unsupported: {quantization}"
         )
@@ -1337,7 +1343,13 @@ def create_weight_runtime_manifest_manager(
             "DP attention weight manifests are unsupported"
         )
     model_type = getattr(config, "model_type", None)
-    text_model_types = ("qwen3_5_text", "qwen3_5_moe_text", "qwen3_next")
+    text_model_types = (
+        "qwen3",
+        "qwen3_moe",
+        "qwen3_5_text",
+        "qwen3_5_moe_text",
+        "qwen3_next",
+    )
     multimodal_model_types = ("qwen3_5", "qwen3_5_moe")
     if is_multimodal and model_type not in multimodal_model_types:
         return UnavailableWeightRuntimeManifestManager(
@@ -1356,6 +1368,9 @@ def create_weight_runtime_manifest_manager(
     from sglang.srt.model_executor.weight_semantics.qwen3_5 import (
         Qwen35MultimodalWeightSemanticsAdapter,
         Qwen35WeightSemanticsAdapter,
+    )
+    from sglang.srt.model_executor.weight_semantics.qwen3 import (
+        Qwen3WeightSemanticsAdapter,
     )
     from sglang.srt.model_executor.weight_semantics.qwen3_next import (
         Qwen3NextWeightSemanticsAdapter,
@@ -1394,12 +1409,33 @@ def create_weight_runtime_manifest_manager(
             up_first_w13_parameter_ids=up_first_w13_parameters,
             num_fused_shared_experts=int(getattr(model, "num_fused_shared_experts", 0)),
         )
+    elif model_type in ("qwen3", "qwen3_moe"):
+        adapter = Qwen3WeightSemanticsAdapter(
+            config=config,
+            dynamic_expert_placement=dynamic_expert_placement,
+            up_first_w13_parameter_ids=up_first_w13_parameters,
+        )
     else:
         adapter = Qwen35WeightSemanticsAdapter(
             config=config,
             dynamic_expert_placement=dynamic_expert_placement,
             up_first_w13_parameter_ids=up_first_w13_parameters,
         )
+
+    if quantization == "fp8":
+        from sglang.srt.model_executor.weight_semantics.fp8_block import (
+            create_serialized_block_fp8_adapter,
+        )
+
+        try:
+            adapter = create_serialized_block_fp8_adapter(
+                model=model,
+                delegate=adapter,
+                fp8_gemm_backend=fp8_gemm_backend,
+                moe_runner_backend=moe_runner_backend,
+            )
+        except WeightManifestError as error:
+            return UnavailableWeightRuntimeManifestManager(str(error))
 
     return WeightRuntimeManifestManager(
         model=model,

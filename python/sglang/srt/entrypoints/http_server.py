@@ -1275,18 +1275,27 @@ async def remote_instance_transfer_engine_info(rank: int = None):
 @app.post("/remote_instance_weight_transfer")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def begin_remote_instance_weight_transfer(
-    lease_timeout_sec: int = 300, manifest_format: str = "runtime_v1"
+    lease_timeout_sec: int = 300,
+    manifest_format: str = "runtime_v1",
+    transfer_id: str | None = None,
 ):
     try:
         return (
             await _global_state.tokenizer_manager.begin_remote_instance_weight_transfer(
-                lease_timeout_sec, manifest_format=manifest_format
+                lease_timeout_sec,
+                manifest_format=manifest_format,
+                transfer_id=transfer_id,
             )
         )
     except (RuntimeError, ValueError) as error:
-        raise HTTPException(
-            status_code=HTTPStatus.CONFLICT, detail=str(error)
-        ) from error
+        return ORJSONResponse(
+            {
+                "transfer_id": getattr(error, "transfer_id", None),
+                "session_state": getattr(error, "session_state", "failed"),
+                "message": str(error),
+            },
+            status_code=HTTPStatus.CONFLICT,
+        )
 
 
 @app.delete("/remote_instance_weight_transfer/{transfer_id}")

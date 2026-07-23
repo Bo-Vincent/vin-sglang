@@ -94,11 +94,11 @@ class Qwen3NextWeightSemanticsAdapter(Qwen35WeightSemanticsAdapter):
 
     @staticmethod
     def _require_grouped_gdn_layout(parameter: Any, name: str) -> None:
-        layout = getattr(parameter, "_sglang_qwen3_next_gdn_layout", "grouped")
+        layout = getattr(parameter, "_sglang_qwen3_next_gdn_layout", None)
         if layout != "grouped":
             raise WeightManifestError(
-                "Qwen3-Next split-checkpoint GDN runtime layout requires an "
-                f"explicit component-to-grouped conversion: {name}: {layout}"
+                "Qwen3-Next GDN runtime layout marker must explicitly be "
+                f"'grouped': {name}: {layout!r}"
             )
 
     def _routed_expert_ids(

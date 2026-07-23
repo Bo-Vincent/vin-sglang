@@ -53,6 +53,15 @@ from sglang.srt.model_executor.weight_runtime_manifest import WeightManifestErro
 
 logger = logging.getLogger(__name__)
 
+_REMOTE_WEIGHT_TRANSFER_TOMBSTONE_TTL_SEC = 300.0
+_REMOTE_WEIGHT_TRANSFER_TOMBSTONE_LIMIT = 4096
+
+
+class _RemoteWeightTransferSessionError(RuntimeError):
+    def __init__(self, message: str, *, session_state: str) -> None:
+        super().__init__(message)
+        self.session_state = session_state
+
 
 def _get_draft_model_runner(draft_worker):
     # DFlash / FrozenKVMTP workers expose draft_model_runner directly
@@ -98,6 +107,14 @@ class SchedulerWeightUpdaterManager:
     remote_weight_transfer_leases: Dict[str, str] = field(default_factory=dict)
     remote_weight_transfer_deadlines: Dict[str, float] = field(default_factory=dict)
     remote_weight_transfer_expired: set[str] = field(default_factory=set)
+    remote_weight_transfer_sessions: Dict[
+        str,
+        Tuple[Tuple[Any, ...], BeginRemoteInstanceWeightTransferReqOutput],
+    ] = field(default_factory=dict)
+    remote_weight_transfer_tombstones: Dict[
+        str,
+        Tuple[Optional[Tuple[Any, ...]], float],
+    ] = field(default_factory=dict)
     remote_weight_transfer_lock: threading.Lock = field(
         default_factory=threading.Lock, init=False, repr=False
     )
@@ -179,11 +196,85 @@ class SchedulerWeightUpdaterManager:
             for transfer_id in expired:
                 self.remote_weight_transfer_deadlines.pop(transfer_id, None)
                 self.remote_weight_transfer_expired.add(transfer_id)
+            expired_tombstones = [
+                transfer_id
+                for transfer_id, (_, deadline) in (
+                    self.remote_weight_transfer_tombstones.items()
+                )
+                if deadline <= now
+            ]
+            for transfer_id in expired_tombstones:
+                self.remote_weight_transfer_tombstones.pop(transfer_id, None)
 
     def _get_remote_weight_transfer_lease(self, transfer_id: str) -> str | None:
         self._prune_remote_weight_transfer_bookkeeping()
         with self.remote_weight_transfer_lock:
             return self.remote_weight_transfer_leases.get(transfer_id)
+
+    @staticmethod
+    def _remote_weight_transfer_request_identity(
+        request: BeginRemoteInstanceWeightTransferReqInput,
+    ) -> Tuple[Any, ...]:
+        return (
+            request.model_id,
+            request.revision,
+            request.lease_timeout_sec,
+            request.manifest_format,
+        )
+
+    def _cached_remote_weight_transfer_session(
+        self,
+        request: BeginRemoteInstanceWeightTransferReqInput,
+    ) -> BeginRemoteInstanceWeightTransferReqOutput | None:
+        self._prune_remote_weight_transfer_bookkeeping()
+        with self.remote_weight_transfer_lock:
+            cached = self.remote_weight_transfer_sessions.get(request.transfer_id)
+            expired = request.transfer_id in self.remote_weight_transfer_expired
+            tombstone = self.remote_weight_transfer_tombstones.get(request.transfer_id)
+        request_identity = self._remote_weight_transfer_request_identity(request)
+        if tombstone is not None:
+            terminal_identity, _ = tombstone
+            if terminal_identity is not None and terminal_identity != request_identity:
+                raise _RemoteWeightTransferSessionError(
+                    "remote weight transfer ID was reused with different parameters",
+                    session_state="conflict",
+                )
+            raise _RemoteWeightTransferSessionError(
+                "remote weight transfer was already released",
+                session_state="released",
+            )
+        if cached is None:
+            return None
+        identity, output = cached
+        if identity != request_identity:
+            raise _RemoteWeightTransferSessionError(
+                "remote weight transfer ID was reused with different parameters",
+                session_state="conflict",
+            )
+        if expired:
+            raise _RemoteWeightTransferSessionError(
+                "remote weight transfer expired and requires explicit release",
+                session_state="expired",
+            )
+        return output
+
+    def _record_remote_weight_transfer_session(
+        self,
+        request: BeginRemoteInstanceWeightTransferReqInput,
+        lease_id: str,
+        output: BeginRemoteInstanceWeightTransferReqOutput,
+    ) -> None:
+        with self.remote_weight_transfer_lock:
+            self.remote_weight_transfer_leases[request.transfer_id] = lease_id
+            self.remote_weight_transfer_deadlines[request.transfer_id] = (
+                time.monotonic() + request.lease_timeout_sec
+            )
+            self.remote_weight_transfer_expired.discard(request.transfer_id)
+            self.remote_weight_transfer_sessions[request.transfer_id] = (
+                self._remote_weight_transfer_request_identity(request),
+                output,
+            )
+            self.remote_weight_transfer_tombstones.pop(request.transfer_id, None)
 
     def _record_remote_weight_transfer_lease(
         self,
@@ -198,11 +289,48 @@ class SchedulerWeightUpdaterManager:
             )
             self.remote_weight_transfer_expired.discard(transfer_id)
 
-    def _forget_remote_weight_transfer_lease(self, transfer_id: str) -> None:
+    def _complete_remote_weight_transfer_session(self, transfer_id: str) -> None:
+        now = time.monotonic()
         with self.remote_weight_transfer_lock:
             self.remote_weight_transfer_leases.pop(transfer_id, None)
             self.remote_weight_transfer_deadlines.pop(transfer_id, None)
             self.remote_weight_transfer_expired.discard(transfer_id)
+            session = self.remote_weight_transfer_sessions.pop(transfer_id, None)
+            if (
+                session is None
+                and transfer_id in self.remote_weight_transfer_tombstones
+            ):
+                return
+            identity = session[0] if session is not None else None
+            self.remote_weight_transfer_tombstones[transfer_id] = (
+                identity,
+                now + _REMOTE_WEIGHT_TRANSFER_TOMBSTONE_TTL_SEC,
+            )
+            while (
+                len(self.remote_weight_transfer_tombstones)
+                > _REMOTE_WEIGHT_TRANSFER_TOMBSTONE_LIMIT
+            ):
+                oldest_transfer_id = next(iter(self.remote_weight_transfer_tombstones))
+                self.remote_weight_transfer_tombstones.pop(oldest_transfer_id)
+
+    def _discard_remote_weight_transfer_lease(self, transfer_id: str) -> None:
+        with self.remote_weight_transfer_lock:
+            self.remote_weight_transfer_leases.pop(transfer_id, None)
+            self.remote_weight_transfer_deadlines.pop(transfer_id, None)
+            self.remote_weight_transfer_expired.discard(transfer_id)
+            self.remote_weight_transfer_sessions.pop(transfer_id, None)
+
+    def _rollback_remote_weight_transfer_snapshot(
+        self,
+        transfer_id: str,
+        lease_id: str,
+    ) -> str | None:
+        try:
+            self.tp_worker.model_runner.release_weight_runtime_manifest(lease_id)
+        except Exception as error:
+            return str(error)
+        self._discard_remote_weight_transfer_lease(transfer_id)
+        return None
 
     @contextmanager
     def _observe_weight_load(self, source: str) -> Iterator[None]:
@@ -624,17 +752,28 @@ class SchedulerWeightUpdaterManager:
         """Acquire one address-stable snapshot on every model rank."""
         collective_group = self.remote_weight_transfer_cpu_group or self.world_cpu_group
         local_snapshot = None
+        cached = None
         split_manifest = recv_req.manifest_format == "placement_binding_v1"
         try:
             if recv_req.manifest_format not in ("runtime_v1", "placement_binding_v1"):
                 raise RuntimeError(
                     f"unsupported source manifest format: {recv_req.manifest_format}"
                 )
-            if self._get_remote_weight_transfer_lease(recv_req.transfer_id) is not None:
-                raise RuntimeError(
-                    f"remote weight transfer already exists: {recv_req.transfer_id}"
+            cached = self._cached_remote_weight_transfer_session(recv_req)
+            if cached is not None:
+                local_result = {
+                    "success": True,
+                    "message": "Success.",
+                    "session_state": "reused",
+                }
+            elif (
+                self._get_remote_weight_transfer_lease(recv_req.transfer_id) is not None
+            ):
+                raise _RemoteWeightTransferSessionError(
+                    f"remote weight transfer already exists: {recv_req.transfer_id}",
+                    session_state="cleanup_pending",
                 )
-            if split_manifest:
+            elif split_manifest:
                 local_snapshot = self.tp_worker.model_runner.get_remote_instance_weight_runtime_manifest_parts(
                     model_id=recv_req.model_id,
                     revision=recv_req.revision,
@@ -664,6 +803,7 @@ class SchedulerWeightUpdaterManager:
                 local_result = {
                     "success": True,
                     "message": "Success.",
+                    "session_state": "created",
                     "placement": placement_payload,
                     "binding": binding_payload,
                 }
@@ -682,12 +822,22 @@ class SchedulerWeightUpdaterManager:
                 local_result = {
                     "success": True,
                     "message": "Success.",
+                    "session_state": "created",
                     "manifest": local_payload,
                 }
+            if local_snapshot is not None:
+                self._record_remote_weight_transfer_lease(
+                    recv_req.transfer_id,
+                    self._remote_transfer_snapshot_lease_id(
+                        local_snapshot, split_manifest=split_manifest
+                    ),
+                    recv_req.lease_timeout_sec,
+                )
         except Exception as error:
             local_result = {
                 "success": False,
                 "message": str(error),
+                "session_state": getattr(error, "session_state", "failed"),
             }
 
         try:
@@ -697,19 +847,52 @@ class SchedulerWeightUpdaterManager:
                 gathered, local_result, group=collective_group
             )
         except Exception as error:
+            cleanup_error = None
             if local_snapshot is not None:
-                self.tp_worker.model_runner.release_weight_runtime_manifest(
+                cleanup_error = self._rollback_remote_weight_transfer_snapshot(
+                    recv_req.transfer_id,
                     self._remote_transfer_snapshot_lease_id(
-                        local_snapshot, split_manifest=split_manifest
-                    )
+                        local_snapshot,
+                        split_manifest=split_manifest,
+                    ),
                 )
+            message = f"Failed to gather source runtime manifests: {error}"
+            session_state = "failed"
+            if cleanup_error is not None:
+                message += f"; snapshot cleanup remains pending: {cleanup_error}"
+                session_state = "cleanup_pending"
             return BeginRemoteInstanceWeightTransferReqOutput(
                 transfer_id=recv_req.transfer_id,
                 success=False,
-                message=f"Failed to gather source runtime manifests: {error}",
+                message=message,
+                session_state=session_state,
             )
 
         failures = [item["message"] for item in gathered if not item["success"]]
+        session_states = {
+            item.get("session_state", "created") for item in gathered if item["success"]
+        }
+        if not failures and len(session_states) != 1:
+            failures.append(
+                "source ranks have inconsistent session state for remote weight transfer"
+            )
+        if not failures and session_states == {"reused"}:
+            if cached is None:
+                failures.append(
+                    "source ranks have inconsistent cached session state for "
+                    "remote weight transfer"
+                )
+            else:
+                return BeginRemoteInstanceWeightTransferReqOutput(
+                    transfer_id=cached.transfer_id,
+                    success=cached.success,
+                    message=cached.message,
+                    session_state="reused",
+                    manifests=cached.manifests,
+                    placements=cached.placements,
+                    bindings=cached.bindings,
+                )
+
         manifests = None
         placements = None
         bindings = None
@@ -728,34 +911,68 @@ class SchedulerWeightUpdaterManager:
                 failures.append(str(error))
 
         if failures:
+            cleanup_error = None
             if local_snapshot is not None:
-                self.tp_worker.model_runner.release_weight_runtime_manifest(
+                cleanup_error = self._rollback_remote_weight_transfer_snapshot(
+                    recv_req.transfer_id,
                     self._remote_transfer_snapshot_lease_id(
-                        local_snapshot, split_manifest=split_manifest
-                    )
+                        local_snapshot,
+                        split_manifest=split_manifest,
+                    ),
                 )
+            all_session_states = {
+                item.get(
+                    "session_state",
+                    "created" if item["success"] else "failed",
+                )
+                for item in gathered
+            }
+            failure_states = {
+                item.get("session_state", "failed")
+                for item in gathered
+                if not item["success"]
+            }
+            if "conflict" in all_session_states:
+                session_state = "conflict"
+            elif "expired" in all_session_states:
+                session_state = "expired"
+            elif all_session_states & {"created", "reused", "cleanup_pending"}:
+                session_state = "cleanup_pending"
+            elif "released" in all_session_states:
+                session_state = "released"
+            elif len(failure_states) == 1:
+                session_state = next(iter(failure_states))
+            else:
+                session_state = "failed"
+            if cleanup_error is not None:
+                failures.append(f"snapshot cleanup remains pending: {cleanup_error}")
+                if session_state not in {"conflict", "expired"}:
+                    session_state = "cleanup_pending"
             return BeginRemoteInstanceWeightTransferReqOutput(
                 transfer_id=recv_req.transfer_id,
                 success=False,
                 message=" | ".join(failures),
+                session_state=session_state,
             )
 
         local_lease_id = self._remote_transfer_snapshot_lease_id(
             local_snapshot, split_manifest=split_manifest
         )
-        self._record_remote_weight_transfer_lease(
-            recv_req.transfer_id,
-            local_lease_id,
-            recv_req.lease_timeout_sec,
-        )
-        return BeginRemoteInstanceWeightTransferReqOutput(
+        output = BeginRemoteInstanceWeightTransferReqOutput(
             transfer_id=recv_req.transfer_id,
             success=True,
             message="Success.",
+            session_state="created",
             manifests=manifests,
             placements=placements,
             bindings=bindings,
         )
+        self._record_remote_weight_transfer_session(
+            recv_req,
+            local_lease_id,
+            output,
+        )
+        return output
 
     @staticmethod
     def _remote_transfer_snapshot_lease_id(snapshot, *, split_manifest: bool) -> str:
@@ -790,8 +1007,16 @@ class SchedulerWeightUpdaterManager:
     def renew_remote_instance_weight_transfer(
         self, recv_req: RenewRemoteInstanceWeightTransferReqInput
     ) -> RenewRemoteInstanceWeightTransferReqOutput:
+        self._prune_remote_weight_transfer_bookkeeping()
+        with self.remote_weight_transfer_lock:
+            expired = recv_req.transfer_id in self.remote_weight_transfer_expired
         lease_id = self._get_remote_weight_transfer_lease(recv_req.transfer_id)
-        if lease_id is None:
+        if expired:
+            local_success = False
+            local_message = (
+                "Remote weight transfer expired and requires explicit release."
+            )
+        elif lease_id is None:
             local_success = False
             local_message = "Remote weight transfer does not exist or has expired."
         else:
@@ -910,12 +1135,13 @@ class SchedulerWeightUpdaterManager:
     ) -> ReleaseRemoteInstanceWeightTransferReqOutput:
         lease_id = self._get_remote_weight_transfer_lease(recv_req.transfer_id)
         if lease_id is None:
+            self._complete_remote_weight_transfer_session(recv_req.transfer_id)
             local_success = True
             local_message = "Remote weight transfer was already released."
         else:
             try:
                 self.tp_worker.model_runner.release_weight_runtime_manifest(lease_id)
-                self._forget_remote_weight_transfer_lease(recv_req.transfer_id)
+                self._complete_remote_weight_transfer_session(recv_req.transfer_id)
                 local_success = True
                 local_message = "Success."
             except Exception as error:

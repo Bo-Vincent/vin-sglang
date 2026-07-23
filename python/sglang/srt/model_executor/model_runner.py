@@ -794,6 +794,7 @@ class ModelRunner:
                 or self.server_args.ep_num_redundant_experts > 0
             ),
             moe_runner_backend=self.server_args.moe_runner_backend,
+            fp8_gemm_backend=self.server_args.fp8_gemm_runner_backend,
             dp_attention_enabled=self.server_args.enable_dp_attention,
             coordinator=coordinator,
         )
