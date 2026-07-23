@@ -1274,11 +1274,13 @@ async def remote_instance_transfer_engine_info(rank: int = None):
 
 @app.post("/remote_instance_weight_transfer")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def begin_remote_instance_weight_transfer(lease_timeout_sec: int = 300):
+async def begin_remote_instance_weight_transfer(
+    lease_timeout_sec: int = 300, manifest_format: str = "runtime_v1"
+):
     try:
         return (
             await _global_state.tokenizer_manager.begin_remote_instance_weight_transfer(
-                lease_timeout_sec
+                lease_timeout_sec, manifest_format=manifest_format
             )
         )
     except (RuntimeError, ValueError) as error:

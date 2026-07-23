@@ -498,7 +498,9 @@ class ModelRunner:
                 WeightSnapshotCoordinator,
             )
 
-            self.weight_snapshot_coordinator = WeightSnapshotCoordinator()
+            self.weight_snapshot_coordinator = WeightSnapshotCoordinator(
+                completion_fence=current_platform.synchronize
+            )
             coordination_kwargs = {
                 "begin_weight_update": self.weight_snapshot_coordinator.begin_update,
                 "finish_weight_update": self.weight_snapshot_coordinator.finish_update,
@@ -781,6 +783,22 @@ class ModelRunner:
             coordinator=coordinator,
         )
 
+    def _select_remote_instance_target_weight_manifest_builder(self):
+        if not self.server_args.enable_weight_runtime_manifest or self.is_draft_worker:
+            return None
+
+        from sglang.srt.model_executor.weight_runtime_manifest import (
+            local_mooncake_supports_placement_binding,
+        )
+
+        if local_mooncake_supports_placement_binding():
+            return self.build_remote_instance_target_weight_manifest_session
+        logger.info(
+            "Local Mooncake lacks placement/binding manifest APIs; "
+            "using the runtime-v1 target builder."
+        )
+        return self.build_remote_instance_target_weight_runtime_manifest
+
     @contextlib.contextmanager
     def build_remote_instance_target_weight_manifest_session(
         self,
@@ -849,17 +867,35 @@ class ModelRunner:
         lease_timeout_sec: int | None = None,
     ):
         self.init_weight_runtime_manifest_manager()
-        assert self.weight_snapshot_coordinator is not None
-        content_revision = (
-            f"{revision}@generation-{self.weight_snapshot_coordinator.generation}"
-        )
         return self.weight_runtime_manifest_manager.snapshot(
             model_id=model_id,
-            revision=content_revision,
+            revision=revision,
             instance_id=instance_id,
             worker_id=worker_id,
             endpoint=endpoint,
             lease_timeout_sec=lease_timeout_sec,
+            bind_revision_to_generation=True,
+        )
+
+    def get_weight_runtime_manifest_parts(
+        self,
+        *,
+        model_id: str,
+        revision: str,
+        instance_id: str,
+        worker_id: str,
+        endpoint: str,
+        lease_timeout_sec: int | None = None,
+    ):
+        self.init_weight_runtime_manifest_manager()
+        return self.weight_runtime_manifest_manager.snapshot_parts(
+            model_id=model_id,
+            revision=revision,
+            instance_id=instance_id,
+            worker_id=worker_id,
+            endpoint=endpoint,
+            lease_timeout_sec=lease_timeout_sec,
+            bind_revision_to_generation=True,
         )
 
     def release_weight_runtime_manifest(self, lease_id: str) -> None:
@@ -900,17 +936,69 @@ class ModelRunner:
         )
         try:
             transporter.validate_runtime_manifest_addresses(manifest)
-        except Exception:
+        except BaseException:
             self.release_weight_runtime_manifest(manifest.lease_id)
             raise
         return manifest
 
-    def commit_weight_runtime_revision(self) -> int:
+    def get_remote_instance_weight_runtime_manifest_parts(
+        self,
+        *,
+        model_id: str,
+        revision: str,
+        transfer_id: str,
+        lease_timeout_sec: int,
+    ):
+        from sglang.srt.model_executor.weight_runtime_manifest import (
+            compose_weight_runtime_manifest,
+        )
+
+        transporter = self.remote_instance_weight_transporter
+        parts = self.get_weight_runtime_manifest_parts(
+            model_id=model_id,
+            revision=revision,
+            instance_id=f"sglang:{transporter.session_id}:{transfer_id}",
+            worker_id=transporter.worker_id,
+            endpoint=transporter.session_id,
+            lease_timeout_sec=lease_timeout_sec,
+        )
+        try:
+            transporter.validate_runtime_manifest_addresses(
+                compose_weight_runtime_manifest(parts.placement, parts.binding)
+            )
+        except BaseException:
+            self.release_weight_runtime_manifest(parts.binding.lease_id)
+            raise
+        return parts
+
+    def pending_weight_runtime_generation(self) -> int | None:
         if self.weight_snapshot_coordinator is None:
             raise RuntimeError(
                 "weight runtime manifests require --enable-weight-runtime-manifest"
             )
-        return self.weight_snapshot_coordinator.commit_revision()
+        return self.weight_snapshot_coordinator.pending_revision_generation()
+
+    def commit_weight_runtime_revision(
+        self, expected_generation: int | None = None
+    ) -> int:
+        if self.weight_snapshot_coordinator is None:
+            raise RuntimeError(
+                "weight runtime manifests require --enable-weight-runtime-manifest"
+            )
+        return self.weight_snapshot_coordinator.commit_revision(
+            expected_generation=expected_generation
+        )
+
+    def poison_weight_runtime_after_global_failure(
+        self, expected_generation: int
+    ) -> None:
+        if self.weight_snapshot_coordinator is None:
+            raise RuntimeError(
+                "weight runtime manifests require --enable-weight-runtime-manifest"
+            )
+        self.weight_snapshot_coordinator.poison_global_update_failure(
+            expected_generation=expected_generation
+        )
 
     def maybe_enable_batch_invariant_mode(self):
         if self.server_args.enable_deterministic_inference:
@@ -1208,10 +1296,7 @@ class ModelRunner:
             remote_instance_weight_transporter_engine=self.remote_instance_weight_transporter.engine,
             remote_instance_weight_transporter_session_id=self.remote_instance_weight_transporter.session_id,
             remote_instance_weight_runtime_manifest_builder=(
-                self.build_remote_instance_target_weight_manifest_session
-                if self.server_args.enable_weight_runtime_manifest
-                and not self.is_draft_worker
-                else None
+                self._select_remote_instance_target_weight_manifest_builder()
             ),
             draft_model_idx=self.draft_model_idx,
             weight_cache_mode=self.server_args.weight_cache_mode,

@@ -1,15 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import enum
-import importlib
 import importlib.util
 import logging
+import math
 import threading
 import time
 from dataclasses import dataclass
 from typing import Any, List
 
 import requests
+
+from sglang.srt.model_executor.weight_runtime_manifest import (
+    local_mooncake_supports_placement_binding,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +29,13 @@ class RemoteInstanceWeightTransferSession:
     transfer_id: str
     manifests: list[dict]
     lease_timeout_sec: int
+    source_placements: list[dict] | None = None
+    source_bindings: list[dict] | None = None
+    manifest_format: str = "runtime_v1"
+
+
+def supports_mooncake_placement_binding_v1() -> bool:
+    return local_mooncake_supports_placement_binding()
 
 
 class RemoteInstanceWeightTransferHeartbeat:
@@ -61,15 +72,26 @@ class RemoteInstanceWeightTransferHeartbeat:
         self._failure_lock = threading.Lock()
         self._failure: BaseException | None = None
         self._thread: threading.Thread | None = None
+        self._lease_deadline = time.monotonic() + lease_timeout_sec
+
+    def _renew(self) -> bool:
+        remaining_lease_sec = self._lease_deadline - time.monotonic()
+        if remaining_lease_sec <= 0:
+            return False
+        renewed = renew_remote_instance_weight_transfer(
+            self.seed_url,
+            self.transfer_id,
+            self.lease_timeout_sec,
+            remaining_lease_sec=remaining_lease_sec,
+        )
+        if renewed:
+            self._lease_deadline = time.monotonic() + self.lease_timeout_sec
+        return renewed
 
     def start(self) -> None:
         if self._thread is not None:
             raise RuntimeError("remote weight transfer heartbeat was already started")
-        if not renew_remote_instance_weight_transfer(
-            self.seed_url,
-            self.transfer_id,
-            self.lease_timeout_sec,
-        ):
+        if not self._renew():
             raise RuntimeError("initial source weight transfer lease renew failed")
         self._thread = threading.Thread(
             target=self._run,
@@ -81,12 +103,7 @@ class RemoteInstanceWeightTransferHeartbeat:
     def _run(self) -> None:
         while not self._stop_event.wait(self.renew_interval_sec):
             try:
-                renewed = renew_remote_instance_weight_transfer(
-                    self.seed_url,
-                    self.transfer_id,
-                    self.lease_timeout_sec,
-                )
-                if not renewed:
+                if not self._renew():
                     raise RuntimeError("source weight transfer lease renew failed")
             except BaseException as error:
                 with self._failure_lock:
@@ -148,13 +165,20 @@ class RemoteInstanceWeightTransferWorldCoordinator:
                 except Exception:
                     logger.exception("Failed to start remote weight transfer heartbeat")
                     try:
-                        release_remote_instance_weight_transfer(
+                        released = release_remote_instance_weight_transfer(
                             self.seed_url, local_session.transfer_id
                         )
+                        if not released:
+                            logger.error(
+                                "Failed to clean up the source weight transfer after "
+                                "heartbeat startup; source mutation remains blocked "
+                                "until explicit release or recovery"
+                            )
                     except Exception:
                         logger.exception(
                             "Failed to clean up the source weight transfer after "
-                            "heartbeat startup; waiting for lease TTL"
+                            "heartbeat startup; source mutation remains blocked "
+                            "until explicit release or recovery"
                         )
                     self.heartbeat = None
                     local_session = None
@@ -163,10 +187,11 @@ class RemoteInstanceWeightTransferWorldCoordinator:
             self.session = self.world_group.broadcast_object(local_session, src=0)
         except Exception:
             self._stop_heartbeat()
-            logger.exception(
-                "Failed to broadcast the source weight transfer session; "
-                "keeping its lease until TTL"
-            )
+            if self.is_owner and local_session is not None:
+                _best_effort_release_invalid_transfer(
+                    self.seed_url, local_session.transfer_id
+                )
+            logger.exception("Failed to broadcast the source weight transfer session")
             raise
         return self.session
 
@@ -202,8 +227,8 @@ class RemoteInstanceWeightTransferWorldCoordinator:
         except Exception:
             self._release_safe = False
             logger.exception(
-                "Failed to gather target transfer readiness; keeping the source "
-                "lease until TTL"
+                "Failed to gather target transfer readiness; source mutation "
+                "remains blocked until explicit release or recovery"
             )
             return False
 
@@ -215,8 +240,8 @@ class RemoteInstanceWeightTransferWorldCoordinator:
         if not readiness_valid:
             self._release_safe = False
             logger.error(
-                "Target world returned invalid transfer readiness; keeping the "
-                "source lease until TTL"
+                "Target world returned invalid transfer readiness; source mutation "
+                "remains blocked until explicit release or recovery"
             )
             return False
         return all(gathered_readiness)
@@ -253,8 +278,8 @@ class RemoteInstanceWeightTransferWorldCoordinator:
         except Exception:
             self._stop_heartbeat()
             logger.exception(
-                "Failed to gather target transfer outcomes; keeping the source "
-                "lease until TTL"
+                "Failed to gather target transfer outcomes; source mutation "
+                "remains blocked until explicit release or recovery"
             )
             return False, False
 
@@ -268,8 +293,8 @@ class RemoteInstanceWeightTransferWorldCoordinator:
         if not outcomes_valid:
             self._stop_heartbeat()
             logger.error(
-                "Target world returned invalid transfer outcomes; keeping the "
-                "source lease until TTL"
+                "Target world returned invalid transfer outcomes; source mutation "
+                "remains blocked until explicit release or recovery"
             )
             return False, False
 
@@ -286,18 +311,26 @@ class RemoteInstanceWeightTransferWorldCoordinator:
                     release_success = release_remote_instance_weight_transfer(
                         self.seed_url, self.session.transfer_id
                     )
+                    if not release_success:
+                        logger.error(
+                            "Failed to release source weight transfer %s; source "
+                            "mutation remains blocked until explicit release or "
+                            "recovery",
+                            self.session.transfer_id,
+                        )
                 except Exception:
                     release_success = False
                     logger.exception(
-                        "Failed to release source weight transfer %s; waiting for "
-                        "lease TTL",
+                        "Failed to release source weight transfer %s; source "
+                        "mutation remains blocked until explicit release or recovery",
                         self.session.transfer_id,
                     )
             else:
                 release_success = False
                 logger.error(
-                    "Keeping source weight transfer %s leased until TTL because "
-                    "a target rank could not confirm transfer completion",
+                    "Keeping source weight transfer %s leased because a target "
+                    "rank could not confirm transfer completion; source mutation "
+                    "remains blocked until explicit release or recovery",
                     self.session.transfer_id,
                 )
 
@@ -420,41 +453,145 @@ def get_remote_instance_transfer_engine_info_per_rank(seed_url: str, rank: int):
         return None, None
 
 
-def begin_remote_instance_weight_transfer(seed_url: str, lease_timeout_sec: int = 300):
+def _unsupported_manifest_format_response(response) -> bool:
+    if response.status_code not in (400, 409, 422):
+        return False
+    details = str(getattr(response, "text", ""))
     try:
-        response = requests.post(
-            f"{seed_url}/remote_instance_weight_transfer",
-            params={"lease_timeout_sec": lease_timeout_sec},
-            timeout=30,
+        details = f"{details} {response.json()}"
+    except Exception:
+        pass
+    details = details.lower()
+    names_format = "manifest_format" in details or "placement_binding_v1" in details
+    rejects_format = any(
+        marker in details
+        for marker in (
+            "unsupported",
+            "not supported",
+            "unexpected",
+            "unknown",
+            "extra_forbidden",
+            "literal_error",
+            "input should be",
+            "invalid",
         )
-        if response.status_code != 200:
+    )
+    return names_format and rejects_format
+
+
+def _best_effort_release_invalid_transfer(seed_url: str, transfer_id: str) -> None:
+    try:
+        released = release_remote_instance_weight_transfer(seed_url, transfer_id)
+        if not released:
             logger.error(
-                "Failed to begin remote weight transfer: %s: %s",
-                response.status_code,
-                response.text,
+                "Failed to clean up invalid remote weight transfer %s; source "
+                "mutation remains blocked until explicit release or recovery",
+                transfer_id,
             )
-            return None
-        payload = response.json()
-        transfer_id = payload.get("transfer_id")
-        manifests = payload.get("weight_runtime_manifests")
-        server_lease_timeout_sec = payload.get("lease_timeout_sec", lease_timeout_sec)
-        if (
-            not transfer_id
-            or not manifests
-            or isinstance(server_lease_timeout_sec, bool)
-            or not isinstance(server_lease_timeout_sec, int)
-            or server_lease_timeout_sec <= 0
-        ):
-            logger.error("Remote instance returned an incomplete transfer session.")
-            return None
-        return RemoteInstanceWeightTransferSession(
-            transfer_id=transfer_id,
-            manifests=manifests,
-            lease_timeout_sec=server_lease_timeout_sec,
+    except Exception:
+        logger.exception(
+            "Failed to clean up invalid remote weight transfer %s; source mutation "
+            "remains blocked until explicit release or recovery",
+            transfer_id,
         )
-    except Exception as error:
-        logger.error(f"Failed to begin remote weight transfer: {error}")
-        return None
+
+
+def begin_remote_instance_weight_transfer(seed_url: str, lease_timeout_sec: int = 300):
+    manifest_format = (
+        "placement_binding_v1"
+        if supports_mooncake_placement_binding_v1()
+        else "runtime_v1"
+    )
+    allow_runtime_fallback = manifest_format == "placement_binding_v1"
+
+    for attempt in range(2):
+        transfer_id = None
+        try:
+            response = requests.post(
+                f"{seed_url}/remote_instance_weight_transfer",
+                params={
+                    "lease_timeout_sec": lease_timeout_sec,
+                    "manifest_format": manifest_format,
+                },
+                timeout=30,
+            )
+            if response.status_code != 200:
+                try:
+                    error_payload = response.json()
+                    transfer_id = error_payload.get("transfer_id")
+                except Exception:
+                    transfer_id = None
+                if transfer_id:
+                    _best_effort_release_invalid_transfer(seed_url, transfer_id)
+                if (
+                    attempt == 0
+                    and allow_runtime_fallback
+                    and transfer_id is None
+                    and _unsupported_manifest_format_response(response)
+                ):
+                    manifest_format = "runtime_v1"
+                    continue
+                logger.error(
+                    "Failed to begin remote weight transfer: %s: %s",
+                    response.status_code,
+                    getattr(response, "text", ""),
+                )
+                return None
+
+            payload = response.json()
+            transfer_id = payload.get("transfer_id")
+            manifests = payload.get("weight_runtime_manifests") or []
+            source_placements = payload.get("source_weight_placements")
+            source_bindings = payload.get("source_weight_runtime_bindings")
+            server_lease_timeout_sec = payload.get(
+                "lease_timeout_sec", lease_timeout_sec
+            )
+            lease_timeout_valid = (
+                not isinstance(server_lease_timeout_sec, bool)
+                and isinstance(server_lease_timeout_sec, int)
+                and server_lease_timeout_sec > 0
+            )
+
+            actual_manifest_format = manifest_format
+            split_manifest_valid = (
+                bool(source_placements)
+                and bool(source_bindings)
+                and len(source_placements) == len(source_bindings)
+            )
+            if manifest_format == "placement_binding_v1" and manifests:
+                actual_manifest_format = "runtime_v1"
+                source_placements = None
+                source_bindings = None
+            payload_valid = (
+                bool(transfer_id)
+                and lease_timeout_valid
+                and (
+                    bool(manifests)
+                    if actual_manifest_format == "runtime_v1"
+                    else split_manifest_valid
+                )
+            )
+            if not payload_valid:
+                if transfer_id:
+                    _best_effort_release_invalid_transfer(seed_url, transfer_id)
+                logger.error("Remote instance returned an incomplete transfer session.")
+                return None
+
+            return RemoteInstanceWeightTransferSession(
+                transfer_id=transfer_id,
+                manifests=manifests,
+                lease_timeout_sec=server_lease_timeout_sec,
+                source_placements=source_placements,
+                source_bindings=source_bindings,
+                manifest_format=actual_manifest_format,
+            )
+        except Exception as error:
+            logger.error("Failed to begin remote weight transfer: %s", error)
+            if transfer_id:
+                _best_effort_release_invalid_transfer(seed_url, transfer_id)
+            return None
+
+    return None
 
 
 def release_remote_instance_weight_transfer(seed_url: str, transfer_id: str) -> bool:
@@ -481,13 +618,31 @@ def release_remote_instance_weight_transfer(seed_url: str, transfer_id: str) -> 
 
 
 def renew_remote_instance_weight_transfer(
-    seed_url: str, transfer_id: str, lease_timeout_sec: int
+    seed_url: str,
+    transfer_id: str,
+    lease_timeout_sec: int,
+    *,
+    remaining_lease_sec: float | None = None,
 ) -> bool:
+    remaining_lease_sec = (
+        float(lease_timeout_sec)
+        if remaining_lease_sec is None
+        else float(remaining_lease_sec)
+    )
+    if not math.isfinite(remaining_lease_sec) or remaining_lease_sec <= 0:
+        logger.error(
+            "Cannot renew remote weight transfer %s after its lease window elapsed",
+            transfer_id,
+        )
+        return False
+    request_timeout_sec = min(30.0, remaining_lease_sec / 2)
+    if request_timeout_sec <= 0:
+        return False
     try:
         response = requests.post(
             f"{seed_url}/remote_instance_weight_transfer/{transfer_id}/renew",
             params={"lease_timeout_sec": lease_timeout_sec},
-            timeout=30,
+            timeout=request_timeout_sec,
         )
         if response.status_code == 200:
             return True

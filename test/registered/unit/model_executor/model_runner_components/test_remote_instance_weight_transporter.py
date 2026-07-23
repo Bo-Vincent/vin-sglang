@@ -209,7 +209,10 @@ def test_remote_transfer_session_uses_begin_and_release_endpoints(monkeypatch) -
         (
             "POST",
             "http://127.0.0.1:30000/remote_instance_weight_transfer",
-            {"lease_timeout_sec": 300},
+            {
+                "lease_timeout_sec": 300,
+                "manifest_format": "placement_binding_v1",
+            },
             30,
         ),
         (

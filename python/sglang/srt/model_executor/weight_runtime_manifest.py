@@ -13,6 +13,42 @@ DEFAULT_REMOTE_INSTANCE_WEIGHT_TRANSFER_LEASE_TIMEOUT_SEC = 300
 MIN_REMOTE_INSTANCE_WEIGHT_TRANSFER_LEASE_TIMEOUT_SEC = 30
 MAX_REMOTE_INSTANCE_WEIGHT_TRANSFER_LEASE_TIMEOUT_SEC = 3600
 
+_MOONCAKE_PLACEMENT_BINDING_CAPABILITY = "placement_binding_v1"
+_MOONCAKE_PLACEMENT_BINDING_APIS = (
+    "RuntimeBindingManifest",
+    "SourcePlacementManifest",
+    "TargetPlacementManifest",
+    "bind_logical_transfer_plan",
+    "bind_runtime_manifest",
+    "placement_manifest_from_runtime_manifest",
+    "plan_placement_transfer_to_local_target",
+    "runtime_binding_from_runtime_manifest",
+)
+
+
+def local_mooncake_supports_placement_binding(
+    weight_transfer_module: Any | None = None,
+) -> bool:
+    try:
+        if weight_transfer_module is None:
+            from mooncake import weight_transfer as weight_transfer_module
+        supports = getattr(
+            weight_transfer_module,
+            "supports_weight_transfer_capability",
+            None,
+        )
+        if (
+            not callable(supports)
+            or supports(_MOONCAKE_PLACEMENT_BINDING_CAPABILITY) is not True
+        ):
+            return False
+        return all(
+            callable(getattr(weight_transfer_module, name, None))
+            for name in _MOONCAKE_PLACEMENT_BINDING_APIS
+        )
+    except Exception:
+        return False
+
 
 def validate_remote_instance_weight_transfer_lease_timeout(
     lease_timeout_sec: int,
@@ -159,12 +195,16 @@ class WeightPlacementTensor(msgspec.Struct, frozen=True, kw_only=True):
     rank: WeightParallelRank
 
 
-class WeightTargetPlacementManifest(msgspec.Struct, frozen=True, kw_only=True):
+class WeightPlacementManifest(msgspec.Struct, frozen=True, kw_only=True):
     model_id: str
     revision: str
     placement_id: str
     tensors: tuple[WeightPlacementTensor, ...]
     format_version: int = 2
+
+
+# Compatibility name used by the target-side session introduced in v2.
+WeightTargetPlacementManifest = WeightPlacementManifest
 
 
 class RuntimeWeightBinding(msgspec.Struct, frozen=True, kw_only=True):
@@ -188,6 +228,11 @@ class WeightRuntimeBindingManifest(msgspec.Struct, frozen=True, kw_only=True):
     lease_id: str
     fragments: tuple[RuntimeWeightBinding, ...]
     format_version: int = 1
+
+
+class WeightRuntimeManifestParts(msgspec.Struct, frozen=True, kw_only=True):
+    placement: WeightPlacementManifest
+    binding: WeightRuntimeBindingManifest
 
 
 class WeightSemanticsAdapter(Protocol):
@@ -389,14 +434,10 @@ def _placement_fragment_id(
 
 def _placement_id(
     *,
-    model_id: str,
-    revision: str,
     tensors: tuple[WeightPlacementTensor, ...],
 ) -> str:
     identity = (
-        "weight-target-placement-v1",
-        model_id,
-        revision,
+        "weight-placement-v2",
         tensors,
     )
     return hashlib.sha256(msgspec.json.encode(identity)).hexdigest()[:32]
@@ -433,7 +474,7 @@ def _physical_layout_signature(physical: tuple[_PhysicalParameter, ...]) -> tupl
 
 
 def compose_weight_runtime_manifest(
-    placement: WeightTargetPlacementManifest,
+    placement: WeightPlacementManifest,
     binding: WeightRuntimeBindingManifest,
 ) -> WeightRuntimeManifest:
     if placement.model_id != binding.model_id:
@@ -504,77 +545,194 @@ def compose_weight_runtime_manifest(
     )
 
 
+class _SnapshotLease(msgspec.Struct, kw_only=True):
+    generation: int
+    deadline: float | None
+    expired: bool = False
+
+
 class WeightSnapshotCoordinator:
     """Serializes in-place updates with address-bearing runtime snapshots."""
 
-    def __init__(self, *, clock: Callable[[], float] = time.monotonic) -> None:
+    def __init__(
+        self,
+        *,
+        clock: Callable[[], float] = time.monotonic,
+        completion_fence: Callable[[], None] | None = None,
+    ) -> None:
         self._lock = threading.Lock()
         self._clock = clock
+        self._completion_fence = completion_fence or (lambda: None)
         self._generation = 1
         self._healthy = True
+        self._poisoned = False
         self._needs_revision_commit = False
         self._last_update_success = True
         self._update_token: str | None = None
-        self._leases: dict[str, tuple[int, float | None]] = {}
+        self._update_full_restore = False
+        self._update_fence_pending = False
+        self._pending_full_restore_commit = False
+        self._leases: dict[str, _SnapshotLease] = {}
 
-    def _prune_expired_leases_locked(self) -> None:
+    def _refresh_expired_leases_locked(self) -> None:
         now = self._clock()
-        expired = [
-            lease_id
-            for lease_id, (_, deadline) in self._leases.items()
-            if deadline is not None and deadline <= now
-        ]
-        for lease_id in expired:
-            del self._leases[lease_id]
+        for lease in self._leases.values():
+            if lease.deadline is not None and lease.deadline <= now:
+                lease.expired = True
 
     @property
     def generation(self) -> int:
         with self._lock:
             return self._generation
 
-    def begin_update(self) -> str:
+    def begin_update(self, *, full_restore: bool = False) -> str:
+        if not isinstance(full_restore, bool):
+            raise TypeError("full_restore must be a boolean")
         with self._lock:
-            self._prune_expired_leases_locked()
+            self._refresh_expired_leases_locked()
             if self._update_token is not None:
                 raise WeightManifestError("a weight update is already in progress")
             if self._leases:
                 raise WeightManifestError("a weight snapshot lease is active")
             token = uuid4().hex
+            expected_generation = self._generation
             self._update_token = token
+            self._update_full_restore = full_restore
+            self._update_fence_pending = True
+
+        try:
+            self._completion_fence()
+        except BaseException:
+            with self._lock:
+                if token == self._update_token:
+                    self._update_token = None
+                    self._update_full_restore = False
+                    self._update_fence_pending = False
+            raise
+
+        with self._lock:
+            if (
+                token != self._update_token
+                or expected_generation != self._generation
+                or not self._update_fence_pending
+            ):
+                raise WeightManifestError(
+                    "weight update reservation changed during completion fence"
+                )
+            self._update_fence_pending = False
             return token
 
-    def finish_update(self, token: str, *, success: bool) -> None:
+    def finish_update(self, token: str, *, success: bool) -> int:
+        if not isinstance(success, bool):
+            raise TypeError("success must be a boolean")
         with self._lock:
             if not token or token != self._update_token:
                 raise WeightManifestError("weight update token does not match")
-            self._generation += 1
-            self._healthy = False
-            self._needs_revision_commit = True
-            self._last_update_success = bool(success)
-            self._update_token = None
+            if self._update_fence_pending:
+                raise WeightManifestError(
+                    "weight update completion fence is in progress"
+                )
+            self._update_fence_pending = True
+
+        try:
+            self._completion_fence()
+        except BaseException:
+            with self._lock:
+                self._publish_update_locked(success=False)
+            raise
+
+        with self._lock:
+            self._publish_update_locked(success=success)
+            return self._generation
+
+    def _publish_update_locked(self, *, success: bool) -> None:
+        self._generation += 1
+        self._healthy = False
+        self._needs_revision_commit = True
+        self._last_update_success = bool(success)
+        if not success:
+            self._poisoned = True
+        self._pending_full_restore_commit = bool(success and self._update_full_restore)
+        self._update_token = None
+        self._update_full_restore = False
+        self._update_fence_pending = False
 
     def cancel_update(self, token: str) -> None:
         """Cancel a reservation before any local weight mutation starts."""
         with self._lock:
             if not token or token != self._update_token:
                 raise WeightManifestError("weight update token does not match")
+            if self._update_fence_pending:
+                raise WeightManifestError(
+                    "weight update completion fence is in progress"
+                )
             self._update_token = None
+            self._update_full_restore = False
 
-    def commit_revision(self) -> int:
+    def pending_revision_generation(self) -> int | None:
         with self._lock:
-            self._prune_expired_leases_locked()
+            if not self._needs_revision_commit:
+                return None
+            return self._generation
+
+    def poison_global_update_failure(self, *, expected_generation: int) -> None:
+        """Fail closed after an upper-layer cross-rank update transaction fails."""
+        if isinstance(expected_generation, bool) or not isinstance(
+            expected_generation, int
+        ):
+            raise TypeError("expected_generation must be an integer")
+        if expected_generation <= 0:
+            raise ValueError("expected_generation must be positive")
+        with self._lock:
+            self._refresh_expired_leases_locked()
             if self._update_token is not None:
                 raise WeightManifestError("a weight update is in progress")
+            if expected_generation != self._generation:
+                raise WeightManifestError("weight update generation does not match")
+            if self._leases:
+                raise WeightManifestError("a weight snapshot lease is active")
+            self._healthy = False
+            self._poisoned = True
+            self._needs_revision_commit = True
+            self._last_update_success = False
+            self._pending_full_restore_commit = False
+
+    def commit_revision(self, *, expected_generation: int | None = None) -> int:
+        if expected_generation is not None:
+            if isinstance(expected_generation, bool) or not isinstance(
+                expected_generation, int
+            ):
+                raise TypeError("expected_generation must be an integer")
+            if expected_generation <= 0:
+                raise ValueError("expected_generation must be positive")
+        with self._lock:
+            self._refresh_expired_leases_locked()
+            if self._update_token is not None:
+                raise WeightManifestError("a weight update is in progress")
+            if (
+                expected_generation is not None
+                and expected_generation != self._generation
+            ):
+                raise WeightManifestError("weight update generation does not match")
             if self._leases:
                 raise WeightManifestError("a weight snapshot lease is active")
             if not self._needs_revision_commit:
                 return self._generation
             if not self._last_update_success:
                 raise WeightManifestError(
-                    "the last weight update failed; a full successful update is required"
+                    "the last weight update failed; "
+                    "a full successful weight restore is required"
                 )
+            if self._poisoned and not self._pending_full_restore_commit:
+                raise WeightManifestError(
+                    "the last weight update failed; "
+                    "a full successful weight restore is required"
+                )
+            if self._pending_full_restore_commit:
+                self._poisoned = False
             self._healthy = True
             self._needs_revision_commit = False
+            self._pending_full_restore_commit = False
             return self._generation
 
     def acquire_snapshot(
@@ -583,64 +741,77 @@ class WeightSnapshotCoordinator:
         if lease_timeout_sec is not None:
             validate_remote_instance_weight_transfer_lease_timeout(lease_timeout_sec)
         with self._lock:
-            self._prune_expired_leases_locked()
+            self._refresh_expired_leases_locked()
             if self._update_token is not None:
                 raise WeightManifestError("a weight update is in progress")
+            if self._poisoned:
+                if self._pending_full_restore_commit and self._last_update_success:
+                    raise WeightManifestError(
+                        "successful full weight restore requires "
+                        "an explicit revision commit"
+                    )
+                raise WeightManifestError(
+                    "the last weight update failed; "
+                    "a full successful weight restore is required"
+                )
             if not self._healthy:
                 if self._needs_revision_commit and self._last_update_success:
                     raise WeightManifestError(
                         "updated weights require an explicit revision commit"
                     )
                 raise WeightManifestError(
-                    "the last weight update failed; a full successful update is required"
+                    "the last weight update failed; "
+                    "a full successful weight restore is required"
                 )
             lease_id = uuid4().hex
             deadline = (
                 None if lease_timeout_sec is None else self._clock() + lease_timeout_sec
             )
-            self._leases[lease_id] = (self._generation, deadline)
+            self._leases[lease_id] = _SnapshotLease(
+                generation=self._generation,
+                deadline=deadline,
+            )
             return lease_id, self._generation
 
     def renew_snapshot(self, lease_id: str, *, lease_timeout_sec: int) -> None:
         validate_remote_instance_weight_transfer_lease_timeout(lease_timeout_sec)
         with self._lock:
-            self._prune_expired_leases_locked()
+            self._refresh_expired_leases_locked()
             lease = self._leases.get(lease_id)
             if lease is None:
                 raise WeightManifestError("weight snapshot lease does not exist")
-            generation, _ = lease
-            self._leases[lease_id] = (
-                generation,
-                self._clock() + lease_timeout_sec,
-            )
+            lease.deadline = self._clock() + lease_timeout_sec
+            lease.expired = False
 
     def has_snapshot(self, lease_id: str) -> bool:
         with self._lock:
-            self._prune_expired_leases_locked()
+            self._refresh_expired_leases_locked()
             return lease_id in self._leases
 
     def release_snapshot(self, lease_id: str) -> None:
         with self._lock:
-            self._prune_expired_leases_locked()
+            self._refresh_expired_leases_locked()
             if lease_id not in self._leases:
                 raise WeightManifestError("weight snapshot lease does not exist")
             del self._leases[lease_id]
 
     def invalidate(self) -> None:
         token = self.begin_update()
-        self.finish_update(token, success=True)
-        self.commit_revision()
+        generation = self.finish_update(token, success=True)
+        self.commit_revision(expected_generation=generation)
 
     def poison_uncoordinated_mutation(self, lease_id: str) -> None:
         with self._lock:
-            self._prune_expired_leases_locked()
+            self._refresh_expired_leases_locked()
             if lease_id not in self._leases:
                 raise WeightManifestError("weight snapshot lease does not exist")
             del self._leases[lease_id]
             self._generation += 1
             self._healthy = False
+            self._poisoned = True
             self._needs_revision_commit = True
             self._last_update_success = False
+            self._pending_full_restore_commit = False
 
 
 class WeightRuntimeManifestManager:
@@ -660,7 +831,7 @@ class WeightRuntimeManifestManager:
         self.coordinator = coordinator or WeightSnapshotCoordinator()
         self._last_signature: tuple | None = None
         self._last_generation: int | None = None
-        self._placements: dict[tuple[str, str], WeightTargetPlacementManifest] = {}
+        self._placements: dict[tuple[str, str], WeightPlacementManifest] = {}
         self._placement_layouts: dict[tuple[str, str], tuple] = {}
         self._lock = threading.Lock()
 
@@ -688,28 +859,93 @@ class WeightRuntimeManifestManager:
         worker_id: str,
         endpoint: str,
         lease_timeout_sec: int | None = None,
+        bind_revision_to_generation: bool = False,
     ) -> WeightRuntimeManifest:
-        placement = self.placement(model_id=model_id, revision=revision)
-        binding = self.snapshot_binding(
-            placement=placement,
+        parts = self.snapshot_parts(
+            model_id=model_id,
+            revision=revision,
             instance_id=instance_id,
             worker_id=worker_id,
             endpoint=endpoint,
             lease_timeout_sec=lease_timeout_sec,
+            bind_revision_to_generation=bind_revision_to_generation,
         )
         try:
-            return compose_weight_runtime_manifest(placement, binding)
-        except Exception:
-            if self.coordinator.has_snapshot(binding.lease_id):
-                self.coordinator.release_snapshot(binding.lease_id)
+            return compose_weight_runtime_manifest(parts.placement, parts.binding)
+        except BaseException:
+            if self.coordinator.has_snapshot(parts.binding.lease_id):
+                self.coordinator.release_snapshot(parts.binding.lease_id)
             raise
+
+    def snapshot_parts(
+        self,
+        *,
+        model_id: str,
+        revision: str,
+        instance_id: str,
+        worker_id: str,
+        endpoint: str,
+        lease_timeout_sec: int | None = None,
+        bind_revision_to_generation: bool = False,
+    ) -> WeightRuntimeManifestParts:
+        if not model_id or not revision:
+            raise WeightManifestError("placement identifiers must not be empty")
+        if not all((instance_id, worker_id, endpoint)):
+            raise WeightManifestError("runtime binding identifiers must not be empty")
+
+        lease_id, generation = self.coordinator.acquire_snapshot(
+            lease_timeout_sec=lease_timeout_sec,
+        )
+        snapshot_revision = (
+            f"{revision}@generation-{generation}"
+            if bind_revision_to_generation
+            else revision
+        )
+        release_on_error = True
+        try:
+            with self._lock:
+                physical = self._collect_physical_parameters()
+                self._accept_physical_snapshot(
+                    physical=physical,
+                    lease_id=lease_id,
+                    generation=generation,
+                )
+                placement = self._placement_from_physical_locked(
+                    model_id=model_id,
+                    revision=snapshot_revision,
+                    physical=physical,
+                )
+                fragments = self._build_binding_fragments(
+                    placement=placement,
+                    physical=physical,
+                    instance_id=instance_id,
+                    worker_id=worker_id,
+                    endpoint=endpoint,
+                    generation=generation,
+                )
+                binding = WeightRuntimeBindingManifest(
+                    model_id=model_id,
+                    revision=snapshot_revision,
+                    placement_id=placement.placement_id,
+                    instance_id=instance_id,
+                    generation=generation,
+                    lease_id=lease_id,
+                    fragments=fragments,
+                )
+            if not self.coordinator.has_snapshot(lease_id):
+                raise WeightManifestError("weight snapshot lease expired")
+            release_on_error = False
+            return WeightRuntimeManifestParts(placement=placement, binding=binding)
+        finally:
+            if release_on_error and self.coordinator.has_snapshot(lease_id):
+                self.coordinator.release_snapshot(lease_id)
 
     def placement(
         self,
         *,
         model_id: str,
         revision: str,
-    ) -> WeightTargetPlacementManifest:
+    ) -> WeightPlacementManifest:
         if not model_id or not revision:
             raise WeightManifestError("placement identifiers must not be empty")
         key = (model_id, revision)
@@ -730,20 +966,11 @@ class WeightRuntimeManifestManager:
                     lease_id=lease_id,
                     generation=generation,
                 )
-                tensors = self._build_placement_tensors(physical=physical)
-                placement = WeightTargetPlacementManifest(
+                return self._placement_from_physical_locked(
                     model_id=model_id,
                     revision=revision,
-                    placement_id=_placement_id(
-                        model_id=model_id,
-                        revision=revision,
-                        tensors=tensors,
-                    ),
-                    tensors=tensors,
+                    physical=physical,
                 )
-                self._placements[key] = placement
-                self._placement_layouts[key] = _physical_layout_signature(physical)
-                return placement
         finally:
             if self.coordinator.has_snapshot(lease_id):
                 self.coordinator.release_snapshot(lease_id)
@@ -751,7 +978,7 @@ class WeightRuntimeManifestManager:
     def snapshot_binding(
         self,
         *,
-        placement: WeightTargetPlacementManifest,
+        placement: WeightPlacementManifest,
         instance_id: str,
         worker_id: str,
         endpoint: str,
@@ -811,6 +1038,28 @@ class WeightRuntimeManifestManager:
         finally:
             if release_on_error and self.coordinator.has_snapshot(lease_id):
                 self.coordinator.release_snapshot(lease_id)
+
+    def _placement_from_physical_locked(
+        self,
+        *,
+        model_id: str,
+        revision: str,
+        physical: tuple[_PhysicalParameter, ...],
+    ) -> WeightPlacementManifest:
+        key = (model_id, revision)
+        tensors = self._build_placement_tensors(physical=physical)
+        placement = WeightPlacementManifest(
+            model_id=model_id,
+            revision=revision,
+            placement_id=_placement_id(tensors=tensors),
+            tensors=tensors,
+        )
+        cached = self._placements.get(key)
+        if cached is not None and cached != placement:
+            raise WeightManifestError("runtime placement layout changed")
+        self._placements[key] = placement
+        self._placement_layouts[key] = _physical_layout_signature(physical)
+        return placement
 
     def _collect_physical_parameters(self) -> tuple[_PhysicalParameter, ...]:
         grouped: dict[tuple, tuple[Any, list[str]]] = {}
@@ -920,7 +1169,7 @@ class WeightRuntimeManifestManager:
     def _build_binding_fragments(
         self,
         *,
-        placement: WeightTargetPlacementManifest,
+        placement: WeightPlacementManifest,
         physical: tuple[_PhysicalParameter, ...],
         instance_id: str,
         worker_id: str,
@@ -979,11 +1228,15 @@ class UnavailableWeightRuntimeManifestManager:
         del kwargs
         raise WeightManifestError(self._reason)
 
-    def placement(self, **kwargs) -> WeightTargetPlacementManifest:
+    def placement(self, **kwargs) -> WeightPlacementManifest:
         del kwargs
         raise WeightManifestError(self._reason)
 
     def snapshot_binding(self, **kwargs) -> WeightRuntimeBindingManifest:
+        del kwargs
+        raise WeightManifestError(self._reason)
+
+    def snapshot_parts(self, **kwargs) -> WeightRuntimeManifestParts:
         del kwargs
         raise WeightManifestError(self._reason)
 

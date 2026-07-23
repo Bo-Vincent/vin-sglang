@@ -191,6 +191,100 @@ def _merge_runtime_manifest_groups(groups) -> list:
     return manifests
 
 
+def _merge_placement_binding_groups(
+    placement_groups, binding_groups
+) -> tuple[list, list]:
+    if (
+        not placement_groups
+        or not binding_groups
+        or len(placement_groups) != len(binding_groups)
+        or any(not group for group in placement_groups)
+        or any(not group for group in binding_groups)
+    ):
+        raise RuntimeError("source workers returned no placement/binding manifests")
+    if any(
+        len(placements) != len(bindings)
+        for placements, bindings in zip(placement_groups, binding_groups)
+    ):
+        raise RuntimeError("source placement and binding counts do not match")
+
+    expected_signature = _runtime_manifest_group_signature(placement_groups[0])
+    if any(
+        _runtime_manifest_group_signature(group) != expected_signature
+        for group in placement_groups[1:]
+    ):
+        raise RuntimeError(
+            "source DP replicas returned semantically inconsistent placements"
+        )
+
+    placements = [placement for group in placement_groups for placement in group]
+    bindings = [binding for group in binding_groups for binding in group]
+    worker_ids = []
+    generations = set()
+    for placement, binding in zip(placements, bindings):
+        placement_identity = (
+            placement.get("model_id"),
+            placement.get("revision"),
+            placement.get("placement_id"),
+        )
+        binding_identity = (
+            binding.get("model_id"),
+            binding.get("revision"),
+            binding.get("placement_id"),
+        )
+        if placement_identity != binding_identity:
+            raise RuntimeError("source runtime binding does not match its placement")
+
+        placement_records = placement.get("tensors") or ()
+        binding_records = binding.get("fragments") or ()
+        placement_fragment_ids = [
+            tensor.get("placement_fragment_id") for tensor in placement_records
+        ]
+        binding_fragment_ids = [
+            fragment.get("placement_fragment_id") for fragment in binding_records
+        ]
+        if len(placement_fragment_ids) != len(set(placement_fragment_ids)):
+            raise RuntimeError("source placement has duplicate placement fragment IDs")
+        if len(binding_fragment_ids) != len(set(binding_fragment_ids)):
+            raise RuntimeError(
+                "source runtime binding has duplicate placement fragment IDs"
+            )
+        placement_fragments = {
+            tensor.get("placement_fragment_id"): tensor.get("nbytes")
+            for tensor in placement_records
+        }
+        binding_fragments = {
+            fragment.get("placement_fragment_id"): fragment.get("nbytes")
+            for fragment in binding_records
+        }
+        if (
+            None in placement_fragments
+            or None in binding_fragments
+            or placement_fragments != binding_fragments
+        ):
+            raise RuntimeError(
+                "source runtime binding fragments do not match placement"
+            )
+
+        fragment_worker_ids = {
+            fragment.get("worker_id") for fragment in binding.get("fragments") or ()
+        }
+        if None in fragment_worker_ids or len(fragment_worker_ids) != 1:
+            raise RuntimeError(
+                "each source runtime binding must describe exactly one worker"
+            )
+        worker_ids.append(next(iter(fragment_worker_ids)))
+        generations.add(binding.get("generation"))
+
+    if len(set(worker_ids)) != len(worker_ids):
+        raise RuntimeError("source runtime binding worker IDs are not unique")
+    if None in generations or len(generations) != 1:
+        raise RuntimeError(
+            "source placement and bindings do not describe one model generation"
+        )
+    return placements, bindings
+
+
 # Declarative spec: (attr_name_prefix, response_type[, mode])
 # Each entry creates self.{prefix}_communicator and registers
 # response_type -> communicator.handle_recv in the dispatch table.
@@ -607,6 +701,7 @@ class TokenizerControlMixin:
         lease_timeout_sec: int = (
             DEFAULT_REMOTE_INSTANCE_WEIGHT_TRANSFER_LEASE_TIMEOUT_SEC
         ),
+        manifest_format: str = "runtime_v1",
     ) -> dict:
         """Acquire source snapshots while inference continues to serve."""
         if not self.server_args.enable_weight_runtime_manifest:
@@ -615,6 +710,8 @@ class TokenizerControlMixin:
                 "--enable-weight-runtime-manifest"
             )
         validate_remote_instance_weight_transfer_lease_timeout(lease_timeout_sec)
+        if manifest_format not in ("runtime_v1", "placement_binding_v1"):
+            raise ValueError(f"unsupported source manifest format: {manifest_format}")
 
         self.auto_create_handle_loop()
         transfer_id = uuid.uuid4().hex
@@ -623,6 +720,7 @@ class TokenizerControlMixin:
             model_id=self.server_args.model_path,
             revision=getattr(self.server_args, "revision", None) or "default",
             lease_timeout_sec=lease_timeout_sec,
+            manifest_format=manifest_format,
         )
         async with TokenizerControlMixin._remote_instance_weight_transfer_pause(self):
             results = await self.begin_remote_instance_weight_transfer_communicator(
@@ -630,13 +728,21 @@ class TokenizerControlMixin:
             )
         failures = [result.message for result in results if not result.success]
         manifests = None
+        placements = None
+        bindings = None
         if not results:
             failures.append("source workers returned no transfer responses")
         elif not failures:
             try:
-                manifests = _merge_runtime_manifest_groups(
-                    [result.manifests for result in results]
-                )
+                if manifest_format == "placement_binding_v1":
+                    placements, bindings = _merge_placement_binding_groups(
+                        [result.placements for result in results],
+                        [result.bindings for result in results],
+                    )
+                else:
+                    manifests = _merge_runtime_manifest_groups(
+                        [result.manifests for result in results]
+                    )
             except RuntimeError as error:
                 failures.append(str(error))
         if failures:
@@ -650,6 +756,14 @@ class TokenizerControlMixin:
                     transfer_id,
                 )
             raise RuntimeError(" | ".join(failures))
+        if manifest_format == "placement_binding_v1":
+            assert placements is not None and bindings is not None
+            return {
+                "transfer_id": transfer_id,
+                "source_weight_placements": placements,
+                "source_weight_runtime_bindings": bindings,
+                "lease_timeout_sec": lease_timeout_sec,
+            }
         assert manifests is not None
 
         return {

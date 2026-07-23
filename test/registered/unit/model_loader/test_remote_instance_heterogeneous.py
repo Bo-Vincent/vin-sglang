@@ -41,6 +41,7 @@ def test_heterogeneous_loader_builds_local_plan_and_reads_from_source(
     target_inventory = {
         "model_id": source_inventory["model_id"],
         "revision": source_inventory["revision"],
+        "lease_id": "target-runtime-lease",
         "fragments": [SimpleNamespace(fragment_id="target-fragment")],
     }
 
@@ -68,6 +69,7 @@ def test_heterogeneous_loader_builds_local_plan_and_reads_from_source(
         transfer_id="transfer-1",
         manifests=[source_inventory],
         lease_timeout_sec=90,
+        manifest_format="runtime_v1",
     )
 
     class FakeCoordinator:
@@ -124,14 +126,26 @@ def test_heterogeneous_loader_builds_local_plan_and_reads_from_source(
         lambda model: calls.setdefault("post_loaded", model),
     )
 
-    @contextlib.contextmanager
-    def target_builder(**kwargs):
-        calls["builder"] = kwargs
-        yield target_inventory
+    class TargetBuilderOwner:
+        @contextlib.contextmanager
+        def build_remote_instance_target_weight_manifest_session(self, **kwargs):
+            del kwargs
+            raise AssertionError(
+                "runtime_v1 must use the legacy target manifest builder"
+            )
+            yield
+
+        @contextlib.contextmanager
+        def build_remote_instance_target_weight_runtime_manifest(self, **kwargs):
+            calls["builder"] = kwargs
+            yield target_inventory
 
     model = object()
     engine = object()
     loader = RemoteInstanceModelLoader.__new__(RemoteInstanceModelLoader)
+    target_builder = (
+        TargetBuilderOwner().build_remote_instance_target_weight_manifest_session
+    )
 
     success = loader.load_model_from_remote_instance_by_transfer_engine_heterogeneous(
         model,
@@ -155,7 +169,7 @@ def test_heterogeneous_loader_builds_local_plan_and_reads_from_source(
         "source_pre_registered": True,
         "source_registrations": ("lease:source-fragment:source-runtime-lease",),
         "target_pre_registered": True,
-        "target_registrations": ("lease:target-fragment",),
+        "target_registrations": ("lease:target-fragment:target-runtime-lease",),
     }
     assert calls["reader_options"] == {"max_batch_operations": 8192}
     assert calls["synchronized"] is True
@@ -176,6 +190,17 @@ def test_heterogeneous_loader_plans_placement_before_acquiring_target_binding(
         "lease_id": "source-runtime-lease",
         "fragments": [SimpleNamespace(fragment_id="source-fragment")],
     }
+    source_placement_inventory = SimpleNamespace(
+        model_id=source_inventory["model_id"],
+        revision=source_inventory["revision"],
+        placement_id="source-placement",
+    )
+    source_binding_inventory = SimpleNamespace(
+        model_id=source_inventory["model_id"],
+        revision=source_inventory["revision"],
+        placement_id="source-placement",
+        lease_id="source-runtime-lease",
+    )
     placement_inventory = SimpleNamespace(
         model_id=source_inventory["model_id"],
         revision=source_inventory["revision"],
@@ -205,6 +230,12 @@ def test_heterogeneous_loader_plans_placement_before_acquiring_target_binding(
             events.append("placement")
             return inventory
 
+    class FakeSourcePlacementManifest:
+        @classmethod
+        def from_runtime_inventory(cls, inventory):
+            events.append("source-placement")
+            return inventory
+
     class FakeRuntimeBindingManifest:
         @classmethod
         def from_runtime_inventory(cls, inventory):
@@ -221,7 +252,13 @@ def test_heterogeneous_loader_plans_placement_before_acquiring_target_binding(
             del engine, kwargs
 
         def execute(self, plan, sources, target, **kwargs):
-            del plan, sources, target, kwargs
+            del plan, sources, target
+            assert kwargs["source_registrations"] == (
+                ("source-fragment", "source-runtime-lease"),
+            )
+            assert kwargs["target_registrations"] == (
+                ("target-fragment", "target-runtime-lease"),
+            )
             events.append("execute")
             return [SimpleNamespace(nbytes=64, operation_count=1, request_count=1)]
 
@@ -230,7 +267,12 @@ def test_heterogeneous_loader_plans_placement_before_acquiring_target_binding(
             del seed_url, world_group
 
         def acquire(self):
-            return SimpleNamespace(manifests=[source_inventory])
+            return SimpleNamespace(
+                manifests=[],
+                source_placements=[source_placement_inventory],
+                source_bindings=[source_binding_inventory],
+                manifest_format="placement_binding_v1",
+            )
 
         def ready_for_transfer(self, local_ready):
             return local_ready
@@ -243,17 +285,37 @@ def test_heterogeneous_loader_plans_placement_before_acquiring_target_binding(
     fake_weight_transfer.MooncakeTransferEngineReader = FakeReader
     fake_weight_transfer.RuntimeManifest = FakeRuntimeManifest
     fake_weight_transfer.RuntimeBindingManifest = FakeRuntimeBindingManifest
+    fake_weight_transfer.SourcePlacementManifest = FakeSourcePlacementManifest
     fake_weight_transfer.TargetPlacementManifest = FakeTargetPlacementManifest
     fake_weight_transfer.TransferEngineError = _CompletionUnknownError
-    fake_weight_transfer.bind_runtime_manifest = lambda placement, binding: (
-        events.append("runtime-bind") or target_runtime
+
+    def bind_runtime_manifest(placement, binding):
+        if placement is source_placement_inventory:
+            events.append("source-runtime-bind")
+            return SimpleNamespace(**source_inventory)
+        events.append("target-runtime-bind")
+        return target_runtime
+
+    fake_weight_transfer.bind_runtime_manifest = bind_runtime_manifest
+
+    def plan_placement_transfer_to_local_target(sources, placement):
+        assert sources == (source_placement_inventory,)
+        assert placement is placement_inventory
+        events.append("logical-plan")
+        return "logical-plan"
+
+    fake_weight_transfer.plan_placement_transfer_to_local_target = (
+        plan_placement_transfer_to_local_target
     )
-    fake_weight_transfer.plan_runtime_transfer_to_local_target_placement = (
-        lambda sources, placement: events.append("logical-plan") or "logical-plan"
-    )
-    fake_weight_transfer.bind_logical_transfer_plan = lambda logical, targets: (
-        events.append("plan-bind") or SimpleNamespace(operations=("bound-operation",))
-    )
+
+    def bind_logical_transfer_plan(logical, targets, *, source_bindings):
+        assert logical == "logical-plan"
+        assert targets == (binding_inventory,)
+        assert source_bindings == (source_binding_inventory,)
+        events.append("plan-bind")
+        return SimpleNamespace(operations=("bound-operation",))
+
+    fake_weight_transfer.bind_logical_transfer_plan = bind_logical_transfer_plan
     fake_weight_transfer.plan_runtime_transfer_to_local_target = (
         lambda sources, target: (_ for _ in ()).throw(
             AssertionError("the session path must not use the legacy planner")
@@ -296,11 +358,14 @@ def test_heterogeneous_loader_plans_placement_before_acquiring_target_binding(
 
     assert success is True
     assert events == [
+        "source-placement",
+        "binding",
+        "source-runtime-bind",
         "placement",
         "logical-plan",
         "binding-lease-open",
         "binding",
-        "runtime-bind",
+        "target-runtime-bind",
         "plan-bind",
         "execute",
         "binding-lease-close",
@@ -465,6 +530,7 @@ def test_heterogeneous_loader_keeps_source_lease_when_transfer_completion_is_unk
     target_inventory = {
         "model_id": source_inventory["model_id"],
         "revision": source_inventory["revision"],
+        "lease_id": "target-runtime-lease",
         "fragments": [SimpleNamespace(fragment_id="target-fragment")],
     }
 
@@ -553,6 +619,7 @@ def test_heterogeneous_loader_fails_closed_when_heartbeat_fails_during_transfer(
     target_inventory = {
         "model_id": source_inventory["model_id"],
         "revision": source_inventory["revision"],
+        "lease_id": "target-runtime-lease",
         "fragments": [],
     }
 

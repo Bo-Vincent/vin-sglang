@@ -14,9 +14,14 @@ from sglang.srt.managers.io_struct import (
     ReleaseRemoteInstanceWeightTransferReqInput,
     ResumeMemoryOccupationReqInput,
     RenewRemoteInstanceWeightTransferReqInput,
+    UpdateWeightsFromDistributedReqInput,
+    UpdateWeightsFromIPCReqInput,
 )
 from sglang.srt.managers.scheduler_components.weight_updater import (
     SchedulerWeightUpdaterManager,
+)
+from sglang.srt.managers.scheduler_components import (
+    weight_updater as weight_updater_module,
 )
 from sglang.srt.managers.tokenizer_control_mixin import TokenizerControlMixin
 from sglang.srt.model_executor.weight_runtime_manifest import (
@@ -51,6 +56,58 @@ def _manifest(worker_id="source/dp0-pp0-ep0-tp0", lease_id="lease-0"):
         "generation": 1,
         "lease_id": lease_id,
         "tensors": [{"worker_id": worker_id}],
+    }
+
+
+def _placement(dp_rank=0):
+    return {
+        "model_id": "Qwen/Qwen3.5-0.8B",
+        "revision": "main@generation-1",
+        "placement_id": f"source-placement-dp{dp_rank}",
+        "tensors": [
+            {
+                "placement_fragment_id": f"source-fragment-dp{dp_rank}",
+                "tensor_id": "model.layers.0.weight",
+                "aliases": ["model.layers.0.weight"],
+                "global_shape": [8, 8],
+                "global_offset": [0, 0],
+                "local_shape": [8, 8],
+                "dtype": "float16",
+                "itemsize": 2,
+                "partition_dim": None,
+                "shard_dims": [],
+                "layer_id": 0,
+                "expert_id": None,
+                "layout_fingerprint": "dense-row-major",
+                "nbytes": 128,
+                "byte_offset": 0,
+                "rank": {"dp": dp_rank, "tp": 0, "pp": 0, "ep": 0},
+            }
+        ],
+    }
+
+
+def _binding(dp_rank=0, lease_id="lease-0"):
+    return {
+        "model_id": "Qwen/Qwen3.5-0.8B",
+        "revision": "main@generation-1",
+        "placement_id": f"source-placement-dp{dp_rank}",
+        "instance_id": f"source-instance-dp{dp_rank}",
+        "generation": 1,
+        "lease_id": lease_id,
+        "fragments": [
+            {
+                "placement_fragment_id": f"source-fragment-dp{dp_rank}",
+                "fragment_id": f"runtime-fragment-dp{dp_rank}",
+                "address": 0x1000 + dp_rank * 0x1000,
+                "nbytes": 128,
+                "storage_offset": 0,
+                "device": "cuda",
+                "is_contiguous": True,
+                "worker_id": f"source/dp{dp_rank}-pp0-ep0-tp0",
+                "endpoint": f"source-session-dp{dp_rank}",
+            }
+        ],
     }
 
 
@@ -125,6 +182,44 @@ def test_begin_and_release_remote_transfer_snapshot(monkeypatch) -> None:
 
     assert result.success is True
     assert result.manifests == [manifest]
+    assert released == []
+
+    release = manager.release_remote_instance_weight_transfer(
+        ReleaseRemoteInstanceWeightTransferReqInput(transfer_id="transfer-1")
+    )
+    assert release.success is True
+    assert released == ["lease-0"]
+
+
+def test_begin_and_release_split_remote_transfer_snapshot(monkeypatch) -> None:
+    released = []
+    placement = _placement()
+    binding = _binding()
+    parts = SimpleNamespace(placement=placement, binding=binding)
+    runner = SimpleNamespace(
+        get_remote_instance_weight_runtime_manifest_parts=lambda **kwargs: parts,
+        release_weight_runtime_manifest=lambda lease_id: released.append(lease_id),
+    )
+    manager = _manager(runner)
+    monkeypatch.setattr("torch.distributed.get_world_size", lambda group: 1)
+    monkeypatch.setattr(
+        "torch.distributed.all_gather_object",
+        lambda outputs, value, group: outputs.__setitem__(0, value),
+    )
+
+    result = manager.begin_remote_instance_weight_transfer(
+        BeginRemoteInstanceWeightTransferReqInput(
+            transfer_id="transfer-1",
+            model_id="Qwen/Qwen3.5-0.8B",
+            revision="main",
+            manifest_format="placement_binding_v1",
+        )
+    )
+
+    assert result.success is True
+    assert result.manifests is None
+    assert result.placements == [placement]
+    assert result.bindings == [binding]
     assert released == []
 
     release = manager.release_remote_instance_weight_transfer(
@@ -230,6 +325,213 @@ def test_runtime_revision_commit_ignores_workers_without_manifest_support() -> N
     SchedulerWeightUpdaterManager._commit_weight_runtime_revision(
         SimpleNamespace(model_runner=SimpleNamespace())
     )
+
+
+def test_weight_update_does_not_commit_before_all_ranks_succeed(
+    monkeypatch,
+) -> None:
+    events = []
+
+    class RecordingCoordinator(WeightSnapshotCoordinator):
+        def commit_revision(self, *, expected_generation=None):
+            events.append("commit")
+            return super().commit_revision(expected_generation=expected_generation)
+
+    coordinator = RecordingCoordinator()
+    runner = SimpleNamespace(
+        weight_snapshot_coordinator=coordinator,
+        commit_weight_runtime_revision=coordinator.commit_revision,
+    )
+    manager = _manager(runner)
+
+    def update_weights_from_distributed(request):
+        del request
+        token = coordinator.begin_update()
+        events.append("mutate")
+        coordinator.finish_update(token, success=True)
+        return True, "local update succeeded"
+
+    manager.tp_worker.update_weights_from_distributed = update_weights_from_distributed
+    collective_calls = []
+
+    def all_gather_object(outputs, value, group):
+        del group
+        collective_calls.append(value)
+        events.append("collective")
+        if len(collective_calls) == 1:
+            outputs[:] = [
+                value,
+                {"success": False, "message": "remote rank mutation failed"},
+            ]
+        else:
+            outputs[:] = [value, {"success": True, "message": "Success."}]
+
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group: 2)
+    monkeypatch.setattr(torch.distributed, "all_gather_object", all_gather_object)
+
+    result = manager.update_weights_from_distributed(
+        UpdateWeightsFromDistributedReqInput(
+            names=[],
+            dtypes=[],
+            shapes=[],
+            flush_cache=False,
+        )
+    )
+
+    assert result.success is False
+    assert "remote rank mutation failed" in result.message
+    assert "commit" not in events
+    assert len(collective_calls) == 3
+    with pytest.raises(WeightManifestError, match="last weight update failed"):
+        coordinator.acquire_snapshot()
+
+
+def test_weight_update_commits_only_after_global_outcome(monkeypatch) -> None:
+    events = []
+
+    class RecordingCoordinator(WeightSnapshotCoordinator):
+        def commit_revision(self, *, expected_generation=None):
+            events.append("commit")
+            return super().commit_revision(expected_generation=expected_generation)
+
+    coordinator = RecordingCoordinator()
+    runner = SimpleNamespace(
+        weight_snapshot_coordinator=coordinator,
+        commit_weight_runtime_revision=coordinator.commit_revision,
+    )
+    manager = _manager(runner)
+
+    def update_weights_from_distributed(request):
+        del request
+        token = coordinator.begin_update()
+        events.append("mutate")
+        coordinator.finish_update(token, success=True)
+        return True, "local update succeeded"
+
+    manager.tp_worker.update_weights_from_distributed = update_weights_from_distributed
+
+    def all_gather_object(outputs, value, group):
+        del group
+        events.append("collective")
+        outputs[:] = [value, dict(value)]
+
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group: 2)
+    monkeypatch.setattr(torch.distributed, "all_gather_object", all_gather_object)
+
+    result = manager.update_weights_from_distributed(
+        UpdateWeightsFromDistributedReqInput(
+            names=[],
+            dtypes=[],
+            shapes=[],
+            flush_cache=False,
+        )
+    )
+
+    assert result.success is True
+    assert events == [
+        "mutate",
+        "collective",
+        "collective",
+        "commit",
+        "collective",
+    ]
+    lease_id, generation = coordinator.acquire_snapshot()
+    assert generation == 2
+    coordinator.release_snapshot(lease_id)
+
+
+def test_stale_weight_update_cannot_finalize_a_newer_transaction(
+    monkeypatch,
+) -> None:
+    coordinator = WeightSnapshotCoordinator()
+    runner = SimpleNamespace(weight_snapshot_coordinator=coordinator)
+    manager = _manager(runner)
+
+    def update_weights_from_distributed(request):
+        del request
+        token = coordinator.begin_update()
+        coordinator.finish_update(token, success=True)
+        return True, "transaction A mutated"
+
+    manager.tp_worker.update_weights_from_distributed = update_weights_from_distributed
+    collective_calls = []
+
+    def all_gather_object(outputs, value, group):
+        del group
+        collective_calls.append(value)
+        if len(collective_calls) == 1:
+            token = coordinator.begin_update()
+            coordinator.finish_update(token, success=True)
+        outputs[:] = [value, dict(value)]
+
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group: 2)
+    monkeypatch.setattr(torch.distributed, "all_gather_object", all_gather_object)
+
+    result = manager.update_weights_from_distributed(
+        UpdateWeightsFromDistributedReqInput(
+            names=[],
+            dtypes=[],
+            shapes=[],
+            flush_cache=False,
+        )
+    )
+
+    assert result.success is False
+    assert "generation" in result.message
+    assert len(collective_calls) == 3
+    assert coordinator.pending_revision_generation() == 3
+
+    coordinator.commit_revision(expected_generation=3)
+    lease_id, generation = coordinator.acquire_snapshot()
+    assert generation == 3
+    coordinator.release_snapshot(lease_id)
+
+
+def test_weight_update_exception_becomes_collective_outcome_without_barrier(
+    monkeypatch,
+) -> None:
+    coordinator = WeightSnapshotCoordinator()
+    runner = SimpleNamespace(
+        weight_snapshot_coordinator=coordinator,
+        commit_weight_runtime_revision=coordinator.commit_revision,
+    )
+    manager = _manager(runner)
+
+    def update_weights_from_ipc(request):
+        del request
+        token = coordinator.begin_update()
+        try:
+            raise RuntimeError("local mutation raised")
+        finally:
+            coordinator.finish_update(token, success=False)
+
+    manager.tp_worker.update_weights_from_ipc = update_weights_from_ipc
+    collective_calls = []
+
+    def all_gather_object(outputs, value, group):
+        del group
+        collective_calls.append(value)
+        outputs[:] = [value, dict(value)]
+
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group: 2)
+    monkeypatch.setattr(torch.distributed, "all_gather_object", all_gather_object)
+    monkeypatch.setattr(
+        torch.distributed,
+        "barrier",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("weight update transaction must not use a bare barrier")
+        ),
+    )
+
+    result = manager.update_weights_from_ipc(
+        UpdateWeightsFromIPCReqInput(zmq_handles={}, flush_cache=False)
+    )
+
+    assert result.success is False
+    assert "local mutation raised" in result.message
+    assert len(collective_calls) == 3
+    with pytest.raises(WeightManifestError, match="last weight update failed"):
+        coordinator.acquire_snapshot()
 
 
 def test_weight_memory_release_is_rejected_while_snapshot_lease_is_active(
@@ -347,6 +649,112 @@ def test_release_keeps_snapshot_lease_available_for_retry(monkeypatch) -> None:
     assert manager.remote_weight_transfer_leases == {}
 
 
+def test_expired_remote_transfer_bookkeeping_renews_original_lease(
+    monkeypatch,
+) -> None:
+    now = [100.0]
+    renewed = []
+    runner = SimpleNamespace(
+        renew_weight_runtime_manifest=lambda lease_id, lease_timeout_sec: (
+            renewed.append((lease_id, lease_timeout_sec))
+        ),
+        has_weight_runtime_manifest_lease=lambda lease_id: True,
+    )
+    manager = _manager(runner)
+    monkeypatch.setattr(weight_updater_module.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr("torch.distributed.get_world_size", lambda group: 1)
+    monkeypatch.setattr(
+        "torch.distributed.all_gather_object",
+        lambda outputs, value, group: outputs.__setitem__(0, value),
+    )
+    manager._record_remote_weight_transfer_lease("transfer-1", "lease-0", 30)
+
+    now[0] = 131.0
+    result = manager.renew_remote_instance_weight_transfer(
+        RenewRemoteInstanceWeightTransferReqInput(
+            transfer_id="transfer-1",
+            lease_timeout_sec=60,
+        )
+    )
+
+    assert result.success is True
+    assert renewed == [("lease-0", 60)]
+    assert manager.remote_weight_transfer_leases == {"transfer-1": "lease-0"}
+    assert manager.remote_weight_transfer_deadlines == {"transfer-1": 191.0}
+    assert manager.remote_weight_transfer_expired == set()
+
+
+def test_expired_remote_transfer_bookkeeping_still_releases_coordinator_lease(
+    monkeypatch,
+) -> None:
+    now = [100.0]
+    released = []
+    runner = SimpleNamespace(
+        release_weight_runtime_manifest=lambda lease_id: released.append(lease_id),
+        has_weight_runtime_manifest_lease=lambda lease_id: True,
+    )
+    manager = _manager(runner)
+    monkeypatch.setattr(weight_updater_module.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr("torch.distributed.get_world_size", lambda group: 1)
+    monkeypatch.setattr(
+        "torch.distributed.all_gather_object",
+        lambda outputs, value, group: outputs.__setitem__(0, value),
+    )
+    manager._record_remote_weight_transfer_lease("transfer-1", "lease-0", 30)
+
+    now[0] = 131.0
+    manager._prune_remote_weight_transfer_bookkeeping()
+    assert manager.remote_weight_transfer_expired == {"transfer-1"}
+    assert manager.remote_weight_transfer_leases == {"transfer-1": "lease-0"}
+
+    result = manager.release_remote_instance_weight_transfer(
+        ReleaseRemoteInstanceWeightTransferReqInput(transfer_id="transfer-1")
+    )
+
+    assert result.success is True
+    assert released == ["lease-0"]
+    assert manager.remote_weight_transfer_leases == {}
+    assert manager.remote_weight_transfer_deadlines == {}
+    assert manager.remote_weight_transfer_expired == set()
+
+
+def test_failed_renew_retains_lease_for_explicit_release(monkeypatch) -> None:
+    released = []
+
+    def renew(lease_id, lease_timeout_sec):
+        del lease_id, lease_timeout_sec
+        raise RuntimeError("coordinator temporarily unavailable")
+
+    runner = SimpleNamespace(
+        renew_weight_runtime_manifest=renew,
+        release_weight_runtime_manifest=lambda lease_id: released.append(lease_id),
+        has_weight_runtime_manifest_lease=lambda lease_id: False,
+    )
+    manager = _manager(runner)
+    monkeypatch.setattr("torch.distributed.get_world_size", lambda group: 1)
+    monkeypatch.setattr(
+        "torch.distributed.all_gather_object",
+        lambda outputs, value, group: outputs.__setitem__(0, value),
+    )
+    manager.remote_weight_transfer_leases["transfer-1"] = "lease-0"
+
+    renewed = manager.renew_remote_instance_weight_transfer(
+        RenewRemoteInstanceWeightTransferReqInput(
+            transfer_id="transfer-1",
+            lease_timeout_sec=60,
+        )
+    )
+    assert renewed.success is False
+    assert manager.remote_weight_transfer_leases == {"transfer-1": "lease-0"}
+
+    released_result = manager.release_remote_instance_weight_transfer(
+        ReleaseRemoteInstanceWeightTransferReqInput(transfer_id="transfer-1")
+    )
+    assert released_result.success is True
+    assert released == ["lease-0"]
+    assert manager.remote_weight_transfer_leases == {}
+
+
 def _tokenizer_manager(begin_results, release):
     events = []
 
@@ -429,6 +837,154 @@ def test_tokenizer_begin_passes_ttl_to_scheduler_without_local_ownership() -> No
     assert requests[0].lease_timeout_sec == 60
     assert result["lease_timeout_sec"] == 60
     assert not hasattr(manager, "_remote_weight_transfer_timeout_tasks")
+
+
+def test_tokenizer_begin_returns_split_source_manifest() -> None:
+    requests = []
+    placement = _placement()
+    binding = _binding()
+
+    async def begin(request):
+        requests.append(request)
+        return [
+            SimpleNamespace(
+                success=True,
+                message="Success.",
+                manifests=None,
+                placements=[placement],
+                bindings=[binding],
+            )
+        ]
+
+    async def release(request):
+        return [SimpleNamespace(success=True, message="Success.")]
+
+    manager = _tokenizer_manager([], release)
+    manager.begin_remote_instance_weight_transfer_communicator = begin
+
+    result = asyncio.run(
+        TokenizerControlMixin.begin_remote_instance_weight_transfer(
+            manager,
+            lease_timeout_sec=60,
+            manifest_format="placement_binding_v1",
+        )
+    )
+
+    assert requests[0].manifest_format == "placement_binding_v1"
+    assert result == {
+        "transfer_id": requests[0].transfer_id,
+        "source_weight_placements": [placement],
+        "source_weight_runtime_bindings": [binding],
+        "lease_timeout_sec": 60,
+    }
+
+
+def test_tokenizer_begin_merges_split_dp_replica_manifests() -> None:
+    async def release(request):
+        return [SimpleNamespace(success=True, message="Success.")]
+
+    manager = _tokenizer_manager(
+        [
+            SimpleNamespace(
+                success=True,
+                message="Success.",
+                placements=[_placement(dp_rank=0)],
+                bindings=[_binding(dp_rank=0, lease_id="lease-dp0")],
+            ),
+            SimpleNamespace(
+                success=True,
+                message="Success.",
+                placements=[_placement(dp_rank=1)],
+                bindings=[_binding(dp_rank=1, lease_id="lease-dp1")],
+            ),
+        ],
+        release,
+    )
+
+    result = asyncio.run(
+        TokenizerControlMixin.begin_remote_instance_weight_transfer(
+            manager, manifest_format="placement_binding_v1"
+        )
+    )
+
+    assert [
+        placement["tensors"][0]["rank"]["dp"]
+        for placement in result["source_weight_placements"]
+    ] == [0, 1]
+    assert [
+        binding["fragments"][0]["worker_id"]
+        for binding in result["source_weight_runtime_bindings"]
+    ] == ["source/dp0-pp0-ep0-tp0", "source/dp1-pp0-ep0-tp0"]
+
+
+def test_tokenizer_begin_rejects_split_dp_generation_mismatch() -> None:
+    released = []
+
+    async def release(request):
+        released.append(request.transfer_id)
+        return [SimpleNamespace(success=True, message="Success.")]
+
+    second_binding = _binding(dp_rank=1, lease_id="lease-dp1")
+    second_binding["generation"] = 2
+    manager = _tokenizer_manager(
+        [
+            SimpleNamespace(
+                success=True,
+                message="Success.",
+                placements=[_placement(dp_rank=0)],
+                bindings=[_binding(dp_rank=0, lease_id="lease-dp0")],
+            ),
+            SimpleNamespace(
+                success=True,
+                message="Success.",
+                placements=[_placement(dp_rank=1)],
+                bindings=[second_binding],
+            ),
+        ],
+        release,
+    )
+
+    with pytest.raises(RuntimeError, match="one model generation"):
+        asyncio.run(
+            TokenizerControlMixin.begin_remote_instance_weight_transfer(
+                manager, manifest_format="placement_binding_v1"
+            )
+        )
+
+    assert len(released) == 1
+
+
+def test_tokenizer_begin_rejects_duplicate_split_fragment_ids() -> None:
+    released = []
+    placement = _placement()
+    placement["tensors"].append(dict(placement["tensors"][0]))
+    binding = _binding()
+    binding["fragments"].append(dict(binding["fragments"][0]))
+
+    async def release(request):
+        released.append(request.transfer_id)
+        return [SimpleNamespace(success=True, message="Success.")]
+
+    manager = _tokenizer_manager(
+        [
+            SimpleNamespace(
+                success=True,
+                message="Success.",
+                placements=[placement],
+                bindings=[binding],
+            )
+        ],
+        release,
+    )
+
+    with pytest.raises(RuntimeError, match="duplicate placement fragment"):
+        asyncio.run(
+            TokenizerControlMixin.begin_remote_instance_weight_transfer(
+                manager, manifest_format="placement_binding_v1"
+            )
+        )
+
+    assert len(released) == 1
 
 
 def test_tokenizer_release_always_fans_out_without_local_session_state() -> None:
