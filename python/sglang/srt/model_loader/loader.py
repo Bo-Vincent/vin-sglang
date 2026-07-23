@@ -137,6 +137,44 @@ _is_npu = is_npu()
 
 logger = logging.getLogger(__name__)
 
+_LEGACY_UNKNOWN_TRANSFER_QUARANTINE = []
+_HETEROGENEOUS_UNKNOWN_DRAIN_MAX_ATTEMPTS = 30
+_HETEROGENEOUS_UNKNOWN_DRAIN_TIMEOUT_MS = 1000
+
+
+@dataclasses.dataclass
+class _HeterogeneousUnknownTransferQuarantine:
+    pending_transfer_id: str
+    resources: ExitStack
+    owners: tuple[Any, ...]
+
+
+_HETEROGENEOUS_UNKNOWN_TRANSFER_QUARANTINE: list[
+    _HeterogeneousUnknownTransferQuarantine
+] = []
+
+
+def _transfer_completion_status_name(status: Any) -> str:
+    name = getattr(status, "name", None)
+    if isinstance(name, str):
+        return name
+    try:
+        value = int(status)
+    except (TypeError, ValueError):
+        value = None
+    by_value = {
+        0: "COMPLETED",
+        -1: "FAILED_DRAINED",
+        -2: "COMPLETION_UNKNOWN",
+    }
+    if value in by_value:
+        return by_value[value]
+    text = str(status)
+    for candidate in by_value.values():
+        if candidate in text:
+            return candidate
+    return text
+
 
 @contextmanager
 def device_loading_context(module: torch.nn.Module, target_device: torch.device):
@@ -3267,15 +3305,65 @@ class RemoteInstanceModelLoader(BaseModelLoader):
             client_ptr_list.append(client_ptr)
             client_len_list.append(client_len)
 
-        # load weights from source instance through TransferEngine
-        ret = transfer_engine.batch_transfer_sync_read(
-            seed_transfer_engine_session_id,
-            client_ptr_list,
-            seed_ptr_list,
-            client_len_list,
+        # Prefer the ticket API so target parameters remain alive until the
+        # native transfer reaches a known terminal state.
+        ticket_method = getattr(
+            transfer_engine,
+            "batch_transfer_sync_read_with_ticket",
+            None,
         )
+        if callable(ticket_method):
+            ticket = ticket_method(
+                seed_transfer_engine_session_id,
+                client_ptr_list,
+                seed_ptr_list,
+                client_len_list,
+            )
+            status = _transfer_completion_status_name(ticket.status)
+            if status == "COMPLETION_UNKNOWN":
+                logger.error(
+                    "Legacy remote weight transfer completion is unknown; "
+                    "retaining the target model while draining the native ticket"
+                )
+            pending_interrupt = None
+            while status == "COMPLETION_UNKNOWN":
+                try:
+                    status = _transfer_completion_status_name(ticket.drain(1000))
+                except BaseException as error:
+                    if isinstance(error, Exception):
+                        logger.exception(
+                            "Failed to query the legacy remote weight transfer "
+                            "ticket; target parameters remain quarantined"
+                        )
+                        time.sleep(1)
+                    else:
+                        if pending_interrupt is None:
+                            pending_interrupt = error
+                        logger.warning(
+                            "Deferring process interruption until the legacy "
+                            "remote weight transfer reaches a terminal state"
+                        )
+            if pending_interrupt is not None:
+                raise pending_interrupt
+            ret = 0 if status == "COMPLETED" else -1
+        else:
+            ret = transfer_engine.batch_transfer_sync_read(
+                seed_transfer_engine_session_id,
+                client_ptr_list,
+                seed_ptr_list,
+                client_len_list,
+            )
+            if ret == -2:
+                _LEGACY_UNKNOWN_TRANSFER_QUARANTINE.append(
+                    (model, transfer_engine, tuple(client_ptr_list))
+                )
+                logger.error(
+                    "Legacy Transfer Engine returned completion unknown without "
+                    "a ticket API; retaining the target model for process lifetime"
+                )
+                return False
         if ret < 0:
-            logger.error(f"batch transfer failed, error: {ret}")
+            logger.error("batch transfer failed, error: %s", ret)
             return False
 
         _post_load_weights(model)
@@ -3300,6 +3388,29 @@ class RemoteInstanceModelLoader(BaseModelLoader):
         local_session_id,
         target_manifest_builder,
     ) -> bool:
+        world_group = get_world_group()
+        local_quarantined = bool(_HETEROGENEOUS_UNKNOWN_TRANSFER_QUARANTINE)
+        world_size = getattr(world_group, "world_size", 1)
+        if world_size > 1:
+            try:
+                quarantine_flags = world_group.all_gather_object(local_quarantined)
+            except Exception:
+                logger.exception("Cannot coordinate the target-world quarantine state")
+                return False
+            if len(quarantine_flags) != world_size or not all(
+                type(flag) is bool for flag in quarantine_flags
+            ):
+                logger.error("Target world returned invalid quarantine state")
+                return False
+            world_quarantined = any(quarantine_flags)
+        else:
+            world_quarantined = local_quarantined
+        if world_quarantined:
+            logger.error(
+                "A previous heterogeneous transfer remains completion-unknown; "
+                "restart the target process before another remote weight load"
+            )
+            return False
         server_args = get_server_args()
         if server_args is not None and getattr(server_args, "torchao_config", None):
             logger.error(
@@ -3312,6 +3423,7 @@ class RemoteInstanceModelLoader(BaseModelLoader):
                 MemoryRegistrationLease,
                 MooncakeTransferEngineReader,
                 RuntimeManifest,
+                TransferCompletionUnknownError,
                 TransferEngineError,
                 plan_runtime_transfer_to_local_target,
             )
@@ -3331,7 +3443,7 @@ class RemoteInstanceModelLoader(BaseModelLoader):
             "release": 0.0,
         }
         coordinator = RemoteInstanceWeightTransferWorldCoordinator(
-            seed_url, get_world_group()
+            seed_url, world_group
         )
         acquire_started = time.perf_counter()
         try:
@@ -3354,8 +3466,6 @@ class RemoteInstanceModelLoader(BaseModelLoader):
         release_success = False
         receipts = ()
         plan = None
-        transfer_attempted = False
-        transfer_completion_confirmed = False
         try:
             with ExitStack() as transfer_resources:
                 planning_error = None
@@ -3514,21 +3624,89 @@ class RemoteInstanceModelLoader(BaseModelLoader):
                     )
 
                 transfer_started = time.perf_counter()
-                transfer_attempted = True
-                release_safe = False
-                receipts = MooncakeTransferEngineReader(
+                reader = MooncakeTransferEngineReader(
                     transfer_engine,
                     max_batch_operations=8192,
-                ).execute(
-                    plan,
-                    source_manifests,
-                    target_manifest,
-                    source_pre_registered=True,
-                    source_registrations=source_registrations,
-                    target_pre_registered=True,
-                    target_registrations=target_registrations,
                 )
-                transfer_completion_confirmed = True
+                release_safe = False
+                try:
+                    receipts = reader.execute(
+                        plan,
+                        source_manifests,
+                        target_manifest,
+                        source_pre_registered=True,
+                        source_registrations=source_registrations,
+                        target_pre_registered=True,
+                        target_registrations=target_registrations,
+                    )
+                except TransferCompletionUnknownError as error:
+                    logger.error(
+                        "Transfer completion is unknown; retaining the target model, "
+                        "runtime binding, registrations, and source lease while "
+                        "draining %s",
+                        error.pending_transfer_id,
+                    )
+                    pending_interrupt = None
+                    for _ in range(_HETEROGENEOUS_UNKNOWN_DRAIN_MAX_ATTEMPTS):
+                        try:
+                            terminal_status = reader.drain_pending_transfer(
+                                error.pending_transfer_id,
+                                timeout_ms=_HETEROGENEOUS_UNKNOWN_DRAIN_TIMEOUT_MS,
+                            )
+                        except BaseException as drain_error:
+                            if isinstance(drain_error, Exception):
+                                logger.exception(
+                                    "Failed to query pending transfer %s; target "
+                                    "resources remain quarantined",
+                                    error.pending_transfer_id,
+                                )
+                                time.sleep(1)
+                            else:
+                                if pending_interrupt is None:
+                                    pending_interrupt = drain_error
+                                logger.warning(
+                                    "Deferring process interruption until pending "
+                                    "transfer %s reaches a terminal state",
+                                    error.pending_transfer_id,
+                                )
+                            continue
+                        if terminal_status == "COMPLETION_UNKNOWN":
+                            continue
+                        release_safe = True
+                        if pending_interrupt is not None:
+                            raise pending_interrupt
+                        raise TransferEngineError(
+                            "heterogeneous transfer became terminal after an "
+                            f"unknown completion state: {terminal_status}"
+                        ) from error
+                    quarantine_resources = transfer_resources.pop_all()
+                    _HETEROGENEOUS_UNKNOWN_TRANSFER_QUARANTINE.append(
+                        _HeterogeneousUnknownTransferQuarantine(
+                            pending_transfer_id=error.pending_transfer_id,
+                            resources=quarantine_resources,
+                            owners=(
+                                model,
+                                transfer_engine,
+                                reader,
+                                tuple(source_manifests),
+                                target_manifest,
+                                source_registrations,
+                                target_registrations,
+                                transfer_session,
+                                plan,
+                            ),
+                        )
+                    )
+                    logger.critical(
+                        "Pending transfer %s did not reach a terminal state after "
+                        "%d drain attempts; target resources are retained for "
+                        "process lifetime and source release remains blocked",
+                        error.pending_transfer_id,
+                        _HETEROGENEOUS_UNKNOWN_DRAIN_MAX_ATTEMPTS,
+                    )
+                    if pending_interrupt is not None:
+                        raise pending_interrupt
+                    raise
                 release_safe = True
                 phase_seconds["transfer"] = time.perf_counter() - transfer_started
             synchronize_started = time.perf_counter()
@@ -3538,19 +3716,20 @@ class RemoteInstanceModelLoader(BaseModelLoader):
             _post_load_weights(model)
             phase_seconds["post_load"] = time.perf_counter() - post_load_started
             transfer_success = True
-        except TransferEngineError:
-            release_safe = not transfer_attempted or transfer_completion_confirmed
+        except TransferCompletionUnknownError:
+            release_safe = False
             logger.exception(
-                "Heterogeneous remote-instance Transfer Engine loading failed; %s",
-                (
-                    "source mutation remains blocked until explicit release or "
-                    "recovery because transfer completion cannot be proven"
-                    if transfer_attempted
-                    else "no transfer was attempted"
-                ),
+                "Heterogeneous remote-instance transfer completion remains unknown; "
+                "target resources and source lease must remain quarantined"
+            )
+        except TransferEngineError:
+            release_safe = True
+            logger.exception(
+                "Heterogeneous remote-instance Transfer Engine loading failed with "
+                "a known terminal completion state"
             )
         except Exception:
-            release_safe = not transfer_attempted or transfer_completion_confirmed
+            release_safe = True
             logger.exception("Heterogeneous remote-instance weight loading failed")
         finally:
             release_started = time.perf_counter()
@@ -3574,11 +3753,13 @@ class RemoteInstanceModelLoader(BaseModelLoader):
             )
             return False
         if not release_success:
-            logger.warning(
+            logger.error(
                 "Loaded weights but failed to release source transfer session %s; "
-                "source mutation remains blocked until explicit release or recovery",
+                "failing remote-instance startup because source mutation remains "
+                "blocked until explicit release or recovery",
                 transfer_session.transfer_id,
             )
+            return False
 
         logger.info(
             "Loaded heterogeneous remote-instance weights: bytes=%d, "

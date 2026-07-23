@@ -100,6 +100,20 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+
+class RemoteInstanceWeightTransferBeginError(RuntimeError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        transfer_id: str,
+        session_state: str,
+    ) -> None:
+        super().__init__(message)
+        self.transfer_id = transfer_id
+        self.session_state = session_state
+
+
 _RUNTIME_TENSOR_SEMANTIC_FIELDS = (
     "tensor_id",
     "aliases",
@@ -702,6 +716,7 @@ class TokenizerControlMixin:
             DEFAULT_REMOTE_INSTANCE_WEIGHT_TRANSFER_LEASE_TIMEOUT_SEC
         ),
         manifest_format: str = "runtime_v1",
+        transfer_id: str | None = None,
     ) -> dict:
         """Acquire source snapshots while inference continues to serve."""
         if not self.server_args.enable_weight_runtime_manifest:
@@ -712,9 +727,13 @@ class TokenizerControlMixin:
         validate_remote_instance_weight_transfer_lease_timeout(lease_timeout_sec)
         if manifest_format not in ("runtime_v1", "placement_binding_v1"):
             raise ValueError(f"unsupported source manifest format: {manifest_format}")
+        if transfer_id is not None and (
+            type(transfer_id) is not str or not transfer_id
+        ):
+            raise ValueError("transfer_id must be a non-empty string")
 
         self.auto_create_handle_loop()
-        transfer_id = uuid.uuid4().hex
+        transfer_id = transfer_id or uuid.uuid4().hex
         request = BeginRemoteInstanceWeightTransferReqInput(
             transfer_id=transfer_id,
             model_id=self.server_args.model_path,
@@ -746,16 +765,50 @@ class TokenizerControlMixin:
             except RuntimeError as error:
                 failures.append(str(error))
         if failures:
-            try:
-                await TokenizerControlMixin.release_remote_instance_weight_transfer(
-                    self, transfer_id
+            session_states = [
+                getattr(result, "session_state", "unknown") for result in results
+            ]
+            cleanup_candidate = any(
+                state in {"created", "reused", "cleanup_pending"}
+                for state in session_states
+            ) and not any(
+                state in {"conflict", "expired"} for state in session_states
+            )
+            cleanup_succeeded = False
+            if cleanup_candidate:
+                for _ in range(3):
+                    try:
+                        (
+                            cleanup_succeeded,
+                            _,
+                        ) = await TokenizerControlMixin.release_remote_instance_weight_transfer(
+                            self,
+                            transfer_id,
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Failed to clean up remote weight transfer %s",
+                            transfer_id,
+                        )
+                    if cleanup_succeeded:
+                        break
+            if cleanup_candidate:
+                session_state = (
+                    "failed" if cleanup_succeeded else "cleanup_pending"
                 )
-            except Exception:
-                logger.exception(
-                    "Failed to clean up remote weight transfer %s",
-                    transfer_id,
-                )
-            raise RuntimeError(" | ".join(failures))
+            elif "conflict" in session_states:
+                session_state = "conflict"
+            elif "expired" in session_states:
+                session_state = "expired"
+            elif "released" in session_states:
+                session_state = "released"
+            else:
+                session_state = "failed"
+            raise RemoteInstanceWeightTransferBeginError(
+                " | ".join(failures),
+                transfer_id=transfer_id,
+                session_state=session_state,
+            )
         if manifest_format == "placement_binding_v1":
             assert placements is not None and bindings is not None
             return {

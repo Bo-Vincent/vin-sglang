@@ -50,12 +50,13 @@ class FakeTensor:
         shape,
         *,
         address: int = 0x10000,
+        dtype: str = "torch.bfloat16",
         itemsize: int = 2,
         device: str = "cpu",
         contiguous: bool = True,
     ) -> None:
         self.shape = tuple(shape)
-        self.dtype = "torch.bfloat16"
+        self.dtype = dtype
         self.device = SimpleNamespace(type=device)
         self.is_sparse = False
         self._address = address
@@ -139,6 +140,63 @@ class FakeMoEModel(FakeModel):
 
     def modules(self):
         return iter((self, self._moe_module))
+
+
+class FakeFp8RuntimeModule:
+    def __init__(
+        self,
+        *,
+        weight=None,
+        weight_scale_inv=None,
+        weight_scale=None,
+        w13_weight=None,
+        w13_weight_scale_inv=None,
+        w2_weight=None,
+        w2_weight_scale_inv=None,
+        block_quant: bool = True,
+        weight_block_size=(128, 128),
+        is_checkpoint_fp8_serialized: bool = True,
+        activation_scheme: str = "dynamic",
+        use_mxfp8: bool = False,
+        load_up_proj_weight_first: bool = False,
+    ) -> None:
+        block_size = None if weight_block_size is None else list(weight_block_size)
+        quant_config = SimpleNamespace(
+            activation_scheme=activation_scheme,
+            is_checkpoint_fp8_serialized=is_checkpoint_fp8_serialized,
+            use_mxfp8=use_mxfp8,
+            weight_block_size=block_size,
+        )
+        self.block_quant = block_quant
+        self.weight_block_size = block_size
+        self.quant_method = SimpleNamespace(
+            block_quant=block_quant,
+            is_checkpoint_fp8_serialized=is_checkpoint_fp8_serialized,
+            load_up_proj_weight_first=load_up_proj_weight_first,
+            quant_config=quant_config,
+            use_mxfp8=use_mxfp8,
+            weight_block_size=block_size,
+        )
+        for name, parameter in (
+            ("weight", weight),
+            ("weight_scale_inv", weight_scale_inv),
+            ("weight_scale", weight_scale),
+            ("w13_weight", w13_weight),
+            ("w13_weight_scale_inv", w13_weight_scale_inv),
+            ("w2_weight", w2_weight),
+            ("w2_weight_scale_inv", w2_weight_scale_inv),
+        ):
+            if parameter is not None:
+                setattr(self, name, parameter)
+
+
+class FakeFp8RuntimeModel(FakeModel):
+    def __init__(self, parameters, *, runtime_modules) -> None:
+        super().__init__(parameters)
+        self._runtime_modules = tuple(runtime_modules)
+
+    def modules(self):
+        return iter((self, *self._runtime_modules))
 
 
 class ReplicatedAdapter:
@@ -765,20 +823,14 @@ def test_expired_snapshot_lease_blocks_mutation_until_explicit_release() -> None
     coordinator.commit_revision()
 
 
-def test_expired_snapshot_lease_can_be_renewed_without_force_release() -> None:
+def test_expired_snapshot_lease_cannot_be_silently_revived() -> None:
     clock = FakeClock(100.0)
     coordinator = WeightSnapshotCoordinator(clock=clock)
     lease_id, _ = coordinator.acquire_snapshot(lease_timeout_sec=30)
 
     clock.advance(30)
-    coordinator.renew_snapshot(lease_id, lease_timeout_sec=30)
-
-    clock.advance(29)
-    assert coordinator.has_snapshot(lease_id)
-    with pytest.raises(WeightManifestError, match="snapshot lease is active"):
-        coordinator.begin_update()
-
-    clock.advance(1)
+    with pytest.raises(WeightManifestError, match="expired.*explicit release"):
+        coordinator.renew_snapshot(lease_id, lease_timeout_sec=30)
     assert coordinator.has_snapshot(lease_id)
     with pytest.raises(WeightManifestError, match="snapshot lease is active"):
         coordinator.begin_update()
@@ -1500,8 +1552,734 @@ def test_qwen_moe_factory_reads_w31_component_order_from_runtime_module() -> Non
     manager.release(manifest.lease_id)
 
 
+def test_qwen_dense_block_fp8_manifest_publishes_weight_and_scale_views() -> None:
+    weight = FakeTensor(
+        (256, 128),
+        address=0x40000,
+        dtype="torch.float8_e4m3fn",
+        itemsize=1,
+    )
+    scale = FakeTensor(
+        (2, 1),
+        address=0x50000,
+        dtype="torch.float32",
+        itemsize=4,
+    )
+    module = FakeFp8RuntimeModule(weight=weight, weight_scale_inv=scale)
+    model = FakeFp8RuntimeModel(
+        [
+            ("layers.1.mlp.gate_up_proj.weight", weight),
+            ("layers.1.mlp.gate_up_proj.weight_scale_inv", scale),
+        ],
+        runtime_modules=(module,),
+    )
+    manager = create_weight_runtime_manifest_manager(
+        model=model,
+        config=qwen_config(hidden_size=128, intermediate_size=256),
+        topology=topology(tp_rank=1, tp_size=2),
+        allowed_devices=("cpu",),
+        quantization="fp8",
+        fp8_gemm_backend="triton",
+    )
+
+    manifest = manager.snapshot(
+        model_id="qwen3.5-fp8",
+        revision="step-1",
+        instance_id="instance-0",
+        worker_id="worker-0",
+        endpoint="worker-0:12345",
+    )
+    tensors = {tensor.tensor_id: tensor for tensor in manifest.tensors}
+
+    assert set(tensors) == {
+        "layers.1.mlp.gate_proj.weight",
+        "layers.1.mlp.gate_proj.weight_scale_inv",
+        "layers.1.mlp.up_proj.weight",
+        "layers.1.mlp.up_proj.weight_scale_inv",
+    }
+    for component in ("gate_proj", "up_proj"):
+        weight_view = tensors[f"layers.1.mlp.{component}.weight"]
+        scale_view = tensors[f"layers.1.mlp.{component}.weight_scale_inv"]
+        assert weight_view.dtype == "float8_e4m3fn"
+        assert weight_view.itemsize == 1
+        assert weight_view.global_shape == (256, 128)
+        assert weight_view.global_offset == (128, 0)
+        assert weight_view.local_shape == (128, 128)
+        assert scale_view.dtype == "float32"
+        assert scale_view.itemsize == 4
+        assert scale_view.global_shape == (2, 1)
+        assert scale_view.global_offset == (1, 0)
+        assert scale_view.local_shape == (1, 1)
+        assert scale_view.shard_dims == weight_view.shard_dims == (0,)
+        assert scale_view.rank == weight_view.rank
+
+    assert tensors["layers.1.mlp.gate_proj.weight"].address == 0x40000
+    assert tensors["layers.1.mlp.up_proj.weight"].address == 0x40000 + 128 * 128
+    assert tensors["layers.1.mlp.gate_proj.weight_scale_inv"].address == 0x50000
+    assert tensors["layers.1.mlp.up_proj.weight_scale_inv"].address == 0x50000 + 4
+    manager.release(manifest.lease_id)
+
+
+def test_qwen3_block_fp8_manifest_uses_ungated_q_projection_shape() -> None:
+    weight = FakeTensor(
+        (768, 128),
+        address=0x40000,
+        dtype="torch.float8_e4m3fn",
+        itemsize=1,
+    )
+    scale = FakeTensor(
+        (6, 1),
+        address=0x60000,
+        dtype="torch.float32",
+        itemsize=4,
+    )
+    module = FakeFp8RuntimeModule(weight=weight, weight_scale_inv=scale)
+    manager = create_weight_runtime_manifest_manager(
+        model=FakeFp8RuntimeModel(
+            [
+                ("layers.0.self_attn.qkv_proj.weight", weight),
+                ("layers.0.self_attn.qkv_proj.weight_scale_inv", scale),
+            ],
+            runtime_modules=(module,),
+        ),
+        config=qwen_config(
+            model_type="qwen3_moe",
+            hidden_size=128,
+            num_attention_heads=4,
+            num_key_value_heads=1,
+            head_dim=128,
+        ),
+        topology=topology(),
+        allowed_devices=("cpu",),
+        quantization="fp8",
+        fp8_gemm_backend="triton",
+        moe_runner_backend="triton",
+    )
+
+    manifest = manager.snapshot(
+        model_id="qwen3-fp8",
+        revision="step-1",
+        instance_id="instance-0",
+        worker_id="worker-0",
+        endpoint="worker-0:12345",
+    )
+    tensors = {tensor.tensor_id: tensor for tensor in manifest.tensors}
+
+    assert tensors["layers.0.self_attn.q_proj.weight"].global_shape == (512, 128)
+    assert tensors["layers.0.self_attn.k_proj.weight"].global_shape == (128, 128)
+    assert tensors["layers.0.self_attn.v_proj.weight"].global_shape == (128, 128)
+    assert tensors["layers.0.self_attn.q_proj.weight_scale_inv"].global_shape == (4, 1)
+    assert (
+        tensors["layers.0.self_attn.v_proj.weight_scale_inv"].address == 0x60000 + 5 * 4
+    )
+    manager.release(manifest.lease_id)
+
+
+def test_qwen3_nonquantized_manifest_uses_ungated_q_projection_shape() -> None:
+    parameter = FakeTensor((768, 128), address=0x40000, itemsize=2)
+    manager = create_weight_runtime_manifest_manager(
+        model=FakeModel([("layers.0.self_attn.qkv_proj.weight", parameter)]),
+        config=qwen_config(
+            model_type="qwen3",
+            hidden_size=128,
+            num_attention_heads=4,
+            num_key_value_heads=1,
+            head_dim=128,
+        ),
+        topology=topology(),
+        allowed_devices=("cpu",),
+    )
+
+    manifest = manager.snapshot(
+        model_id="qwen3-bf16",
+        revision="step-1",
+        instance_id="instance-0",
+        worker_id="worker-0",
+        endpoint="worker-0:12345",
+    )
+    tensors = {tensor.tensor_id: tensor for tensor in manifest.tensors}
+
+    assert tensors["layers.0.self_attn.q_proj.weight"].global_shape == (512, 128)
+    assert tensors["layers.0.self_attn.k_proj.weight"].global_shape == (128, 128)
+    assert tensors["layers.0.self_attn.v_proj.weight"].global_shape == (128, 128)
+    manager.release(manifest.lease_id)
+
+
+def test_qwen_moe_block_fp8_scale_views_preserve_ep_and_block_tp_coordinates() -> None:
+    weight = FakeTensor(
+        (2, 512, 256),
+        address=0x60000,
+        dtype="torch.float8_e4m3fn",
+        itemsize=1,
+    )
+    scale = FakeTensor(
+        (2, 4, 2),
+        address=0xA0000,
+        dtype="torch.float32",
+        itemsize=4,
+    )
+    module = FakeFp8RuntimeModule(
+        w13_weight=weight,
+        w13_weight_scale_inv=scale,
+    )
+    model = FakeFp8RuntimeModel(
+        [
+            ("layers.2.mlp.experts.w13_weight", weight),
+            ("layers.2.mlp.experts.w13_weight_scale_inv", scale),
+        ],
+        runtime_modules=(module,),
+    )
+    manager = create_weight_runtime_manifest_manager(
+        model=model,
+        config=qwen_config(
+            model_type="qwen3_5_moe_text",
+            hidden_size=256,
+            moe_intermediate_size=512,
+            num_experts=8,
+        ),
+        topology=topology(
+            ep_rank=1,
+            ep_size=4,
+            moe_tp_rank=1,
+            moe_tp_size=2,
+        ),
+        allowed_devices=("cpu",),
+        quantization="fp8",
+        fp8_gemm_backend="triton",
+        moe_runner_backend="triton",
+    )
+
+    manifest = manager.snapshot(
+        model_id="qwen3.5-moe-fp8",
+        revision="step-1",
+        instance_id="instance-0",
+        worker_id="worker-0",
+        endpoint="worker-0:12345",
+    )
+    scales = [
+        tensor
+        for tensor in manifest.tensors
+        if tensor.tensor_id.endswith("weight_scale_inv")
+    ]
+
+    assert [(tensor.tensor_id, tensor.global_offset) for tensor in scales] == [
+        ("layers.2.mlp.experts.gate_proj.weight_scale_inv", (2, 2, 0)),
+        ("layers.2.mlp.experts.gate_proj.weight_scale_inv", (3, 2, 0)),
+        ("layers.2.mlp.experts.up_proj.weight_scale_inv", (2, 2, 0)),
+        ("layers.2.mlp.experts.up_proj.weight_scale_inv", (3, 2, 0)),
+    ]
+    assert {tensor.global_shape for tensor in scales} == {(8, 4, 2)}
+    assert {tensor.local_shape for tensor in scales} == {(1, 2, 2)}
+    assert {tensor.shard_dims for tensor in scales} == {(0, 1)}
+    assert {tensor.nbytes for tensor in scales} == {16}
+
+    weights = {
+        (tensor.tensor_id, tensor.global_offset[0]): tensor
+        for tensor in manifest.tensors
+        if tensor.tensor_id.endswith(".weight")
+    }
+    for scale_view in scales:
+        weight_id = scale_view.tensor_id.removesuffix("_scale_inv")
+        weight_view = weights[(weight_id, scale_view.global_offset[0])]
+        assert scale_view.global_shape == (
+            weight_view.global_shape[0],
+            weight_view.global_shape[1] // 128,
+            weight_view.global_shape[2] // 128,
+        )
+        assert scale_view.global_offset == (
+            weight_view.global_offset[0],
+            weight_view.global_offset[1] // 128,
+            weight_view.global_offset[2] // 128,
+        )
+        assert scale_view.local_shape == (
+            weight_view.local_shape[0],
+            weight_view.local_shape[1] // 128,
+            weight_view.local_shape[2] // 128,
+        )
+    manager.release(manifest.lease_id)
+
+
+def test_qwen_moe_block_fp8_w31_reorders_weight_and_scale_together() -> None:
+    weight = FakeTensor(
+        (1, 256, 128),
+        address=0xB0000,
+        dtype="torch.float8_e4m3fn",
+        itemsize=1,
+    )
+    scale = FakeTensor(
+        (1, 2, 1),
+        address=0xC0000,
+        dtype="torch.float32",
+        itemsize=4,
+    )
+    module = FakeFp8RuntimeModule(
+        w13_weight=weight,
+        w13_weight_scale_inv=scale,
+        load_up_proj_weight_first=True,
+    )
+    model = FakeFp8RuntimeModel(
+        [
+            ("layers.2.mlp.experts.w13_weight", weight),
+            ("layers.2.mlp.experts.w13_weight_scale_inv", scale),
+        ],
+        runtime_modules=(module,),
+    )
+    manager = create_weight_runtime_manifest_manager(
+        model=model,
+        config=qwen_config(
+            model_type="qwen3_5_moe_text",
+            hidden_size=128,
+            moe_intermediate_size=128,
+            num_experts=1,
+        ),
+        topology=topology(),
+        allowed_devices=("cpu",),
+        quantization="fp8",
+        fp8_gemm_backend="triton",
+        moe_runner_backend="triton",
+    )
+
+    manifest = manager.snapshot(
+        model_id="qwen3.5-moe-fp8",
+        revision="step-1",
+        instance_id="instance-0",
+        worker_id="worker-0",
+        endpoint="worker-0:12345",
+    )
+    tensors = {tensor.tensor_id: tensor for tensor in manifest.tensors}
+
+    assert tensors["layers.2.mlp.experts.up_proj.weight"].address == 0xB0000
+    assert (
+        tensors["layers.2.mlp.experts.gate_proj.weight"].address == 0xB0000 + 128 * 128
+    )
+    assert tensors["layers.2.mlp.experts.up_proj.weight_scale_inv"].address == 0xC0000
+    assert (
+        tensors["layers.2.mlp.experts.gate_proj.weight_scale_inv"].address
+        == 0xC0000 + 4
+    )
+    for component in ("gate_proj", "up_proj"):
+        weight_view = tensors[f"layers.2.mlp.experts.{component}.weight"]
+        scale_view = tensors[f"layers.2.mlp.experts.{component}.weight_scale_inv"]
+        assert scale_view.global_offset == (
+            weight_view.global_offset[0],
+            weight_view.global_offset[1] // 128,
+            weight_view.global_offset[2] // 128,
+        )
+    manager.release(manifest.lease_id)
+
+
+def test_block_fp8_manifest_rejects_online_quantization() -> None:
+    weight = FakeTensor(
+        (256, 128),
+        dtype="torch.float8_e4m3fn",
+        itemsize=1,
+    )
+    scale = FakeTensor(
+        (2, 1),
+        address=0x20000,
+        dtype="torch.float32",
+        itemsize=4,
+    )
+    module = FakeFp8RuntimeModule(
+        weight=weight,
+        weight_scale_inv=scale,
+        is_checkpoint_fp8_serialized=False,
+    )
+    provider = create_weight_runtime_manifest_manager(
+        model=FakeFp8RuntimeModel(
+            [
+                ("layers.1.mlp.gate_up_proj.weight", weight),
+                ("layers.1.mlp.gate_up_proj.weight_scale_inv", scale),
+            ],
+            runtime_modules=(module,),
+        ),
+        config=qwen_config(hidden_size=128, intermediate_size=256),
+        topology=topology(),
+        allowed_devices=("cpu",),
+        quantization="fp8",
+        fp8_gemm_backend="triton",
+    )
+
+    with pytest.raises(WeightManifestError, match="(?i)(online|serialized)"):
+        provider.snapshot(
+            model_id="model",
+            revision="revision",
+            instance_id="instance",
+            worker_id="worker",
+            endpoint="worker:12345",
+        )
+
+
+def test_fp8_manifest_rejects_per_channel_scales() -> None:
+    weight = FakeTensor(
+        (128, 128),
+        dtype="torch.float8_e4m3fn",
+        itemsize=1,
+    )
+    scale = FakeTensor(
+        (128, 1),
+        address=0x20000,
+        dtype="torch.float32",
+        itemsize=4,
+    )
+    module = FakeFp8RuntimeModule(
+        weight=weight,
+        weight_scale=scale,
+        block_quant=False,
+        weight_block_size=None,
+    )
+    provider = create_weight_runtime_manifest_manager(
+        model=FakeFp8RuntimeModel(
+            [
+                ("layers.1.mlp.down_proj.weight", weight),
+                ("layers.1.mlp.down_proj.weight_scale", scale),
+            ],
+            runtime_modules=(module,),
+        ),
+        config=qwen_config(hidden_size=128, intermediate_size=128),
+        topology=topology(),
+        allowed_devices=("cpu",),
+        quantization="fp8",
+        fp8_gemm_backend="triton",
+    )
+
+    with pytest.raises(WeightManifestError, match="(?i)(channel|block)"):
+        provider.snapshot(
+            model_id="model",
+            revision="revision",
+            instance_id="instance",
+            worker_id="worker",
+            endpoint="worker:12345",
+        )
+
+
+def test_block_fp8_manifest_rejects_missing_inverse_scale() -> None:
+    weight = FakeTensor(
+        (256, 128),
+        dtype="torch.float8_e4m3fn",
+        itemsize=1,
+    )
+    module = FakeFp8RuntimeModule(weight=weight)
+    provider = create_weight_runtime_manifest_manager(
+        model=FakeFp8RuntimeModel(
+            [("layers.1.mlp.gate_up_proj.weight", weight)],
+            runtime_modules=(module,),
+        ),
+        config=qwen_config(hidden_size=128, intermediate_size=256),
+        topology=topology(),
+        allowed_devices=("cpu",),
+        quantization="fp8",
+        fp8_gemm_backend="triton",
+    )
+
+    with pytest.raises(WeightManifestError, match="(?i)scale"):
+        provider.snapshot(
+            model_id="model",
+            revision="revision",
+            instance_id="instance",
+            worker_id="worker",
+            endpoint="worker:12345",
+        )
+
+
+def test_block_fp8_manifest_rejects_non_128_block_size() -> None:
+    weight = FakeTensor(
+        (256, 128),
+        dtype="torch.float8_e4m3fn",
+        itemsize=1,
+    )
+    scale = FakeTensor(
+        (4, 1),
+        address=0x20000,
+        dtype="torch.float32",
+        itemsize=4,
+    )
+    module = FakeFp8RuntimeModule(
+        weight=weight,
+        weight_scale_inv=scale,
+        weight_block_size=(64, 128),
+    )
+    provider = create_weight_runtime_manifest_manager(
+        model=FakeFp8RuntimeModel(
+            [
+                ("layers.1.mlp.gate_up_proj.weight", weight),
+                ("layers.1.mlp.gate_up_proj.weight_scale_inv", scale),
+            ],
+            runtime_modules=(module,),
+        ),
+        config=qwen_config(hidden_size=128, intermediate_size=128),
+        topology=topology(),
+        allowed_devices=("cpu",),
+        quantization="fp8",
+        fp8_gemm_backend="triton",
+    )
+
+    with pytest.raises(WeightManifestError, match="128"):
+        provider.snapshot(
+            model_id="model",
+            revision="revision",
+            instance_id="instance",
+            worker_id="worker",
+            endpoint="worker:12345",
+        )
+
+
+def test_block_fp8_manifest_rejects_unaligned_fused_partition() -> None:
+    weight = FakeTensor(
+        (384, 128),
+        dtype="torch.float8_e4m3fn",
+        itemsize=1,
+    )
+    scale = FakeTensor(
+        (3, 1),
+        address=0x20000,
+        dtype="torch.float32",
+        itemsize=4,
+    )
+    module = FakeFp8RuntimeModule(weight=weight, weight_scale_inv=scale)
+    provider = create_weight_runtime_manifest_manager(
+        model=FakeFp8RuntimeModel(
+            [
+                ("layers.1.mlp.gate_up_proj.weight", weight),
+                ("layers.1.mlp.gate_up_proj.weight_scale_inv", scale),
+            ],
+            runtime_modules=(module,),
+        ),
+        config=qwen_config(hidden_size=128, intermediate_size=192),
+        topology=topology(),
+        allowed_devices=("cpu",),
+        quantization="fp8",
+        fp8_gemm_backend="triton",
+    )
+
+    with pytest.raises(WeightManifestError, match="(?i)(align|128)"):
+        provider.snapshot(
+            model_id="model",
+            revision="revision",
+            instance_id="instance",
+            worker_id="worker",
+            endpoint="worker:12345",
+        )
+
+
+def test_block_fp8_manifest_rejects_swizzled_derived_scale() -> None:
+    weight = FakeTensor(
+        (256, 128),
+        dtype="torch.float8_e4m3fn",
+        itemsize=1,
+    )
+    scale = FakeTensor(
+        (2, 1),
+        address=0x20000,
+        dtype="torch.float32",
+        itemsize=4,
+    )
+    swizzled_scale = FakeTensor(
+        (2, 1),
+        address=0x30000,
+        dtype="torch.float32",
+        itemsize=4,
+    )
+    module = FakeFp8RuntimeModule(weight=weight, weight_scale_inv=scale)
+    module.weight_scale_inv_swizzled = swizzled_scale
+    provider = create_weight_runtime_manifest_manager(
+        model=FakeFp8RuntimeModel(
+            [
+                ("layers.1.mlp.gate_up_proj.weight", weight),
+                ("layers.1.mlp.gate_up_proj.weight_scale_inv", scale),
+                (
+                    "layers.1.mlp.gate_up_proj.weight_scale_inv_swizzled",
+                    swizzled_scale,
+                ),
+            ],
+            runtime_modules=(module,),
+        ),
+        config=qwen_config(hidden_size=128, intermediate_size=256),
+        topology=topology(),
+        allowed_devices=("cpu",),
+        quantization="fp8",
+        fp8_gemm_backend="triton",
+    )
+
+    with pytest.raises(WeightManifestError, match="(?i)swizzled"):
+        provider.snapshot(
+            model_id="model",
+            revision="revision",
+            instance_id="instance",
+            worker_id="worker",
+            endpoint="worker:12345",
+        )
+
+
+def test_block_fp8_manifest_rejects_noncanonical_gemm_backend() -> None:
+    weight = FakeTensor(
+        (128, 128),
+        dtype="torch.float8_e4m3fn",
+        itemsize=1,
+    )
+    scale = FakeTensor(
+        (1, 1),
+        address=0x20000,
+        dtype="torch.float32",
+        itemsize=4,
+    )
+    module = FakeFp8RuntimeModule(weight=weight, weight_scale_inv=scale)
+    provider = create_weight_runtime_manifest_manager(
+        model=FakeFp8RuntimeModel(
+            [
+                ("layers.1.mlp.down_proj.weight", weight),
+                ("layers.1.mlp.down_proj.weight_scale_inv", scale),
+            ],
+            runtime_modules=(module,),
+        ),
+        config=qwen_config(hidden_size=128, intermediate_size=128),
+        topology=topology(),
+        allowed_devices=("cpu",),
+        quantization="fp8",
+        fp8_gemm_backend="deep_gemm",
+    )
+
+    with pytest.raises(WeightManifestError, match="(?i)(triton|backend)"):
+        provider.snapshot(
+            model_id="model",
+            revision="revision",
+            instance_id="instance",
+            worker_id="worker",
+            endpoint="worker:12345",
+        )
+
+
+def test_block_fp8_manifest_rejects_missing_backend_evidence() -> None:
+    weight = FakeTensor(
+        (128, 128),
+        dtype="torch.float8_e4m3fn",
+        itemsize=1,
+    )
+    scale = FakeTensor(
+        (1, 1),
+        address=0x20000,
+        dtype="torch.float32",
+        itemsize=4,
+    )
+    module = FakeFp8RuntimeModule(weight=weight, weight_scale_inv=scale)
+    provider = create_weight_runtime_manifest_manager(
+        model=FakeFp8RuntimeModel(
+            [
+                ("layers.1.mlp.down_proj.weight", weight),
+                ("layers.1.mlp.down_proj.weight_scale_inv", scale),
+            ],
+            runtime_modules=(module,),
+        ),
+        config=qwen_config(hidden_size=128, intermediate_size=128),
+        topology=topology(),
+        allowed_devices=("cpu",),
+        quantization="fp8",
+    )
+
+    with pytest.raises(WeightManifestError, match="(?i)(triton|backend)"):
+        provider.snapshot(
+            model_id="model",
+            revision="revision",
+            instance_id="instance",
+            worker_id="worker",
+            endpoint="worker:12345",
+        )
+
+
+def test_qwen3_next_fused_shared_expert_block_fp8_scales_use_logical_axes() -> None:
+    w13_weight = FakeTensor(
+        (3, 256, 128),
+        address=0x30000,
+        dtype="torch.float8_e4m3fn",
+        itemsize=1,
+    )
+    w13_scale = FakeTensor(
+        (3, 2, 1),
+        address=0x50000,
+        dtype="torch.float32",
+        itemsize=4,
+    )
+    w2_weight = FakeTensor(
+        (3, 128, 128),
+        address=0x60000,
+        dtype="torch.float8_e4m3fn",
+        itemsize=1,
+    )
+    w2_scale = FakeTensor(
+        (3, 1, 1),
+        address=0x70000,
+        dtype="torch.float32",
+        itemsize=4,
+    )
+    module = FakeFp8RuntimeModule(
+        w13_weight=w13_weight,
+        w13_weight_scale_inv=w13_scale,
+        w2_weight=w2_weight,
+        w2_weight_scale_inv=w2_scale,
+    )
+    model = FakeFp8RuntimeModel(
+        [
+            ("model.layers.0.mlp.experts.w13_weight", w13_weight),
+            (
+                "model.layers.0.mlp.experts.w13_weight_scale_inv",
+                w13_scale,
+            ),
+            ("model.layers.0.mlp.experts.w2_weight", w2_weight),
+            ("model.layers.0.mlp.experts.w2_weight_scale_inv", w2_scale),
+        ],
+        runtime_modules=(module,),
+    )
+    model.num_fused_shared_experts = 1
+    manager = create_weight_runtime_manifest_manager(
+        model=model,
+        config=qwen_config(
+            model_type="qwen3_next",
+            hidden_size=128,
+            moe_intermediate_size=128,
+            shared_expert_intermediate_size=128,
+            num_experts=4,
+        ),
+        topology=topology(ep_rank=0, ep_size=2),
+        allowed_devices=("cpu",),
+        quantization="fp8",
+        fp8_gemm_backend="triton",
+        moe_runner_backend="triton",
+    )
+
+    manifest = manager.snapshot(
+        model_id="qwen3-next-fp8",
+        revision="step-1",
+        instance_id="instance-0",
+        worker_id="worker-0",
+        endpoint="worker-0:12345",
+    )
+    tensors = {tensor.tensor_id: tensor for tensor in manifest.tensors}
+
+    gate = tensors["layers.0.mlp.shared_expert.gate_proj.weight_scale_inv"]
+    up = tensors["layers.0.mlp.shared_expert.up_proj.weight_scale_inv"]
+    down = tensors["layers.0.mlp.shared_expert.down_proj.weight_scale_inv"]
+    assert gate.global_shape == up.global_shape == down.global_shape == (1, 1)
+    assert gate.local_shape == up.local_shape == down.local_shape == (1, 1)
+    assert gate.address == 0x50000 + 16
+    assert up.address == 0x50000 + 20
+    assert down.address == 0x70000 + 8
+    routed_down = [
+        tensor
+        for tensor in manifest.tensors
+        if tensor.tensor_id == "layers.0.mlp.experts.down_proj.weight_scale_inv"
+    ]
+    assert [tensor.global_shape for tensor in routed_down] == [(4, 1, 1)] * 2
+    assert [tensor.global_offset for tensor in routed_down] == [
+        (0, 0, 0),
+        (1, 0, 0),
+    ]
+    assert [tensor.address for tensor in routed_down] == [0x70000, 0x70000 + 4]
+    manager.release(manifest.lease_id)
+
+
 def test_qwen3_next_factory_uses_grouped_gdn_runtime_semantics() -> None:
     parameter = FakeTensor((24, 8), address=0x50000, itemsize=2)
+    parameter._sglang_qwen3_next_gdn_layout = "grouped"
     manager = create_weight_runtime_manifest_manager(
         model=FakeModel(
             [("model.layers.0.linear_attn.in_proj_qkvz.weight", parameter)]
@@ -1548,9 +2326,11 @@ def test_qwen3_next_groups_gdn_ba_by_key_head() -> None:
         )
     )
 
+    parameter = FakeTensor((8, 8), itemsize=2)
+    parameter._sglang_qwen3_next_gdn_layout = "grouped"
     views = adapter.describe_parameter(
         names=("model.layers.0.linear_attn.in_proj_ba.weight",),
-        parameter=FakeTensor((8, 8), itemsize=2),
+        parameter=parameter,
         topology=topology(attention_tp_rank=1, attention_tp_size=2),
     )
 
@@ -1693,10 +2473,32 @@ def test_qwen3_next_rejects_split_checkpoint_gdn_runtime_layout() -> None:
         )
     )
 
-    with pytest.raises(WeightManifestError, match="split-checkpoint GDN"):
+    with pytest.raises(WeightManifestError, match="marker must explicitly"):
         adapter.describe_parameter(
             names=("model.layers.0.linear_attn.in_proj_qkvz.weight",),
             parameter=parameter,
+            topology=topology(attention_tp_rank=1, attention_tp_size=2),
+        )
+
+
+def test_qwen3_next_rejects_missing_gdn_runtime_layout_marker() -> None:
+    adapter = Qwen3NextWeightSemanticsAdapter(
+        config=qwen_config(
+            model_type="qwen3_next",
+            linear_key_head_dim=2,
+            linear_value_head_dim=2,
+            linear_num_key_heads=4,
+            linear_num_value_heads=8,
+        )
+    )
+
+    with pytest.raises(
+        WeightManifestError,
+        match=r"in_proj_qkvz\.weight: None",
+    ):
+        adapter.describe_parameter(
+            names=("model.layers.0.linear_attn.in_proj_qkvz.weight",),
+            parameter=FakeTensor((24, 8), itemsize=2),
             topology=topology(attention_tp_rank=1, attention_tp_size=2),
         )
 

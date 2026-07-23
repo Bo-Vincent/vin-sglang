@@ -13,8 +13,14 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
 
-class _CompletionUnknownError(RuntimeError):
+class _TransferEngineError(RuntimeError):
     pass
+
+
+class _CompletionUnknownError(_TransferEngineError):
+    def __init__(self, message, *, pending_transfer_id="pending-1"):
+        super().__init__(message)
+        self.pending_transfer_id = pending_transfer_id
 
 
 @pytest.fixture(autouse=True)
@@ -95,7 +101,8 @@ def test_heterogeneous_loader_builds_local_plan_and_reads_from_source(
     fake_weight_transfer.MemoryRegistrationLease = FakeRegistrationLease
     fake_weight_transfer.MooncakeTransferEngineReader = FakeReader
     fake_weight_transfer.RuntimeManifest = FakeRuntimeManifest
-    fake_weight_transfer.TransferEngineError = _CompletionUnknownError
+    fake_weight_transfer.TransferCompletionUnknownError = _CompletionUnknownError
+    fake_weight_transfer.TransferEngineError = _TransferEngineError
 
     def plan_runtime_transfer_to_local_target(sources, target):
         calls["plan"] = (sources, target)
@@ -155,7 +162,7 @@ def test_heterogeneous_loader_builds_local_plan_and_reads_from_source(
         target_builder,
     )
 
-    assert success is True
+    assert success is release_success
     assert calls["builder"] == {
         "model": model,
         "model_id": source_inventory["model_id"],
@@ -287,7 +294,8 @@ def test_heterogeneous_loader_plans_placement_before_acquiring_target_binding(
     fake_weight_transfer.RuntimeBindingManifest = FakeRuntimeBindingManifest
     fake_weight_transfer.SourcePlacementManifest = FakeSourcePlacementManifest
     fake_weight_transfer.TargetPlacementManifest = FakeTargetPlacementManifest
-    fake_weight_transfer.TransferEngineError = _CompletionUnknownError
+    fake_weight_transfer.TransferCompletionUnknownError = _CompletionUnknownError
+    fake_weight_transfer.TransferEngineError = _TransferEngineError
 
     def bind_runtime_manifest(placement, binding):
         if placement is source_placement_inventory:
@@ -454,6 +462,197 @@ def test_heterogeneous_loader_fails_closed_without_source_manifests(
     )
 
 
+def test_heterogeneous_loader_blocks_world_when_any_rank_is_quarantined(
+    monkeypatch,
+) -> None:
+    gathered = []
+
+    class World:
+        world_size = 2
+
+        def all_gather_object(self, value):
+            gathered.append(value)
+            return [False, True]
+
+    monkeypatch.setattr(loader_module, "get_world_group", lambda: World())
+    monkeypatch.setattr(
+        loader_module,
+        "_HETEROGENEOUS_UNKNOWN_TRANSFER_QUARANTINE",
+        [],
+    )
+    monkeypatch.setattr(
+        loader_module,
+        "RemoteInstanceWeightTransferWorldCoordinator",
+        lambda *args, **kwargs: pytest.fail(
+            "quarantined target world must not acquire a new source lease"
+        ),
+    )
+    loader = RemoteInstanceModelLoader.__new__(RemoteInstanceModelLoader)
+
+    assert (
+        loader.load_model_from_remote_instance_by_transfer_engine_heterogeneous(
+            object(), object(), "http://seed:30000", "target-session", object()
+        )
+        is False
+    )
+    assert gathered == [False]
+
+
+def test_legacy_loader_drains_ticket_before_releasing_target_model(
+    monkeypatch,
+) -> None:
+    events = []
+
+    class Ticket:
+        status = "COMPLETION_UNKNOWN"
+
+        def __init__(self):
+            self.results = iter(("COMPLETION_UNKNOWN", "COMPLETED"))
+
+        def drain(self, timeout_ms):
+            assert timeout_ms > 0
+            events.append(("drain", timeout_ms))
+            return next(self.results)
+
+    class Engine:
+        def batch_transfer_sync_read_with_ticket(self, *args):
+            events.append(("submit", args))
+            return Ticket()
+
+        def batch_transfer_sync_read(self, *args):
+            raise AssertionError("ticket-capable engine must not use legacy sync API")
+
+    tensor = SimpleNamespace(
+        numel=lambda: 4,
+        element_size=lambda: 2,
+        data_ptr=lambda: 0x2000,
+    )
+    model = SimpleNamespace(named_parameters=lambda: [("weight", tensor)])
+    monkeypatch.setattr(
+        loader_module,
+        "get_remote_instance_transfer_engine_info_per_rank",
+        lambda seed_url, tp_rank: (
+            "source-session",
+            {"weight": (0x1000, 4, 2)},
+        ),
+    )
+    monkeypatch.setattr(
+        loader_module,
+        "_post_load_weights",
+        lambda loaded_model: events.append(("post_load", loaded_model)),
+    )
+    loader = RemoteInstanceModelLoader.__new__(RemoteInstanceModelLoader)
+
+    success = loader.load_model_from_remote_instance_by_transfer_engine(
+        model,
+        Engine(),
+        "http://seed:30000",
+        0,
+    )
+
+    assert success is True
+    assert [event[0] for event in events] == [
+        "submit",
+        "drain",
+        "drain",
+        "post_load",
+    ]
+    assert events[-1][1] is model
+
+
+def test_legacy_loader_rejects_failed_drained_ticket(monkeypatch) -> None:
+    class Ticket:
+        status = "FAILED_DRAINED"
+
+    class Engine:
+        def batch_transfer_sync_read_with_ticket(self, *args):
+            return Ticket()
+
+    tensor = SimpleNamespace(
+        numel=lambda: 4,
+        element_size=lambda: 2,
+        data_ptr=lambda: 0x2000,
+    )
+    model = SimpleNamespace(named_parameters=lambda: [("weight", tensor)])
+    monkeypatch.setattr(
+        loader_module,
+        "get_remote_instance_transfer_engine_info_per_rank",
+        lambda seed_url, tp_rank: (
+            "source-session",
+            {"weight": (0x1000, 4, 2)},
+        ),
+    )
+    monkeypatch.setattr(
+        loader_module,
+        "_post_load_weights",
+        lambda loaded_model: pytest.fail("failed transfer must not post-load"),
+    )
+    loader = RemoteInstanceModelLoader.__new__(RemoteInstanceModelLoader)
+
+    assert (
+        loader.load_model_from_remote_instance_by_transfer_engine(
+            model,
+            Engine(),
+            "http://seed:30000",
+            0,
+        )
+        is False
+    )
+
+
+def test_legacy_loader_defers_interrupt_until_ticket_is_drained(monkeypatch) -> None:
+    events = []
+
+    class Ticket:
+        status = "COMPLETION_UNKNOWN"
+
+        def __init__(self):
+            self.drain_count = 0
+
+        def drain(self, timeout_ms):
+            self.drain_count += 1
+            events.append(("drain", self.drain_count))
+            if self.drain_count == 1:
+                raise KeyboardInterrupt
+            return "COMPLETED"
+
+    class Engine:
+        def batch_transfer_sync_read_with_ticket(self, *args):
+            events.append(("submit", args))
+            return Ticket()
+
+    tensor = SimpleNamespace(
+        numel=lambda: 4,
+        element_size=lambda: 2,
+        data_ptr=lambda: 0x2000,
+    )
+    model = SimpleNamespace(named_parameters=lambda: [("weight", tensor)])
+    monkeypatch.setattr(
+        loader_module,
+        "get_remote_instance_transfer_engine_info_per_rank",
+        lambda seed_url, tp_rank: (
+            "source-session",
+            {"weight": (0x1000, 4, 2)},
+        ),
+    )
+    monkeypatch.setattr(
+        loader_module,
+        "_post_load_weights",
+        lambda loaded_model: pytest.fail("interrupted load must not post-load"),
+    )
+    loader = RemoteInstanceModelLoader.__new__(RemoteInstanceModelLoader)
+
+    with pytest.raises(KeyboardInterrupt):
+        loader.load_model_from_remote_instance_by_transfer_engine(
+            model,
+            Engine(),
+            "http://seed:30000",
+            0,
+        )
+
+    assert [event[0] for event in events] == ["submit", "drain", "drain"]
+
+
 def test_heterogeneous_loader_releases_source_snapshot_after_transfer_failure(
     monkeypatch,
 ) -> None:
@@ -502,7 +701,8 @@ def test_heterogeneous_loader_releases_source_snapshot_after_transfer_failure(
     fake_weight_transfer.RuntimeManifest = FailingRuntimeManifest
     fake_weight_transfer.MemoryRegistrationLease = object
     fake_weight_transfer.MooncakeTransferEngineReader = object
-    fake_weight_transfer.TransferEngineError = _CompletionUnknownError
+    fake_weight_transfer.TransferCompletionUnknownError = _CompletionUnknownError
+    fake_weight_transfer.TransferEngineError = _TransferEngineError
     fake_weight_transfer.plan_runtime_transfer_to_local_target = object
     monkeypatch.setitem(sys.modules, "mooncake.weight_transfer", fake_weight_transfer)
     loader = RemoteInstanceModelLoader.__new__(RemoteInstanceModelLoader)
@@ -516,11 +716,29 @@ def test_heterogeneous_loader_releases_source_snapshot_after_transfer_failure(
     assert outcomes == [("ready", False), (False, True)]
 
 
-@pytest.mark.parametrize("error_type", [_CompletionUnknownError, RuntimeError])
-def test_heterogeneous_loader_keeps_source_lease_when_transfer_completion_is_unknown(
-    monkeypatch, error_type
+@pytest.mark.parametrize("drain_mode", ["terminal", "interrupt", "permanent"])
+def test_heterogeneous_loader_drains_unknown_before_releasing_target_and_source(
+    monkeypatch,
+    drain_mode,
 ) -> None:
-    outcomes = []
+    events = []
+    quarantine = []
+    monkeypatch.setattr(
+        loader_module,
+        "_HETEROGENEOUS_UNKNOWN_TRANSFER_QUARANTINE",
+        quarantine,
+    )
+    if drain_mode == "permanent":
+        monkeypatch.setattr(
+            loader_module,
+            "_HETEROGENEOUS_UNKNOWN_DRAIN_MAX_ATTEMPTS",
+            2,
+        )
+        monkeypatch.setattr(
+            loader_module,
+            "_HETEROGENEOUS_UNKNOWN_DRAIN_TIMEOUT_MS",
+            0,
+        )
     source_inventory = {
         "model_id": "Qwen/Qwen3.5-0.8B",
         "revision": "main@generation-1",
@@ -547,12 +765,162 @@ def test_heterogeneous_loader_keeps_source_lease_when_transfer_completion_is_unk
             raise AssertionError("loader must use the fixed readiness gate")
 
         def ready_for_transfer(self, local_ready):
+            events.append(("ready", local_ready))
+            return local_ready
+
+        def finish(self, *, local_success, local_release_safe=True):
+            events.append(("finish", local_success, local_release_safe))
+            return False, local_release_safe
+
+    class FakeRuntimeManifest:
+        @classmethod
+        def from_runtime_inventory(cls, inventory):
+            return SimpleNamespace(**inventory)
+
+    class FakeRegistrationLease:
+        @classmethod
+        def from_fragment(cls, fragment, *, runtime_lease_id=None):
+            return fragment
+
+    class FailingReader:
+        def __init__(self, engine, **kwargs):
+            self.drain_results = iter(("COMPLETION_UNKNOWN", "FAILED_DRAINED"))
+            self.interrupted = False
+
+        def execute(self, *args, **kwargs):
+            assert kwargs["target_pre_registered"] is True
+            events.append("execute")
+            raise _CompletionUnknownError(
+                "completion unknown",
+                pending_transfer_id="pending-1",
+            )
+
+        def drain_pending_transfer(self, pending_transfer_id, *, timeout_ms):
+            assert pending_transfer_id == "pending-1"
+            assert timeout_ms >= 0
+            assert events[-1] != "target-close"
+            if drain_mode == "interrupt" and not self.interrupted:
+                self.interrupted = True
+                events.append(("drain-error", "KeyboardInterrupt"))
+                raise KeyboardInterrupt
+            if drain_mode == "permanent":
+                events.append(("drain", "COMPLETION_UNKNOWN"))
+                return "COMPLETION_UNKNOWN"
+            result = next(self.drain_results)
+            events.append(("drain", result))
+            return result
+
+    fake_weight_transfer = ModuleType("mooncake.weight_transfer")
+    fake_weight_transfer.MemoryRegistrationLease = FakeRegistrationLease
+    fake_weight_transfer.MooncakeTransferEngineReader = FailingReader
+    fake_weight_transfer.RuntimeManifest = FakeRuntimeManifest
+    fake_weight_transfer.TransferCompletionUnknownError = _CompletionUnknownError
+    fake_weight_transfer.TransferEngineError = _TransferEngineError
+    fake_weight_transfer.plan_runtime_transfer_to_local_target = (
+        lambda sources, target: object()
+    )
+    monkeypatch.setitem(sys.modules, "mooncake.weight_transfer", fake_weight_transfer)
+    monkeypatch.setattr(
+        loader_module,
+        "RemoteInstanceWeightTransferWorldCoordinator",
+        FakeCoordinator,
+    )
+    monkeypatch.setattr(loader_module, "get_world_group", lambda: object())
+
+    @contextlib.contextmanager
+    def target_builder(**kwargs):
+        events.append("target-open")
+        try:
+            yield target_inventory
+        finally:
+            events.append("target-close")
+
+    loader = RemoteInstanceModelLoader.__new__(RemoteInstanceModelLoader)
+    target_model = object()
+
+    def load():
+        return loader.load_model_from_remote_instance_by_transfer_engine_heterogeneous(
+            target_model,
+            object(),
+            "http://seed:30000",
+            "target-session",
+            target_builder,
+        )
+
+    if drain_mode == "interrupt":
+        with pytest.raises(KeyboardInterrupt):
+            load()
+    else:
+        assert load() is False
+
+    expected_events = [
+        "target-open",
+        ("ready", True),
+        "execute",
+    ]
+    if drain_mode == "interrupt":
+        expected_events.append(("drain-error", "KeyboardInterrupt"))
+    if drain_mode == "permanent":
+        expected_events.extend(
+            [
+                ("drain", "COMPLETION_UNKNOWN"),
+                ("drain", "COMPLETION_UNKNOWN"),
+                ("finish", False, False),
+            ]
+        )
+    else:
+        expected_events.extend(
+            [
+                ("drain", "COMPLETION_UNKNOWN"),
+                ("drain", "FAILED_DRAINED"),
+                "target-close",
+                ("finish", False, True),
+            ]
+        )
+    assert events == expected_events
+    if drain_mode == "permanent":
+        assert len(quarantine) == 1
+        assert quarantine[0].pending_transfer_id == "pending-1"
+        assert target_model in quarantine[0].owners
+        quarantine[0].resources.close()
+        assert events[-1] == "target-close"
+        quarantine.clear()
+
+
+@pytest.mark.parametrize("error_type", [_TransferEngineError, RuntimeError])
+def test_heterogeneous_loader_releases_source_after_known_transfer_failure(
+    monkeypatch, error_type
+) -> None:
+    outcomes = []
+    source_inventory = {
+        "model_id": "Qwen/Qwen3.5-0.8B",
+        "revision": "main@generation-1",
+        "lease_id": "source-runtime-lease",
+        "fragments": [SimpleNamespace(fragment_id="source-fragment")],
+    }
+    target_inventory = {
+        "model_id": source_inventory["model_id"],
+        "revision": source_inventory["revision"],
+        "lease_id": "target-runtime-lease",
+        "fragments": [SimpleNamespace(fragment_id="target-fragment")],
+    }
+
+    class FakeCoordinator:
+        def __init__(self, seed_url, world_group):
+            pass
+
+        def acquire(self):
+            return SimpleNamespace(
+                transfer_id="transfer-1", manifests=[source_inventory]
+            )
+
+        def ready_for_transfer(self, local_ready):
             outcomes.append(("ready", local_ready))
             return local_ready
 
         def finish(self, *, local_success, local_release_safe=True):
             outcomes.append((local_success, local_release_safe))
-            return False, False
+            return False, local_release_safe
 
     class FakeRuntimeManifest:
         @classmethod
@@ -569,13 +937,14 @@ def test_heterogeneous_loader_keeps_source_lease_when_transfer_completion_is_unk
             pass
 
         def execute(self, *args, **kwargs):
-            raise error_type("completion unknown")
+            raise error_type("known failure")
 
     fake_weight_transfer = ModuleType("mooncake.weight_transfer")
     fake_weight_transfer.MemoryRegistrationLease = FakeRegistrationLease
     fake_weight_transfer.MooncakeTransferEngineReader = FailingReader
     fake_weight_transfer.RuntimeManifest = FakeRuntimeManifest
-    fake_weight_transfer.TransferEngineError = _CompletionUnknownError
+    fake_weight_transfer.TransferCompletionUnknownError = _CompletionUnknownError
+    fake_weight_transfer.TransferEngineError = _TransferEngineError
     fake_weight_transfer.plan_runtime_transfer_to_local_target = (
         lambda sources, target: object()
     )
@@ -603,7 +972,7 @@ def test_heterogeneous_loader_keeps_source_lease_when_transfer_completion_is_unk
         )
         is False
     )
-    assert outcomes == [("ready", True), (False, False)]
+    assert outcomes == [("ready", True), (False, True)]
 
 
 def test_heterogeneous_loader_fails_closed_when_heartbeat_fails_during_transfer(
@@ -668,7 +1037,8 @@ def test_heterogeneous_loader_fails_closed_when_heartbeat_fails_during_transfer(
     )
     fake_weight_transfer.MooncakeTransferEngineReader = FakeReader
     fake_weight_transfer.RuntimeManifest = FakeRuntimeManifest
-    fake_weight_transfer.TransferEngineError = _CompletionUnknownError
+    fake_weight_transfer.TransferCompletionUnknownError = _CompletionUnknownError
+    fake_weight_transfer.TransferEngineError = _TransferEngineError
     fake_weight_transfer.plan_runtime_transfer_to_local_target = (
         lambda sources, target: object()
     )

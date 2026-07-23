@@ -6,6 +6,7 @@ import logging
 import math
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 from typing import Any, List
 
@@ -164,22 +165,11 @@ class RemoteInstanceWeightTransferWorldCoordinator:
                     self.heartbeat.start()
                 except Exception:
                     logger.exception("Failed to start remote weight transfer heartbeat")
-                    try:
-                        released = release_remote_instance_weight_transfer(
-                            self.seed_url, local_session.transfer_id
-                        )
-                        if not released:
-                            logger.error(
-                                "Failed to clean up the source weight transfer after "
-                                "heartbeat startup; source mutation remains blocked "
-                                "until explicit release or recovery"
-                            )
-                    except Exception:
-                        logger.exception(
-                            "Failed to clean up the source weight transfer after "
-                            "heartbeat startup; source mutation remains blocked "
-                            "until explicit release or recovery"
-                        )
+                    _best_effort_release_invalid_transfer(
+                        self.seed_url,
+                        local_session.transfer_id,
+                        attempts=3,
+                    )
                     self.heartbeat = None
                     local_session = None
 
@@ -189,7 +179,9 @@ class RemoteInstanceWeightTransferWorldCoordinator:
             self._stop_heartbeat()
             if self.is_owner and local_session is not None:
                 _best_effort_release_invalid_transfer(
-                    self.seed_url, local_session.transfer_id
+                    self.seed_url,
+                    local_session.transfer_id,
+                    attempts=3,
                 )
             logger.exception("Failed to broadcast the source weight transfer session")
             raise
@@ -479,24 +471,39 @@ def _unsupported_manifest_format_response(response) -> bool:
     return names_format and rejects_format
 
 
-def _best_effort_release_invalid_transfer(seed_url: str, transfer_id: str) -> None:
-    try:
-        released = release_remote_instance_weight_transfer(seed_url, transfer_id)
-        if not released:
-            logger.error(
-                "Failed to clean up invalid remote weight transfer %s; source "
-                "mutation remains blocked until explicit release or recovery",
+def _best_effort_release_invalid_transfer(
+    seed_url: str,
+    transfer_id: str,
+    *,
+    attempts: int = 1,
+) -> bool:
+    for _ in range(attempts):
+        try:
+            if release_remote_instance_weight_transfer(seed_url, transfer_id):
+                return True
+        except Exception:
+            logger.exception(
+                "Failed to clean up invalid remote weight transfer %s",
                 transfer_id,
             )
-    except Exception:
-        logger.exception(
-            "Failed to clean up invalid remote weight transfer %s; source mutation "
-            "remains blocked until explicit release or recovery",
-            transfer_id,
-        )
+    logger.error(
+        "Failed to clean up invalid remote weight transfer %s; source mutation "
+        "remains blocked until explicit release or recovery",
+        transfer_id,
+    )
+    return False
 
 
-def begin_remote_instance_weight_transfer(seed_url: str, lease_timeout_sec: int = 300):
+def begin_remote_instance_weight_transfer(
+    seed_url: str,
+    lease_timeout_sec: int = 300,
+    *,
+    transfer_id: str | None = None,
+):
+    if transfer_id is None:
+        transfer_id = uuid.uuid4().hex
+    if not isinstance(transfer_id, str) or not transfer_id:
+        raise ValueError("transfer_id must be a non-empty string")
     manifest_format = (
         "placement_binding_v1"
         if supports_mooncake_placement_binding_v1()
@@ -504,32 +511,41 @@ def begin_remote_instance_weight_transfer(seed_url: str, lease_timeout_sec: int 
     )
     allow_runtime_fallback = manifest_format == "placement_binding_v1"
 
-    for attempt in range(2):
-        transfer_id = None
+    for attempt in range(3):
         try:
             response = requests.post(
                 f"{seed_url}/remote_instance_weight_transfer",
                 params={
                     "lease_timeout_sec": lease_timeout_sec,
                     "manifest_format": manifest_format,
+                    "transfer_id": transfer_id,
                 },
                 timeout=30,
             )
             if response.status_code != 200:
                 try:
                     error_payload = response.json()
-                    transfer_id = error_payload.get("transfer_id")
+                    response_transfer_id = error_payload.get("transfer_id")
+                    response_session_state = error_payload.get("session_state")
                 except Exception:
-                    transfer_id = None
-                if transfer_id:
-                    _best_effort_release_invalid_transfer(seed_url, transfer_id)
+                    response_transfer_id = None
+                    response_session_state = None
+                if response_transfer_id == transfer_id and response_session_state in {
+                    "created",
+                    "cleanup_pending",
+                }:
+                    _best_effort_release_invalid_transfer(
+                        seed_url,
+                        response_transfer_id,
+                        attempts=3,
+                    )
                 if (
-                    attempt == 0
-                    and allow_runtime_fallback
-                    and transfer_id is None
+                    allow_runtime_fallback
+                    and response_transfer_id is None
                     and _unsupported_manifest_format_response(response)
                 ):
                     manifest_format = "runtime_v1"
+                    allow_runtime_fallback = False
                     continue
                 logger.error(
                     "Failed to begin remote weight transfer: %s: %s",
@@ -539,7 +555,24 @@ def begin_remote_instance_weight_transfer(seed_url: str, lease_timeout_sec: int 
                 return None
 
             payload = response.json()
-            transfer_id = payload.get("transfer_id")
+            response_transfer_id = payload.get("transfer_id")
+            if response_transfer_id != transfer_id:
+                if response_transfer_id:
+                    _best_effort_release_invalid_transfer(
+                        seed_url,
+                        response_transfer_id,
+                    )
+                _best_effort_release_invalid_transfer(
+                    seed_url,
+                    transfer_id,
+                    attempts=3,
+                )
+                logger.error(
+                    "Remote instance returned a different transfer ID: %r != %r",
+                    response_transfer_id,
+                    transfer_id,
+                )
+                return None
             manifests = payload.get("weight_runtime_manifests") or []
             source_placements = payload.get("source_weight_placements")
             source_bindings = payload.get("source_weight_runtime_bindings")
@@ -562,18 +595,18 @@ def begin_remote_instance_weight_transfer(seed_url: str, lease_timeout_sec: int 
                 actual_manifest_format = "runtime_v1"
                 source_placements = None
                 source_bindings = None
-            payload_valid = (
-                bool(transfer_id)
-                and lease_timeout_valid
-                and (
-                    bool(manifests)
-                    if actual_manifest_format == "runtime_v1"
-                    else split_manifest_valid
-                )
+            payload_valid = lease_timeout_valid and (
+                bool(manifests)
+                if actual_manifest_format == "runtime_v1"
+                else split_manifest_valid
             )
             if not payload_valid:
                 if transfer_id:
-                    _best_effort_release_invalid_transfer(seed_url, transfer_id)
+                    _best_effort_release_invalid_transfer(
+                        seed_url,
+                        transfer_id,
+                        attempts=3,
+                    )
                 logger.error("Remote instance returned an incomplete transfer session.")
                 return None
 
@@ -587,8 +620,13 @@ def begin_remote_instance_weight_transfer(seed_url: str, lease_timeout_sec: int 
             )
         except Exception as error:
             logger.error("Failed to begin remote weight transfer: %s", error)
-            if transfer_id:
-                _best_effort_release_invalid_transfer(seed_url, transfer_id)
+            if attempt + 1 < 3:
+                continue
+            _best_effort_release_invalid_transfer(
+                seed_url,
+                transfer_id,
+                attempts=3,
+            )
             return None
 
     return None

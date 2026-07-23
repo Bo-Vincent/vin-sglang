@@ -1680,6 +1680,7 @@ class BeginRemoteInstanceWeightTransferReqOutput(BaseReq, kw_only=True):
     transfer_id: str
     success: bool
     message: str
+    session_state: str = "unknown"
     manifests: Optional[List[Dict[str, Any]]] = None
     placements: Optional[List[Dict[str, Any]]] = None
     bindings: Optional[List[Dict[str, Any]]] = None
