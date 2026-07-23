@@ -168,16 +168,24 @@ pub async fn chat_completions(
         .as_ref()
         .and_then(|v| request_tokens_for(&ctx.tokenizers, &model_id, v));
 
-    // Sticky-session routing key. When the sticky policy is configured,
-    // read the routing key from the operator-chosen header into the
-    // selection context; the policy pins it to a worker. Other policies
-    // leave `routing_key` `None` and ignore it.
-    let routing_key = ctx
+    // Affinity routing key. Session-Aware and legacy Sticky each read their
+    // operator-chosen header into the selection context; other policies leave
+    // `routing_key` unset.
+    let routing_header = ctx
         .config
         .model
-        .sticky
+        .session_aware
         .as_ref()
-        .and_then(|s| headers.get(s.header_name.as_str()))
+        .map(|config| config.header_name.as_str())
+        .or_else(|| {
+            ctx.config
+                .model
+                .sticky
+                .as_ref()
+                .map(|config| config.header_name.as_str())
+        });
+    let routing_key = routing_header
+        .and_then(|header| headers.get(header))
         .and_then(|v| v.to_str().ok())
         .filter(|s| !s.is_empty());
     let selection_ctx = SelectionContext::with_routing_key(&model_id, Some(&body), routing_key)

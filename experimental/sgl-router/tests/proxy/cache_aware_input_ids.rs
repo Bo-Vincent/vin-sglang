@@ -53,6 +53,8 @@ fn config() -> Config {
             policy: PolicyKind::CacheAwareZmq,
             circuit_breaker: None,
             cache_aware: Some(CacheAwareConfig::default()),
+            bounded_cache_aware: None,
+            session_aware: None,
             sticky: None,
         },
         discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
@@ -86,6 +88,7 @@ fn build_ctx(url: String) -> Arc<AppContext> {
             Arc::new(HashTree::new()),
             Arc::clone(&tokenizers),
             BlockSizeOracle::new(),
+            sgl_router::policies::active_load::ActiveLoadRegistry::with_defaults(),
         )
         .unwrap(),
     );

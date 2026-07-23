@@ -70,7 +70,8 @@ impl Default for ActiveLoadConfig {
 /// policy factory.
 ///
 /// Accepted on the CLI (`--policy`) as `round_robin` / `random` /
-/// `power_of_two` / `load_based` / `cache_aware_zmq` / `sticky`.
+/// `power_of_two` / `load_based` / `session_aware` / `cache_aware` /
+/// `cache_aware_zmq` / `sticky`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 pub enum PolicyKind {
     #[default]
@@ -83,6 +84,12 @@ pub enum PolicyKind {
     /// Selects the currently least-loaded worker.
     #[value(name = "load_based")]
     LoadBased,
+    /// Session-ID affinity with an optional bounded-load escape.
+    #[value(name = "session_aware")]
+    SessionAware,
+    /// Prefix-cache affinity with bounded primary/backup selection.
+    #[value(name = "cache_aware")]
+    CacheAware,
     /// Cache-aware routing fed by SGLang's ZMQ KV-cache event publisher.
     /// Requires the model to have a tokenizer loaded; cache_aware tuning
     /// lives on `ModelConfig::cache_aware`.
@@ -150,11 +157,77 @@ pub struct ModelConfig {
     /// `policy = "cache_aware_zmq"`. `None` falls back to defaults at
     /// policy construction time.
     pub cache_aware: Option<CacheAwareConfig>,
+    /// Tuning for the new bounded Cache-Aware policy. `Some` exactly when
+    /// `policy = "cache_aware"`; the existing `cache_aware_zmq` policy keeps
+    /// using `cache_aware` above and is not changed by these knobs.
+    pub bounded_cache_aware: Option<BoundedCacheAwareConfig>,
+    /// Tuning for the new Session-Aware policy. `Some` exactly when
+    /// `policy = "session_aware"`.
+    pub session_aware: Option<SessionAwareConfig>,
     /// Tuning for the sticky-session policy. `Some` exactly when
     /// `policy = "sticky"` (built by [`crate::config::cli::Cli::into_config`]).
-    /// The chat handler reads `sticky.header_name` to populate
-    /// [`crate::policies::SelectionContext::routing_key`].
+    /// The chat handler reads this header when `sticky` is selected; the new
+    /// Session-Aware policy analogously reads `session_aware.header_name`.
     pub sticky: Option<StickyConfig>,
+}
+
+/// Shared bounded-affinity defaults used by the new policies.
+pub fn default_affinity_pressure_abs_threshold() -> usize {
+    8192
+}
+
+pub fn default_affinity_pressure_rel_threshold() -> f32 {
+    1.5
+}
+
+/// New bounded Cache-Aware policy tuning.
+#[derive(Debug, Clone, Copy)]
+pub struct BoundedCacheAwareConfig {
+    pub stable_pair: bool,
+    pub cache_benefit: bool,
+    pub pressure_guard: bool,
+    pub pressure_abs_threshold: usize,
+    pub pressure_rel_threshold: f32,
+}
+
+impl Default for BoundedCacheAwareConfig {
+    fn default() -> Self {
+        Self {
+            stable_pair: false,
+            cache_benefit: true,
+            pressure_guard: true,
+            pressure_abs_threshold: default_affinity_pressure_abs_threshold(),
+            pressure_rel_threshold: default_affinity_pressure_rel_threshold(),
+        }
+    }
+}
+
+/// Header and bounded-load behavior for the new Session-Aware policy.
+#[derive(Debug, Clone)]
+pub struct SessionAwareConfig {
+    pub header_name: String,
+    pub strict: bool,
+    pub stable_pair: bool,
+    pub pressure_guard: bool,
+    pub pressure_abs_threshold: usize,
+    pub pressure_rel_threshold: f32,
+    pub idle_secs: u64,
+    pub eviction_interval_secs: u64,
+}
+
+impl Default for SessionAwareConfig {
+    fn default() -> Self {
+        Self {
+            header_name: "x-sgl-session-id".to_string(),
+            strict: false,
+            stable_pair: false,
+            pressure_guard: true,
+            pressure_abs_threshold: default_affinity_pressure_abs_threshold(),
+            pressure_rel_threshold: default_affinity_pressure_rel_threshold(),
+            idle_secs: 600,
+            eviction_interval_secs: 60,
+        }
+    }
 }
 
 /// Per-model cache-aware-ZMQ tuning.

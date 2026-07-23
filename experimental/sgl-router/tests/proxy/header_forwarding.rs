@@ -33,6 +33,8 @@ async fn forwards_whitelisted_headers_strips_others() {
             policy: PolicyKind::RoundRobin,
             circuit_breaker: None,
             cache_aware: None,
+            bounded_cache_aware: None,
+            session_aware: None,
             sticky: None,
         },
         discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {

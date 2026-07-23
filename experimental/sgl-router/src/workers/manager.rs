@@ -480,6 +480,8 @@ mod tests {
                     cool_down_secs,
                 }),
                 cache_aware: None,
+                bounded_cache_aware: None,
+                session_aware: None,
                 sticky: None,
             },
             discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {

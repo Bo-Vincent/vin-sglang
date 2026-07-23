@@ -32,6 +32,7 @@
 //! | `sgl_router_stale_requests_total` | Counter | `outcome` |
 //! | `sgl_router_decode_affinity_total` | Counter | `outcome` |
 //! | `sgl_router_sticky_total` | Counter | `outcome` |
+//! | `sgl_router_policy_decisions_total` | Counter | `policy`, `reason` |
 //! | `sgl_router_ingress_tokenize_errors_total` | Counter | `model_id` |
 //!
 //! The four `sgl_router_worker*` gauges and `sgl_router_workers` are sampled
@@ -224,6 +225,7 @@ pub struct MetricsRegistry {
     stale_requests_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
     decode_affinity_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
     sticky_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
+    policy_decisions_total: Mutex<HashMap<(&'static str, &'static str), Arc<AtomicU64>>>,
     ingress_tokenize_errors_total: Mutex<HashMap<String, Arc<AtomicU64>>>,
 }
 
@@ -475,6 +477,20 @@ impl MetricsRegistry {
         let mut guard = self.sticky_total.lock();
         let counter = guard
             .entry(outcome.as_str())
+            .or_insert_with(|| Arc::new(AtomicU64::new(0)))
+            .clone();
+        drop(guard);
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Bump `sgl_router_policy_decisions_total{policy,reason}`.
+    ///
+    /// Both labels come from fixed policy code paths; request/session values
+    /// and worker URLs are deliberately excluded to keep cardinality bounded.
+    pub fn record_policy_decision(&self, policy: &'static str, reason: &'static str) {
+        let mut guard = self.policy_decisions_total.lock();
+        let counter = guard
+            .entry((policy, reason))
             .or_insert_with(|| Arc::new(AtomicU64::new(0)))
             .clone();
         drop(guard);
@@ -785,6 +801,25 @@ impl MetricsRegistry {
         }
         drop(guard);
 
+        // policy_decisions_total
+        out.push_str(
+            "# HELP sgl_router_policy_decisions_total Final worker-selection decisions from bounded affinity policies.\n",
+        );
+        out.push_str("# TYPE sgl_router_policy_decisions_total counter\n");
+        let guard = self.policy_decisions_total.lock();
+        let mut entries: Vec<(&(&str, &str), u64)> = guard
+            .iter()
+            .map(|(key, value)| (key, value.load(Ordering::Relaxed)))
+            .collect();
+        entries.sort_by_key(|entry| *entry.0);
+        for ((policy, reason), value) in entries {
+            out.push_str(&format!(
+                "sgl_router_policy_decisions_total{{policy=\"{}\",reason=\"{}\"}} {}\n",
+                policy, reason, value,
+            ));
+        }
+        drop(guard);
+
         // ingress_tokenize_errors_total
         out.push_str(
             "# HELP sgl_router_ingress_tokenize_errors_total Chat requests on a chat-encoder model whose ingress tokenization failed, silently falling back to engine-side tokenization (the input_ids offload was defeated).\n",
@@ -870,12 +905,29 @@ mod tests {
         assert!(out.contains("# TYPE sgl_router_stale_requests_total counter"));
         assert!(out.contains("# TYPE sgl_router_decode_affinity_total counter"));
         assert!(out.contains("# TYPE sgl_router_sticky_total counter"));
+        assert!(out.contains("# TYPE sgl_router_policy_decisions_total counter"));
         assert!(out.contains("# TYPE sgl_router_ingress_tokenize_errors_total counter"));
         // Pool-size series exist (at 0) for all three modes even with no
         // workers, so dashboards have a stable series to graph.
         assert!(out.contains(r#"sgl_router_workers{mode="plain"} 0"#));
         assert!(out.contains(r#"sgl_router_workers{mode="prefill"} 0"#));
         assert!(out.contains(r#"sgl_router_workers{mode="decode"} 0"#));
+    }
+
+    #[test]
+    fn policy_decisions_are_counted_by_policy_and_reason() {
+        let reg = MetricsRegistry::new();
+        reg.record_policy_decision("session_aware", "session_primary");
+        reg.record_policy_decision("session_aware", "session_primary");
+        reg.record_policy_decision("cache_aware", "cache_benefit");
+
+        let out = reg.render();
+        assert!(out.contains(
+            r#"sgl_router_policy_decisions_total{policy="cache_aware",reason="cache_benefit"} 1"#
+        ));
+        assert!(out.contains(
+            r#"sgl_router_policy_decisions_total{policy="session_aware",reason="session_primary"} 2"#
+        ));
     }
 
     #[test]

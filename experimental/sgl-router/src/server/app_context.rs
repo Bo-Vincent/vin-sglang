@@ -26,9 +26,9 @@ pub struct AppContext {
     pub active_load: Arc<ActiveLoadRegistry>,
     /// Lightweight Prometheus-format metrics registry served via
     /// `/metrics`. Shared with the chat handler (requests_total),
-    /// cache-aware-zmq policy (overlap_blocks), active-load registry
-    /// (active_load gauge + stale_requests_total), and PD resolver
-    /// (decode_affinity_total).
+    /// affinity policies (decision reasons), cache-aware-zmq policy
+    /// (overlap_blocks), active-load registry (active_load gauge +
+    /// stale_requests_total), and PD resolver (decode_affinity_total).
     pub metrics: Arc<MetricsRegistry>,
     ready: AtomicBool,
 }
@@ -52,9 +52,8 @@ impl AppContext {
     }
 
     /// Construct an [`AppContext`] with an explicit [`ActiveLoadRegistry`].
-    /// Production wires the default (5-minute timeout, SystemTimeClock)
-    /// via [`Self::new`]; tests that exercise the janitor pass a registry
-    /// built with a `MockClock`.
+    /// Production passes the same registry used to build affinity policies;
+    /// tests that do not inspect load sharing may use [`Self::new`].
     pub fn with_active_load(
         config: Config,
         tokenizers: Arc<TokenizerRegistry>,
@@ -69,10 +68,9 @@ impl AppContext {
         // Without this, the metric is permanently 0 in production even
         // though the chat handler is faithfully calling `register`.
         active_load.attach_metrics(Arc::clone(&metrics));
-        // Same rationale for the cache-aware-zmq policy's
-        // `sgl_router_overlap_blocks`: the metrics registry is built here,
-        // after the policy registry, so inject it now. No-op for policies
-        // that don't emit metrics.
+        // The metrics registry is built after the policy registry, so inject
+        // it here for cache overlap and affinity-decision counters. No-op for
+        // policies that do not emit metrics.
         policies.attach_metrics(Arc::clone(&metrics));
         Self {
             config,
@@ -111,6 +109,8 @@ impl AppContext {
                     policy: crate::config::PolicyKind::RoundRobin,
                     circuit_breaker: None,
                     cache_aware: None,
+                    bounded_cache_aware: None,
+                    session_aware: None,
                     sticky: None,
                 },
                 discovery: crate::config::DiscoveryBackend::StaticUrls(

@@ -4,12 +4,15 @@
 use crate::config::{Config, ModelConfig, PolicyKind};
 use crate::discovery::ModelId;
 use crate::policies::{
+    active_load::ActiveLoadRegistry,
+    cache_aware::CacheAwarePolicy,
     cache_aware_zmq::CacheAwareZmqPolicy,
     kv_events::{BlockSizeOracle, HashTree},
     load_based::LoadBasedPolicy,
     power_of_two::PowerOfTwoChoicesPolicy,
     random::RandomPolicy,
     round_robin::RoundRobinPolicy,
+    session_aware::SessionAwarePolicy,
     sticky::StickyPolicy,
     Policy, PolicyRegistry,
 };
@@ -28,7 +31,10 @@ fn build_sticky_fallback(kind: PolicyKind) -> Arc<dyn Policy> {
         PolicyKind::Random => Arc::new(RandomPolicy::new()),
         PolicyKind::PowerOfTwo => Arc::new(PowerOfTwoChoicesPolicy::new()),
         PolicyKind::LoadBased => Arc::new(LoadBasedPolicy::new()),
-        PolicyKind::CacheAwareZmq | PolicyKind::Sticky => {
+        PolicyKind::SessionAware
+        | PolicyKind::CacheAware
+        | PolicyKind::CacheAwareZmq
+        | PolicyKind::Sticky => {
             unreachable!("sticky fallback is validated to be dependency-free in Cli::into_config")
         }
     }
@@ -49,21 +55,32 @@ fn build_sticky(model: &ModelConfig) -> Arc<dyn Policy> {
 /// Construct a policy for a single model from its [`ModelConfig`] and the
 /// process-shared `HashTree` + `TokenizerRegistry` + `BlockSizeOracle`.
 ///
-/// The tree, tokenizer registry, and oracle are only consulted by the
-/// cache-aware-zmq variant; other policies ignore them. Callers building
-/// all policies for the same process pass the same instances to every
-/// model.
+/// The tree, tokenizer registry, and oracle are consulted by both
+/// cache-aware variants. Callers pass shared instances together with the
+/// shared active-load registry.
 pub fn build_policy(
     model: &ModelConfig,
     tree: Arc<HashTree>,
     tokenizers: Arc<TokenizerRegistry>,
     block_size_oracle: Arc<BlockSizeOracle>,
+    active_load: Arc<ActiveLoadRegistry>,
 ) -> Arc<dyn Policy> {
     match model.policy {
         PolicyKind::RoundRobin => Arc::new(RoundRobinPolicy::new()),
         PolicyKind::Random => Arc::new(RandomPolicy::new()),
         PolicyKind::PowerOfTwo => Arc::new(PowerOfTwoChoicesPolicy::new()),
         PolicyKind::LoadBased => Arc::new(LoadBasedPolicy::new()),
+        PolicyKind::SessionAware => Arc::new(SessionAwarePolicy::new(
+            model.session_aware.clone().unwrap_or_default(),
+            active_load,
+        )),
+        PolicyKind::CacheAware => Arc::new(CacheAwarePolicy::new(
+            model.bounded_cache_aware.unwrap_or_default(),
+            tree,
+            tokenizers,
+            block_size_oracle,
+            active_load,
+        )),
         PolicyKind::CacheAwareZmq => {
             let cache_cfg = model.cache_aware.unwrap_or_default();
             Arc::new(CacheAwareZmqPolicy::new(
@@ -77,10 +94,7 @@ pub fn build_policy(
     }
 }
 
-/// Compatibility shim used by tests + non-cache-aware code paths. Builds
-/// a policy without wiring the cache-aware dependencies; rejects
-/// `CacheAwareZmq` to keep the call sites that don't have a `HashTree` /
-/// `TokenizerRegistry` to hand from accidentally compiling.
+/// Test-only constructor that supplies empty process dependencies.
 #[cfg(test)]
 pub fn build_policy_kind_only(kind: PolicyKind) -> Arc<dyn Policy> {
     match kind {
@@ -88,6 +102,17 @@ pub fn build_policy_kind_only(kind: PolicyKind) -> Arc<dyn Policy> {
         PolicyKind::Random => Arc::new(RandomPolicy::new()),
         PolicyKind::PowerOfTwo => Arc::new(PowerOfTwoChoicesPolicy::new()),
         PolicyKind::LoadBased => Arc::new(LoadBasedPolicy::new()),
+        PolicyKind::SessionAware => Arc::new(SessionAwarePolicy::new(
+            crate::config::SessionAwareConfig::default(),
+            ActiveLoadRegistry::with_defaults(),
+        )),
+        PolicyKind::CacheAware => Arc::new(CacheAwarePolicy::new(
+            crate::config::BoundedCacheAwareConfig::default(),
+            Arc::new(HashTree::new()),
+            Arc::new(TokenizerRegistry::default()),
+            BlockSizeOracle::new(),
+            ActiveLoadRegistry::with_defaults(),
+        )),
         PolicyKind::CacheAwareZmq => {
             // Provide an empty tree + empty tokenizer registry + fresh
             // oracle so the test policy is constructible. Production
@@ -116,6 +141,7 @@ pub fn build_registry(
     tree: Arc<HashTree>,
     tokenizers: Arc<TokenizerRegistry>,
     block_size_oracle: Arc<BlockSizeOracle>,
+    active_load: Arc<ActiveLoadRegistry>,
 ) -> Result<PolicyRegistry> {
     let reg = PolicyRegistry::default();
     let m = &cfg.model;
@@ -126,6 +152,7 @@ pub fn build_registry(
             Arc::clone(&tree),
             Arc::clone(&tokenizers),
             Arc::clone(&block_size_oracle),
+            active_load,
         ),
     );
     Ok(reg)
@@ -133,9 +160,8 @@ pub fn build_registry(
 
 /// Convenience for tests + non-cache-aware callers: builds a registry with
 /// a fresh, empty `HashTree` and an empty `TokenizerRegistry`. The
-/// cache-aware-zmq policy will then degrade to min-load (no tokenizer +
-/// no worker-published block size → fallback) — which is exactly what
-/// the legacy tests assume.
+/// cache-aware policies then degrade through their normal missing-signal
+/// fallbacks, which is what dependency-free tests expect.
 ///
 /// Production callers go through [`build_registry`] with the real
 /// process-shared instances.
@@ -145,6 +171,7 @@ pub fn build_registry_with_defaults(cfg: &Config) -> Result<PolicyRegistry> {
         Arc::new(HashTree::new()),
         Arc::new(TokenizerRegistry::default()),
         BlockSizeOracle::new(),
+        ActiveLoadRegistry::with_defaults(),
     )
 }
 
@@ -171,6 +198,8 @@ mod tests {
                 policy,
                 circuit_breaker: None,
                 cache_aware: None,
+                bounded_cache_aware: None,
+                session_aware: None,
                 sticky: None,
             },
             discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
@@ -188,6 +217,8 @@ mod tests {
         let _ = build_policy_kind_only(PolicyKind::Random);
         let _ = build_policy_kind_only(PolicyKind::PowerOfTwo);
         let _ = build_policy_kind_only(PolicyKind::LoadBased);
+        let _ = build_policy_kind_only(PolicyKind::SessionAware);
+        let _ = build_policy_kind_only(PolicyKind::CacheAware);
         let _ = build_policy_kind_only(PolicyKind::CacheAwareZmq);
         let _ = build_policy_kind_only(PolicyKind::Sticky);
     }
@@ -197,7 +228,14 @@ mod tests {
         let cfg = cfg_with_model("qwen", PolicyKind::RoundRobin);
         let tree = Arc::new(HashTree::new());
         let tokenizers = Arc::new(TokenizerRegistry::default());
-        let reg = build_registry(&cfg, tree, tokenizers, BlockSizeOracle::new()).unwrap();
+        let reg = build_registry(
+            &cfg,
+            tree,
+            tokenizers,
+            BlockSizeOracle::new(),
+            ActiveLoadRegistry::with_defaults(),
+        )
+        .unwrap();
         assert!(reg.get(&ModelId("qwen".into())).is_some());
         assert!(reg.get(&ModelId("missing".into())).is_none());
     }
@@ -207,7 +245,14 @@ mod tests {
         let cfg = cfg_with_model("modelA", PolicyKind::CacheAwareZmq);
         let tree = Arc::new(HashTree::new());
         let tokenizers = Arc::new(TokenizerRegistry::default());
-        let reg = build_registry(&cfg, tree, tokenizers, BlockSizeOracle::new()).unwrap();
+        let reg = build_registry(
+            &cfg,
+            tree,
+            tokenizers,
+            BlockSizeOracle::new(),
+            ActiveLoadRegistry::with_defaults(),
+        )
+        .unwrap();
         let p = reg.get(&ModelId("modelA".into())).unwrap();
         // Down-cast probe via Debug — cheaper than carrying a type-tag
         // on the trait. Pinning the debug repr is fine because the field
@@ -220,11 +265,36 @@ mod tests {
     }
 
     #[test]
+    fn session_aware_builds_via_factory() {
+        let cfg = cfg_with_model("modelA", PolicyKind::SessionAware);
+        let reg = build_registry_with_defaults(&cfg).unwrap();
+        let policy = reg.get(&ModelId("modelA".into())).unwrap();
+
+        assert!(format!("{policy:?}").contains("SessionAwarePolicy"));
+    }
+
+    #[test]
+    fn bounded_cache_aware_builds_via_factory() {
+        let cfg = cfg_with_model("modelA", PolicyKind::CacheAware);
+        let reg = build_registry_with_defaults(&cfg).unwrap();
+        let policy = reg.get(&ModelId("modelA".into())).unwrap();
+
+        assert!(format!("{policy:?}").contains("CacheAwarePolicy"));
+    }
+
+    #[test]
     fn load_based_builds_via_factory() {
         let cfg = cfg_with_model("modelA", PolicyKind::LoadBased);
         let tree = Arc::new(HashTree::new());
         let tokenizers = Arc::new(TokenizerRegistry::default());
-        let reg = build_registry(&cfg, tree, tokenizers, BlockSizeOracle::new()).unwrap();
+        let reg = build_registry(
+            &cfg,
+            tree,
+            tokenizers,
+            BlockSizeOracle::new(),
+            ActiveLoadRegistry::with_defaults(),
+        )
+        .unwrap();
         let p = reg.get(&ModelId("modelA".into())).unwrap();
         let dbg = format!("{p:?}");
         assert!(
@@ -238,7 +308,14 @@ mod tests {
         let cfg = cfg_with_model("modelA", PolicyKind::Sticky);
         let tree = Arc::new(HashTree::new());
         let tokenizers = Arc::new(TokenizerRegistry::default());
-        let reg = build_registry(&cfg, tree, tokenizers, BlockSizeOracle::new()).unwrap();
+        let reg = build_registry(
+            &cfg,
+            tree,
+            tokenizers,
+            BlockSizeOracle::new(),
+            ActiveLoadRegistry::with_defaults(),
+        )
+        .unwrap();
         let p = reg.get(&ModelId("modelA".into())).unwrap();
         let dbg = format!("{p:?}");
         assert!(

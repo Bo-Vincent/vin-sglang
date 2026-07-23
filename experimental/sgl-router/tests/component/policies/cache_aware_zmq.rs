@@ -71,6 +71,8 @@ async fn zmq_indexer_routes_to_publishing_worker_e2e() {
             policy: sgl_router::config::PolicyKind::CacheAwareZmq,
             circuit_breaker: None,
             cache_aware: None,
+            bounded_cache_aware: None,
+            session_aware: None,
             sticky: None,
         },
         discovery: sgl_router::config::DiscoveryBackend::StaticUrls(

@@ -99,10 +99,18 @@ async fn main() -> Result<()> {
 
     let registry = Arc::new(sgl_router::workers::WorkerRegistry::default());
 
-    // Build the KV-event index up front so the cache-aware-zmq policy can
+    // Shared ActiveLoadRegistry is created before policies so the new
+    // affinity policies and the request path read/write the same counters.
+    let stale_timeout = std::time::Duration::from_secs(cfg.active_load.stale_request_timeout_secs);
+    let active_load = sgl_router::policies::active_load::ActiveLoadRegistry::new(
+        Arc::new(sgl_router::policies::active_load::SystemTimeClock),
+        stale_timeout,
+    );
+
+    // Build the KV-event index up front so both cache-aware policies can
     // share its `HashTree` handle + `BlockSizeOracle`. When no model uses
-    // `cache_aware_zmq`, the index is still constructed (cheap) but no
-    // subscribers are ever added.
+    // cache affinity, the same index remains harmlessly available to the
+    // existing worker-manager lifecycle.
     let block_size_oracle = sgl_router::policies::kv_events::BlockSizeOracle::new();
     let kv_index = sgl_router::policies::kv_events::KvEventIndex::new_with_http_and_oracle(
         reqwest::Client::builder()
@@ -117,6 +125,7 @@ async fn main() -> Result<()> {
             kv_index.tree(),
             Arc::clone(&tokenizers),
             Arc::clone(&block_size_oracle),
+            Arc::clone(&active_load),
         )
         .context("build policy registry")?,
     );
@@ -127,11 +136,6 @@ async fn main() -> Result<()> {
     // worker's load forever. The registry is built BEFORE the manager
     // is spawned so the manager can call `forget_worker` on
     // `DiscoveryEvent::Removed`.
-    let stale_timeout = std::time::Duration::from_secs(cfg.active_load.stale_request_timeout_secs);
-    let active_load = sgl_router::policies::active_load::ActiveLoadRegistry::new(
-        Arc::new(sgl_router::policies::active_load::SystemTimeClock),
-        stale_timeout,
-    );
     // Sweep cadence is 1/10 of the configured timeout, clamped to
     // [1 s, 60 s]. A short timeout (test setting) needs frequent
     // sweeps to fire within the test's window; a long timeout

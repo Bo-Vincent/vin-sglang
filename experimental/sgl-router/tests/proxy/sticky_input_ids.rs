@@ -56,6 +56,8 @@ fn config() -> Config {
             policy: PolicyKind::Sticky,
             circuit_breaker: None,
             cache_aware: None,
+            bounded_cache_aware: None,
+            session_aware: None,
             // Push eviction far out so the background sweeper never fires
             // mid-test; round-robin fallback for the initial pin of a key.
             sticky: Some(StickyConfig {

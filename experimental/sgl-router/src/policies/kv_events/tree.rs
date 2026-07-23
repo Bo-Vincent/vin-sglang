@@ -446,7 +446,12 @@ impl TreeState {
     /// no worker context to do the same, so multiple candidates fall back
     /// to root. The asymmetry is intentional for v1; the public doc on
     /// [`HashTree::match_prefix`] documents the policy for callers.
-    fn match_prefix(&self, parent_hash: Option<i64>, block_hashes: &[i64]) -> MatchResult {
+    fn match_prefix_filtered(
+        &self,
+        parent_hash: Option<i64>,
+        block_hashes: &[i64],
+        allowed_urls: Option<&HashSet<&str>>,
+    ) -> MatchResult {
         if block_hashes.is_empty() {
             return MatchResult {
                 matched_blocks: 0,
@@ -466,7 +471,7 @@ impl TreeState {
 
         let mut current = start;
         let mut matched = 0usize;
-        let mut last_match_node: Option<NodeId> = None;
+        let mut last_eligible_match: Option<(usize, NodeId)> = None;
         let now = now_millis();
         for &h in block_hashes {
             let next = self
@@ -479,16 +484,37 @@ impl TreeState {
                     // borrow — no &mut needed.
                     if let Some(child) = self.nodes.get(&child_id) {
                         child.last_used.store(now, Ordering::Relaxed);
+                        if allowed_urls.is_none_or(|allowed| {
+                            child
+                                .workers
+                                .iter()
+                                .any(|worker| allowed.contains(worker.url.as_str()))
+                        }) {
+                            last_eligible_match = Some((matched + 1, child_id));
+                        }
                     }
                     current = child_id;
                     matched += 1;
-                    last_match_node = Some(child_id);
                 }
                 None => break,
             }
         }
-        let workers = match last_match_node {
-            Some(id) => self
+        let workers = match last_eligible_match {
+            Some((_, id)) if allowed_urls.is_some() => self
+                .nodes
+                .get(&id)
+                .map(|node| {
+                    node.workers
+                        .iter()
+                        .filter(|worker| {
+                            allowed_urls
+                                .is_some_and(|allowed| allowed.contains(worker.url.as_str()))
+                        })
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default(),
+            Some((_, id)) => self
                 .nodes
                 .get(&id)
                 .map(|n| n.workers.clone())
@@ -496,7 +522,7 @@ impl TreeState {
             None => HashSet::new(),
         };
         MatchResult {
-            matched_blocks: matched,
+            matched_blocks: last_eligible_match.map_or(0, |(depth, _)| depth),
             workers,
         }
     }
@@ -649,7 +675,20 @@ impl HashTree {
     /// context, so the asymmetry is intentional.)
     pub fn match_prefix(&self, parent_hash: Option<i64>, block_hashes: &[i64]) -> MatchResult {
         let state = self.state.read();
-        state.match_prefix(parent_hash, block_hashes)
+        state.match_prefix_filtered(parent_hash, block_hashes, None)
+    }
+
+    /// Find the longest matching prefix held by at least one currently
+    /// eligible worker URL. If the globally deepest holder is ineligible,
+    /// this falls back along the same path to the deepest eligible ancestor.
+    pub fn match_prefix_for_workers(
+        &self,
+        parent_hash: Option<i64>,
+        block_hashes: &[i64],
+        allowed_urls: &HashSet<&str>,
+    ) -> MatchResult {
+        let state = self.state.read();
+        state.match_prefix_filtered(parent_hash, block_hashes, Some(allowed_urls))
     }
 
     /// Approximate number of non-root nodes in the tree (the root sentinel
@@ -760,6 +799,21 @@ mod tests {
         let m = tree.match_prefix(None, &[1, 2, 4]);
         assert_eq!(m.matched_blocks, 3);
         assert_eq!(m.workers, workers(&[&b]));
+    }
+
+    #[test]
+    fn filtered_match_falls_back_to_deepest_prefix_with_an_allowed_holder() {
+        let tree = HashTree::new();
+        let healthy = worker("http://healthy", 0);
+        let unhealthy = worker("http://unhealthy", 0);
+        tree.insert(&healthy, None, &[1, 2]);
+        tree.insert(&unhealthy, None, &[1, 2, 3]);
+        let allowed = HashSet::from(["http://healthy"]);
+
+        let matched = tree.match_prefix_for_workers(None, &[1, 2, 3], &allowed);
+
+        assert_eq!(matched.matched_blocks, 2);
+        assert_eq!(matched.workers, workers(&[&healthy]));
     }
 
     #[test]

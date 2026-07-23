@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 pub mod active_load;
+pub mod bounded;
+pub mod cache_aware;
 pub mod cache_aware_zmq;
 pub mod factory;
 pub mod kv_events;
@@ -10,6 +12,7 @@ pub mod power_of_two;
 pub mod random;
 pub mod registry;
 pub mod round_robin;
+pub mod session_aware;
 pub mod sticky;
 
 use crate::discovery::ModelId;
@@ -250,8 +253,7 @@ pub trait Policy: Send + Sync + std::fmt::Debug {
     }
 
     /// Attach the process metrics registry after construction. Default is a
-    /// no-op — only policies that emit metrics (cache-aware-zmq's
-    /// `sgl_router_overlap_blocks`) override it. Mirrors
+    /// no-op — only policies that emit metrics override it. Mirrors
     /// `ActiveLoadRegistry::attach_metrics`: the registry is built after the
     /// policies, so it is injected here rather than passed to the constructor.
     fn attach_metrics(&self, _metrics: Arc<MetricsRegistry>) {}

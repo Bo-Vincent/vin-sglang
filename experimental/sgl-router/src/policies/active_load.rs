@@ -4,7 +4,8 @@
 //! Per-worker active-load tracking with RAII guards and a stale-request
 //! janitor.
 //!
-//! The cache-aware-zmq policy ([`super::cache_aware_zmq`]) needs to combine
+//! The cache-aware policies ([`super::cache_aware`] and
+//! [`super::cache_aware_zmq`]) need to combine
 //! the hash tree's overlap score with a per-worker load signal. The
 //! per-worker `Worker::active_requests` counter tracks one axis — number of
 //! in-flight HTTP requests — and is already drop-safe through

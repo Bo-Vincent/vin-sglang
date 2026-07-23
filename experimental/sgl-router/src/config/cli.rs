@@ -11,9 +11,10 @@ use std::num::NonZeroU32;
 
 use crate::config::{
     default_cb_cool_down, default_proxy_request_timeout_secs, default_stale_request_timeout_secs,
-    resolve_mode, ActiveLoadConfig, CacheAwareConfig, CircuitBreakerConfig, Config,
-    DiscoveryBackend, K8sDiscoveryConfig, LogFormat, ModelConfig, ObservabilityConfig, PolicyKind,
-    ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig, StickyConfig,
+    resolve_mode, ActiveLoadConfig, BoundedCacheAwareConfig, CacheAwareConfig,
+    CircuitBreakerConfig, Config, DiscoveryBackend, K8sDiscoveryConfig, LogFormat, ModelConfig,
+    ObservabilityConfig, PolicyKind, ProxyConfig, ServerConfig, SessionAwareConfig,
+    StaticUrlsDiscoveryConfig, StickyConfig,
 };
 
 /// `sgl-router` — slim KV-aware OpenAI-compatible router for SGLang workers.
@@ -69,6 +70,35 @@ pub struct Cli {
     /// Multiplicative load spread gating the absolute balance check.
     #[arg(long)]
     pub balance_rel_threshold: Option<f32>,
+
+    // ---- new bounded affinity policies ----
+    /// Use a deterministic non-primary backup for Session/Cache affinity.
+    #[arg(long)]
+    pub affinity_stable_pair: Option<bool>,
+    /// Allow a materially hotter affinity primary to escape to its backup.
+    #[arg(long)]
+    pub affinity_pressure_guard: Option<bool>,
+    /// Absolute active prefill-token gap required by Pressure Guard.
+    #[arg(long)]
+    pub affinity_pressure_abs_threshold: Option<usize>,
+    /// Relative primary/backup load ratio required by Pressure Guard.
+    #[arg(long)]
+    pub affinity_pressure_rel_threshold: Option<f32>,
+    /// Require reusable prefix work to exceed remaining uncached work.
+    #[arg(long)]
+    pub cache_benefit: Option<bool>,
+    /// Request header carrying the Session-Aware key.
+    #[arg(long)]
+    pub session_id_header: Option<String>,
+    /// Disable soft load escape and retain a healthy session primary.
+    #[arg(long)]
+    pub session_strict: Option<bool>,
+    /// Evict an idle Session-ID assignment after this many seconds.
+    #[arg(long)]
+    pub session_idle_secs: Option<u64>,
+    /// Session assignment eviction sweep cadence.
+    #[arg(long)]
+    pub session_eviction_interval_secs: Option<u64>,
 
     // ---- sticky-session policy (only used by `--policy sticky`) ----
     /// Request header carrying the routing key for sticky-session routing.
@@ -165,6 +195,39 @@ impl Cli {
             ));
         }
 
+        let tuned_affinity = self.affinity_stable_pair.is_some()
+            || self.affinity_pressure_guard.is_some()
+            || self.affinity_pressure_abs_threshold.is_some()
+            || self.affinity_pressure_rel_threshold.is_some();
+        if tuned_affinity
+            && !matches!(
+                self.policy,
+                PolicyKind::SessionAware | PolicyKind::CacheAware
+            )
+        {
+            return Err(anyhow!(
+                "--affinity-* flags require --policy session_aware or cache_aware"
+            ));
+        }
+        if self.cache_benefit.is_some() && self.policy != PolicyKind::CacheAware {
+            return Err(anyhow!("--cache-benefit requires --policy cache_aware"));
+        }
+        let tuned_session = self.session_id_header.is_some()
+            || self.session_strict.is_some()
+            || self.session_idle_secs.is_some()
+            || self.session_eviction_interval_secs.is_some();
+        if tuned_session && self.policy != PolicyKind::SessionAware {
+            return Err(anyhow!("--session-* flags require --policy session_aware"));
+        }
+        if self
+            .affinity_pressure_rel_threshold
+            .is_some_and(|threshold| !threshold.is_finite() || threshold < 1.0)
+        {
+            return Err(anyhow!(
+                "--affinity-pressure-rel-threshold must be finite and >= 1.0"
+            ));
+        }
+
         let tuned_sticky = self.routing_key_header.is_some()
             || self.sticky_fallback_policy.is_some()
             || self.sticky_idle_secs.is_some()
@@ -190,11 +253,15 @@ impl Cli {
             let fallback_policy = self.sticky_fallback_policy.unwrap_or(d.fallback_policy);
             if matches!(
                 fallback_policy,
-                PolicyKind::Sticky | PolicyKind::CacheAwareZmq
+                PolicyKind::SessionAware
+                    | PolicyKind::CacheAware
+                    | PolicyKind::Sticky
+                    | PolicyKind::CacheAwareZmq
             ) {
                 return Err(anyhow!(
                     "--sticky-fallback-policy must be one of round_robin / random / \
-                     power_of_two / load_based; cache_aware_zmq and sticky are not allowed"
+                     power_of_two / load_based; affinity, cache_aware_zmq, and sticky policies \
+                     are not allowed"
                 ));
             }
             let idle_secs = self.sticky_idle_secs.unwrap_or(d.idle_secs);
@@ -249,6 +316,56 @@ impl Cli {
             None
         };
 
+        let bounded_cache_aware = if self.policy == PolicyKind::CacheAware {
+            let d = BoundedCacheAwareConfig::default();
+            Some(BoundedCacheAwareConfig {
+                stable_pair: self.affinity_stable_pair.unwrap_or(d.stable_pair),
+                cache_benefit: self.cache_benefit.unwrap_or(d.cache_benefit),
+                pressure_guard: self.affinity_pressure_guard.unwrap_or(d.pressure_guard),
+                pressure_abs_threshold: self
+                    .affinity_pressure_abs_threshold
+                    .unwrap_or(d.pressure_abs_threshold),
+                pressure_rel_threshold: self
+                    .affinity_pressure_rel_threshold
+                    .unwrap_or(d.pressure_rel_threshold),
+            })
+        } else {
+            None
+        };
+
+        let session_aware = if self.policy == PolicyKind::SessionAware {
+            let d = SessionAwareConfig::default();
+            let header_name = self.session_id_header.unwrap_or(d.header_name);
+            axum::http::HeaderName::try_from(header_name.as_str()).map_err(|e| {
+                anyhow!("--session-id-header {header_name:?} is not a valid HTTP header name: {e}")
+            })?;
+            let idle_secs = self.session_idle_secs.unwrap_or(d.idle_secs);
+            let eviction_interval_secs = self
+                .session_eviction_interval_secs
+                .unwrap_or(d.eviction_interval_secs);
+            if idle_secs == 0 || eviction_interval_secs == 0 {
+                return Err(anyhow!(
+                    "--session-idle-secs and --session-eviction-interval-secs must be greater than 0"
+                ));
+            }
+            Some(SessionAwareConfig {
+                header_name,
+                strict: self.session_strict.unwrap_or(d.strict),
+                stable_pair: self.affinity_stable_pair.unwrap_or(d.stable_pair),
+                pressure_guard: self.affinity_pressure_guard.unwrap_or(d.pressure_guard),
+                pressure_abs_threshold: self
+                    .affinity_pressure_abs_threshold
+                    .unwrap_or(d.pressure_abs_threshold),
+                pressure_rel_threshold: self
+                    .affinity_pressure_rel_threshold
+                    .unwrap_or(d.pressure_rel_threshold),
+                idle_secs,
+                eviction_interval_secs,
+            })
+        } else {
+            None
+        };
+
         let config = Config {
             server: ServerConfig {
                 host: self.host,
@@ -266,6 +383,8 @@ impl Cli {
                 policy: self.policy,
                 circuit_breaker,
                 cache_aware,
+                bounded_cache_aware,
+                session_aware,
                 sticky,
             },
             discovery,
@@ -819,6 +938,134 @@ mod tests {
         assert_eq!(s.fallback_policy, PolicyKind::RoundRobin);
         assert_eq!(s.idle_secs, 600);
         assert_eq!(s.eviction_interval_secs, 60);
+    }
+
+    #[test]
+    fn session_aware_policy_builds_our_defaults() {
+        let c = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--policy",
+            "session_aware",
+        ]))
+        .unwrap();
+
+        assert_eq!(c.model.policy, PolicyKind::SessionAware);
+        let s = c.model.session_aware.expect("session-aware config built");
+        assert_eq!(s.header_name, "x-sgl-session-id");
+        assert!(!s.strict);
+        assert!(!s.stable_pair);
+        assert!(s.pressure_guard);
+        assert_eq!(s.pressure_abs_threshold, 8192);
+        assert!((s.pressure_rel_threshold - 1.5).abs() < f32::EPSILON);
+        assert_eq!(s.idle_secs, 600);
+        assert_eq!(s.eviction_interval_secs, 60);
+    }
+
+    #[test]
+    fn bounded_cache_aware_policy_builds_our_defaults() {
+        let c = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--policy",
+            "cache_aware",
+        ]))
+        .unwrap();
+
+        assert_eq!(c.model.policy, PolicyKind::CacheAware);
+        let ca = c
+            .model
+            .bounded_cache_aware
+            .expect("bounded cache-aware config built");
+        assert!(!ca.stable_pair);
+        assert!(ca.cache_benefit);
+        assert!(ca.pressure_guard);
+        assert_eq!(ca.pressure_abs_threshold, 8192);
+        assert!((ca.pressure_rel_threshold - 1.5).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn affinity_flags_override_cache_aware_defaults() {
+        let c = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--policy",
+            "cache_aware",
+            "--affinity-stable-pair",
+            "true",
+            "--cache-benefit",
+            "false",
+            "--affinity-pressure-guard",
+            "false",
+            "--affinity-pressure-abs-threshold",
+            "123",
+            "--affinity-pressure-rel-threshold",
+            "2.0",
+        ]))
+        .unwrap();
+        let config = c.model.bounded_cache_aware.unwrap();
+        assert!(config.stable_pair);
+        assert!(!config.cache_benefit);
+        assert!(!config.pressure_guard);
+        assert_eq!(config.pressure_abs_threshold, 123);
+        assert!((config.pressure_rel_threshold - 2.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn affinity_flags_require_an_affinity_policy() {
+        let error = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--policy",
+            "power_of_two",
+            "--affinity-stable-pair",
+            "true",
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("--affinity-* flags require"), "{error}");
+    }
+
+    #[test]
+    fn session_flags_validate_header_and_ttl() {
+        let bad_header = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--policy",
+            "session_aware",
+            "--session-id-header",
+            "bad header",
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(bad_header.contains("not a valid HTTP header name"));
+
+        let zero_ttl = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--policy",
+            "session_aware",
+            "--session-idle-secs",
+            "0",
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(zero_ttl.contains("must be greater than 0"));
+    }
+
+    #[test]
+    fn rejects_non_finite_affinity_relative_threshold() {
+        let error = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--policy",
+            "cache_aware",
+            "--affinity-pressure-rel-threshold",
+            "NaN",
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("must be finite and >= 1.0"), "{error}");
     }
 
     #[test]
