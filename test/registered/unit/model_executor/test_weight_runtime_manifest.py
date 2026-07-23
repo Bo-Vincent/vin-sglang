@@ -9,12 +9,15 @@ from types import SimpleNamespace
 import msgspec
 import pytest
 
+import sglang.srt.model_executor.weight_runtime_manifest as weight_runtime_manifest_module
 from sglang.srt.model_executor.weight_runtime_manifest import (
     LogicalTensorView,
     WeightManifestError,
     WeightParallelTopology,
+    WeightPlacementManifest,
     WeightRuntimeManifestManager,
     WeightSnapshotCoordinator,
+    WeightTargetPlacementManifest,
     compose_weight_runtime_manifest,
     create_sglang_weight_runtime_manifest_manager,
     create_weight_runtime_manifest_manager,
@@ -95,6 +98,37 @@ class FakeModel:
         return iter(self.parameters)
 
 
+class CountingFakeModel(FakeModel):
+    def __init__(self, parameters) -> None:
+        super().__init__(parameters)
+        self.physical_collections = 0
+
+    def named_parameters(self, *, remove_duplicate: bool):
+        self.physical_collections += 1
+        return super().named_parameters(remove_duplicate=remove_duplicate)
+
+
+class CountingSnapshotCoordinator(WeightSnapshotCoordinator):
+    def __init__(self) -> None:
+        super().__init__()
+        self.snapshot_acquisitions = 0
+
+    def acquire_snapshot(self, **kwargs):
+        self.snapshot_acquisitions += 1
+        return super().acquire_snapshot(**kwargs)
+
+
+class FakeClock:
+    def __init__(self, now: float) -> None:
+        self.now = now
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
 class FakeMoEModel(FakeModel):
     def __init__(self, parameters, *, w13_parameter, up_first: bool) -> None:
         super().__init__(parameters)
@@ -138,6 +172,38 @@ class DummyWeightUpdater:
         if raise_error:
             raise RuntimeError("update failed")
         return result
+
+
+class ProductionShapeWeightUpdater:
+    def __init__(self, coordinator: WeightSnapshotCoordinator) -> None:
+        self.begin_weight_update = coordinator.begin_update
+        self.finish_weight_update = coordinator.finish_update
+
+    @coordinated_weight_update
+    def update_weights_from_disk(
+        self,
+        model_path,
+        load_format,
+        weight_name_filter=None,
+        recapture_cuda_graph=False,
+    ):
+        del model_path, load_format, weight_name_filter, recapture_cuda_graph
+        return True, "disk update complete"
+
+    @coordinated_weight_update
+    def update_weights_from_distributed(self, *args, **kwargs):
+        del args, kwargs
+        return True, "distributed update complete"
+
+    @coordinated_weight_update
+    def update_weights_from_tensor(self, *args, **kwargs):
+        del args, kwargs
+        return True, "tensor update complete"
+
+    @coordinated_weight_update
+    def update_weights_from_ipc(self, *args, **kwargs):
+        del args, kwargs
+        return True, "ipc update complete"
 
 
 def topology(**overrides) -> WeightParallelTopology:
@@ -344,6 +410,207 @@ def test_target_placement_has_stable_semantics_without_runtime_location() -> Non
     assert same_layout == placement
 
 
+def test_source_and_target_share_one_placement_manifest_contract() -> None:
+    assert WeightTargetPlacementManifest is WeightPlacementManifest
+
+    manager = WeightRuntimeManifestManager(
+        model=FakeModel([("weight", FakeTensor((4, 2)))]),
+        adapter=ReplicatedAdapter(),
+        topology=topology(),
+        allowed_devices=("cpu",),
+    )
+    parts = manager.snapshot_parts(
+        model_id="model",
+        revision="revision",
+        instance_id="instance",
+        worker_id="worker",
+        endpoint="endpoint",
+    )
+
+    assert isinstance(parts.placement, WeightPlacementManifest)
+    assert parts.binding.placement_id == parts.placement.placement_id
+    manager.release(parts.binding.lease_id)
+
+
+def test_local_mooncake_split_capability_requires_the_complete_loader_api() -> None:
+    required_apis = {
+        "RuntimeBindingManifest",
+        "SourcePlacementManifest",
+        "TargetPlacementManifest",
+        "bind_logical_transfer_plan",
+        "bind_runtime_manifest",
+        "placement_manifest_from_runtime_manifest",
+        "plan_placement_transfer_to_local_target",
+        "runtime_binding_from_runtime_manifest",
+    }
+    api_only_module = SimpleNamespace(**{name: lambda: None for name in required_apis})
+    requested_capabilities = []
+
+    def supports(capability):
+        requested_capabilities.append(capability)
+        return capability == "placement_binding_v1"
+
+    def broken_supports(capability):
+        del capability
+        raise RuntimeError("mixed Mooncake wheel")
+
+    complete_module = SimpleNamespace(
+        supports_weight_transfer_capability=supports,
+        **{name: lambda: None for name in required_apis},
+    )
+
+    assert (
+        weight_runtime_manifest_module.local_mooncake_supports_placement_binding(
+            SimpleNamespace()
+        )
+        is False
+    )
+    assert (
+        weight_runtime_manifest_module.local_mooncake_supports_placement_binding(
+            api_only_module
+        )
+        is False
+    )
+    assert (
+        weight_runtime_manifest_module.local_mooncake_supports_placement_binding(
+            SimpleNamespace(
+                supports_weight_transfer_capability=lambda capability: False,
+                **{name: lambda: None for name in required_apis},
+            )
+        )
+        is False
+    )
+    assert (
+        weight_runtime_manifest_module.local_mooncake_supports_placement_binding(
+            SimpleNamespace(
+                supports_weight_transfer_capability=True,
+                **{name: lambda: None for name in required_apis},
+            )
+        )
+        is False
+    )
+    assert (
+        weight_runtime_manifest_module.local_mooncake_supports_placement_binding(
+            SimpleNamespace(
+                supports_weight_transfer_capability=broken_supports,
+                **{name: lambda: None for name in required_apis},
+            )
+        )
+        is False
+    )
+    assert (
+        weight_runtime_manifest_module.local_mooncake_supports_placement_binding(
+            complete_module
+        )
+        is True
+    )
+    assert requested_capabilities == ["placement_binding_v1"]
+    for missing in required_apis:
+        incomplete_module = SimpleNamespace(
+            supports_weight_transfer_capability=supports,
+            **{
+                name: (None if name == missing else lambda: None)
+                for name in required_apis
+            },
+        )
+        assert (
+            weight_runtime_manifest_module.local_mooncake_supports_placement_binding(
+                incomplete_module
+            )
+            is False
+        )
+
+
+def test_snapshot_parts_use_one_lease_and_one_physical_collection() -> None:
+    model = CountingFakeModel([("weight", FakeTensor((4, 2)))])
+    coordinator = CountingSnapshotCoordinator()
+    manager = WeightRuntimeManifestManager(
+        model=model,
+        adapter=ReplicatedAdapter(),
+        topology=topology(),
+        allowed_devices=("cpu",),
+        coordinator=coordinator,
+    )
+
+    parts = manager.snapshot_parts(
+        model_id="model",
+        revision="revision",
+        instance_id="instance",
+        worker_id="worker",
+        endpoint="endpoint",
+    )
+
+    assert coordinator.snapshot_acquisitions == 1
+    assert model.physical_collections == 1
+    assert parts.placement.revision == parts.binding.revision
+    manager.release(parts.binding.lease_id)
+
+
+def test_snapshot_parts_qualify_revision_from_the_acquired_generation() -> None:
+    coordinator = WeightSnapshotCoordinator()
+    token = coordinator.begin_update()
+    coordinator.finish_update(token, success=True)
+    coordinator.commit_revision()
+    manager = WeightRuntimeManifestManager(
+        model=FakeModel([("weight", FakeTensor((4, 2)))]),
+        adapter=ReplicatedAdapter(),
+        topology=topology(),
+        allowed_devices=("cpu",),
+        coordinator=coordinator,
+    )
+
+    parts = manager.snapshot_parts(
+        model_id="model",
+        revision="main",
+        instance_id="instance",
+        worker_id="worker",
+        endpoint="endpoint",
+        bind_revision_to_generation=True,
+    )
+
+    assert parts.binding.generation == 2
+    assert parts.placement.revision == "main@generation-2"
+    assert parts.binding.revision == parts.placement.revision
+    manager.release(parts.binding.lease_id)
+
+
+def test_placement_id_depends_only_on_stable_layout_semantics() -> None:
+    tensor = FakeTensor((4, 2), address=0x10000)
+    manager = WeightRuntimeManifestManager(
+        model=FakeModel([("weight", tensor)]),
+        adapter=ReplicatedAdapter(),
+        topology=topology(),
+        allowed_devices=("cpu",),
+    )
+
+    first = manager.snapshot_parts(
+        model_id="model-a",
+        revision="revision-a",
+        instance_id="instance",
+        worker_id="worker",
+        endpoint="endpoint",
+    )
+    manager.release(first.binding.lease_id)
+
+    token = manager.coordinator.begin_update()
+    tensor._address = 0x20000
+    manager.coordinator.finish_update(token, success=True)
+    manager.coordinator.commit_revision()
+
+    second = manager.snapshot_parts(
+        model_id="model-b",
+        revision="revision-b",
+        instance_id="instance",
+        worker_id="worker",
+        endpoint="endpoint",
+    )
+
+    assert first.binding.generation != second.binding.generation
+    assert first.placement.revision != second.placement.revision
+    assert first.placement.placement_id == second.placement.placement_id
+    manager.release(second.binding.lease_id)
+
+
 def test_runtime_binding_refreshes_addresses_and_composes_legacy_snapshot() -> None:
     tensor = FakeTensor((4, 2), address=0x10000)
     manager = WeightRuntimeManifestManager(
@@ -475,39 +742,48 @@ def test_snapshot_lease_blocks_updates_until_explicit_release() -> None:
     manager.release(next_snapshot.lease_id)
 
 
-def test_snapshot_lease_ttl_expires_inside_coordinator() -> None:
-    now = [100.0]
-    coordinator = WeightSnapshotCoordinator(clock=lambda: now[0])
+def test_expired_snapshot_lease_blocks_mutation_until_explicit_release() -> None:
+    clock = FakeClock(100.0)
+    coordinator = WeightSnapshotCoordinator(clock=clock)
 
     lease_id, generation = coordinator.acquire_snapshot(lease_timeout_sec=30)
     assert generation == 1
 
-    now[0] = 129.0
+    clock.advance(30)
+    assert coordinator.has_snapshot(lease_id)
     with pytest.raises(WeightManifestError, match="snapshot lease is active"):
         coordinator.begin_update()
 
-    now[0] = 130.0
+    clock.advance(3600)
+    assert coordinator.has_snapshot(lease_id)
+    with pytest.raises(WeightManifestError, match="snapshot lease is active"):
+        coordinator.begin_update()
+
+    coordinator.release_snapshot(lease_id)
     token = coordinator.begin_update()
     coordinator.finish_update(token, success=True)
     coordinator.commit_revision()
 
-    with pytest.raises(WeightManifestError, match="does not exist"):
-        coordinator.release_snapshot(lease_id)
 
-
-def test_snapshot_lease_renewal_extends_coordinator_deadline() -> None:
-    now = [100.0]
-    coordinator = WeightSnapshotCoordinator(clock=lambda: now[0])
+def test_expired_snapshot_lease_can_be_renewed_without_force_release() -> None:
+    clock = FakeClock(100.0)
+    coordinator = WeightSnapshotCoordinator(clock=clock)
     lease_id, _ = coordinator.acquire_snapshot(lease_timeout_sec=30)
 
-    now[0] = 120.0
+    clock.advance(30)
     coordinator.renew_snapshot(lease_id, lease_timeout_sec=30)
 
-    now[0] = 149.0
+    clock.advance(29)
+    assert coordinator.has_snapshot(lease_id)
     with pytest.raises(WeightManifestError, match="snapshot lease is active"):
         coordinator.begin_update()
 
-    now[0] = 150.0
+    clock.advance(1)
+    assert coordinator.has_snapshot(lease_id)
+    with pytest.raises(WeightManifestError, match="snapshot lease is active"):
+        coordinator.begin_update()
+
+    coordinator.release_snapshot(lease_id)
     token = coordinator.begin_update()
     coordinator.finish_update(token, success=True)
     coordinator.commit_revision()
@@ -533,10 +809,17 @@ def test_online_update_coordination_executes_generation_and_failure_contract() -
     with pytest.raises(WeightManifestError, match="last weight update failed"):
         coordinator.acquire_snapshot()
 
-    assert updater.update((True, "recovered")) == (True, "recovered")
+    assert updater.update((True, "incremental")) == (True, "incremental")
+    with pytest.raises(WeightManifestError, match="full successful weight restore"):
+        coordinator.commit_revision()
+    with pytest.raises(WeightManifestError, match="full successful weight restore"):
+        coordinator.acquire_snapshot()
+
+    restored = coordinator.begin_update(full_restore=True)
+    coordinator.finish_update(restored, success=True)
     coordinator.commit_revision()
     lease_id, generation = coordinator.acquire_snapshot()
-    assert generation == 4
+    assert generation == 5
     coordinator.release_snapshot(lease_id)
 
 
@@ -554,6 +837,143 @@ def test_successful_updates_require_explicit_revision_commit() -> None:
     coordinator.release_snapshot(lease_id)
 
 
+def test_new_generation_supersedes_uncommitted_success_without_stale_commit() -> None:
+    coordinator = WeightSnapshotCoordinator()
+    first = coordinator.begin_update()
+    first_generation = coordinator.finish_update(first, success=True)
+
+    assert first_generation == 2
+    assert coordinator.pending_revision_generation() == first_generation
+    second = coordinator.begin_update()
+    second_generation = coordinator.finish_update(second, success=True)
+
+    assert second_generation == 3
+    assert coordinator.pending_revision_generation() == second_generation
+    with pytest.raises(WeightManifestError, match="generation does not match"):
+        coordinator.commit_revision(expected_generation=first_generation)
+    assert (
+        coordinator.commit_revision(expected_generation=second_generation)
+        == second_generation
+    )
+    assert coordinator.pending_revision_generation() is None
+
+
+def test_commit_and_global_poison_reject_stale_generations() -> None:
+    coordinator = WeightSnapshotCoordinator()
+    first = coordinator.begin_update()
+    first_generation = coordinator.finish_update(first, success=True)
+    coordinator.commit_revision(expected_generation=first_generation)
+
+    second = coordinator.begin_update()
+    second_generation = coordinator.finish_update(second, success=True)
+
+    with pytest.raises(WeightManifestError, match="generation does not match"):
+        coordinator.commit_revision(expected_generation=first_generation)
+    with pytest.raises(WeightManifestError, match="generation does not match"):
+        coordinator.poison_global_update_failure(expected_generation=first_generation)
+
+    coordinator.poison_global_update_failure(expected_generation=second_generation)
+    with pytest.raises(WeightManifestError, match="full successful weight restore"):
+        coordinator.commit_revision(expected_generation=second_generation)
+
+
+def test_completion_fence_precedes_generation_publish_and_snapshot() -> None:
+    generations_during_fence = []
+    coordinator = None
+
+    def completion_fence() -> None:
+        generations_during_fence.append(coordinator.generation)
+        with pytest.raises(WeightManifestError, match="update is in progress"):
+            coordinator.acquire_snapshot()
+        with pytest.raises(WeightManifestError, match="update is in progress"):
+            coordinator.commit_revision()
+
+    coordinator = WeightSnapshotCoordinator(completion_fence=completion_fence)
+    token = coordinator.begin_update()
+    coordinator.finish_update(token, success=True)
+
+    assert generations_during_fence == [1, 1]
+    assert coordinator.generation == 2
+    with pytest.raises(WeightManifestError, match="revision commit"):
+        coordinator.acquire_snapshot()
+
+
+def test_coordinated_update_fences_before_and_after_weight_mutation() -> None:
+    events = []
+    coordinator = WeightSnapshotCoordinator(
+        completion_fence=lambda: events.append("fence")
+    )
+
+    class OrderedUpdater:
+        def __init__(self) -> None:
+            self.begin_weight_update = coordinator.begin_update
+            self.finish_weight_update = coordinator.finish_update
+
+        @coordinated_weight_update
+        def update(self):
+            events.append("mutation")
+            return True, "updated"
+
+    assert OrderedUpdater().update() == (True, "updated")
+    assert events == ["fence", "mutation", "fence"]
+
+
+def test_pre_mutation_fence_failure_cancels_the_update_reservation() -> None:
+    def completion_fence() -> None:
+        raise RuntimeError("old reader failed to drain")
+
+    coordinator = WeightSnapshotCoordinator(completion_fence=completion_fence)
+
+    with pytest.raises(RuntimeError, match="old reader failed to drain"):
+        coordinator.begin_update()
+
+    assert coordinator.generation == 1
+    lease_id, generation = coordinator.acquire_snapshot()
+    assert generation == 1
+    coordinator.release_snapshot(lease_id)
+
+
+def test_completion_fence_failure_poisons_the_unpublished_update() -> None:
+    fence_calls = 0
+
+    def completion_fence() -> None:
+        nonlocal fence_calls
+        fence_calls += 1
+        if fence_calls == 2:
+            raise RuntimeError("device work failed")
+
+    coordinator = WeightSnapshotCoordinator(completion_fence=completion_fence)
+    token = coordinator.begin_update()
+
+    with pytest.raises(RuntimeError, match="device work failed"):
+        coordinator.finish_update(token, success=True)
+
+    assert coordinator.generation == 2
+    with pytest.raises(WeightManifestError, match="full successful weight restore"):
+        coordinator.acquire_snapshot()
+
+
+def test_update_and_fence_failure_preserve_both_errors() -> None:
+    fence_calls = 0
+
+    def completion_fence() -> None:
+        nonlocal fence_calls
+        fence_calls += 1
+        if fence_calls == 2:
+            raise RuntimeError("device fence failed")
+
+    coordinator = WeightSnapshotCoordinator(completion_fence=completion_fence)
+    updater = DummyWeightUpdater(coordinator)
+
+    with pytest.raises(RuntimeError, match="update failed") as error:
+        updater.update((True, "unused"), raise_error=True)
+
+    assert isinstance(error.value.__cause__, RuntimeError)
+    assert str(error.value.__cause__) == "device fence failed"
+    with pytest.raises(WeightManifestError, match="full successful weight restore"):
+        coordinator.acquire_snapshot()
+
+
 def test_online_update_exception_poisons_runtime_snapshots() -> None:
     coordinator = WeightSnapshotCoordinator()
     updater = DummyWeightUpdater(coordinator)
@@ -565,11 +985,11 @@ def test_online_update_exception_poisons_runtime_snapshots() -> None:
     with pytest.raises(WeightManifestError, match="last weight update failed"):
         coordinator.acquire_snapshot()
 
-    assert updater.update((True, "recovered")) == (True, "recovered")
-    coordinator.commit_revision()
-    lease_id, generation = coordinator.acquire_snapshot()
-    assert generation == 3
-    coordinator.release_snapshot(lease_id)
+    assert updater.update((True, "incremental")) == (True, "incremental")
+    with pytest.raises(WeightManifestError, match="full successful weight restore"):
+        coordinator.commit_revision()
+    with pytest.raises(WeightManifestError, match="full successful weight restore"):
+        coordinator.acquire_snapshot()
 
 
 def test_failed_weight_update_poison_snapshot_until_a_full_update_succeeds() -> None:
@@ -580,12 +1000,171 @@ def test_failed_weight_update_poison_snapshot_until_a_full_update_succeeds() -> 
     with pytest.raises(WeightManifestError, match="last weight update failed"):
         coordinator.acquire_snapshot()
 
-    recovered = coordinator.begin_update()
-    coordinator.finish_update(recovered, success=True)
+    incremental = coordinator.begin_update()
+    coordinator.finish_update(incremental, success=True)
+    with pytest.raises(WeightManifestError, match="full successful weight restore"):
+        coordinator.commit_revision()
+
+    restored = coordinator.begin_update(full_restore=True)
+    coordinator.finish_update(restored, success=True)
+    with pytest.raises(WeightManifestError, match="revision commit"):
+        coordinator.acquire_snapshot()
+    coordinator.commit_revision()
+    lease_id, generation = coordinator.acquire_snapshot()
+    assert generation == 4
+    coordinator.release_snapshot(lease_id)
+
+
+def test_full_restore_decorator_explicitly_selects_restore_mode() -> None:
+    coordinator = WeightSnapshotCoordinator()
+    failed = coordinator.begin_update()
+    coordinator.finish_update(failed, success=False)
+
+    class FullRestoreUpdater:
+        def __init__(self) -> None:
+            self.begin_weight_update = coordinator.begin_update
+            self.finish_weight_update = coordinator.finish_update
+
+        @coordinated_weight_update(full_restore=True)
+        def restore(self):
+            return True, "restored"
+
+    assert FullRestoreUpdater().restore() == (True, "restored")
+    with pytest.raises(WeightManifestError, match="revision commit"):
+        coordinator.acquire_snapshot()
     coordinator.commit_revision()
     lease_id, generation = coordinator.acquire_snapshot()
     assert generation == 3
     coordinator.release_snapshot(lease_id)
+
+
+def test_complete_disk_checkpoint_is_a_production_full_restore_path() -> None:
+    coordinator = WeightSnapshotCoordinator()
+    failed = coordinator.begin_update()
+    coordinator.finish_update(failed, success=False)
+    updater = ProductionShapeWeightUpdater(coordinator)
+
+    assert updater.update_weights_from_disk("checkpoint", "auto") == (
+        True,
+        "disk update complete",
+    )
+
+    with pytest.raises(WeightManifestError, match="revision commit"):
+        coordinator.acquire_snapshot()
+    coordinator.commit_revision()
+    lease_id, generation = coordinator.acquire_snapshot()
+    assert generation == 3
+    coordinator.release_snapshot(lease_id)
+
+
+@pytest.mark.parametrize(
+    ("method_name", "args", "kwargs"),
+    [
+        (
+            "update_weights_from_disk",
+            ("checkpoint", "auto"),
+            {"weight_name_filter": lambda name: name == "partial.weight"},
+        ),
+        ("update_weights_from_distributed", (), {}),
+        ("update_weights_from_tensor", (), {}),
+        ("update_weights_from_ipc", (), {}),
+    ],
+)
+def test_partial_or_unproven_updates_cannot_clear_poison(
+    method_name, args, kwargs
+) -> None:
+    coordinator = WeightSnapshotCoordinator()
+    failed = coordinator.begin_update()
+    coordinator.finish_update(failed, success=False)
+    updater = ProductionShapeWeightUpdater(coordinator)
+
+    result = getattr(updater, method_name)(*args, **kwargs)
+
+    assert result[0] is True
+    with pytest.raises(WeightManifestError, match="full successful weight restore"):
+        coordinator.commit_revision()
+    with pytest.raises(WeightManifestError, match="full successful weight restore"):
+        coordinator.acquire_snapshot()
+
+
+def test_global_update_failure_hook_reasserts_sticky_poison() -> None:
+    coordinator = WeightSnapshotCoordinator()
+    locally_successful = coordinator.begin_update()
+    generation = coordinator.finish_update(locally_successful, success=True)
+
+    coordinator.poison_global_update_failure(expected_generation=generation)
+
+    with pytest.raises(WeightManifestError, match="full successful weight restore"):
+        coordinator.commit_revision()
+    restored = coordinator.begin_update(full_restore=True)
+    coordinator.finish_update(restored, success=True)
+    coordinator.commit_revision()
+    lease_id, generation = coordinator.acquire_snapshot()
+    assert generation == 3
+    coordinator.release_snapshot(lease_id)
+
+
+def test_full_restore_mode_rejects_non_boolean_values() -> None:
+    coordinator = WeightSnapshotCoordinator()
+
+    with pytest.raises(TypeError, match="full_restore must be a boolean"):
+        coordinator.begin_update(full_restore="false")
+    with pytest.raises(TypeError, match="full_restore must be a boolean"):
+        coordinated_weight_update(full_restore="false")
+
+    token = coordinator.begin_update()
+    coordinator.cancel_update(token)
+
+
+def test_finish_update_rejects_non_boolean_success_without_publishing() -> None:
+    coordinator = WeightSnapshotCoordinator()
+    failed = coordinator.begin_update()
+    coordinator.finish_update(failed, success=False)
+    restore = coordinator.begin_update(full_restore=True)
+
+    with pytest.raises(TypeError, match="success must be a boolean"):
+        coordinator.finish_update(restore, success="false")
+
+    assert coordinator.generation == 2
+    coordinator.cancel_update(restore)
+    with pytest.raises(WeightManifestError, match="full successful weight restore"):
+        coordinator.acquire_snapshot()
+
+
+def test_snapshot_releases_lease_when_composition_is_cancelled(monkeypatch) -> None:
+    class SnapshotCancelled(BaseException):
+        pass
+
+    captured_lease_ids = []
+
+    def cancel_composition(placement, binding):
+        del placement
+        captured_lease_ids.append(binding.lease_id)
+        raise SnapshotCancelled
+
+    monkeypatch.setattr(
+        weight_runtime_manifest_module,
+        "compose_weight_runtime_manifest",
+        cancel_composition,
+    )
+    manager = WeightRuntimeManifestManager(
+        model=FakeModel([("weight", FakeTensor((2, 2)))]),
+        adapter=ReplicatedAdapter(),
+        topology=topology(),
+        allowed_devices=("cpu",),
+    )
+
+    with pytest.raises(SnapshotCancelled):
+        manager.snapshot(
+            model_id="model",
+            revision="revision",
+            instance_id="instance",
+            worker_id="worker",
+            endpoint="worker:12345",
+        )
+
+    assert len(captured_lease_ids) == 1
+    assert not manager.has_lease(captured_lease_ids[0])
 
 
 def test_uncoordinated_pointer_replacement_fails_closed() -> None:
@@ -1431,6 +2010,62 @@ def test_model_runner_provider_is_lazy_after_layout_transforms() -> None:
     assert "maybe_init_lora_manager" in calls
 
 
+def test_model_runner_target_builder_follows_local_mooncake_capability() -> None:
+    runner_tree = ast.parse(
+        Path("python/sglang/srt/model_executor/model_runner.py").read_text()
+    )
+    selector = next(
+        (
+            node
+            for node in ast.walk(runner_tree)
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_select_remote_instance_target_weight_manifest_builder"
+        ),
+        None,
+    )
+
+    assert selector is not None
+    selector_attributes = {
+        node.attr for node in ast.walk(selector) if isinstance(node, ast.Attribute)
+    }
+    assert "build_remote_instance_target_weight_manifest_session" in (
+        selector_attributes
+    )
+    assert "build_remote_instance_target_weight_runtime_manifest" in (
+        selector_attributes
+    )
+    assert any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "local_mooncake_supports_placement_binding"
+        for node in ast.walk(selector)
+    )
+
+    load_model = next(
+        node
+        for node in ast.walk(runner_tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "load_model"
+    )
+    build_load_config = next(
+        node
+        for node in ast.walk(load_model)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "build_load_config"
+    )
+    builder_value = next(
+        keyword.value
+        for keyword in build_load_config.keywords
+        if keyword.arg == "remote_instance_weight_runtime_manifest_builder"
+    )
+    assert (
+        isinstance(builder_value, ast.Call)
+        and isinstance(builder_value.func, ast.Attribute)
+        and builder_value.func.attr
+        == "_select_remote_instance_target_weight_manifest_builder"
+    )
+
+
 def test_model_runner_rejects_nontrivial_static_expert_placement() -> None:
     source = Path("python/sglang/srt/model_executor/model_runner.py").read_text()
 
@@ -1469,6 +2104,28 @@ def test_model_runner_wires_all_online_updates_to_snapshot_coordinator() -> None
         and node.attr == "enable_weight_runtime_manifest"
         for node in ast.walk(init_updater)
     )
+    coordinator_calls = [
+        node
+        for node in ast.walk(init_updater)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "WeightSnapshotCoordinator"
+    ]
+    assert len(coordinator_calls) == 1
+    completion_fence = next(
+        (
+            keyword.value
+            for keyword in coordinator_calls[0].keywords
+            if keyword.arg == "completion_fence"
+        ),
+        None,
+    )
+    assert (
+        isinstance(completion_fence, ast.Attribute)
+        and isinstance(completion_fence.value, ast.Name)
+        and completion_fence.value.id == "current_platform"
+        and completion_fence.attr == "synchronize"
+    )
 
     updater_tree = ast.parse(
         Path(
@@ -1492,6 +2149,177 @@ def test_model_runner_wires_all_online_updates_to_snapshot_coordinator() -> None
             isinstance(decorator, ast.Name)
             and decorator.id == "coordinated_weight_update"
             for decorator in method.decorator_list
+        )
+    disk_update = methods["update_weights_from_disk"]
+    disk_arguments = [argument.arg for argument in disk_update.args.args]
+    filter_index = disk_arguments.index("weight_name_filter")
+    default_index = filter_index - (
+        len(disk_arguments) - len(disk_update.args.defaults)
+    )
+    assert isinstance(disk_update.args.defaults[default_index], ast.Constant)
+    assert disk_update.args.defaults[default_index].value is None
+    assert any(
+        isinstance(node, ast.Compare)
+        and isinstance(node.left, ast.Name)
+        and node.left.id == "weight_name_filter"
+        and any(isinstance(operator, ast.IsNot) for operator in node.ops)
+        and any(
+            isinstance(comparator, ast.Constant) and comparator.value is None
+            for comparator in node.comparators
+        )
+        for node in ast.walk(disk_update)
+    )
+
+    tp_worker_tree = ast.parse(
+        Path("python/sglang/srt/managers/tp_worker.py").read_text()
+    )
+    tp_disk_update = next(
+        node
+        for node in ast.walk(tp_worker_tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "update_weights_from_disk"
+    )
+    production_calls = [
+        node
+        for node in ast.walk(tp_disk_update)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "update_weights_from_disk"
+    ]
+    assert len(production_calls) == 1
+    assert not any(
+        keyword.arg == "weight_name_filter" for keyword in production_calls[0].keywords
+    )
+
+    scheduler_tree = ast.parse(
+        Path(
+            "python/sglang/srt/managers/scheduler_components/weight_updater.py"
+        ).read_text()
+    )
+    scheduler_disk_update = next(
+        node
+        for node in ast.walk(scheduler_tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "update_weights_from_disk"
+    )
+    assert any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "_run_weight_update_transaction"
+        for node in ast.walk(scheduler_disk_update)
+    )
+    finalize_update = next(
+        node
+        for node in ast.walk(scheduler_tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "_finalize_weight_update"
+    )
+    finalization_calls = [
+        node
+        for node in ast.walk(finalize_update)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr in {"commit_revision", "poison_global_update_failure"}
+    ]
+    assert {node.func.attr for node in finalization_calls} == {
+        "commit_revision",
+        "poison_global_update_failure",
+    }
+    assert all(
+        any(keyword.arg == "expected_generation" for keyword in call.keywords)
+        for call in finalization_calls
+    )
+
+
+def test_model_runner_exposes_cross_rank_failure_poison_hook() -> None:
+    runner_tree = ast.parse(
+        Path("python/sglang/srt/model_executor/model_runner.py").read_text()
+    )
+    poison_method = next(
+        (
+            node
+            for node in ast.walk(runner_tree)
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "poison_weight_runtime_after_global_failure"
+        ),
+        None,
+    )
+
+    assert poison_method is not None
+    assert any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "poison_global_update_failure"
+        for node in ast.walk(poison_method)
+    )
+    assert any(
+        argument.arg == "expected_generation" for argument in poison_method.args.args
+    )
+
+
+def test_model_runner_releases_manifest_lease_on_cancellation() -> None:
+    runner_tree = ast.parse(
+        Path("python/sglang/srt/model_executor/model_runner.py").read_text()
+    )
+    methods = {
+        node.name: node
+        for node in ast.walk(runner_tree)
+        if isinstance(node, ast.FunctionDef)
+        and node.name
+        in {
+            "get_remote_instance_weight_runtime_manifest",
+            "get_remote_instance_weight_runtime_manifest_parts",
+        }
+    }
+
+    assert set(methods) == {
+        "get_remote_instance_weight_runtime_manifest",
+        "get_remote_instance_weight_runtime_manifest_parts",
+    }
+    for method in methods.values():
+        handlers = [
+            node for node in ast.walk(method) if isinstance(node, ast.ExceptHandler)
+        ]
+        assert any(
+            isinstance(handler.type, ast.Name) and handler.type.id == "BaseException"
+            for handler in handlers
+        )
+
+
+def test_model_runner_does_not_pre_read_generation_for_manifest_revision() -> None:
+    runner_tree = ast.parse(
+        Path("python/sglang/srt/model_executor/model_runner.py").read_text()
+    )
+    methods = {
+        node.name: node
+        for node in ast.walk(runner_tree)
+        if isinstance(node, ast.FunctionDef)
+        and node.name
+        in {
+            "get_weight_runtime_manifest",
+            "get_weight_runtime_manifest_parts",
+        }
+    }
+
+    assert set(methods) == {
+        "get_weight_runtime_manifest",
+        "get_weight_runtime_manifest_parts",
+    }
+    for method in methods.values():
+        assert not any(
+            isinstance(node, ast.Attribute) and node.attr == "generation"
+            for node in ast.walk(method)
+        )
+        snapshot_calls = [
+            node
+            for node in ast.walk(method)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in {"snapshot", "snapshot_parts"}
+        ]
+        assert len(snapshot_calls) == 1
+        assert any(
+            keyword.arg == "bind_revision_to_generation"
+            and isinstance(keyword.value, ast.Constant)
+            and keyword.value.value is True
+            for keyword in snapshot_calls[0].keywords
         )
 
 

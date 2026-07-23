@@ -195,6 +195,9 @@ def test_remote_transfer_session_uses_begin_and_release_endpoints(monkeypatch) -
 
     monkeypatch.setattr(loader_utils.requests, "post", fake_post)
     monkeypatch.setattr(loader_utils.requests, "delete", fake_delete)
+    monkeypatch.setattr(
+        loader_utils, "supports_mooncake_placement_binding_v1", lambda: True
+    )
 
     result = loader_utils.begin_remote_instance_weight_transfer(
         "http://127.0.0.1:30000"
@@ -209,7 +212,10 @@ def test_remote_transfer_session_uses_begin_and_release_endpoints(monkeypatch) -
         (
             "POST",
             "http://127.0.0.1:30000/remote_instance_weight_transfer",
-            {"lease_timeout_sec": 300},
+            {
+                "lease_timeout_sec": 300,
+                "manifest_format": "placement_binding_v1",
+            },
             30,
         ),
         (

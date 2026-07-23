@@ -97,6 +97,7 @@ class SchedulerWeightUpdaterManager:
     stashed_model_static_state: Any = None
     remote_weight_transfer_leases: Dict[str, str] = field(default_factory=dict)
     remote_weight_transfer_deadlines: Dict[str, float] = field(default_factory=dict)
+    remote_weight_transfer_expired: set[str] = field(default_factory=set)
     remote_weight_transfer_lock: threading.Lock = field(
         default_factory=threading.Lock, init=False, repr=False
     )
@@ -177,7 +178,7 @@ class SchedulerWeightUpdaterManager:
             ]
             for transfer_id in expired:
                 self.remote_weight_transfer_deadlines.pop(transfer_id, None)
-                self.remote_weight_transfer_leases.pop(transfer_id, None)
+                self.remote_weight_transfer_expired.add(transfer_id)
 
     def _get_remote_weight_transfer_lease(self, transfer_id: str) -> str | None:
         self._prune_remote_weight_transfer_bookkeeping()
@@ -195,11 +196,13 @@ class SchedulerWeightUpdaterManager:
             self.remote_weight_transfer_deadlines[transfer_id] = (
                 time.monotonic() + lease_timeout_sec
             )
+            self.remote_weight_transfer_expired.discard(transfer_id)
 
     def _forget_remote_weight_transfer_lease(self, transfer_id: str) -> None:
         with self.remote_weight_transfer_lock:
             self.remote_weight_transfer_leases.pop(transfer_id, None)
             self.remote_weight_transfer_deadlines.pop(transfer_id, None)
+            self.remote_weight_transfer_expired.discard(transfer_id)
 
     @contextmanager
     def _observe_weight_load(self, source: str) -> Iterator[None]:
@@ -230,16 +233,242 @@ class SchedulerWeightUpdaterManager:
             return
         runner.commit_weight_runtime_revision()
 
+    @staticmethod
+    def _weight_snapshot_coordinator(worker):
+        if worker is None:
+            return None
+        runner = getattr(worker, "model_runner", None)
+        if runner is None:
+            runner = _get_draft_model_runner(worker)
+        return getattr(runner, "weight_snapshot_coordinator", None)
+
+    def _weight_update_coordinators(self, workers) -> tuple:
+        coordinators = []
+        seen = set()
+        for worker in workers:
+            coordinator = self._weight_snapshot_coordinator(worker)
+            if coordinator is None or id(coordinator) in seen:
+                continue
+            coordinators.append(coordinator)
+            seen.add(id(coordinator))
+        return tuple(coordinators)
+
+    def _capture_weight_update_generations(self, workers) -> tuple:
+        return tuple(
+            (coordinator, coordinator.generation)
+            for coordinator in self._weight_update_coordinators(workers)
+        )
+
+    @staticmethod
+    def _validate_weight_update_generations(
+        generation_mapping,
+        *,
+        require_pending_revision: bool,
+    ) -> None:
+        failures = []
+        for coordinator, expected_generation in generation_mapping:
+            current_generation = coordinator.generation
+            if current_generation != expected_generation:
+                failures.append(
+                    "weight update generation changed from "
+                    f"{expected_generation} to {current_generation}"
+                )
+                continue
+            if require_pending_revision:
+                pending_generation = coordinator.pending_revision_generation()
+                if pending_generation != expected_generation:
+                    failures.append(
+                        "weight update generation "
+                        f"{expected_generation} is not pending revision commit"
+                    )
+        if failures:
+            raise WeightManifestError(" | ".join(failures))
+
+    @staticmethod
+    def _finalize_weight_update(generation_mapping, *, commit: bool) -> None:
+        failures = []
+        for coordinator, expected_generation in generation_mapping:
+            try:
+                if commit:
+                    coordinator.commit_revision(expected_generation=expected_generation)
+                else:
+                    coordinator.poison_global_update_failure(
+                        expected_generation=expected_generation
+                    )
+            except Exception as error:
+                failures.append(f"{type(error).__name__}: {error}")
+        if failures:
+            raise WeightManifestError(" | ".join(failures))
+
+    @staticmethod
+    def _poison_weight_update_best_effort(generation_mapping) -> None:
+        for coordinator, expected_generation in generation_mapping:
+            try:
+                coordinator.poison_global_update_failure(
+                    expected_generation=expected_generation
+                )
+            except Exception:
+                logger.exception("Failed to poison a partial weight update")
+
+    def _gather_weight_update_outcome(
+        self,
+        *,
+        success: bool,
+        message: str,
+        phase: str,
+    ) -> Tuple[bool, str]:
+        local_outcome = {"success": bool(success), "message": str(message)}
+        world_size = torch.distributed.get_world_size(group=self.world_cpu_group)
+        gathered = [None] * world_size
+        torch.distributed.all_gather_object(
+            gathered,
+            local_outcome,
+            group=self.world_cpu_group,
+        )
+
+        failures = []
+        for rank, outcome in enumerate(gathered):
+            if (
+                not isinstance(outcome, dict)
+                or not isinstance(outcome.get("success"), bool)
+                or not isinstance(outcome.get("message"), str)
+            ):
+                failures.append(f"rank {rank}: invalid {phase} outcome")
+            elif not outcome["success"]:
+                failures.append(f"rank {rank}: {outcome['message']}")
+        if failures:
+            return False, " | ".join(failures)
+        return True, "Success."
+
+    def _run_weight_update_transaction(
+        self,
+        *,
+        operation: str,
+        mutate: Callable[[], Tuple[bool, str]],
+        workers,
+        recv_req,
+    ) -> Tuple[bool, str]:
+        try:
+            local_success, local_message = mutate()
+            if not isinstance(local_success, bool):
+                raise TypeError("weight update success outcome must be a boolean")
+            local_message = str(local_message)
+        except Exception as error:
+            local_success = False
+            local_message = f"{type(error).__name__}: {error}"
+
+        try:
+            generation_mapping = self._capture_weight_update_generations(workers)
+        except Exception as error:
+            generation_mapping = ()
+            local_success = False
+            local_message = (
+                f"{local_message} | failed to capture weight update generation: "
+                f"{type(error).__name__}: {error}"
+            )
+
+        if local_success:
+            try:
+                self.flush_cache_after_weight_update(recv_req)
+            except Exception as error:
+                local_success = False
+                local_message = f"{type(error).__name__}: {error}"
+
+        try:
+            mutation_success, mutation_message = self._gather_weight_update_outcome(
+                success=local_success,
+                message=local_message,
+                phase=f"{operation} mutation",
+            )
+        except Exception as error:
+            self._poison_weight_update_best_effort(generation_mapping)
+            return (
+                False,
+                f"Failed to gather {operation} mutation outcomes: "
+                f"{type(error).__name__}: {error}",
+            )
+
+        try:
+            self._validate_weight_update_generations(
+                generation_mapping,
+                require_pending_revision=mutation_success,
+            )
+            local_ready_success = True
+            local_ready_message = "Success."
+        except Exception as error:
+            local_ready_success = False
+            local_ready_message = f"{type(error).__name__}: {error}"
+
+        try:
+            ready_success, ready_message = self._gather_weight_update_outcome(
+                success=local_ready_success,
+                message=local_ready_message,
+                phase=f"{operation} finalize readiness",
+            )
+        except Exception as error:
+            self._poison_weight_update_best_effort(generation_mapping)
+            return (
+                False,
+                f"Failed to gather {operation} finalize readiness outcomes: "
+                f"{type(error).__name__}: {error}",
+            )
+
+        try:
+            self._finalize_weight_update(
+                generation_mapping,
+                commit=mutation_success and ready_success,
+            )
+            local_finalize_success = True
+            local_finalize_message = "Success."
+        except Exception as error:
+            local_finalize_success = False
+            local_finalize_message = f"{type(error).__name__}: {error}"
+
+        try:
+            finalize_success, finalize_message = self._gather_weight_update_outcome(
+                success=local_finalize_success,
+                message=local_finalize_message,
+                phase=f"{operation} finalize",
+            )
+        except Exception as error:
+            self._poison_weight_update_best_effort(generation_mapping)
+            return (
+                False,
+                f"Failed to gather {operation} finalize outcomes: "
+                f"{type(error).__name__}: {error}",
+            )
+
+        if not finalize_success:
+            self._poison_weight_update_best_effort(generation_mapping)
+        if not mutation_success:
+            return False, mutation_message
+        if not ready_success:
+            return False, ready_message
+        if not finalize_success:
+            return False, finalize_message
+        return True, local_message
+
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
         """In-place update of the weights from disk."""
         with self._observe_weight_load("disk"):
-            success, message = self.tp_worker.update_weights_from_disk(recv_req)
-            tp_success = success
-            if success and self.draft_worker is not None:
-                success, message = self.draft_worker.update_weights_from_disk(recv_req)
-            if tp_success:
-                self._commit_weight_runtime_revision(self.tp_worker)
-                self.flush_cache_after_weight_update(recv_req)
+            workers = [self.tp_worker]
+            if self.draft_worker is not None:
+                workers.append(self.draft_worker)
+
+            def mutate():
+                success, message = self.tp_worker.update_weights_from_disk(recv_req)
+                if success and self.draft_worker is not None:
+                    success, message = self.draft_worker.update_weights_from_disk(
+                        recv_req
+                    )
+                return success, message
+
+            success, message = self._run_weight_update_transaction(
+                operation="disk weight update",
+                mutate=mutate,
+                workers=workers,
+                recv_req=recv_req,
+            )
             if not success:
                 logger.error(message)
             return UpdateWeightFromDiskReqOutput(
@@ -265,11 +494,13 @@ class SchedulerWeightUpdaterManager:
     ) -> Tuple[bool, str]:
         """Update the online model parameter."""
         with self._observe_weight_load("distributed"):
-            success, message = self.tp_worker.update_weights_from_distributed(recv_req)
-            if success:
-                self._commit_weight_runtime_revision(self.tp_worker)
-                self.flush_cache_after_weight_update(recv_req)
-            else:
+            success, message = self._run_weight_update_transaction(
+                operation="distributed weight update",
+                mutate=lambda: self.tp_worker.update_weights_from_distributed(recv_req),
+                workers=(self.tp_worker,),
+                recv_req=recv_req,
+            )
+            if not success:
                 logger.error(message)
             return UpdateWeightsFromDistributedReqOutput(
                 success=success, message=message
@@ -282,28 +513,39 @@ class SchedulerWeightUpdaterManager:
                 worker = self.tp_worker
             else:
                 worker = self.draft_worker or self.tp_worker
-            success, message = worker.update_weights_from_tensor(recv_req)
-            if success:
-                self._commit_weight_runtime_revision(worker)
-                self.flush_cache_after_weight_update(recv_req)
-            else:
+            success, message = self._run_weight_update_transaction(
+                operation="tensor weight update",
+                mutate=lambda: worker.update_weights_from_tensor(recv_req),
+                workers=(worker,),
+                recv_req=recv_req,
+            )
+            if not success:
                 logger.error(message)
-            torch.distributed.barrier(group=self.tp_cpu_group)
             return UpdateWeightsFromTensorReqOutput(success=success, message=message)
 
     def update_weights_from_ipc(self, recv_req: UpdateWeightsFromIPCReqInput):
         """Update the online model parameter from IPC for checkpoint-engine integration."""
         with self._observe_weight_load("ipc"):
-            success, message = self.tp_worker.update_weights_from_ipc(recv_req)
-            tp_success = success
-            if success and self.draft_worker is not None:
-                success, message = self.draft_worker.update_weights_from_ipc(recv_req)
-            if tp_success:
-                self._commit_weight_runtime_revision(self.tp_worker)
-                self.flush_cache_after_weight_update(recv_req)
+            workers = [self.tp_worker]
+            if self.draft_worker is not None:
+                workers.append(self.draft_worker)
+
+            def mutate():
+                success, message = self.tp_worker.update_weights_from_ipc(recv_req)
+                if success and self.draft_worker is not None:
+                    success, message = self.draft_worker.update_weights_from_ipc(
+                        recv_req
+                    )
+                return success, message
+
+            success, message = self._run_weight_update_transaction(
+                operation="IPC weight update",
+                mutate=mutate,
+                workers=workers,
+                recv_req=recv_req,
+            )
             if not success:
                 logger.error(message)
-            torch.distributed.barrier(group=self.tp_cpu_group)
             return UpdateWeightsFromIPCReqOutput(success=success, message=message)
 
     def get_weights_by_name(self, recv_req: GetWeightsByNameReqInput):
@@ -381,35 +623,71 @@ class SchedulerWeightUpdaterManager:
     ) -> BeginRemoteInstanceWeightTransferReqOutput:
         """Acquire one address-stable snapshot on every model rank."""
         collective_group = self.remote_weight_transfer_cpu_group or self.world_cpu_group
-        local_manifest = None
+        local_snapshot = None
+        split_manifest = recv_req.manifest_format == "placement_binding_v1"
         try:
+            if recv_req.manifest_format not in ("runtime_v1", "placement_binding_v1"):
+                raise RuntimeError(
+                    f"unsupported source manifest format: {recv_req.manifest_format}"
+                )
             if self._get_remote_weight_transfer_lease(recv_req.transfer_id) is not None:
                 raise RuntimeError(
                     f"remote weight transfer already exists: {recv_req.transfer_id}"
                 )
-            local_manifest = (
-                self.tp_worker.model_runner.get_remote_instance_weight_runtime_manifest(
+            if split_manifest:
+                local_snapshot = self.tp_worker.model_runner.get_remote_instance_weight_runtime_manifest_parts(
                     model_id=recv_req.model_id,
                     revision=recv_req.revision,
                     transfer_id=recv_req.transfer_id,
                     lease_timeout_sec=recv_req.lease_timeout_sec,
                 )
-            )
-            local_payload = (
-                local_manifest
-                if isinstance(local_manifest, dict)
-                else msgspec.to_builtins(local_manifest)
-            )
-            local_result = {
-                "success": True,
-                "message": "Success.",
-                "manifest": local_payload,
-            }
+                placement = (
+                    local_snapshot["placement"]
+                    if isinstance(local_snapshot, dict)
+                    else local_snapshot.placement
+                )
+                binding = (
+                    local_snapshot["binding"]
+                    if isinstance(local_snapshot, dict)
+                    else local_snapshot.binding
+                )
+                placement_payload = (
+                    placement
+                    if isinstance(placement, dict)
+                    else msgspec.to_builtins(placement)
+                )
+                binding_payload = (
+                    binding
+                    if isinstance(binding, dict)
+                    else msgspec.to_builtins(binding)
+                )
+                local_result = {
+                    "success": True,
+                    "message": "Success.",
+                    "placement": placement_payload,
+                    "binding": binding_payload,
+                }
+            else:
+                local_snapshot = self.tp_worker.model_runner.get_remote_instance_weight_runtime_manifest(
+                    model_id=recv_req.model_id,
+                    revision=recv_req.revision,
+                    transfer_id=recv_req.transfer_id,
+                    lease_timeout_sec=recv_req.lease_timeout_sec,
+                )
+                local_payload = (
+                    local_snapshot
+                    if isinstance(local_snapshot, dict)
+                    else msgspec.to_builtins(local_snapshot)
+                )
+                local_result = {
+                    "success": True,
+                    "message": "Success.",
+                    "manifest": local_payload,
+                }
         except Exception as error:
             local_result = {
                 "success": False,
                 "message": str(error),
-                "manifest": None,
             }
 
         try:
@@ -419,11 +697,11 @@ class SchedulerWeightUpdaterManager:
                 gathered, local_result, group=collective_group
             )
         except Exception as error:
-            if local_manifest is not None:
+            if local_snapshot is not None:
                 self.tp_worker.model_runner.release_weight_runtime_manifest(
-                    local_manifest["lease_id"]
-                    if isinstance(local_manifest, dict)
-                    else local_manifest.lease_id
+                    self._remote_transfer_snapshot_lease_id(
+                        local_snapshot, split_manifest=split_manifest
+                    )
                 )
             return BeginRemoteInstanceWeightTransferReqOutput(
                 transfer_id=recv_req.transfer_id,
@@ -432,19 +710,29 @@ class SchedulerWeightUpdaterManager:
             )
 
         failures = [item["message"] for item in gathered if not item["success"]]
-        manifests = [item["manifest"] for item in gathered if item["success"]]
+        manifests = None
+        placements = None
+        bindings = None
         if not failures:
             try:
-                self._validate_remote_transfer_manifests(manifests, world_size)
+                if split_manifest:
+                    placements = [item["placement"] for item in gathered]
+                    bindings = [item["binding"] for item in gathered]
+                    self._validate_remote_transfer_parts(
+                        placements, bindings, world_size
+                    )
+                else:
+                    manifests = [item["manifest"] for item in gathered]
+                    self._validate_remote_transfer_manifests(manifests, world_size)
             except Exception as error:
                 failures.append(str(error))
 
         if failures:
-            if local_manifest is not None:
+            if local_snapshot is not None:
                 self.tp_worker.model_runner.release_weight_runtime_manifest(
-                    local_manifest["lease_id"]
-                    if isinstance(local_manifest, dict)
-                    else local_manifest.lease_id
+                    self._remote_transfer_snapshot_lease_id(
+                        local_snapshot, split_manifest=split_manifest
+                    )
                 )
             return BeginRemoteInstanceWeightTransferReqOutput(
                 transfer_id=recv_req.transfer_id,
@@ -452,10 +740,8 @@ class SchedulerWeightUpdaterManager:
                 message=" | ".join(failures),
             )
 
-        local_lease_id = (
-            local_manifest["lease_id"]
-            if isinstance(local_manifest, dict)
-            else local_manifest.lease_id
+        local_lease_id = self._remote_transfer_snapshot_lease_id(
+            local_snapshot, split_manifest=split_manifest
         )
         self._record_remote_weight_transfer_lease(
             recv_req.transfer_id,
@@ -467,7 +753,20 @@ class SchedulerWeightUpdaterManager:
             success=True,
             message="Success.",
             manifests=manifests,
+            placements=placements,
+            bindings=bindings,
         )
+
+    @staticmethod
+    def _remote_transfer_snapshot_lease_id(snapshot, *, split_manifest: bool) -> str:
+        if split_manifest:
+            binding = (
+                snapshot["binding"] if isinstance(snapshot, dict) else snapshot.binding
+            )
+            return (
+                binding["lease_id"] if isinstance(binding, dict) else binding.lease_id
+            )
+        return snapshot["lease_id"] if isinstance(snapshot, dict) else snapshot.lease_id
 
     def _gather_remote_weight_transfer_status(
         self, *, success: bool, message: str, operation: str
@@ -511,13 +810,6 @@ class SchedulerWeightUpdaterManager:
             except Exception as error:
                 local_success = False
                 local_message = str(error)
-                is_active = getattr(
-                    self.tp_worker.model_runner,
-                    "has_weight_runtime_manifest_lease",
-                    None,
-                )
-                if callable(is_active) and not is_active(lease_id):
-                    self._forget_remote_weight_transfer_lease(recv_req.transfer_id)
 
         success, message = self._gather_remote_weight_transfer_status(
             success=local_success,
@@ -560,6 +852,59 @@ class SchedulerWeightUpdaterManager:
                 "source runtime manifests do not describe one model generation"
             )
 
+    @staticmethod
+    def _validate_remote_transfer_parts(placements, bindings, world_size: int) -> None:
+        if len(placements) != world_size or len(bindings) != world_size:
+            raise RuntimeError(
+                "source placement and binding counts must match the model world"
+            )
+        if any(not placement.get("tensors") for placement in placements):
+            raise RuntimeError("every source rank must publish at least one tensor")
+        if any(not binding.get("fragments") for binding in bindings):
+            raise RuntimeError("every source rank must publish at least one binding")
+
+        for placement, binding in zip(placements, bindings):
+            placement_identity = (
+                placement.get("model_id"),
+                placement.get("revision"),
+                placement.get("placement_id"),
+            )
+            binding_identity = (
+                binding.get("model_id"),
+                binding.get("revision"),
+                binding.get("placement_id"),
+            )
+            if placement_identity != binding_identity:
+                raise RuntimeError(
+                    "source runtime binding does not match its placement"
+                )
+
+        worker_ids = []
+        for binding in bindings:
+            fragment_worker_ids = {
+                fragment.get("worker_id") for fragment in binding["fragments"]
+            }
+            if None in fragment_worker_ids or len(fragment_worker_ids) != 1:
+                raise RuntimeError(
+                    "each source runtime binding must describe exactly one worker"
+                )
+            worker_ids.append(next(iter(fragment_worker_ids)))
+        if len(set(worker_ids)) != world_size:
+            raise RuntimeError("source runtime binding worker IDs are not unique")
+
+        identities = {
+            (
+                placement.get("model_id"),
+                placement.get("revision"),
+                binding.get("generation"),
+            )
+            for placement, binding in zip(placements, bindings)
+        }
+        if len(identities) != 1:
+            raise RuntimeError(
+                "source placement and bindings do not describe one model generation"
+            )
+
     def release_remote_instance_weight_transfer(
         self, recv_req: ReleaseRemoteInstanceWeightTransferReqInput
     ) -> ReleaseRemoteInstanceWeightTransferReqOutput:
@@ -568,31 +913,14 @@ class SchedulerWeightUpdaterManager:
             local_success = True
             local_message = "Remote weight transfer was already released."
         else:
-            is_active = getattr(
-                self.tp_worker.model_runner,
-                "has_weight_runtime_manifest_lease",
-                None,
-            )
-            if callable(is_active) and not is_active(lease_id):
+            try:
+                self.tp_worker.model_runner.release_weight_runtime_manifest(lease_id)
                 self._forget_remote_weight_transfer_lease(recv_req.transfer_id)
                 local_success = True
-                local_message = "Remote weight transfer lease already expired."
-            else:
-                try:
-                    self.tp_worker.model_runner.release_weight_runtime_manifest(
-                        lease_id
-                    )
-                    self._forget_remote_weight_transfer_lease(recv_req.transfer_id)
-                    local_success = True
-                    local_message = "Success."
-                except Exception as error:
-                    if callable(is_active) and not is_active(lease_id):
-                        self._forget_remote_weight_transfer_lease(recv_req.transfer_id)
-                        local_success = True
-                        local_message = "Remote weight transfer lease already expired."
-                    else:
-                        local_success = False
-                        local_message = str(error)
+                local_message = "Success."
+            except Exception as error:
+                local_success = False
+                local_message = str(error)
 
         success, message = self._gather_remote_weight_transfer_status(
             success=local_success,

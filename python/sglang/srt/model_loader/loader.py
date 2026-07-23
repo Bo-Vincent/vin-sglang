@@ -2437,6 +2437,16 @@ class RemoteInstanceModelLoader(BaseModelLoader):
 
         return True
 
+    @staticmethod
+    def _runtime_v1_target_manifest_builder(target_manifest_builder):
+        owner = getattr(target_manifest_builder, "__self__", None)
+        legacy_builder = getattr(
+            owner,
+            "build_remote_instance_target_weight_runtime_manifest",
+            None,
+        )
+        return legacy_builder if callable(legacy_builder) else target_manifest_builder
+
     def load_model_from_remote_instance_by_transfer_engine_heterogeneous(
         self,
         model,
@@ -2489,6 +2499,11 @@ class RemoteInstanceModelLoader(BaseModelLoader):
             logger.error("Cannot acquire remote weight transfer session.")
             return False
         inventories = transfer_session.manifests
+        source_placement_inventories = getattr(
+            transfer_session, "source_placements", None
+        )
+        source_binding_inventories = getattr(transfer_session, "source_bindings", None)
+        manifest_format = getattr(transfer_session, "manifest_format", "runtime_v1")
         transfer_success = False
         release_safe = True
         release_success = False
@@ -2501,17 +2516,70 @@ class RemoteInstanceModelLoader(BaseModelLoader):
                 planning_error = None
                 try:
                     source_manifest_started = time.perf_counter()
-                    source_manifests = tuple(
-                        RuntimeManifest.from_runtime_inventory(inventory)
-                        for inventory in inventories
-                    )
+                    source_placements = ()
+                    source_bindings = ()
+                    if manifest_format == "placement_binding_v1":
+                        if (
+                            not source_placement_inventories
+                            or not source_binding_inventories
+                            or len(source_placement_inventories)
+                            != len(source_binding_inventories)
+                        ):
+                            raise ValueError(
+                                "source placement and runtime binding inventories "
+                                "must be paired"
+                            )
+                        from mooncake.weight_transfer import (
+                            RuntimeBindingManifest,
+                            SourcePlacementManifest,
+                            bind_runtime_manifest,
+                        )
+
+                        source_placements = tuple(
+                            SourcePlacementManifest.from_runtime_inventory(inventory)
+                            for inventory in source_placement_inventories
+                        )
+                        source_bindings = tuple(
+                            RuntimeBindingManifest.from_runtime_inventory(inventory)
+                            for inventory in source_binding_inventories
+                        )
+                        source_manifests = tuple(
+                            bind_runtime_manifest(placement, binding)
+                            for placement, binding in zip(
+                                source_placements, source_bindings
+                            )
+                        )
+                    elif manifest_format == "runtime_v1":
+                        if not inventories:
+                            raise ValueError(
+                                "source runtime manifest inventories must not be empty"
+                            )
+                        source_manifests = tuple(
+                            RuntimeManifest.from_runtime_inventory(inventory)
+                            for inventory in inventories
+                        )
+                    else:
+                        raise ValueError(
+                            f"unsupported source manifest format: {manifest_format}"
+                        )
                     phase_seconds["source_manifest"] = (
                         time.perf_counter() - source_manifest_started
                     )
-                    source = source_manifests[0]
+                    source = (
+                        source_placements[0]
+                        if source_placements
+                        else source_manifests[0]
+                    )
                     target_manifest_started = time.perf_counter()
+                    selected_target_builder = target_manifest_builder
+                    if manifest_format == "runtime_v1":
+                        selected_target_builder = (
+                            self._runtime_v1_target_manifest_builder(
+                                target_manifest_builder
+                            )
+                        )
                     target_resource = transfer_resources.enter_context(
-                        target_manifest_builder(
+                        selected_target_builder(
                             model=model,
                             model_id=source.model_id,
                             revision=source.revision,
@@ -2519,15 +2587,20 @@ class RemoteInstanceModelLoader(BaseModelLoader):
                             endpoint=local_session_id,
                         )
                     )
-                    if hasattr(target_resource, "placement") and callable(
-                        getattr(target_resource, "bind", None)
-                    ):
+                    if manifest_format == "placement_binding_v1":
+                        if not hasattr(target_resource, "placement") or not callable(
+                            getattr(target_resource, "bind", None)
+                        ):
+                            raise ValueError(
+                                "placement_binding_v1 requires a target manifest "
+                                "session with placement and bind()"
+                            )
                         from mooncake.weight_transfer import (
                             RuntimeBindingManifest,
                             TargetPlacementManifest,
                             bind_logical_transfer_plan,
                             bind_runtime_manifest,
-                            plan_runtime_transfer_to_local_target_placement,
+                            plan_placement_transfer_to_local_target,
                         )
 
                         target_placement = (
@@ -2539,8 +2612,8 @@ class RemoteInstanceModelLoader(BaseModelLoader):
                             time.perf_counter() - target_manifest_started
                         )
                         plan_started = time.perf_counter()
-                        logical_plan = plan_runtime_transfer_to_local_target_placement(
-                            source_manifests, target_placement
+                        logical_plan = plan_placement_transfer_to_local_target(
+                            source_placements, target_placement
                         )
                         target_binding_inventory = transfer_resources.enter_context(
                             target_resource.bind()
@@ -2552,7 +2625,9 @@ class RemoteInstanceModelLoader(BaseModelLoader):
                             target_placement, target_binding
                         )
                         plan = bind_logical_transfer_plan(
-                            logical_plan, (target_manifest,)
+                            logical_plan,
+                            (target_binding,),
+                            source_bindings=source_bindings,
                         )
                         phase_seconds["plan"] = time.perf_counter() - plan_started
                     else:
@@ -2576,7 +2651,10 @@ class RemoteInstanceModelLoader(BaseModelLoader):
                         for fragment in manifest.fragments
                     )
                     target_registrations = tuple(
-                        MemoryRegistrationLease.from_fragment(fragment)
+                        MemoryRegistrationLease.from_fragment(
+                            fragment,
+                            runtime_lease_id=target_manifest.lease_id,
+                        )
                         for fragment in target_manifest.fragments
                     )
                 except Exception as error:
@@ -2620,8 +2698,8 @@ class RemoteInstanceModelLoader(BaseModelLoader):
             logger.exception(
                 "Heterogeneous remote-instance Transfer Engine loading failed; %s",
                 (
-                    "keeping the source lease until TTL because transfer completion "
-                    "cannot be proven"
+                    "source mutation remains blocked until explicit release or "
+                    "recovery because transfer completion cannot be proven"
                     if transfer_attempted
                     else "no transfer was attempted"
                 ),
@@ -2653,7 +2731,7 @@ class RemoteInstanceModelLoader(BaseModelLoader):
         if not release_success:
             logger.warning(
                 "Loaded weights but failed to release source transfer session %s; "
-                "the source lease will expire automatically",
+                "source mutation remains blocked until explicit release or recovery",
                 transfer_session.transfer_id,
             )
 

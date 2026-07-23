@@ -1673,6 +1673,7 @@ class BeginRemoteInstanceWeightTransferReqInput(BaseReq, kw_only=True):
     model_id: str
     revision: str
     lease_timeout_sec: int = DEFAULT_REMOTE_INSTANCE_WEIGHT_TRANSFER_LEASE_TIMEOUT_SEC
+    manifest_format: str = "runtime_v1"
 
 
 class BeginRemoteInstanceWeightTransferReqOutput(BaseReq, kw_only=True):
@@ -1680,6 +1681,8 @@ class BeginRemoteInstanceWeightTransferReqOutput(BaseReq, kw_only=True):
     success: bool
     message: str
     manifests: Optional[List[Dict[str, Any]]] = None
+    placements: Optional[List[Dict[str, Any]]] = None
+    bindings: Optional[List[Dict[str, Any]]] = None
 
 
 class ReleaseRemoteInstanceWeightTransferReqInput(BaseReq, kw_only=True):
