@@ -106,6 +106,7 @@ class SchedulerWeightUpdaterManager:
     stashed_model_static_state: Any = None
     remote_weight_transfer_leases: Dict[str, str] = field(default_factory=dict)
     remote_weight_transfer_deadlines: Dict[str, float] = field(default_factory=dict)
+    remote_weight_transfer_generations: Dict[str, int] = field(default_factory=dict)
     remote_weight_transfer_expired: set[str] = field(default_factory=set)
     remote_weight_transfer_sessions: Dict[
         str,
@@ -194,7 +195,6 @@ class SchedulerWeightUpdaterManager:
                 if deadline <= now
             ]
             for transfer_id in expired:
-                self.remote_weight_transfer_deadlines.pop(transfer_id, None)
                 self.remote_weight_transfer_expired.add(transfer_id)
             expired_tombstones = [
                 transfer_id
@@ -210,6 +210,35 @@ class SchedulerWeightUpdaterManager:
         self._prune_remote_weight_transfer_bookkeeping()
         with self.remote_weight_transfer_lock:
             return self.remote_weight_transfer_leases.get(transfer_id)
+
+    def list_remote_instance_weight_transfer_sessions(self) -> List[Dict[str, Any]]:
+        self._prune_remote_weight_transfer_bookkeeping()
+        with self.remote_weight_transfer_lock:
+            return [
+                {
+                    "transfer_id": transfer_id,
+                    "lease_id": lease_id,
+                    "generation": self.remote_weight_transfer_generations.get(
+                        transfer_id
+                    ),
+                    "deadline_monotonic_sec": (
+                        self.remote_weight_transfer_deadlines.get(transfer_id)
+                    ),
+                    "expired": transfer_id in self.remote_weight_transfer_expired,
+                    "session_state": (
+                        "expired"
+                        if transfer_id in self.remote_weight_transfer_expired
+                        else (
+                            "active"
+                            if transfer_id in self.remote_weight_transfer_sessions
+                            else "cleanup_pending"
+                        )
+                    ),
+                }
+                for transfer_id, lease_id in sorted(
+                    self.remote_weight_transfer_leases.items()
+                )
+            ]
 
     @staticmethod
     def _remote_weight_transfer_request_identity(
@@ -263,12 +292,20 @@ class SchedulerWeightUpdaterManager:
         request: BeginRemoteInstanceWeightTransferReqInput,
         lease_id: str,
         output: BeginRemoteInstanceWeightTransferReqOutput,
+        generation: int | None = None,
     ) -> None:
+        if generation is None:
+            generation = self._remote_transfer_output_generation(output)
         with self.remote_weight_transfer_lock:
             self.remote_weight_transfer_leases[request.transfer_id] = lease_id
-            self.remote_weight_transfer_deadlines[request.transfer_id] = (
-                time.monotonic() + request.lease_timeout_sec
+            self.remote_weight_transfer_deadlines.setdefault(
+                request.transfer_id,
+                time.monotonic() + request.lease_timeout_sec,
             )
+            if generation is not None:
+                self.remote_weight_transfer_generations[request.transfer_id] = (
+                    generation
+                )
             self.remote_weight_transfer_expired.discard(request.transfer_id)
             self.remote_weight_transfer_sessions[request.transfer_id] = (
                 self._remote_weight_transfer_request_identity(request),
@@ -281,12 +318,16 @@ class SchedulerWeightUpdaterManager:
         transfer_id: str,
         lease_id: str,
         lease_timeout_sec: int,
+        *,
+        generation: int | None = None,
     ) -> None:
         with self.remote_weight_transfer_lock:
             self.remote_weight_transfer_leases[transfer_id] = lease_id
             self.remote_weight_transfer_deadlines[transfer_id] = (
                 time.monotonic() + lease_timeout_sec
             )
+            if generation is not None:
+                self.remote_weight_transfer_generations[transfer_id] = generation
             self.remote_weight_transfer_expired.discard(transfer_id)
 
     def _complete_remote_weight_transfer_session(self, transfer_id: str) -> None:
@@ -294,6 +335,7 @@ class SchedulerWeightUpdaterManager:
         with self.remote_weight_transfer_lock:
             self.remote_weight_transfer_leases.pop(transfer_id, None)
             self.remote_weight_transfer_deadlines.pop(transfer_id, None)
+            self.remote_weight_transfer_generations.pop(transfer_id, None)
             self.remote_weight_transfer_expired.discard(transfer_id)
             session = self.remote_weight_transfer_sessions.pop(transfer_id, None)
             if (
@@ -317,6 +359,7 @@ class SchedulerWeightUpdaterManager:
         with self.remote_weight_transfer_lock:
             self.remote_weight_transfer_leases.pop(transfer_id, None)
             self.remote_weight_transfer_deadlines.pop(transfer_id, None)
+            self.remote_weight_transfer_generations.pop(transfer_id, None)
             self.remote_weight_transfer_expired.discard(transfer_id)
             self.remote_weight_transfer_sessions.pop(transfer_id, None)
 
@@ -768,6 +811,8 @@ class SchedulerWeightUpdaterManager:
         """Acquire one address-stable snapshot on every model rank."""
         collective_group = self.remote_weight_transfer_cpu_group or self.world_cpu_group
         local_snapshot = None
+        local_lease_id = None
+        local_generation = None
         cached = None
         split_manifest = recv_req.manifest_format == "placement_binding_v1"
         try:
@@ -789,66 +834,78 @@ class SchedulerWeightUpdaterManager:
                     f"remote weight transfer already exists: {recv_req.transfer_id}",
                     session_state="cleanup_pending",
                 )
-            elif split_manifest:
-                local_snapshot = self.tp_worker.model_runner.get_remote_instance_weight_runtime_manifest_parts(
-                    model_id=recv_req.model_id,
-                    revision=recv_req.revision,
-                    transfer_id=recv_req.transfer_id,
-                    lease_timeout_sec=recv_req.lease_timeout_sec,
-                )
-                placement = (
-                    local_snapshot["placement"]
-                    if isinstance(local_snapshot, dict)
-                    else local_snapshot.placement
-                )
-                binding = (
-                    local_snapshot["binding"]
-                    if isinstance(local_snapshot, dict)
-                    else local_snapshot.binding
-                )
-                placement_payload = (
-                    placement
-                    if isinstance(placement, dict)
-                    else msgspec.to_builtins(placement)
-                )
-                binding_payload = (
-                    binding
-                    if isinstance(binding, dict)
-                    else msgspec.to_builtins(binding)
-                )
-                local_result = {
-                    "success": True,
-                    "message": "Success.",
-                    "session_state": "created",
-                    "placement": placement_payload,
-                    "binding": binding_payload,
-                }
             else:
-                local_snapshot = self.tp_worker.model_runner.get_remote_instance_weight_runtime_manifest(
-                    model_id=recv_req.model_id,
-                    revision=recv_req.revision,
-                    transfer_id=recv_req.transfer_id,
-                    lease_timeout_sec=recv_req.lease_timeout_sec,
+                if split_manifest:
+                    local_snapshot = self.tp_worker.model_runner.get_remote_instance_weight_runtime_manifest_parts(
+                        model_id=recv_req.model_id,
+                        revision=recv_req.revision,
+                        transfer_id=recv_req.transfer_id,
+                        lease_timeout_sec=recv_req.lease_timeout_sec,
+                    )
+                else:
+                    local_snapshot = self.tp_worker.model_runner.get_remote_instance_weight_runtime_manifest(
+                        model_id=recv_req.model_id,
+                        revision=recv_req.revision,
+                        transfer_id=recv_req.transfer_id,
+                        lease_timeout_sec=recv_req.lease_timeout_sec,
+                    )
+                local_lease_id = self._remote_transfer_snapshot_lease_id(
+                    local_snapshot,
+                    split_manifest=split_manifest,
                 )
-                local_payload = (
-                    local_snapshot
-                    if isinstance(local_snapshot, dict)
-                    else msgspec.to_builtins(local_snapshot)
-                )
-                local_result = {
-                    "success": True,
-                    "message": "Success.",
-                    "session_state": "created",
-                    "manifest": local_payload,
-                }
-            if local_snapshot is not None:
                 self._record_remote_weight_transfer_lease(
                     recv_req.transfer_id,
-                    self._remote_transfer_snapshot_lease_id(
-                        local_snapshot, split_manifest=split_manifest
-                    ),
+                    local_lease_id,
                     recv_req.lease_timeout_sec,
                 )
+                local_generation = self._remote_transfer_snapshot_generation(
+                    local_snapshot,
+                    split_manifest=split_manifest,
+                )
+                with self.remote_weight_transfer_lock:
+                    self.remote_weight_transfer_generations[recv_req.transfer_id] = (
+                        local_generation
+                    )
+                if split_manifest:
+                    placement = (
+                        local_snapshot["placement"]
+                        if isinstance(local_snapshot, dict)
+                        else local_snapshot.placement
+                    )
+                    binding = (
+                        local_snapshot["binding"]
+                        if isinstance(local_snapshot, dict)
+                        else local_snapshot.binding
+                    )
+                    placement_payload = (
+                        placement
+                        if isinstance(placement, dict)
+                        else msgspec.to_builtins(placement)
+                    )
+                    binding_payload = (
+                        binding
+                        if isinstance(binding, dict)
+                        else msgspec.to_builtins(binding)
+                    )
+                    local_result = {
+                        "success": True,
+                        "message": "Success.",
+                        "session_state": "created",
+                        "placement": placement_payload,
+                        "binding": binding_payload,
+                    }
+                else:
+                    local_payload = (
+                        local_snapshot
+                        if isinstance(local_snapshot, dict)
+                        else msgspec.to_builtins(local_snapshot)
+                    )
+                    local_result = {
+                        "success": True,
+                        "message": "Success.",
+                        "session_state": "created",
+                        "manifest": local_payload,
+                    }
         except Exception as error:
             local_result = {
                 "success": False,
@@ -864,13 +921,10 @@ class SchedulerWeightUpdaterManager:
             )
         except Exception as error:
             cleanup_error = None
-            if local_snapshot is not None:
+            if local_lease_id is not None:
                 cleanup_error = self._rollback_remote_weight_transfer_snapshot(
                     recv_req.transfer_id,
-                    self._remote_transfer_snapshot_lease_id(
-                        local_snapshot,
-                        split_manifest=split_manifest,
-                    ),
+                    local_lease_id,
                 )
             message = f"Failed to gather source runtime manifests: {error}"
             session_state = "failed"
@@ -928,13 +982,10 @@ class SchedulerWeightUpdaterManager:
 
         if failures:
             cleanup_error = None
-            if local_snapshot is not None:
+            if local_lease_id is not None:
                 cleanup_error = self._rollback_remote_weight_transfer_snapshot(
                     recv_req.transfer_id,
-                    self._remote_transfer_snapshot_lease_id(
-                        local_snapshot,
-                        split_manifest=split_manifest,
-                    ),
+                    local_lease_id,
                 )
             all_session_states = {
                 item.get(
@@ -971,9 +1022,7 @@ class SchedulerWeightUpdaterManager:
                 session_state=session_state,
             )
 
-        local_lease_id = self._remote_transfer_snapshot_lease_id(
-            local_snapshot, split_manifest=split_manifest
-        )
+        assert local_lease_id is not None
         output = BeginRemoteInstanceWeightTransferReqOutput(
             transfer_id=recv_req.transfer_id,
             success=True,
@@ -987,6 +1036,7 @@ class SchedulerWeightUpdaterManager:
             recv_req,
             local_lease_id,
             output,
+            generation=local_generation,
         )
         return output
 
@@ -1000,6 +1050,34 @@ class SchedulerWeightUpdaterManager:
                 binding["lease_id"] if isinstance(binding, dict) else binding.lease_id
             )
         return snapshot["lease_id"] if isinstance(snapshot, dict) else snapshot.lease_id
+
+    @staticmethod
+    def _remote_transfer_snapshot_generation(snapshot, *, split_manifest: bool) -> int:
+        if split_manifest:
+            binding = (
+                snapshot["binding"] if isinstance(snapshot, dict) else snapshot.binding
+            )
+            return (
+                binding["generation"]
+                if isinstance(binding, dict)
+                else binding.generation
+            )
+        return (
+            snapshot["generation"]
+            if isinstance(snapshot, dict)
+            else snapshot.generation
+        )
+
+    @staticmethod
+    def _remote_transfer_output_generation(
+        output: BeginRemoteInstanceWeightTransferReqOutput,
+    ) -> int | None:
+        records = output.bindings or output.manifests or ()
+        generations = {
+            record.get("generation") for record in records if isinstance(record, dict)
+        }
+        generations.discard(None)
+        return next(iter(generations)) if len(generations) == 1 else None
 
     def _gather_remote_weight_transfer_status(
         self, *, success: bool, message: str, operation: str
@@ -1150,6 +1228,10 @@ class SchedulerWeightUpdaterManager:
         self, recv_req: ReleaseRemoteInstanceWeightTransferReqInput
     ) -> ReleaseRemoteInstanceWeightTransferReqOutput:
         lease_id = self._get_remote_weight_transfer_lease(recv_req.transfer_id)
+        with self.remote_weight_transfer_lock:
+            generation = self.remote_weight_transfer_generations.get(
+                recv_req.transfer_id
+            )
         if lease_id is None:
             self._complete_remote_weight_transfer_session(recv_req.transfer_id)
             local_success = True
@@ -1163,6 +1245,14 @@ class SchedulerWeightUpdaterManager:
             except Exception as error:
                 local_success = False
                 local_message = str(error)
+                logger.warning(
+                    "Explicit remote weight transfer release failed: "
+                    "transfer_id=%s lease_id=%s generation=%s error=%s",
+                    recv_req.transfer_id,
+                    lease_id,
+                    generation,
+                    error,
+                )
 
         success, message = self._gather_remote_weight_transfer_status(
             success=local_success,
@@ -1176,9 +1266,9 @@ class SchedulerWeightUpdaterManager:
         )
 
     def release_memory_occupation(self, recv_req: ReleaseMemoryOccupationReqInput):
-        assert self.is_fully_idle(), (
-            "release_memory_occupation should be called only when server is idle."
-        )
+        assert (
+            self.is_fully_idle()
+        ), "release_memory_occupation should be called only when server is idle."
 
         tags = recv_req.tags
 
@@ -1317,9 +1407,9 @@ class SchedulerWeightUpdaterManager:
 
         if self.draft_worker is not None:
             draft_url = params.get("draft_url", None)
-            assert draft_url is not None, (
-                "draft_url must be provided when draft model is enabled"
-            )
+            assert (
+                draft_url is not None
+            ), "draft_url must be provided when draft model is enabled"
             self.draft_worker.model_runner.weight_exporter.save_remote_model(draft_url)
 
     def save_sharded_model(self, params):

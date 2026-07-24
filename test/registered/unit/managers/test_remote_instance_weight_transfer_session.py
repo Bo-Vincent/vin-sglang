@@ -7,23 +7,29 @@ import pytest
 import torch
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_WEIGHTS
+from sglang.srt.managers import (
+    tokenizer_control_mixin as tokenizer_control_mixin_module,
+)
 from sglang.srt.managers.io_struct import (
     BeginRemoteInstanceWeightTransferReqInput,
     BeginRemoteInstanceWeightTransferReqOutput,
     ReleaseMemoryOccupationReqInput,
     ReleaseRemoteInstanceWeightTransferReqInput,
-    ResumeMemoryOccupationReqInput,
     RenewRemoteInstanceWeightTransferReqInput,
+    ResumeMemoryOccupationReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
-)
-from sglang.srt.managers.scheduler_components.weight_updater import (
-    SchedulerWeightUpdaterManager,
 )
 from sglang.srt.managers.scheduler_components import (
     weight_updater as weight_updater_module,
 )
-from sglang.srt.managers.tokenizer_control_mixin import TokenizerControlMixin
+from sglang.srt.managers.scheduler_components.weight_updater import (
+    SchedulerWeightUpdaterManager,
+)
+from sglang.srt.managers.tokenizer_control_mixin import (
+    RemoteInstanceWeightTransferBeginError,
+    TokenizerControlMixin,
+)
 from sglang.srt.model_executor.weight_runtime_manifest import (
     WeightManifestError,
     WeightSnapshotCoordinator,
@@ -612,6 +618,109 @@ def test_begin_keeps_cleanup_pending_lease_when_rollback_release_fails(
     assert manager.remote_weight_transfer_leases == {}
 
 
+def test_begin_tracks_snapshot_when_serialization_and_rollback_release_fail(
+    monkeypatch,
+) -> None:
+    release_attempts = []
+    snapshot = SimpleNamespace(lease_id="lease-0", generation=7)
+
+    def release(lease_id):
+        release_attempts.append(lease_id)
+        if len(release_attempts) == 1:
+            raise RuntimeError("temporary rollback release failure")
+
+    runner = SimpleNamespace(
+        get_remote_instance_weight_runtime_manifest=lambda **kwargs: snapshot,
+        release_weight_runtime_manifest=release,
+    )
+    manager = _manager(runner)
+    monkeypatch.setattr(
+        weight_updater_module.msgspec,
+        "to_builtins",
+        lambda value: (_ for _ in ()).throw(RuntimeError("serialization failed")),
+    )
+    monkeypatch.setattr("torch.distributed.get_world_size", lambda group: 1)
+    monkeypatch.setattr(
+        "torch.distributed.all_gather_object",
+        lambda outputs, value, group: outputs.__setitem__(0, value),
+    )
+    request = BeginRemoteInstanceWeightTransferReqInput(
+        transfer_id="transfer-1",
+        model_id="Qwen/Qwen3.5-0.8B",
+        revision="main",
+    )
+
+    result = manager.begin_remote_instance_weight_transfer(request)
+
+    assert result.success is False
+    assert result.session_state == "cleanup_pending"
+    assert "serialization failed" in result.message
+    assert "temporary rollback release failure" in result.message
+    assert manager.list_remote_instance_weight_transfer_sessions() == [
+        {
+            "transfer_id": "transfer-1",
+            "lease_id": "lease-0",
+            "generation": 7,
+            "deadline_monotonic_sec": manager.remote_weight_transfer_deadlines[
+                "transfer-1"
+            ],
+            "expired": False,
+            "session_state": "cleanup_pending",
+        }
+    ]
+
+    released = manager.release_remote_instance_weight_transfer(
+        ReleaseRemoteInstanceWeightTransferReqInput(transfer_id="transfer-1")
+    )
+
+    assert released.success is True
+    assert release_attempts == ["lease-0", "lease-0"]
+    assert manager.list_remote_instance_weight_transfer_sessions() == []
+
+
+def test_begin_tracks_snapshot_when_generation_and_rollback_release_fail(
+    monkeypatch,
+) -> None:
+    release_attempts = []
+    snapshot = SimpleNamespace(lease_id="lease-0")
+
+    def release(lease_id):
+        release_attempts.append(lease_id)
+        if len(release_attempts) == 1:
+            raise RuntimeError("temporary rollback release failure")
+
+    runner = SimpleNamespace(
+        get_remote_instance_weight_runtime_manifest=lambda **kwargs: snapshot,
+        release_weight_runtime_manifest=release,
+    )
+    manager = _manager(runner)
+    monkeypatch.setattr("torch.distributed.get_world_size", lambda group: 1)
+    monkeypatch.setattr(
+        "torch.distributed.all_gather_object",
+        lambda outputs, value, group: outputs.__setitem__(0, value),
+    )
+    request = BeginRemoteInstanceWeightTransferReqInput(
+        transfer_id="transfer-1",
+        model_id="Qwen/Qwen3.5-0.8B",
+        revision="main",
+    )
+
+    result = manager.begin_remote_instance_weight_transfer(request)
+
+    assert result.success is False
+    assert result.session_state == "cleanup_pending"
+    assert "generation" in result.message
+    assert manager.remote_weight_transfer_leases == {"transfer-1": "lease-0"}
+
+    released = manager.release_remote_instance_weight_transfer(
+        ReleaseRemoteInstanceWeightTransferReqInput(transfer_id="transfer-1")
+    )
+
+    assert released.success is True
+    assert release_attempts == ["lease-0", "lease-0"]
+    assert manager.remote_weight_transfer_leases == {}
+
+
 def test_runtime_revision_commit_ignores_workers_without_manifest_support() -> None:
     SchedulerWeightUpdaterManager._commit_weight_runtime_revision(
         SimpleNamespace(model_runner=SimpleNamespace())
@@ -972,7 +1081,7 @@ def test_expired_remote_transfer_bookkeeping_rejects_silent_renewal(
     assert "expired" in result.message.lower()
     assert renewed == []
     assert manager.remote_weight_transfer_leases == {"transfer-1": "lease-0"}
-    assert manager.remote_weight_transfer_deadlines == {}
+    assert manager.remote_weight_transfer_deadlines == {"transfer-1": 130.0}
     assert manager.remote_weight_transfer_expired == {"transfer-1"}
 
 
@@ -1008,6 +1117,80 @@ def test_expired_remote_transfer_bookkeeping_still_releases_coordinator_lease(
     assert manager.remote_weight_transfer_leases == {}
     assert manager.remote_weight_transfer_deadlines == {}
     assert manager.remote_weight_transfer_expired == set()
+
+
+def test_scheduler_lists_expired_session_without_releasing_lease(monkeypatch) -> None:
+    now = [100.0]
+    released = []
+    runner = SimpleNamespace(
+        release_weight_runtime_manifest=lambda lease_id: released.append(lease_id),
+    )
+    manager = _manager(runner)
+    monkeypatch.setattr(weight_updater_module.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr("torch.distributed.get_world_size", lambda group: 1)
+    monkeypatch.setattr(
+        "torch.distributed.all_gather_object",
+        lambda outputs, value, group: outputs.__setitem__(0, value),
+    )
+    manager._record_remote_weight_transfer_lease(
+        "transfer-1",
+        "lease-0",
+        30,
+        generation=7,
+    )
+
+    now[0] = 131.0
+    assert manager.list_remote_instance_weight_transfer_sessions() == [
+        {
+            "transfer_id": "transfer-1",
+            "lease_id": "lease-0",
+            "generation": 7,
+            "deadline_monotonic_sec": 130.0,
+            "expired": True,
+            "session_state": "expired",
+        }
+    ]
+    assert released == []
+    assert manager.remote_weight_transfer_leases == {"transfer-1": "lease-0"}
+    assert manager.remote_weight_transfer_deadlines == {"transfer-1": 130.0}
+
+    result = manager.release_remote_instance_weight_transfer(
+        ReleaseRemoteInstanceWeightTransferReqInput(transfer_id="transfer-1")
+    )
+
+    assert result.success is True
+    assert released == ["lease-0"]
+    assert manager.list_remote_instance_weight_transfer_sessions() == []
+
+
+def test_session_record_does_not_extend_snapshot_deadline(monkeypatch) -> None:
+    now = [100.0]
+    manager = _manager(SimpleNamespace())
+    monkeypatch.setattr(weight_updater_module.time, "monotonic", lambda: now[0])
+    manager._record_remote_weight_transfer_lease(
+        "transfer-1",
+        "lease-0",
+        30,
+        generation=1,
+    )
+
+    now[0] = 105.0
+    request = BeginRemoteInstanceWeightTransferReqInput(
+        transfer_id="transfer-1",
+        model_id="Qwen/Qwen3.5-0.8B",
+        revision="main",
+        lease_timeout_sec=30,
+    )
+    output = BeginRemoteInstanceWeightTransferReqOutput(
+        transfer_id="transfer-1",
+        success=True,
+        message="Success.",
+        session_state="created",
+        manifests=[_manifest()],
+    )
+    manager._record_remote_weight_transfer_session(request, "lease-0", output)
+
+    assert manager.remote_weight_transfer_deadlines == {"transfer-1": 130.0}
 
 
 def test_failed_renew_retains_lease_for_explicit_release(monkeypatch) -> None:
@@ -1099,6 +1282,493 @@ def test_tokenizer_begin_pauses_only_snapshot_capture() -> None:
         "continue",
     ]
     assert manager._remote_weight_transfer_events[-1] == ("continue", False)
+
+
+def test_tokenizer_begin_resume_failure_keeps_session_discoverable_and_releasable(
+    monkeypatch,
+) -> None:
+    release_requests = []
+    resume_attempts = []
+
+    async def release(request):
+        release_requests.append(request.transfer_id)
+        return [SimpleNamespace(success=True, message="Success.")]
+
+    manager = _tokenizer_manager(
+        [
+            SimpleNamespace(
+                success=True,
+                message="Success.",
+                session_state="created",
+                manifests=[_manifest()],
+            )
+        ],
+        release,
+    )
+
+    async def pause(request):
+        manager._remote_weight_transfer_events.append(("pause", request.mode))
+        manager.is_pause = True
+
+    async def fail_resume_once(request):
+        del request
+        resume_attempts.append("resume")
+        manager.is_pause = False
+        if len(resume_attempts) == 1:
+            raise RuntimeError("source resume failed")
+
+    manager.pause_generation = pause
+    manager.continue_generation = fail_resume_once
+
+    with pytest.raises(RemoteInstanceWeightTransferBeginError) as raised:
+        asyncio.run(
+            TokenizerControlMixin.begin_remote_instance_weight_transfer(
+                manager,
+                lease_timeout_sec=60,
+                transfer_id="transfer-1",
+            )
+        )
+
+    assert raised.value.transfer_id == "transfer-1"
+    assert raised.value.session_state == "cleanup_pending"
+    assert "source resume failed" in str(raised.value)
+    status = asyncio.run(
+        TokenizerControlMixin.get_remote_instance_weight_transfer_session(
+            manager, "transfer-1"
+        )
+    )
+    assert status["lease_ids"] == ["lease-0"]
+    assert status["session_state"] == "cleanup_pending"
+
+    success, _ = asyncio.run(
+        TokenizerControlMixin.release_remote_instance_weight_transfer(
+            manager, "transfer-1"
+        )
+    )
+
+    assert success is True
+    assert release_requests == ["transfer-1"]
+    assert resume_attempts == ["resume", "resume"]
+    assert manager.is_pause is False
+    released = asyncio.run(
+        TokenizerControlMixin.get_remote_instance_weight_transfer_session(
+            manager, "transfer-1"
+        )
+    )
+    assert released["session_state"] == "released"
+
+
+def test_tokenizer_begin_cancellation_waits_for_snapshot_and_releases() -> None:
+    async def scenario():
+        begin_started = asyncio.Event()
+        finish_begin = asyncio.Event()
+        release_requests = []
+
+        async def release(request):
+            release_requests.append(request.transfer_id)
+            return [SimpleNamespace(success=True, message="Success.")]
+
+        manager = _tokenizer_manager([], release)
+
+        async def begin(request):
+            begin_started.set()
+            await finish_begin.wait()
+            return [
+                SimpleNamespace(
+                    transfer_id=request.transfer_id,
+                    success=True,
+                    message="Success.",
+                    session_state="created",
+                    manifests=[_manifest()],
+                )
+            ]
+
+        manager.begin_remote_instance_weight_transfer_communicator = begin
+        task = asyncio.create_task(
+            TokenizerControlMixin.begin_remote_instance_weight_transfer(
+                manager,
+                lease_timeout_sec=60,
+                transfer_id="transfer-cancelled",
+            )
+        )
+        await begin_started.wait()
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done()
+
+        finish_begin.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert release_requests == ["transfer-cancelled"]
+        status = (
+            await TokenizerControlMixin.get_remote_instance_weight_transfer_session(
+                manager, "transfer-cancelled"
+            )
+        )
+        assert status["session_state"] == "released"
+        assert manager._remote_weight_transfer_events[-1] == ("continue", False)
+
+    asyncio.run(scenario())
+
+
+def test_tokenizer_cancelled_reused_begin_keeps_existing_session() -> None:
+    async def scenario():
+        begin_started = asyncio.Event()
+        finish_begin = asyncio.Event()
+        release_requests = []
+
+        async def release(request):
+            release_requests.append(request.transfer_id)
+            return [SimpleNamespace(success=True, message="Success.")]
+
+        manager = _tokenizer_manager(
+            [
+                SimpleNamespace(
+                    transfer_id="transfer-1",
+                    success=True,
+                    message="Success.",
+                    session_state="created",
+                    manifests=[_manifest()],
+                )
+            ],
+            release,
+        )
+        await TokenizerControlMixin.begin_remote_instance_weight_transfer(
+            manager,
+            lease_timeout_sec=60,
+            transfer_id="transfer-1",
+        )
+
+        async def reused_begin(request):
+            begin_started.set()
+            await finish_begin.wait()
+            return [
+                SimpleNamespace(
+                    transfer_id=request.transfer_id,
+                    success=True,
+                    message="Success.",
+                    session_state="reused",
+                    manifests=[_manifest()],
+                )
+            ]
+
+        manager.begin_remote_instance_weight_transfer_communicator = reused_begin
+        task = asyncio.create_task(
+            TokenizerControlMixin.begin_remote_instance_weight_transfer(
+                manager,
+                lease_timeout_sec=60,
+                transfer_id="transfer-1",
+            )
+        )
+        await begin_started.wait()
+        task.cancel()
+        finish_begin.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert release_requests == []
+        status = (
+            await TokenizerControlMixin.get_remote_instance_weight_transfer_session(
+                manager, "transfer-1"
+            )
+        )
+        assert status["session_state"] == "active"
+        assert status["lease_ids"] == ["lease-0"]
+
+    asyncio.run(scenario())
+
+
+def test_tokenizer_cancelled_created_begin_serializes_same_id_retry() -> None:
+    async def scenario():
+        session_exists = False
+        first_resume_started = asyncio.Event()
+        finish_first_resume = asyncio.Event()
+        second_begin_started = asyncio.Event()
+        begin_calls = 0
+        resume_calls = 0
+        release_requests = []
+
+        async def release(request):
+            nonlocal session_exists
+            release_requests.append(request.transfer_id)
+            session_exists = False
+            return [SimpleNamespace(success=True, message="Success.")]
+
+        manager = _tokenizer_manager([], release)
+
+        async def begin(request):
+            nonlocal begin_calls, session_exists
+            begin_calls += 1
+            if begin_calls == 2:
+                second_begin_started.set()
+            session_state = "reused" if session_exists else "created"
+            session_exists = True
+            return [
+                SimpleNamespace(
+                    transfer_id=request.transfer_id,
+                    success=True,
+                    message="Success.",
+                    session_state=session_state,
+                    manifests=[_manifest()],
+                )
+            ]
+
+        async def pause(request):
+            del request
+            manager.is_pause = True
+
+        async def resume(request):
+            nonlocal resume_calls
+            del request
+            resume_calls += 1
+            if resume_calls == 1:
+                first_resume_started.set()
+                await finish_first_resume.wait()
+            manager.is_pause = False
+
+        manager.begin_remote_instance_weight_transfer_communicator = begin
+        manager.pause_generation = pause
+        manager.continue_generation = resume
+
+        first = asyncio.create_task(
+            TokenizerControlMixin.begin_remote_instance_weight_transfer(
+                manager,
+                lease_timeout_sec=60,
+                transfer_id="transfer-1",
+            )
+        )
+        await first_resume_started.wait()
+        first.cancel()
+        second = asyncio.create_task(
+            TokenizerControlMixin.begin_remote_instance_weight_transfer(
+                manager,
+                lease_timeout_sec=60,
+                transfer_id="transfer-1",
+            )
+        )
+        await asyncio.sleep(0)
+        retry_interleaved = second_begin_started.is_set()
+
+        finish_first_resume.set()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+        result = await second
+
+        assert retry_interleaved is False
+        assert result["transfer_id"] == "transfer-1"
+        assert begin_calls == 2
+        assert release_requests == ["transfer-1"]
+        assert session_exists is True
+
+    asyncio.run(scenario())
+
+
+def test_tokenizer_reused_begin_resume_failure_keeps_existing_session() -> None:
+    release_requests = []
+    resume_calls = []
+
+    async def release(request):
+        release_requests.append(request.transfer_id)
+        return [SimpleNamespace(success=True, message="Success.")]
+
+    manager = _tokenizer_manager(
+        [
+            SimpleNamespace(
+                transfer_id="transfer-1",
+                success=True,
+                message="Success.",
+                session_state="created",
+                manifests=[_manifest()],
+            )
+        ],
+        release,
+    )
+    asyncio.run(
+        TokenizerControlMixin.begin_remote_instance_weight_transfer(
+            manager,
+            lease_timeout_sec=60,
+            transfer_id="transfer-1",
+        )
+    )
+
+    async def reused_begin(request):
+        return [
+            SimpleNamespace(
+                transfer_id=request.transfer_id,
+                success=True,
+                message="Success.",
+                session_state="reused",
+                manifests=[_manifest()],
+            )
+        ]
+
+    manager.begin_remote_instance_weight_transfer_communicator = reused_begin
+
+    async def fail_resume(request):
+        del request
+        resume_calls.append("resume")
+        manager.is_pause = False
+        raise RuntimeError("source resume failed")
+
+    manager.continue_generation = fail_resume
+    with pytest.raises(RemoteInstanceWeightTransferBeginError) as raised:
+        asyncio.run(
+            TokenizerControlMixin.begin_remote_instance_weight_transfer(
+                manager,
+                lease_timeout_sec=60,
+                transfer_id="transfer-1",
+            )
+        )
+
+    assert raised.value.session_state == "reused"
+    assert release_requests == []
+    assert resume_calls == ["resume"]
+    status = asyncio.run(
+        TokenizerControlMixin.get_remote_instance_weight_transfer_session(
+            manager, "transfer-1"
+        )
+    )
+    assert status["session_state"] == "active"
+    assert status["lease_ids"] == ["lease-0"]
+
+
+def test_tokenizer_cancel_during_resume_finishes_resume_and_tracks_cleanup() -> None:
+    async def scenario():
+        resume_started = asyncio.Event()
+        finish_resume = asyncio.Event()
+        release_requests = []
+
+        async def release(request):
+            release_requests.append(request.transfer_id)
+            return [SimpleNamespace(success=False, message="release still pending")]
+
+        manager = _tokenizer_manager(
+            [
+                SimpleNamespace(
+                    transfer_id="transfer-cancelled",
+                    success=True,
+                    message="Success.",
+                    session_state="created",
+                    manifests=[_manifest()],
+                )
+            ],
+            release,
+        )
+
+        async def pause(request):
+            del request
+            manager.is_pause = True
+
+        async def resume(request):
+            del request
+            resume_started.set()
+            await finish_resume.wait()
+            manager.is_pause = False
+
+        manager.pause_generation = pause
+        manager.continue_generation = resume
+        task = asyncio.create_task(
+            TokenizerControlMixin.begin_remote_instance_weight_transfer(
+                manager,
+                lease_timeout_sec=60,
+                transfer_id="transfer-cancelled",
+            )
+        )
+        await resume_started.wait()
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done()
+
+        finish_resume.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert manager.is_pause is False
+        assert release_requests == ["transfer-cancelled"]
+        status = (
+            await TokenizerControlMixin.get_remote_instance_weight_transfer_session(
+                manager, "transfer-cancelled"
+            )
+        )
+        assert status["session_state"] == "cleanup_pending"
+        assert status["last_release_success"] is False
+
+    asyncio.run(scenario())
+
+
+def test_tokenizer_cancel_during_failed_begin_cleanup_finishes_release() -> None:
+    async def scenario():
+        cleanup_pause_started = asyncio.Event()
+        finish_cleanup_pause = asyncio.Event()
+        pause_calls = 0
+        release_requests = []
+
+        async def release(request):
+            release_requests.append(request.transfer_id)
+            return [SimpleNamespace(success=True, message="Success.")]
+
+        manager = _tokenizer_manager(
+            [
+                SimpleNamespace(
+                    transfer_id="transfer-cancelled",
+                    success=True,
+                    message="Success.",
+                    session_state="created",
+                    manifests=[_manifest()],
+                ),
+                SimpleNamespace(
+                    transfer_id="transfer-cancelled",
+                    success=False,
+                    message="source worker failed",
+                    session_state="failed",
+                    manifests=[],
+                ),
+            ],
+            release,
+        )
+
+        async def pause(request):
+            nonlocal pause_calls
+            del request
+            pause_calls += 1
+            manager.is_pause = True
+            if pause_calls == 2:
+                cleanup_pause_started.set()
+                await finish_cleanup_pause.wait()
+
+        async def resume(request):
+            del request
+            manager.is_pause = False
+
+        manager.pause_generation = pause
+        manager.continue_generation = resume
+        task = asyncio.create_task(
+            TokenizerControlMixin.begin_remote_instance_weight_transfer(
+                manager,
+                lease_timeout_sec=60,
+                transfer_id="transfer-cancelled",
+            )
+        )
+        await cleanup_pause_started.wait()
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done()
+
+        finish_cleanup_pause.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert release_requests == ["transfer-cancelled"]
+        assert manager.is_pause is False
+        status = (
+            await TokenizerControlMixin.get_remote_instance_weight_transfer_session(
+                manager, "transfer-cancelled"
+            )
+        )
+        assert status["session_state"] == "released"
+
+    asyncio.run(scenario())
 
 
 def test_tokenizer_begin_passes_ttl_to_scheduler_without_local_ownership() -> None:
@@ -1207,6 +1877,14 @@ def test_tokenizer_begin_merges_split_dp_replica_manifests() -> None:
         binding["fragments"][0]["worker_id"]
         for binding in result["source_weight_runtime_bindings"]
     ] == ["source/dp0-pp0-ep0-tp0", "source/dp1-pp0-ep0-tp0"]
+    status = asyncio.run(
+        TokenizerControlMixin.get_remote_instance_weight_transfer_session(
+            manager, result["transfer_id"]
+        )
+    )
+    assert status["lease_id"] is None
+    assert status["lease_ids"] == ["lease-dp0", "lease-dp1"]
+    assert status["generation"] == 1
 
 
 def test_tokenizer_begin_rejects_split_dp_generation_mismatch() -> None:
@@ -1351,36 +2029,46 @@ def test_tokenizer_begin_reports_cleanup_pending_when_release_never_succeeds() -
 
 
 @pytest.mark.parametrize(
-    "begin_results",
+    ("begin_results", "expected_released"),
     [
-        [
-            SimpleNamespace(
-                success=True,
-                message="Success.",
-                session_state="reused",
-                manifests=[_manifest(worker_id="source/dp0-pp0-ep0-tp0")],
-            ),
-            SimpleNamespace(
-                success=False,
-                message="source rank failed",
-                session_state="failed",
-            ),
-        ],
-        [
-            SimpleNamespace(
-                success=False,
-                message="snapshot cleanup remains pending",
-                session_state="cleanup_pending",
-            ),
-            SimpleNamespace(
-                success=False,
-                message="already released",
-                session_state="released",
-            ),
-        ],
+        pytest.param(
+            [
+                SimpleNamespace(
+                    success=True,
+                    message="Success.",
+                    session_state="reused",
+                    manifests=[_manifest(worker_id="source/dp0-pp0-ep0-tp0")],
+                ),
+                SimpleNamespace(
+                    success=False,
+                    message="source rank failed",
+                    session_state="failed",
+                ),
+            ],
+            [],
+            id="reused-is-not-owned",
+        ),
+        pytest.param(
+            [
+                SimpleNamespace(
+                    success=False,
+                    message="snapshot cleanup remains pending",
+                    session_state="cleanup_pending",
+                ),
+                SimpleNamespace(
+                    success=False,
+                    message="already released",
+                    session_state="released",
+                ),
+            ],
+            ["transfer-1"],
+            id="cleanup-pending-is-owned",
+        ),
     ],
 )
-def test_tokenizer_begin_cleans_mixed_owned_session_states(begin_results) -> None:
+def test_tokenizer_begin_cleans_only_owned_session_states(
+    begin_results, expected_released
+) -> None:
     released = []
 
     async def release(request):
@@ -1399,7 +2087,7 @@ def test_tokenizer_begin_cleans_mixed_owned_session_states(begin_results) -> Non
 
     assert raised.value.transfer_id == "transfer-1"
     assert raised.value.session_state == "failed"
-    assert released == ["transfer-1"]
+    assert released == expected_released
 
 
 def test_tokenizer_begin_rejects_duplicate_split_fragment_ids() -> None:
@@ -1481,6 +2169,134 @@ def test_tokenizer_renew_fans_out_without_local_session_state() -> None:
             transfer_id="transfer-from-another-worker", lease_timeout_sec=60
         )
     ]
+
+
+def test_tokenizer_lists_active_then_expired_session_without_auto_release(
+    monkeypatch,
+) -> None:
+    now = [100.0]
+    release_requests = []
+
+    async def release(request):
+        release_requests.append(request.transfer_id)
+        return [SimpleNamespace(success=True, message="Success.")]
+
+    manager = _tokenizer_manager(
+        [
+            SimpleNamespace(
+                success=True,
+                message="Success.",
+                session_state="created",
+                manifests=[_manifest()],
+            )
+        ],
+        release,
+    )
+    monkeypatch.setattr(tokenizer_control_mixin_module.time, "time", lambda: now[0])
+
+    result = asyncio.run(
+        TokenizerControlMixin.begin_remote_instance_weight_transfer(
+            manager,
+            lease_timeout_sec=60,
+            transfer_id="transfer-1",
+        )
+    )
+    assert result["transfer_id"] == "transfer-1"
+
+    sessions = asyncio.run(
+        TokenizerControlMixin.list_remote_instance_weight_transfer_sessions(manager)
+    )
+    assert sessions == [
+        {
+            "transfer_id": "transfer-1",
+            "lease_id": "lease-0",
+            "lease_ids": ["lease-0"],
+            "generation": 1,
+            "manifest_format": "runtime_v1",
+            "deadline_unix_sec": 160.0,
+            "expired": False,
+            "session_state": "active",
+            "last_release_attempt_unix_sec": None,
+            "last_release_success": None,
+            "last_release_message": None,
+        }
+    ]
+
+    now[0] = 161.0
+    status = asyncio.run(
+        TokenizerControlMixin.get_remote_instance_weight_transfer_session(
+            manager, "transfer-1"
+        )
+    )
+    assert status["expired"] is True
+    assert status["session_state"] == "expired"
+    assert release_requests == []
+
+
+def test_tokenizer_failed_manual_release_keeps_discoverable_session(
+    monkeypatch,
+) -> None:
+    now = [100.0]
+    release_results = [
+        SimpleNamespace(success=False, message="release still unsafe"),
+        SimpleNamespace(success=True, message="Success."),
+    ]
+
+    async def release(request):
+        del request
+        return [release_results.pop(0)]
+
+    manager = _tokenizer_manager(
+        [
+            SimpleNamespace(
+                success=True,
+                message="Success.",
+                session_state="created",
+                manifests=[_manifest()],
+            )
+        ],
+        release,
+    )
+    monkeypatch.setattr(tokenizer_control_mixin_module.time, "time", lambda: now[0])
+    asyncio.run(
+        TokenizerControlMixin.begin_remote_instance_weight_transfer(
+            manager,
+            lease_timeout_sec=60,
+            transfer_id="transfer-1",
+        )
+    )
+
+    now[0] = 161.0
+    success, message = asyncio.run(
+        TokenizerControlMixin.release_remote_instance_weight_transfer(
+            manager, "transfer-1"
+        )
+    )
+    assert success is False
+    assert message == "release still unsafe"
+    failed_status = asyncio.run(
+        TokenizerControlMixin.get_remote_instance_weight_transfer_session(
+            manager, "transfer-1"
+        )
+    )
+    assert failed_status["session_state"] == "expired"
+    assert failed_status["last_release_attempt_unix_sec"] == 161.0
+    assert failed_status["last_release_success"] is False
+    assert failed_status["last_release_message"] == "release still unsafe"
+
+    success, _ = asyncio.run(
+        TokenizerControlMixin.release_remote_instance_weight_transfer(
+            manager, "transfer-1"
+        )
+    )
+    assert success is True
+    released_status = asyncio.run(
+        TokenizerControlMixin.get_remote_instance_weight_transfer_session(
+            manager, "transfer-1"
+        )
+    )
+    assert released_status["session_state"] == "released"
+    assert released_status["last_release_success"] is True
 
 
 def test_tokenizer_begin_releases_successful_empty_manifest_response() -> None:

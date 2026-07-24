@@ -42,6 +42,7 @@ import json
 import math
 import os
 import signal
+import socket
 import statistics
 import subprocess
 import threading
@@ -50,11 +51,38 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import psutil
 import requests
 
 ALL_MODES = ("cold", "legacy", "manifest")
 REUSE_MODES = ("legacy", "manifest")
 MIN_PERCENTILE_SAMPLES = 5
+REUSE_REQUIRED_LOG_MARKERS = {
+    "legacy": (
+        "Loading weights from remote instance ...",
+        "TransferEngine memory regions have been successfully registered.",
+    ),
+    "manifest": (
+        "TransferEngine memory regions have been successfully registered.",
+        "Loaded heterogeneous remote-instance weights:",
+        "manifest_format=placement_binding_v1",
+        "transfer_id=",
+        "release_success=true",
+    ),
+}
+REUSE_FORBIDDEN_LOG_MARKERS = (
+    "Fallback load_format to 'auto'",
+    "using the runtime-v1 target builder",
+    "manifest_format=runtime_v1",
+    "Cannot acquire remote weight transfer session",
+    "Heterogeneous remote-instance weight loading failed",
+    "Failed to load weights from remote instance via transfer engine",
+    "completion remains unknown",
+    "Failed to finish remote weight transfer session",
+    "Loaded weights but failed to release source transfer session",
+    "Remote weight transfer lease renewal failed",
+    "source weight transfer lease renew failed",
+)
 
 
 def _p95(values: list[float]) -> float | None:
@@ -70,6 +98,8 @@ class ServerProcess:
     log_file: Any
     log_path: Path
     started_at: float
+    port: int
+    ready_identity: dict[str, Any] | None = None
 
 
 class ResponseRecorder:
@@ -94,6 +124,7 @@ class ResponseRecorder:
         expected: dict[str, Any] | None,
         logprob_atol: float,
         logprob_rtol: float,
+        server_identity: dict[str, Any],
     ) -> dict[str, Any]:
         consistent = expected is None or _responses_match(
             deterministic_response,
@@ -111,6 +142,7 @@ class ResponseRecorder:
             "latency_s": latency_s,
             "consistent_with_expected": consistent,
             "deterministic_response": deterministic_response,
+            "server_identity": server_identity,
             "raw_response": response,
         }
         return self._write(entry)
@@ -159,12 +191,14 @@ class SourceProbe:
         iteration: int,
         expected: dict[str, Any],
         recorder: ResponseRecorder,
+        server: ServerProcess,
     ) -> None:
         self.args = args
         self.mode = mode
         self.iteration = iteration
         self.expected = expected
         self.recorder = recorder
+        self.server = server
         self.latencies: list[float] = []
         self.errors: list[str] = []
         self.mismatches: list[dict[str, Any]] = []
@@ -198,7 +232,7 @@ class SourceProbe:
             try:
                 measurement = _generate_and_record(
                     self.args,
-                    port=self.args.source_port,
+                    server=self.server,
                     mode=self.mode,
                     iteration=self.iteration,
                     endpoint="source",
@@ -334,6 +368,9 @@ def _start_server(
     load_mode: str,
     log_path: Path,
 ) -> ServerProcess:
+    _assert_port_available(port)
+    if load_mode == "source":
+        _assert_port_available(args.bootstrap_port)
     environment = os.environ.copy()
     environment["CUDA_VISIBLE_DEVICES"] = gpus
     environment["MOONCAKE_PROTOCOL"] = args.protocol
@@ -353,7 +390,89 @@ def _start_server(
     except BaseException:
         log_file.close()
         raise
-    return ServerProcess(process, log_file, log_path, started_at)
+    return ServerProcess(
+        process=process,
+        log_file=log_file,
+        log_path=log_path,
+        started_at=started_at,
+        port=port,
+    )
+
+
+def _listening_port_owner_pids(port: int) -> set[int]:
+    loopback_hosts = {
+        "0.0.0.0",
+        "127.0.0.1",
+        "::",
+        "::1",
+        "::ffff:127.0.0.1",
+    }
+    owners = set()
+    for connection in psutil.net_connections(kind="inet"):
+        local_address = connection.laddr
+        if not local_address or connection.status != psutil.CONN_LISTEN:
+            continue
+        if local_address.port != port or local_address.ip not in loopback_hosts:
+            continue
+        if connection.pid is not None:
+            owners.add(connection.pid)
+    return owners
+
+
+def _process_tree_pids(root_pid: int) -> set[int]:
+    try:
+        root = psutil.Process(root_pid)
+        return {root_pid, *(child.pid for child in root.children(recursive=True))}
+    except (psutil.AccessDenied, psutil.NoSuchProcess) as error:
+        raise RuntimeError(
+            f"cannot inspect spawned server process tree rooted at PID {root_pid}"
+        ) from error
+
+
+def _assert_process_alive(server: ServerProcess) -> None:
+    returncode = server.process.poll()
+    if returncode is not None:
+        raise RuntimeError(
+            f"server exited with {returncode}:\n{_tail(server.log_path)}"
+        )
+
+
+def _assert_port_available(port: int) -> None:
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.bind(("127.0.0.1", port))
+    except OSError as error:
+        owners = sorted(_listening_port_owner_pids(port))
+        owner_text = f" by listening PID(s) {owners}" if owners else ""
+        raise RuntimeError(f"port {port} is already in use{owner_text}") from error
+
+
+def _assert_server_identity(
+    server: ServerProcess, owner_pids: set[int] | None = None
+) -> dict[str, Any]:
+    _assert_process_alive(server)
+    if owner_pids is None:
+        owner_pids = _listening_port_owner_pids(server.port)
+    process_tree_pids = _process_tree_pids(server.process.pid)
+    unexpected_owners = owner_pids - process_tree_pids
+    if unexpected_owners:
+        raise RuntimeError(
+            f"listener owner PID(s) {sorted(unexpected_owners)} for port "
+            f"{server.port} are outside spawned process tree "
+            f"{sorted(process_tree_pids)}"
+        )
+    if not owner_pids:
+        raise RuntimeError(
+            f"port {server.port} has no auditable listener owner for spawned "
+            f"process tree {sorted(process_tree_pids)}"
+        )
+    _assert_process_alive(server)
+    return {
+        "root_pid": server.process.pid,
+        "port": server.port,
+        "process_tree_pids": sorted(process_tree_pids),
+        "listener_owner_pids": sorted(owner_pids),
+    }
 
 
 def _tail(path: Path, lines: int = 80) -> str:
@@ -363,17 +482,49 @@ def _tail(path: Path, lines: int = 80) -> str:
         return repr(error)
 
 
+def _assert_reuse_log_contract(mode: str, log_path: Path) -> dict[str, Any]:
+    if mode not in REUSE_MODES:
+        raise ValueError(f"log contract is only defined for reuse modes: {mode}")
+    text = log_path.read_text(errors="replace")
+    forbidden = [marker for marker in REUSE_FORBIDDEN_LOG_MARKERS if marker in text]
+    if forbidden:
+        raise RuntimeError(
+            f"{mode} log contains forbidden log marker(s) {forbidden}: {log_path}"
+        )
+    required = REUSE_REQUIRED_LOG_MARKERS[mode]
+    missing = [marker for marker in required if marker not in text]
+    if missing:
+        raise RuntimeError(
+            f"{mode} log is missing required log marker(s) {missing}: {log_path}"
+        )
+    return {
+        "passed": True,
+        "required_markers": list(required),
+        "forbidden_markers_checked": list(REUSE_FORBIDDEN_LOG_MARKERS),
+    }
+
+
 def _wait_ready(server: ServerProcess, port: int, timeout_s: float) -> float:
+    if port != server.port:
+        raise ValueError(
+            f"readiness port {port} does not match spawned server port {server.port}"
+        )
     deadline = time.monotonic() + timeout_s
     url = f"http://127.0.0.1:{port}/health_generate"
     while time.monotonic() < deadline:
-        if server.process.poll() is not None:
-            raise RuntimeError(
-                f"server exited with {server.process.returncode}:\n{_tail(server.log_path)}"
-            )
+        _assert_process_alive(server)
+        owner_pids = _listening_port_owner_pids(server.port)
+        if not owner_pids:
+            time.sleep(0.2)
+            continue
+        before_health = _assert_server_identity(server, owner_pids)
         try:
             response = requests.get(url, timeout=1)
             if response.status_code == 200:
+                server.ready_identity = {
+                    "before_health": before_health,
+                    "after_health": _assert_server_identity(server),
+                }
                 return time.perf_counter() - server.started_at
         except requests.RequestException:
             pass
@@ -479,21 +630,33 @@ def _responses_match(
     return True
 
 
-def _generate(args: argparse.Namespace, port: int) -> tuple[float, Any]:
+def _generate(
+    args: argparse.Namespace, server: ServerProcess
+) -> tuple[float, Any, dict[str, Any]]:
+    before_request = _assert_server_identity(server)
     started = time.perf_counter()
     response = requests.post(
-        f"http://127.0.0.1:{port}/generate",
+        f"http://127.0.0.1:{server.port}/generate",
         json=_inference_request(args),
         timeout=args.request_timeout_s,
     )
     response.raise_for_status()
-    return time.perf_counter() - started, response.json()
+    latency_s = time.perf_counter() - started
+    after_response = _assert_server_identity(server)
+    return (
+        latency_s,
+        response.json(),
+        {
+            "before_request": before_request,
+            "after_response": after_response,
+        },
+    )
 
 
 def _generate_and_record(
     args: argparse.Namespace,
     *,
-    port: int,
+    server: ServerProcess,
     mode: str,
     iteration: int,
     endpoint: str,
@@ -502,7 +665,7 @@ def _generate_and_record(
     recorder: ResponseRecorder,
 ) -> dict[str, Any]:
     try:
-        latency_s, response = _generate(args, port)
+        latency_s, response, server_identity = _generate(args, server)
         deterministic_response = _deterministic_response(response)
     except Exception as error:
         recorder.record_error(
@@ -524,21 +687,25 @@ def _generate_and_record(
         expected=expected,
         logprob_atol=args.logprob_atol,
         logprob_rtol=args.logprob_rtol,
+        server_identity=server_identity,
     )
     return {
         "latency_s": latency_s,
         "response_sequence": record["sequence"],
         "consistent_with_expected": record["consistent_with_expected"],
         "deterministic_response": deterministic_response,
+        "server_identity": server_identity,
     }
 
 
 def _collect_source_baseline(
-    args: argparse.Namespace, recorder: ResponseRecorder
+    args: argparse.Namespace,
+    recorder: ResponseRecorder,
+    source_server: ServerProcess,
 ) -> dict[str, Any]:
     warmup = _generate_and_record(
         args,
-        port=args.source_port,
+        server=source_server,
         mode="source",
         iteration=-1,
         endpoint="source",
@@ -551,7 +718,7 @@ def _collect_source_baseline(
     for sample in range(args.source_baseline_samples):
         measurement = _generate_and_record(
             args,
-            port=args.source_port,
+            server=source_server,
             mode="source",
             iteration=-1,
             endpoint="source",
@@ -635,6 +802,7 @@ def _assert_iteration_consistency(
 def _run_target(
     args: argparse.Namespace,
     *,
+    source_server: ServerProcess,
     mode: str,
     iteration: int,
     output_dir: Path,
@@ -648,7 +816,7 @@ def _run_target(
 
     before = _generate_and_record(
         args,
-        port=args.source_port,
+        server=source_server,
         mode=mode,
         iteration=iteration,
         endpoint="source",
@@ -662,6 +830,7 @@ def _run_target(
         iteration=iteration,
         expected=source_baseline,
         recorder=recorder,
+        server=source_server,
     )
     server: ServerProcess | None = None
     probe_summary: dict[str, Any] | None = None
@@ -677,7 +846,7 @@ def _run_target(
         ready_s = _wait_ready(server, args.target_port, args.timeout_s)
         target = _generate_and_record(
             args,
-            port=args.target_port,
+            server=server,
             mode=mode,
             iteration=iteration,
             endpoint="target",
@@ -688,7 +857,7 @@ def _run_target(
         probe_summary = probe.stop()
         after = _generate_and_record(
             args,
-            port=args.source_port,
+            server=source_server,
             mode=mode,
             iteration=iteration,
             endpoint="source",
@@ -710,6 +879,11 @@ def _run_target(
             min_source_probe_samples=args.min_source_probe_samples,
             responses_path=recorder.path,
         )
+        reuse_log_contract = (
+            _assert_reuse_log_contract(mode, server.log_path)
+            if mode in REUSE_MODES
+            else None
+        )
         return {
             "mode": mode,
             "iteration": iteration,
@@ -722,6 +896,13 @@ def _run_target(
                 "source_after": after["response_sequence"],
             },
             "source_probe": probe_summary,
+            "reuse_log_contract": reuse_log_contract,
+            "server_identity": {
+                "root_pid": server.process.pid,
+                "port": server.port,
+                "ready": server.ready_identity,
+                "generation": target["server_identity"],
+            },
             "log": str(server.log_path),
         }
     finally:
@@ -860,7 +1041,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             log_path=output_dir / "source.log",
         )
         source_ready_s = _wait_ready(source, args.source_port, args.timeout_s)
-        baseline = _collect_source_baseline(args, recorder)
+        baseline = _collect_source_baseline(args, recorder, source)
         source_baseline = baseline["deterministic_response"]
         executed_modes, skipped_modes = _eligible_modes(args)
         executed_modes = _ordered_modes(executed_modes)
@@ -872,6 +1053,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             for mode in iteration_modes:
                 record = _run_target(
                     args,
+                    source_server=source,
                     mode=mode,
                     iteration=iteration,
                     output_dir=output_dir,
@@ -902,6 +1084,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         threshold_results = [
             comparison["passes_significant_improvement_threshold"]
             for comparison in comparisons.values()
+        ]
+        reuse_log_results = [
+            record["reuse_log_contract"]["passed"]
+            for mode, mode_records in records.items()
+            if mode in REUSE_MODES
+            for record in mode_records
         ]
         result = {
             "schema_version": 1,
@@ -946,6 +1134,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             },
             "source": {
                 "spawn_to_ready_s": source_ready_s,
+                "server_identity": {
+                    "root_pid": source.process.pid,
+                    "port": source.port,
+                    "ready": source.ready_identity,
+                },
                 "baseline_sample_count": baseline["sample_count"],
                 "baseline_generation_latency_p50_s": baseline["latency_p50_s"],
                 "baseline_generation_latency_p95_s": baseline["latency_p95_s"],
@@ -967,6 +1160,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 ),
                 "strict_response_consistency_passed": True,
                 "source_serving_continuity_passed": True,
+                "strict_reuse_log_contract_passed": (
+                    all(reuse_log_results) if reuse_log_results else None
+                ),
             },
             "artifacts": {
                 "result_json": str(result_path),

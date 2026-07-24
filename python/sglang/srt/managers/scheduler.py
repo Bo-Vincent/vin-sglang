@@ -802,6 +802,18 @@ class Scheduler(
             self.external_corpus_manager = None
             return
 
+        draft_load_format = (
+            self.server_args.speculative_draft_load_format
+            or self.server_args.load_format
+        )
+        if (
+            not self.spec_algorithm.is_ngram()
+            and draft_load_format == "remote_instance"
+        ):
+            raise RuntimeError(
+                "remote_instance is not supported for a speculative draft worker"
+            )
+
         # Launch a draft worker for speculative decoding
         draft_worker_kwargs = dict(
             server_args=self.server_args,

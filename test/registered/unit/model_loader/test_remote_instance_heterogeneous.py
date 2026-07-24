@@ -12,6 +12,9 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
+_TARGET_MODEL_ID = "Qwen/Qwen3.5-0.8B"
+_TARGET_REVISION = "main"
+
 
 class _TransferEngineError(RuntimeError):
     pass
@@ -32,6 +35,32 @@ def _runtime_server_args(monkeypatch):
     )
 
 
+def _load_heterogeneous(loader, *args, **kwargs):
+    kwargs.setdefault("target_model_id", _TARGET_MODEL_ID)
+    kwargs.setdefault("target_revision", _TARGET_REVISION)
+    return loader.load_model_from_remote_instance_by_transfer_engine_heterogeneous(
+        *args,
+        **kwargs,
+    )
+
+
+def test_heterogeneous_loader_rejects_source_model_identity_mismatch() -> None:
+    loader = RemoteInstanceModelLoader.__new__(RemoteInstanceModelLoader)
+
+    with pytest.raises(ValueError, match="source manifest identity"):
+        loader._require_manifest_identity(
+            (
+                SimpleNamespace(
+                    model_id=_TARGET_MODEL_ID,
+                    revision="different-revision",
+                ),
+            ),
+            model_id=_TARGET_MODEL_ID,
+            revision=_TARGET_REVISION,
+            role="source",
+        )
+
+
 @pytest.mark.parametrize("release_success", [True, False])
 def test_heterogeneous_loader_builds_local_plan_and_reads_from_source(
     monkeypatch,
@@ -39,8 +68,8 @@ def test_heterogeneous_loader_builds_local_plan_and_reads_from_source(
 ) -> None:
     calls = {}
     source_inventory = {
-        "model_id": "Qwen/Qwen3.5-0.8B",
-        "revision": "main@generation-1",
+        "model_id": _TARGET_MODEL_ID,
+        "revision": _TARGET_REVISION,
         "lease_id": "source-runtime-lease",
         "fragments": [SimpleNamespace(fragment_id="source-fragment")],
     }
@@ -154,7 +183,8 @@ def test_heterogeneous_loader_builds_local_plan_and_reads_from_source(
         TargetBuilderOwner().build_remote_instance_target_weight_manifest_session
     )
 
-    success = loader.load_model_from_remote_instance_by_transfer_engine_heterogeneous(
+    success = _load_heterogeneous(
+        loader,
         model,
         engine,
         "http://seed:30000",
@@ -165,8 +195,8 @@ def test_heterogeneous_loader_builds_local_plan_and_reads_from_source(
     assert success is release_success
     assert calls["builder"] == {
         "model": model,
-        "model_id": source_inventory["model_id"],
-        "revision": source_inventory["revision"],
+        "model_id": _TARGET_MODEL_ID,
+        "revision": _TARGET_REVISION,
         "instance_id": "sglang:target-session",
         "endpoint": "target-session",
     }
@@ -192,8 +222,8 @@ def test_heterogeneous_loader_plans_placement_before_acquiring_target_binding(
 ) -> None:
     events = []
     source_inventory = {
-        "model_id": "Qwen/Qwen3.5-0.8B",
-        "revision": "main@generation-1",
+        "model_id": _TARGET_MODEL_ID,
+        "revision": _TARGET_REVISION,
         "lease_id": "source-runtime-lease",
         "fragments": [SimpleNamespace(fragment_id="source-fragment")],
     }
@@ -275,6 +305,7 @@ def test_heterogeneous_loader_plans_placement_before_acquiring_target_binding(
 
         def acquire(self):
             return SimpleNamespace(
+                transfer_id="transfer-1",
                 manifests=[],
                 source_placements=[source_placement_inventory],
                 source_bindings=[source_binding_inventory],
@@ -356,7 +387,8 @@ def test_heterogeneous_loader_plans_placement_before_acquiring_target_binding(
         yield TargetSession()
 
     loader = RemoteInstanceModelLoader.__new__(RemoteInstanceModelLoader)
-    success = loader.load_model_from_remote_instance_by_transfer_engine_heterogeneous(
+    success = _load_heterogeneous(
+        loader,
         object(),
         object(),
         "http://seed:30000",
@@ -455,8 +487,8 @@ def test_heterogeneous_loader_fails_closed_without_source_manifests(
     loader = RemoteInstanceModelLoader.__new__(RemoteInstanceModelLoader)
 
     assert (
-        loader.load_model_from_remote_instance_by_transfer_engine_heterogeneous(
-            object(), object(), "http://seed:30000", "target-session", object()
+        _load_heterogeneous(
+            loader, object(), object(), "http://seed:30000", "target-session", object()
         )
         is False
     )
@@ -490,8 +522,8 @@ def test_heterogeneous_loader_blocks_world_when_any_rank_is_quarantined(
     loader = RemoteInstanceModelLoader.__new__(RemoteInstanceModelLoader)
 
     assert (
-        loader.load_model_from_remote_instance_by_transfer_engine_heterogeneous(
-            object(), object(), "http://seed:30000", "target-session", object()
+        _load_heterogeneous(
+            loader, object(), object(), "http://seed:30000", "target-session", object()
         )
         is False
     )
@@ -658,8 +690,8 @@ def test_heterogeneous_loader_releases_source_snapshot_after_transfer_failure(
 ) -> None:
     outcomes = []
     source_inventory = {
-        "model_id": "Qwen/Qwen3.5-0.8B",
-        "revision": "main@generation-1",
+        "model_id": _TARGET_MODEL_ID,
+        "revision": _TARGET_REVISION,
         "lease_id": "source-runtime-lease",
         "fragments": [],
     }
@@ -708,8 +740,8 @@ def test_heterogeneous_loader_releases_source_snapshot_after_transfer_failure(
     loader = RemoteInstanceModelLoader.__new__(RemoteInstanceModelLoader)
 
     assert (
-        loader.load_model_from_remote_instance_by_transfer_engine_heterogeneous(
-            object(), object(), "http://seed:30000", "target-session", object()
+        _load_heterogeneous(
+            loader, object(), object(), "http://seed:30000", "target-session", object()
         )
         is False
     )
@@ -740,8 +772,8 @@ def test_heterogeneous_loader_drains_unknown_before_releasing_target_and_source(
             0,
         )
     source_inventory = {
-        "model_id": "Qwen/Qwen3.5-0.8B",
-        "revision": "main@generation-1",
+        "model_id": _TARGET_MODEL_ID,
+        "revision": _TARGET_REVISION,
         "lease_id": "source-runtime-lease",
         "fragments": [SimpleNamespace(fragment_id="source-fragment")],
     }
@@ -839,7 +871,8 @@ def test_heterogeneous_loader_drains_unknown_before_releasing_target_and_source(
     target_model = object()
 
     def load():
-        return loader.load_model_from_remote_instance_by_transfer_engine_heterogeneous(
+        return _load_heterogeneous(
+            loader,
             target_model,
             object(),
             "http://seed:30000",
@@ -893,8 +926,8 @@ def test_heterogeneous_loader_releases_source_after_known_transfer_failure(
 ) -> None:
     outcomes = []
     source_inventory = {
-        "model_id": "Qwen/Qwen3.5-0.8B",
-        "revision": "main@generation-1",
+        "model_id": _TARGET_MODEL_ID,
+        "revision": _TARGET_REVISION,
         "lease_id": "source-runtime-lease",
         "fragments": [SimpleNamespace(fragment_id="source-fragment")],
     }
@@ -963,7 +996,8 @@ def test_heterogeneous_loader_releases_source_after_known_transfer_failure(
     loader = RemoteInstanceModelLoader.__new__(RemoteInstanceModelLoader)
 
     assert (
-        loader.load_model_from_remote_instance_by_transfer_engine_heterogeneous(
+        _load_heterogeneous(
+            loader,
             object(),
             object(),
             "http://seed:30000",
@@ -980,8 +1014,8 @@ def test_heterogeneous_loader_fails_closed_when_heartbeat_fails_during_transfer(
 ) -> None:
     state = {"outcomes": []}
     source_inventory = {
-        "model_id": "Qwen/Qwen3.5-0.8B",
-        "revision": "main@generation-1",
+        "model_id": _TARGET_MODEL_ID,
+        "revision": _TARGET_REVISION,
         "lease_id": "source-runtime-lease",
         "fragments": [],
     }
@@ -1059,7 +1093,8 @@ def test_heterogeneous_loader_fails_closed_when_heartbeat_fails_during_transfer(
     loader = RemoteInstanceModelLoader.__new__(RemoteInstanceModelLoader)
 
     assert (
-        loader.load_model_from_remote_instance_by_transfer_engine_heterogeneous(
+        _load_heterogeneous(
+            loader,
             object(),
             object(),
             "http://seed:30000",

@@ -411,9 +411,9 @@ class ModelRunner:
         )
 
         if self.ps.pp_size > 1:
-            assert self.support_pp, (
-                "Pipeline Parallel is not compatible with this model."
-            )
+            assert (
+                self.support_pp
+            ), "Pipeline Parallel is not compatible with this model."
 
         # For weight updates
         self.init_weight_updater()
@@ -875,7 +875,6 @@ class ModelRunner:
             worker_id=worker_id,
             endpoint=endpoint,
             lease_timeout_sec=lease_timeout_sec,
-            bind_revision_to_generation=True,
         )
 
     def get_weight_runtime_manifest_parts(
@@ -896,7 +895,6 @@ class ModelRunner:
             worker_id=worker_id,
             endpoint=endpoint,
             lease_timeout_sec=lease_timeout_sec,
-            bind_revision_to_generation=True,
         )
 
     def release_weight_runtime_manifest(self, lease_id: str) -> None:

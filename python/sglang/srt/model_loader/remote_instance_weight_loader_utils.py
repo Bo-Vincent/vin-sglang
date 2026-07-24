@@ -7,6 +7,7 @@ import math
 import threading
 import time
 import uuid
+from bisect import bisect_right
 from dataclasses import dataclass
 from typing import Any, List
 
@@ -733,53 +734,67 @@ def register_memory_region_v2(model, transfer_engine):
     start_tic = time.time()
 
     weight_mr_dict = {}
-    weight_addr_set = set()
+    weight_ranges = []
     for name, weight in model.named_parameters():
-        weight_mr_dict[name] = (
-            weight.data_ptr(),
-            weight.numel(),
-            weight.element_size(),
-        )
-        weight_addr_set.add(weight.data_ptr())
+        address = int(weight.data_ptr())
+        numel = int(weight.numel())
+        itemsize = int(weight.element_size())
+        nbytes = numel * itemsize
+        if address <= 0 or nbytes <= 0:
+            raise RuntimeError(f"weight {name} has no registerable storage")
+        weight_mr_dict[name] = (address, numel, itemsize)
+        weight_ranges.append((name, address, address + nbytes))
 
     import torch
 
     memory_snapshot = torch.cuda.memory.memory_snapshot()
-    weight_blocks_for_reg_mr = []
-    # Blocks in each segment have continuous physical addresses,
-    # so they can be merged for memory registration.
-    for segment in memory_snapshot:
-        current_weight_block = None
-        blocks = segment.get("blocks", [])
-        for block in blocks:
+    active_blocks = []
+    for segment_index, segment in enumerate(memory_snapshot):
+        for block in segment.get("blocks", []):
             address = block.get("address", -1)
             size = block.get("size", -1)
-            state = block.get("state", "")
-            if address < 0 or size < 0 or state == "":
-                continue
-            # Only register active allocated memory blocks that hold weights.
-            if state == "active_allocated":
-                if address in weight_addr_set:
-                    if current_weight_block is None:
-                        current_weight_block = (address, size)
-                    elif current_weight_block[0] + current_weight_block[1] == address:
-                        current_weight_block = (
-                            current_weight_block[0],
-                            current_weight_block[1] + size,
-                        )
-                    else:
-                        weight_blocks_for_reg_mr.append(current_weight_block)
-                        current_weight_block = (address, size)
-        if current_weight_block is not None:
-            weight_blocks_for_reg_mr.append(current_weight_block)
+            if (
+                type(address) is int
+                and type(size) is int
+                and address >= 0
+                and size > 0
+                and block.get("state") == "active_allocated"
+            ):
+                active_blocks.append((address, address + size, segment_index))
+    active_blocks.sort()
+    block_starts = [block[0] for block in active_blocks]
+    selected_indices = set()
+    for name, begin, end in weight_ranges:
+        index = bisect_right(block_starts, begin) - 1
+        if index < 0 or end > active_blocks[index][1]:
+            raise RuntimeError(
+                f"weight {name} is not covered by an active CUDA allocation"
+            )
+        selected_indices.add(index)
 
-    # Register merged memory blocks that hold weights.
-    for weight_block in weight_blocks_for_reg_mr:
-        address, size = weight_block
-        ret = transfer_engine.register_memory(address, size)
+    weight_blocks_for_reg_mr = []
+    for index in sorted(selected_indices):
+        begin, end, segment_index = active_blocks[index]
+        if (
+            weight_blocks_for_reg_mr
+            and weight_blocks_for_reg_mr[-1][1] == begin
+            and weight_blocks_for_reg_mr[-1][2] == segment_index
+        ):
+            previous_begin, _, _ = weight_blocks_for_reg_mr[-1]
+            weight_blocks_for_reg_mr[-1] = (
+                previous_begin,
+                end,
+                segment_index,
+            )
+        else:
+            weight_blocks_for_reg_mr.append((begin, end, segment_index))
+
+    for begin, end, _ in weight_blocks_for_reg_mr:
+        ret = transfer_engine.register_memory(begin, end - begin)
         if ret != 0:
             raise RuntimeError(
-                f"register memory failed for weight block at address {address} with size {size}, error: {ret}"
+                f"register memory failed for weight block at address {begin} "
+                f"with size {end - begin}, error: {ret}"
             )
 
     end_tic = time.time()

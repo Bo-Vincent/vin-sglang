@@ -1,4 +1,5 @@
-from types import SimpleNamespace
+import sys
+from types import ModuleType, SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
@@ -140,6 +141,36 @@ def test_transporter_registration_failure_prevents_source_from_becoming_ready(
 
     with pytest.raises(RuntimeError, match="bootstrap unavailable"):
         transporter.maybe_register_and_publish_weight_info()
+
+
+def test_transfer_engine_initialization_failure_is_fatal(monkeypatch) -> None:
+    class FailingTransferEngine:
+        def initialize(self, *args):
+            return -7
+
+        def get_rpc_port(self):
+            raise AssertionError(
+                "RPC port must not be read after failed initialization"
+            )
+
+    engine_module = ModuleType("mooncake.engine")
+    engine_module.TransferEngine = FailingTransferEngine
+    mooncake_module = ModuleType("mooncake")
+    mooncake_module.__path__ = []
+    monkeypatch.setitem(sys.modules, "mooncake", mooncake_module)
+    monkeypatch.setitem(sys.modules, "mooncake.engine", engine_module)
+    monkeypatch.setattr(transporter_module, "get_local_ip_auto", lambda: "127.0.0.1")
+    transporter = RemoteInstanceWeightTransporter(
+        server_args=_FakeServerArgs(),
+        get_model=lambda: object(),
+        tp_rank=0,
+        gpu_id=0,
+    )
+
+    with pytest.raises(RuntimeError, match="initialization failed.*-7"):
+        transporter.init_engine()
+
+    assert transporter.session_id == ""
 
 
 def test_engine_info_bootstrap_keeps_legacy_index(monkeypatch) -> None:

@@ -60,10 +60,10 @@ from sglang.srt.managers.io_struct import (
     ReleaseMemoryOccupationReqOutput,
     ReleaseRemoteInstanceWeightTransferReqInput,
     ReleaseRemoteInstanceWeightTransferReqOutput,
-    RenewRemoteInstanceWeightTransferReqInput,
-    RenewRemoteInstanceWeightTransferReqOutput,
     RemoveExternalCorpusReqInput,
     RemoveExternalCorpusReqOutput,
+    RenewRemoteInstanceWeightTransferReqInput,
+    RenewRemoteInstanceWeightTransferReqOutput,
     ResumeMemoryOccupationReqInput,
     ResumeMemoryOccupationReqOutput,
     ScaleElasticEPReqOutput,
@@ -112,6 +112,190 @@ class RemoteInstanceWeightTransferBeginError(RuntimeError):
         super().__init__(message)
         self.transfer_id = transfer_id
         self.session_state = session_state
+
+
+_REMOTE_WEIGHT_TRANSFER_SESSION_INDEX_LIMIT = 4096
+
+
+def _remote_weight_transfer_session_index(manager) -> Dict[str, Dict[str, Any]]:
+    # Discovery only; scheduler leases remain authoritative for release and updates.
+    index = getattr(manager, "_remote_weight_transfer_session_index", None)
+    if index is None:
+        index = {}
+        setattr(manager, "_remote_weight_transfer_session_index", index)
+    return index
+
+
+def _remote_weight_transfer_lease_identity(payloads) -> Tuple[List[str], int | None]:
+    lease_ids = sorted(
+        {
+            payload["lease_id"]
+            for payload in payloads
+            if isinstance(payload, dict) and payload.get("lease_id")
+        }
+    )
+    generations = {
+        payload["generation"]
+        for payload in payloads
+        if isinstance(payload, dict) and payload.get("generation") is not None
+    }
+    generation = next(iter(generations)) if len(generations) == 1 else None
+    return lease_ids, generation
+
+
+def _remote_weight_transfer_result_payloads(results, manifest_format: str) -> List:
+    field = "bindings" if manifest_format == "placement_binding_v1" else "manifests"
+    return [
+        payload
+        for result in results
+        for payload in (getattr(result, field, None) or ())
+    ]
+
+
+def _remote_weight_transfer_created_by_request(results) -> bool:
+    states = [getattr(result, "session_state", "unknown") for result in (results or ())]
+    if any(state in {"conflict", "expired"} for state in states):
+        return False
+    return any(
+        (getattr(result, "success", False) and state != "reused")
+        or state in {"created", "cleanup_pending"}
+        for result, state in zip(results, states)
+    )
+
+
+def _remote_weight_transfer_begin_lock(manager) -> asyncio.Lock:
+    lock = getattr(manager, "_remote_weight_transfer_begin_lock", None)
+    if lock is None:
+        lock = asyncio.Lock()
+        setattr(manager, "_remote_weight_transfer_begin_lock", lock)
+    return lock
+
+
+def _remember_remote_weight_transfer_session(
+    manager,
+    *,
+    transfer_id: str,
+    manifest_format: str,
+    deadline_unix_sec: float | None,
+    payloads,
+    session_state: str,
+) -> Dict[str, Any]:
+    index = _remote_weight_transfer_session_index(manager)
+    existing = index.get(transfer_id, {})
+    lease_ids, generation = _remote_weight_transfer_lease_identity(payloads)
+    lease_ids = lease_ids or list(existing.get("lease_ids", ()))
+    record = {
+        "transfer_id": transfer_id,
+        "lease_id": lease_ids[0] if len(lease_ids) == 1 else None,
+        "lease_ids": lease_ids,
+        "generation": (
+            generation if generation is not None else existing.get("generation")
+        ),
+        "manifest_format": manifest_format,
+        "deadline_unix_sec": deadline_unix_sec,
+        "expired": session_state == "expired",
+        "session_state": session_state,
+        "last_release_attempt_unix_sec": existing.get("last_release_attempt_unix_sec"),
+        "last_release_success": existing.get("last_release_success"),
+        "last_release_message": existing.get("last_release_message"),
+    }
+    index[transfer_id] = record
+    while len(index) > _REMOTE_WEIGHT_TRANSFER_SESSION_INDEX_LIMIT:
+        released_id = next(
+            (
+                item_id
+                for item_id, item in index.items()
+                if item["session_state"] == "released"
+            ),
+            None,
+        )
+        if released_id is None:
+            break
+        index.pop(released_id)
+    return record
+
+
+def _refresh_remote_weight_transfer_session(
+    manager, transfer_id: str
+) -> Dict[str, Any] | None:
+    index = _remote_weight_transfer_session_index(manager)
+    current = index.get(transfer_id)
+    if current is None:
+        return None
+    record = dict(current)
+    deadline = record.get("deadline_unix_sec")
+    if (
+        record["session_state"] != "released"
+        and deadline is not None
+        and deadline <= time.time()
+    ):
+        record["expired"] = True
+        record["session_state"] = "expired"
+        index[transfer_id] = record
+    return dict(record)
+
+
+def _record_remote_weight_transfer_release(
+    manager,
+    *,
+    transfer_id: str,
+    attempted_at: float,
+    success: bool,
+    message: str,
+) -> None:
+    index = _remote_weight_transfer_session_index(manager)
+    record = _refresh_remote_weight_transfer_session(manager, transfer_id)
+    if record is None:
+        record = {
+            "transfer_id": transfer_id,
+            "lease_id": None,
+            "lease_ids": [],
+            "generation": None,
+            "manifest_format": None,
+            "deadline_unix_sec": None,
+            "expired": False,
+            "session_state": "release_failed",
+        }
+    record["last_release_attempt_unix_sec"] = attempted_at
+    record["last_release_success"] = success
+    record["last_release_message"] = message
+    if success:
+        record["session_state"] = "released"
+    index[transfer_id] = record
+
+
+def _record_remote_weight_transfer_renewal(
+    manager,
+    *,
+    transfer_id: str,
+    deadline_unix_sec: float,
+) -> None:
+    index = _remote_weight_transfer_session_index(manager)
+    record = _refresh_remote_weight_transfer_session(manager, transfer_id)
+    if record is None:
+        record = {
+            "transfer_id": transfer_id,
+            "lease_id": None,
+            "lease_ids": [],
+            "generation": None,
+            "manifest_format": None,
+            "last_release_attempt_unix_sec": None,
+            "last_release_success": None,
+            "last_release_message": None,
+        }
+    record["deadline_unix_sec"] = deadline_unix_sec
+    record["expired"] = False
+    record["session_state"] = "active"
+    index[transfer_id] = record
+
+
+async def _finish_control_task(task: asyncio.Task):
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            continue
+    return task.result()
 
 
 _RUNTIME_TENSOR_SEMANTIC_FIELDS = (
@@ -299,7 +483,7 @@ def _merge_placement_binding_groups(
     return placements, bindings
 
 
-# Declarative spec: (attr_name_prefix, response_type[, mode])
+# Declarative spec: (attr_name_prefix, response_type[, mode, correlation_attr])
 # Each entry creates self.{prefix}_communicator and registers
 # response_type -> communicator.handle_recv in the dispatch table.
 _COMMUNICATOR_SPECS = [
@@ -314,14 +498,20 @@ _COMMUNICATOR_SPECS = [
     (
         "begin_remote_instance_weight_transfer",
         BeginRemoteInstanceWeightTransferReqOutput,
+        "queueing",
+        "transfer_id",
     ),
     (
         "release_remote_instance_weight_transfer",
         ReleaseRemoteInstanceWeightTransferReqOutput,
+        "queueing",
+        "transfer_id",
     ),
     (
         "renew_remote_instance_weight_transfer",
         RenewRemoteInstanceWeightTransferReqOutput,
+        "queueing",
+        "transfer_id",
     ),
     ("update_weights_from_tensor", UpdateWeightsFromTensorReqOutput),
     ("update_weights_from_ipc", UpdateWeightsFromIPCReqOutput),
@@ -362,19 +552,24 @@ class TokenizerControlMixin:
             yield
         finally:
             if owns_pause:
-                await self.continue_generation(
-                    ContinueGenerationReqInput(torch_empty_cache=False)
+                resume_task = asyncio.create_task(
+                    self.continue_generation(
+                        ContinueGenerationReqInput(torch_empty_cache=False)
+                    )
                 )
+                await _finish_control_task(resume_task)
 
     def init_communicators(self: TokenizerManager, server_args: ServerArgs):
         dispatch_pairs = []
         for spec in _COMMUNICATOR_SPECS:
             name, resp_type = spec[0], spec[1]
             mode = spec[2] if len(spec) > 2 else "queueing"
+            correlation_attr = spec[3] if len(spec) > 3 else None
             comm = FanOutCommunicator(
                 self._dispatch_to_scheduler,
                 server_args.dp_size,
                 mode,
+                correlation_attr,
             )
             setattr(self, f"{name}_communicator", comm)
             dispatch_pairs.append((resp_type, comm.handle_recv))
@@ -718,7 +913,7 @@ class TokenizerControlMixin:
         manifest_format: str = "runtime_v1",
         transfer_id: str | None = None,
     ) -> dict:
-        """Acquire source snapshots while inference continues to serve."""
+        """Pause for snapshot capture, then serve while the lease is held."""
         if not self.server_args.enable_weight_runtime_manifest:
             raise RuntimeError(
                 "remote heterogeneous weight reuse requires "
@@ -734,6 +929,22 @@ class TokenizerControlMixin:
 
         self.auto_create_handle_loop()
         transfer_id = transfer_id or uuid.uuid4().hex
+        async with _remote_weight_transfer_begin_lock(self):
+            return await TokenizerControlMixin._begin_remote_instance_weight_transfer(
+                self,
+                lease_timeout_sec=lease_timeout_sec,
+                manifest_format=manifest_format,
+                transfer_id=transfer_id,
+            )
+
+    async def _begin_remote_instance_weight_transfer(
+        self: TokenizerManager,
+        *,
+        lease_timeout_sec: int,
+        manifest_format: str,
+        transfer_id: str,
+    ) -> dict:
+        deadline_unix_sec = time.time() + lease_timeout_sec
         request = BeginRemoteInstanceWeightTransferReqInput(
             transfer_id=transfer_id,
             model_id=self.server_args.model_path,
@@ -741,10 +952,93 @@ class TokenizerControlMixin:
             lease_timeout_sec=lease_timeout_sec,
             manifest_format=manifest_format,
         )
-        async with TokenizerControlMixin._remote_instance_weight_transfer_pause(self):
-            results = await self.begin_remote_instance_weight_transfer_communicator(
-                request
+        results = None
+
+        async def capture_snapshot():
+            nonlocal results
+            async with TokenizerControlMixin._remote_instance_weight_transfer_pause(
+                self
+            ):
+                results = await self.begin_remote_instance_weight_transfer_communicator(
+                    request
+                )
+            return results
+
+        capture_task = asyncio.create_task(capture_snapshot())
+        try:
+            results = await asyncio.shield(capture_task)
+        except asyncio.CancelledError:
+            capture_error = None
+            try:
+                results = await _finish_control_task(capture_task)
+            except BaseException as error:
+                capture_error = error
+
+            cleanup_candidate = _remote_weight_transfer_created_by_request(
+                results or ()
             )
+            if cleanup_candidate or capture_error is not None:
+                _remember_remote_weight_transfer_session(
+                    self,
+                    transfer_id=transfer_id,
+                    manifest_format=manifest_format,
+                    deadline_unix_sec=deadline_unix_sec,
+                    payloads=_remote_weight_transfer_result_payloads(
+                        results or (), manifest_format
+                    ),
+                    session_state="cleanup_pending",
+                )
+            if cleanup_candidate:
+                cleanup_task = asyncio.create_task(
+                    TokenizerControlMixin.release_remote_instance_weight_transfer(
+                        self, transfer_id
+                    )
+                )
+                try:
+                    await _finish_control_task(cleanup_task)
+                except Exception:
+                    logger.exception(
+                        "Failed to clean up cancelled remote weight transfer %s",
+                        transfer_id,
+                    )
+            raise
+        except Exception as error:
+            if results is None:
+                raise
+            session_states = [
+                getattr(result, "session_state", "unknown") for result in results
+            ]
+            cleanup_pending = _remote_weight_transfer_created_by_request(results)
+            if not cleanup_pending:
+                if results and all(state == "reused" for state in session_states):
+                    session_state = "reused"
+                elif "conflict" in session_states:
+                    session_state = "conflict"
+                elif "expired" in session_states:
+                    session_state = "expired"
+                else:
+                    session_state = "failed"
+                raise RemoteInstanceWeightTransferBeginError(
+                    f"Failed to resume source generation after snapshot capture: "
+                    f"{error}",
+                    transfer_id=transfer_id,
+                    session_state=session_state,
+                ) from error
+            _remember_remote_weight_transfer_session(
+                self,
+                transfer_id=transfer_id,
+                manifest_format=manifest_format,
+                deadline_unix_sec=deadline_unix_sec,
+                payloads=_remote_weight_transfer_result_payloads(
+                    results, manifest_format
+                ),
+                session_state="cleanup_pending",
+            )
+            raise RemoteInstanceWeightTransferBeginError(
+                f"Failed to resume source generation after snapshot capture: {error}",
+                transfer_id=transfer_id,
+                session_state="cleanup_pending",
+            ) from error
         failures = [result.message for result in results if not result.success]
         manifests = None
         placements = None
@@ -768,23 +1062,33 @@ class TokenizerControlMixin:
             session_states = [
                 getattr(result, "session_state", "unknown") for result in results
             ]
-            cleanup_candidate = any(
-                state in {"created", "reused", "cleanup_pending"}
-                for state in session_states
-            ) and not any(
-                state in {"conflict", "expired"} for state in session_states
-            )
+            cleanup_candidate = _remote_weight_transfer_created_by_request(results)
             cleanup_succeeded = False
+            cleanup_cancellation = None
             if cleanup_candidate:
                 for _ in range(3):
+                    cleanup_task = asyncio.create_task(
+                        TokenizerControlMixin.release_remote_instance_weight_transfer(
+                            self,
+                            transfer_id,
+                        )
+                    )
                     try:
                         (
                             cleanup_succeeded,
                             _,
-                        ) = await TokenizerControlMixin.release_remote_instance_weight_transfer(
-                            self,
-                            transfer_id,
-                        )
+                        ) = await asyncio.shield(cleanup_task)
+                    except asyncio.CancelledError as error:
+                        cleanup_cancellation = cleanup_cancellation or error
+                        try:
+                            cleanup_succeeded, _ = await _finish_control_task(
+                                cleanup_task
+                            )
+                        except Exception:
+                            logger.exception(
+                                "Failed to clean up remote weight transfer %s",
+                                transfer_id,
+                            )
                     except Exception:
                         logger.exception(
                             "Failed to clean up remote weight transfer %s",
@@ -793,9 +1097,7 @@ class TokenizerControlMixin:
                     if cleanup_succeeded:
                         break
             if cleanup_candidate:
-                session_state = (
-                    "failed" if cleanup_succeeded else "cleanup_pending"
-                )
+                session_state = "failed" if cleanup_succeeded else "cleanup_pending"
             elif "conflict" in session_states:
                 session_state = "conflict"
             elif "expired" in session_states:
@@ -804,6 +1106,19 @@ class TokenizerControlMixin:
                 session_state = "released"
             else:
                 session_state = "failed"
+            if session_state in {"cleanup_pending", "expired"}:
+                _remember_remote_weight_transfer_session(
+                    self,
+                    transfer_id=transfer_id,
+                    manifest_format=manifest_format,
+                    deadline_unix_sec=deadline_unix_sec,
+                    payloads=_remote_weight_transfer_result_payloads(
+                        results, manifest_format
+                    ),
+                    session_state=session_state,
+                )
+            if cleanup_cancellation is not None:
+                raise cleanup_cancellation
             raise RemoteInstanceWeightTransferBeginError(
                 " | ".join(failures),
                 transfer_id=transfer_id,
@@ -811,24 +1126,45 @@ class TokenizerControlMixin:
             )
         if manifest_format == "placement_binding_v1":
             assert placements is not None and bindings is not None
-            return {
+            session_payloads = bindings
+            response = {
                 "transfer_id": transfer_id,
                 "source_weight_placements": placements,
                 "source_weight_runtime_bindings": bindings,
                 "lease_timeout_sec": lease_timeout_sec,
             }
-        assert manifests is not None
-
-        return {
-            "transfer_id": transfer_id,
-            "weight_runtime_manifests": manifests,
-            "lease_timeout_sec": lease_timeout_sec,
-        }
+        else:
+            assert manifests is not None
+            session_payloads = manifests
+            response = {
+                "transfer_id": transfer_id,
+                "weight_runtime_manifests": manifests,
+                "lease_timeout_sec": lease_timeout_sec,
+            }
+        reused = bool(results) and all(
+            getattr(result, "session_state", "created") == "reused"
+            for result in results
+        )
+        existing = _refresh_remote_weight_transfer_session(self, transfer_id)
+        _remember_remote_weight_transfer_session(
+            self,
+            transfer_id=transfer_id,
+            manifest_format=manifest_format,
+            deadline_unix_sec=(
+                existing.get("deadline_unix_sec")
+                if reused and existing is not None
+                else (None if reused else deadline_unix_sec)
+            ),
+            payloads=session_payloads,
+            session_state="reused" if reused and existing is None else "active",
+        )
+        return response
 
     async def release_remote_instance_weight_transfer(
         self: TokenizerManager, transfer_id: str
     ) -> Tuple[bool, str]:
         self.auto_create_handle_loop()
+        attempted_at = time.time()
         try:
             async with TokenizerControlMixin._remote_instance_weight_transfer_pause(
                 self
@@ -843,6 +1179,21 @@ class TokenizerControlMixin:
             success, message = FanOutCommunicator.merge_results(results)
         except Exception as error:
             success, message = False, str(error)
+        _record_remote_weight_transfer_release(
+            self,
+            transfer_id=transfer_id,
+            attempted_at=attempted_at,
+            success=success,
+            message=message,
+        )
+        log = logger.info if success else logger.warning
+        log(
+            "Explicit remote weight transfer release: "
+            "transfer_id=%s success=%s message=%s",
+            transfer_id,
+            success,
+            message,
+        )
         return success, message
 
     async def renew_remote_instance_weight_transfer(
@@ -854,6 +1205,7 @@ class TokenizerControlMixin:
     ) -> Tuple[bool, str]:
         validate_remote_instance_weight_transfer_lease_timeout(lease_timeout_sec)
         self.auto_create_handle_loop()
+        deadline_unix_sec = time.time() + lease_timeout_sec
         try:
             async with TokenizerControlMixin._remote_instance_weight_transfer_pause(
                 self
@@ -864,9 +1216,33 @@ class TokenizerControlMixin:
                         lease_timeout_sec=lease_timeout_sec,
                     )
                 )
-            return FanOutCommunicator.merge_results(results)
+            success, message = FanOutCommunicator.merge_results(results)
         except Exception as error:
-            return False, str(error)
+            success, message = False, str(error)
+        if success:
+            _record_remote_weight_transfer_renewal(
+                self,
+                transfer_id=transfer_id,
+                deadline_unix_sec=deadline_unix_sec,
+            )
+        return success, message
+
+    async def list_remote_instance_weight_transfer_sessions(
+        self: TokenizerManager,
+    ) -> List[Dict[str, Any]]:
+        index = _remote_weight_transfer_session_index(self)
+        sessions = [
+            _refresh_remote_weight_transfer_session(self, transfer_id)
+            for transfer_id in sorted(index)
+        ]
+        return [session for session in sessions if session is not None]
+
+    async def get_remote_instance_weight_transfer_session(
+        self: TokenizerManager, transfer_id: str
+    ) -> Dict[str, Any] | None:
+        if type(transfer_id) is not str or not transfer_id:
+            raise ValueError("transfer_id must be a non-empty string")
+        return _refresh_remote_weight_transfer_session(self, transfer_id)
 
     async def update_weights_from_tensor(
         self: TokenizerManager,

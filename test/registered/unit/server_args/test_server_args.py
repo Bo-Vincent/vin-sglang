@@ -1070,6 +1070,101 @@ class TestAdaptiveSpecArgs(CustomTestCase):
         self.assertEqual(args.speculative_num_draft_tokens, 4)
 
 
+class TestRemoteInstanceLoadFormat(CustomTestCase):
+    @staticmethod
+    def _args(**overrides):
+        values = {
+            "model_path": "dummy",
+            "load_format": "remote_instance",
+            "remote_instance_weight_loader_backend": "transfer_engine",
+            "remote_instance_weight_loader_seed_instance_ip": "127.0.0.1",
+            "remote_instance_weight_loader_seed_instance_service_port": 30000,
+        }
+        values.update(overrides)
+        return ServerArgs(**values)
+
+    def test_missing_seed_settings_fail_closed(self):
+        args = self._args(remote_instance_weight_loader_seed_instance_service_port=None)
+
+        with self.assertRaisesRegex(ValueError, "seed instance"):
+            args._handle_load_format()
+
+        self.assertEqual(args.load_format, "remote_instance")
+
+    def test_missing_transfer_engine_fails_closed(self):
+        args = self._args()
+
+        with patch.object(args, "validate_transfer_engine", return_value=False):
+            with self.assertRaisesRegex(ValueError, "TransferEngine"):
+                args._handle_load_format()
+
+        self.assertEqual(args.load_format, "remote_instance")
+
+    def test_memory_saver_conflict_fails_closed(self):
+        args = self._args(enable_memory_saver=True)
+
+        with patch(
+            "sglang.srt.server_args.importlib.util.find_spec",
+            return_value=object(),
+        ):
+            with self.assertRaisesRegex(ValueError, "memory saver"):
+                args._handle_load_format()
+
+        self.assertEqual(args.load_format, "remote_instance")
+
+    def test_explicit_remote_instance_preserves_runai_model_uri(self):
+        args = self._args()
+        args.model_path = "s3://models/example"
+
+        with patch.object(
+            args, "validate_transfer_engine", return_value=True
+        ) as validate:
+            args._handle_load_format()
+
+        self.assertEqual(args.load_format, "remote_instance")
+        validate.assert_called_once_with()
+
+    def test_explicit_remote_instance_preserves_other_model_uri(self):
+        args = self._args()
+        args.model_path = "https://models.example/example"
+
+        with patch.object(
+            args, "validate_transfer_engine", return_value=True
+        ) as validate:
+            args._handle_load_format()
+
+        self.assertEqual(args.load_format, "remote_instance")
+        validate.assert_called_once_with()
+
+    def test_speculative_draft_cannot_inherit_remote_instance(self):
+        args = self._args(speculative_algorithm="EAGLE")
+
+        with patch.object(args, "validate_transfer_engine", return_value=True):
+            with self.assertRaisesRegex(ValueError, "speculative draft"):
+                args._handle_load_format()
+
+    def test_speculative_draft_can_use_an_explicit_checkpoint_loader(self):
+        args = self._args(
+            speculative_algorithm="EAGLE",
+            speculative_draft_load_format="auto",
+        )
+
+        with patch.object(args, "validate_transfer_engine", return_value=True):
+            args._handle_load_format()
+
+        self.assertEqual(args.load_format, "remote_instance")
+
+    def test_explicit_remote_instance_draft_fails_for_other_main_loader(self):
+        args = self._args(
+            load_format="auto",
+            speculative_algorithm="EAGLE",
+            speculative_draft_load_format="remote_instance",
+        )
+
+        with self.assertRaisesRegex(ValueError, "speculative draft"):
+            args._handle_load_format()
+
+
 class TestWaterfillArgs(CustomTestCase):
     def test_waterfill_enforces_shared_experts_fusion(self):
         server_args = ServerArgs(
