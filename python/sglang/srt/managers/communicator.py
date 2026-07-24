@@ -27,16 +27,20 @@ class FanOutCommunicator(Generic[T]):
         send: Callable[[T], None],
         fan_out: int,
         mode: str = "queueing",
+        correlation_attr: str | None = None,
     ):
         self._send = send
         self._fan_out = fan_out
         self._mode = mode
+        self._correlation_attr = correlation_attr
         self._result_event: Optional[asyncio.Event] = None
         self._result_values: Optional[List[T]] = None
         self._result_fan_out: Optional[int] = None
+        self._result_correlation_value = None
         self._queueing_lock = asyncio.Lock()
 
         assert mode in ["queueing", "watching"]
+        assert correlation_attr is None or correlation_attr
 
     async def queueing_call(self, obj: T):
         # asyncio.Lock is FIFO-fair: a new caller cannot acquire while earlier
@@ -44,17 +48,19 @@ class FanOutCommunicator(Generic[T]):
         # arrival order. It also releases on exception/cancellation, so a
         # failed caller never blocks the callers queued behind it.
         async with self._queueing_lock:
-            if obj is not None:
-                self._send(obj)
-
-            self._result_event = asyncio.Event()
+            event = asyncio.Event()
+            self._result_event = event
             self._result_values = []
             self._result_fan_out = self._fan_out
-            await self._result_event.wait()
-            result_values = self._result_values
-            self._result_event = self._result_values = None
-            self._result_fan_out = None
-            return result_values
+            self._result_correlation_value = self._correlation_value(obj)
+            try:
+                if obj is not None:
+                    self._send(obj)
+                await event.wait()
+                return self._result_values
+            finally:
+                if self._result_event is event:
+                    self._clear_result_state()
 
     async def watching_call(self, obj):
         if self._result_event is None:
@@ -62,6 +68,7 @@ class FanOutCommunicator(Generic[T]):
             self._result_values = []
             self._result_event = asyncio.Event()
             self._result_fan_out = self._fan_out
+            self._result_correlation_value = self._correlation_value(obj)
 
             if obj is not None:
                 self._send(obj)
@@ -74,8 +81,7 @@ class FanOutCommunicator(Generic[T]):
 
         result_values = copy.deepcopy(values)
         if self._result_event is event:
-            self._result_event = self._result_values = None
-            self._result_fan_out = None
+            self._clear_result_state()
         return result_values
 
     async def __call__(self, obj):
@@ -98,9 +104,29 @@ class FanOutCommunicator(Generic[T]):
                 type(recv_obj).__name__,
             )
             return
+        correlation_value = self._correlation_value(recv_obj)
+        if correlation_value != self._result_correlation_value:
+            logger.debug(
+                "Dropping communicator response for stale correlation value: %r",
+                correlation_value,
+            )
+            return
+        if self._result_event.is_set():
+            logger.debug("Dropping communicator response after fan-out completed")
+            return
         self._result_values.append(recv_obj)
         if len(self._result_values) == self._result_fan_out:
             self._result_event.set()
+
+    def _correlation_value(self, obj):
+        if self._correlation_attr is None:
+            return None
+        return getattr(obj, self._correlation_attr, None)
+
+    def _clear_result_state(self):
+        self._result_event = self._result_values = None
+        self._result_fan_out = None
+        self._result_correlation_value = None
 
     @staticmethod
     def merge_results(results):

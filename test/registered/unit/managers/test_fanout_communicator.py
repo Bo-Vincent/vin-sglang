@@ -2,6 +2,7 @@
 
 import asyncio
 import unittest
+from types import SimpleNamespace
 
 from sglang.srt.managers.communicator import FanOutCommunicator
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -43,6 +44,45 @@ class TestQueueingCall(CustomTestCase):
             # All callers complete without error, in strict FIFO order.
             await asyncio.gather(*tasks)
             self.assertEqual(sent, ["A", "B", "C"])
+
+        asyncio.run(scenario())
+
+    def test_cancelled_correlated_call_drops_its_late_response(self):
+        async def scenario():
+            sent = []
+            comm = FanOutCommunicator(
+                send=sent.append,
+                fan_out=1,
+                mode="queueing",
+                correlation_attr="transfer_id",
+            )
+
+            task_a = asyncio.create_task(
+                comm(SimpleNamespace(transfer_id="transfer-a"))
+            )
+            await asyncio.sleep(0)
+            task_a.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task_a
+
+            task_b = asyncio.create_task(
+                comm(SimpleNamespace(transfer_id="transfer-b"))
+            )
+            await asyncio.sleep(0)
+            comm.handle_recv(SimpleNamespace(transfer_id="transfer-a"))
+            await asyncio.sleep(0)
+            self.assertFalse(task_b.done())
+
+            comm.handle_recv(SimpleNamespace(transfer_id="transfer-b"))
+            result = await task_b
+            self.assertEqual(
+                [item.transfer_id for item in result],
+                ["transfer-b"],
+            )
+            self.assertEqual(
+                [item.transfer_id for item in sent],
+                ["transfer-a", "transfer-b"],
+            )
 
         asyncio.run(scenario())
 

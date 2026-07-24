@@ -551,6 +551,13 @@ class _SnapshotLease(msgspec.Struct, kw_only=True):
     expired: bool = False
 
 
+class WeightSnapshotLeaseStatus(msgspec.Struct, frozen=True, kw_only=True):
+    lease_id: str
+    generation: int
+    deadline: float | None
+    expired: bool
+
+
 class WeightSnapshotCoordinator:
     """Serializes in-place updates with address-bearing runtime snapshots."""
 
@@ -791,6 +798,19 @@ class WeightSnapshotCoordinator:
             self._refresh_expired_leases_locked()
             return lease_id in self._leases
 
+    def list_snapshot_leases(self) -> tuple[WeightSnapshotLeaseStatus, ...]:
+        with self._lock:
+            self._refresh_expired_leases_locked()
+            return tuple(
+                WeightSnapshotLeaseStatus(
+                    lease_id=lease_id,
+                    generation=lease.generation,
+                    deadline=lease.deadline,
+                    expired=lease.expired,
+                )
+                for lease_id, lease in sorted(self._leases.items())
+            )
+
     def release_snapshot(self, lease_id: str) -> None:
         with self._lock:
             self._refresh_expired_leases_locked()
@@ -849,6 +869,9 @@ class WeightRuntimeManifestManager:
 
     def has_lease(self, lease_id: str) -> bool:
         return self.coordinator.has_snapshot(lease_id)
+
+    def list_leases(self) -> tuple[WeightSnapshotLeaseStatus, ...]:
+        return self.coordinator.list_snapshot_leases()
 
     def commit_revision(self) -> int:
         return self.coordinator.commit_revision()
@@ -1250,6 +1273,9 @@ class UnavailableWeightRuntimeManifestManager:
     def has_lease(self, lease_id: str) -> bool:
         del lease_id
         return False
+
+    def list_leases(self) -> tuple[WeightSnapshotLeaseStatus, ...]:
+        return ()
 
     def commit_revision(self) -> int:
         raise WeightManifestError(self._reason)

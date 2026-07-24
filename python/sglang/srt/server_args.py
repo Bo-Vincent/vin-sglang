@@ -6802,45 +6802,62 @@ class ServerArgs:
                 "Detected Mistral native format checkpoint, setting load_format='mistral'"
             )
 
-        if is_runai_obj_uri(self.model_path):
-            self.load_format = "runai_streamer"
-        elif is_remote_url(self.model_path):
-            self.load_format = "remote"
+        if self.load_format != "remote_instance":
+            if is_runai_obj_uri(self.model_path):
+                self.load_format = "runai_streamer"
+            elif is_remote_url(self.model_path):
+                self.load_format = "remote"
 
         if self.custom_weight_loader is None:
             self.custom_weight_loader = []
+
+        speculative_algorithm = str(self.speculative_algorithm or "").upper()
+        draft_load_format = self.speculative_draft_load_format or self.load_format
+        if (
+            speculative_algorithm
+            and speculative_algorithm != "NGRAM"
+            and draft_load_format == "remote_instance"
+        ):
+            raise ValueError(
+                "remote_instance is not supported for a speculative draft "
+                "worker; set --speculative-draft-load-format explicitly"
+            )
 
         if self.load_format == "remote_instance":
             if self.remote_instance_weight_loader_backend != "modelexpress" and (
                 self.remote_instance_weight_loader_seed_instance_ip is None
                 or self.remote_instance_weight_loader_seed_instance_service_port is None
             ):
-                logger.warning(
-                    "Fallback load_format to 'auto' due to incomplete remote instance weight loader settings."
+                raise ValueError(
+                    "--load-format remote_instance requires both seed instance "
+                    "IP and service port"
                 )
-                self.load_format = "auto"
-            elif (
+            if (
                 self.remote_instance_weight_loader_send_weights_group_ports is None
                 and self.remote_instance_weight_loader_backend == "nccl"
             ):
-                logger.warning(
-                    "Fallback load_format to 'auto' due to incomplete remote instance weight loader NCCL group ports settings."
+                raise ValueError(
+                    "--load-format remote_instance with NCCL requires send "
+                    "weights group ports"
                 )
-                self.load_format = "auto"
-            elif (
-                self.remote_instance_weight_loader_backend == "transfer_engine"
-                and not self.validate_transfer_engine()
-            ):
-                logger.warning(
-                    "Fallback load_format to 'auto' due to 'transfer_engine' backend is not supported."
-                )
-                self.load_format = "auto"
+            if self.remote_instance_weight_loader_backend == "transfer_engine":
+                if self.enable_memory_saver:
+                    raise ValueError(
+                        "--load-format remote_instance with TransferEngine is "
+                        "incompatible with memory saver"
+                    )
+                if not self.validate_transfer_engine():
+                    raise ValueError(
+                        "--load-format remote_instance requires an available "
+                        "TransferEngine"
+                    )
 
-        # Check whether TransferEngine can be used when users want to start seed service that supports TransferEngine backend.
         if self.remote_instance_weight_loader_start_seed_via_transfer_engine:
-            self.remote_instance_weight_loader_start_seed_via_transfer_engine = (
-                self.validate_transfer_engine()
-            )
+            if not self.validate_transfer_engine():
+                raise ValueError(
+                    "--remote-instance-weight-loader-start-seed-via-transfer-engine "
+                    "requires an available TransferEngine"
+                )
 
     def _is_mistral_native_format(self) -> bool:
         """True iff the checkpoint requires load_format=mistral.

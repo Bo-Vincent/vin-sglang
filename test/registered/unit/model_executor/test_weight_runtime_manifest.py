@@ -841,6 +841,27 @@ def test_expired_snapshot_lease_cannot_be_silently_revived() -> None:
     coordinator.commit_revision()
 
 
+def test_snapshot_lease_status_keeps_expired_lease_until_explicit_release() -> None:
+    clock = FakeClock(100.0)
+    coordinator = WeightSnapshotCoordinator(clock=clock)
+    lease_id, generation = coordinator.acquire_snapshot(lease_timeout_sec=30)
+
+    clock.advance(30)
+    statuses = coordinator.list_snapshot_leases()
+
+    assert len(statuses) == 1
+    assert statuses[0].lease_id == lease_id
+    assert statuses[0].generation == generation
+    assert statuses[0].deadline == 130.0
+    assert statuses[0].expired is True
+    assert coordinator.has_snapshot(lease_id)
+    with pytest.raises(WeightManifestError, match="snapshot lease is active"):
+        coordinator.begin_update()
+
+    coordinator.release_snapshot(lease_id)
+    assert coordinator.list_snapshot_leases() == ()
+
+
 def test_online_update_coordination_executes_generation_and_failure_contract() -> None:
     coordinator = WeightSnapshotCoordinator()
     updater = DummyWeightUpdater(coordinator)
@@ -3085,7 +3106,7 @@ def test_model_runner_releases_manifest_lease_on_cancellation() -> None:
         )
 
 
-def test_model_runner_does_not_pre_read_generation_for_manifest_revision() -> None:
+def test_model_runner_keeps_model_revision_independent_from_generation() -> None:
     runner_tree = ast.parse(
         Path("python/sglang/srt/model_executor/model_runner.py").read_text()
     )
@@ -3117,10 +3138,8 @@ def test_model_runner_does_not_pre_read_generation_for_manifest_revision() -> No
             and node.func.attr in {"snapshot", "snapshot_parts"}
         ]
         assert len(snapshot_calls) == 1
-        assert any(
-            keyword.arg == "bind_revision_to_generation"
-            and isinstance(keyword.value, ast.Constant)
-            and keyword.value.value is True
+        assert all(
+            keyword.arg != "bind_revision_to_generation"
             for keyword in snapshot_calls[0].keywords
         )
 

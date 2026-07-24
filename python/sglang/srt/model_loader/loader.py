@@ -2335,6 +2335,8 @@ class RemoteInstanceModelLoader(BaseModelLoader):
                     seed_url,
                     load_config.remote_instance_weight_loader_transfer_engine_session_id,
                     load_config.remote_instance_weight_runtime_manifest_builder,
+                    target_model_id=model_config.model_path,
+                    target_revision=model_config.revision or "default",
                 )
             else:
                 success = self.load_model_from_remote_instance_by_transfer_engine(
@@ -2535,6 +2537,25 @@ class RemoteInstanceModelLoader(BaseModelLoader):
         )
         return legacy_builder if callable(legacy_builder) else target_manifest_builder
 
+    @staticmethod
+    def _require_manifest_identity(
+        manifests,
+        *,
+        model_id: str,
+        revision: str,
+        role: str,
+    ) -> None:
+        mismatches = {
+            (manifest.model_id, manifest.revision)
+            for manifest in manifests
+            if (manifest.model_id, manifest.revision) != (model_id, revision)
+        }
+        if mismatches:
+            raise ValueError(
+                f"{role} manifest identity does not match target model "
+                f"{model_id}@{revision}: {sorted(mismatches)}"
+            )
+
     def load_model_from_remote_instance_by_transfer_engine_heterogeneous(
         self,
         model,
@@ -2542,6 +2563,9 @@ class RemoteInstanceModelLoader(BaseModelLoader):
         seed_url,
         local_session_id,
         target_manifest_builder,
+        *,
+        target_model_id: str,
+        target_revision: str,
     ) -> bool:
         world_group = get_world_group()
         local_quarantined = bool(_HETEROGENEOUS_UNKNOWN_TRANSFER_QUARANTINE)
@@ -2675,10 +2699,14 @@ class RemoteInstanceModelLoader(BaseModelLoader):
                     phase_seconds["source_manifest"] = (
                         time.perf_counter() - source_manifest_started
                     )
-                    source = (
-                        source_placements[0]
-                        if source_placements
-                        else source_manifests[0]
+                    source_identity_manifests = (
+                        source_placements if source_placements else source_manifests
+                    )
+                    self._require_manifest_identity(
+                        source_identity_manifests,
+                        model_id=target_model_id,
+                        revision=target_revision,
+                        role="source",
                     )
                     target_manifest_started = time.perf_counter()
                     selected_target_builder = target_manifest_builder
@@ -2691,8 +2719,8 @@ class RemoteInstanceModelLoader(BaseModelLoader):
                     target_resource = transfer_resources.enter_context(
                         selected_target_builder(
                             model=model,
-                            model_id=source.model_id,
-                            revision=source.revision,
+                            model_id=target_model_id,
+                            revision=target_revision,
                             instance_id=f"sglang:{local_session_id}",
                             endpoint=local_session_id,
                         )
@@ -2717,6 +2745,12 @@ class RemoteInstanceModelLoader(BaseModelLoader):
                             TargetPlacementManifest.from_runtime_inventory(
                                 target_resource.placement
                             )
+                        )
+                        self._require_manifest_identity(
+                            (target_placement,),
+                            model_id=target_model_id,
+                            revision=target_revision,
+                            role="target",
                         )
                         phase_seconds["target_manifest"] = (
                             time.perf_counter() - target_manifest_started
@@ -2743,6 +2777,12 @@ class RemoteInstanceModelLoader(BaseModelLoader):
                     else:
                         target_manifest = RuntimeManifest.from_runtime_inventory(
                             target_resource
+                        )
+                        self._require_manifest_identity(
+                            (target_manifest,),
+                            model_id=target_model_id,
+                            revision=target_revision,
+                            role="target",
                         )
                         phase_seconds["target_manifest"] = (
                             time.perf_counter() - target_manifest_started
@@ -2917,9 +2957,12 @@ class RemoteInstanceModelLoader(BaseModelLoader):
             return False
 
         logger.info(
-            "Loaded heterogeneous remote-instance weights: bytes=%d, "
+            "Loaded heterogeneous remote-instance weights: "
+            "manifest_format=%s, transfer_id=%s, release_success=true, bytes=%d, "
             "compact_operations=%d, segments=%d, elapsed=%.4fs; "
             "phases: %s",
+            manifest_format,
+            transfer_session.transfer_id,
             sum(receipt.nbytes for receipt in receipts),
             len(plan.operations),
             sum(receipt.operation_count for receipt in receipts),

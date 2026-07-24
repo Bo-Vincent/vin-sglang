@@ -1,5 +1,7 @@
 import importlib.util
+import socket
 import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -42,9 +44,145 @@ def _args(**overrides):
         modes=("cold", "legacy", "manifest"),
         bootstrap_port=31999,
         source_port=31000,
+        protocol="tcp",
+        transport_device="",
+        request_timeout_s=1,
+        prompt="test",
+        max_new_tokens=1,
+        sampling_seed=0,
     )
     values.update(overrides)
     return SimpleNamespace(**values)
+
+
+def _server(tmp_path, process, port=32000):
+    log_path = tmp_path / "server.log"
+    log_path.write_text("", encoding="utf-8")
+    return benchmark.ServerProcess(
+        process=process,
+        log_file=SimpleNamespace(close=lambda: None),
+        log_path=log_path,
+        started_at=time.perf_counter(),
+        port=port,
+    )
+
+
+class _FakeProcess:
+    def __init__(self, pid=1234, poll_results=None):
+        self.pid = pid
+        self.returncode = None
+        self._poll_results = iter(poll_results or [None])
+        self._last_poll = None
+
+    def poll(self):
+        try:
+            self._last_poll = next(self._poll_results)
+        except StopIteration:
+            pass
+        self.returncode = self._last_poll
+        return self._last_poll
+
+
+class _Response:
+    status_code = 200
+
+    def raise_for_status(self):
+        return None
+
+    def json(self):
+        return {"text": "ok"}
+
+
+def test_start_server_rejects_occupied_port_before_spawn(monkeypatch, tmp_path) -> None:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen()
+        port = listener.getsockname()[1]
+
+        def unexpected_popen(*args, **kwargs):
+            raise AssertionError("Popen must not run for an occupied port")
+
+        monkeypatch.setattr(benchmark.subprocess, "Popen", unexpected_popen)
+        with pytest.raises(RuntimeError, match=rf"port {port} .*already in use"):
+            benchmark._start_server(
+                _args(),
+                gpus="0",
+                port=port,
+                load_mode="cold",
+                log_path=tmp_path / "occupied.log",
+            )
+
+
+def test_wait_ready_rejects_a_child_that_exits_after_health(
+    monkeypatch, tmp_path
+) -> None:
+    process = _FakeProcess(poll_results=[None, None, None, None, 17])
+    server = _server(tmp_path, process)
+    monkeypatch.setattr(
+        benchmark, "_listening_port_owner_pids", lambda port: {process.pid}
+    )
+    monkeypatch.setattr(benchmark, "_process_tree_pids", lambda root_pid: {root_pid})
+    monkeypatch.setattr(benchmark.requests, "get", lambda *args, **kwargs: _Response())
+
+    with pytest.raises(RuntimeError, match="server exited with 17"):
+        benchmark._wait_ready(server, server.port, timeout_s=0.1)
+
+
+def test_wait_ready_rejects_listener_outside_spawned_process_tree(
+    monkeypatch, tmp_path
+) -> None:
+    process = _FakeProcess(pid=1234)
+    server = _server(tmp_path, process)
+    monkeypatch.setattr(
+        benchmark, "_listening_port_owner_pids", lambda port: {9999}, raising=False
+    )
+    monkeypatch.setattr(
+        benchmark, "_process_tree_pids", lambda root_pid: {root_pid}, raising=False
+    )
+
+    def unexpected_get(*args, **kwargs):
+        raise AssertionError("health must not be sent to an unexpected listener owner")
+
+    monkeypatch.setattr(benchmark.requests, "get", unexpected_get)
+
+    with pytest.raises(RuntimeError, match="listener owner.*9999.*process tree"):
+        benchmark._wait_ready(server, server.port, timeout_s=0.1)
+
+
+def test_generate_rechecks_owner_and_process_after_response(
+    monkeypatch, tmp_path
+) -> None:
+    process = _FakeProcess(poll_results=[None, None, 23])
+    server = _server(tmp_path, process)
+    monkeypatch.setattr(
+        benchmark, "_listening_port_owner_pids", lambda port: {process.pid}
+    )
+    monkeypatch.setattr(benchmark, "_process_tree_pids", lambda root_pid: {root_pid})
+    monkeypatch.setattr(benchmark.requests, "post", lambda *args, **kwargs: _Response())
+
+    with pytest.raises(RuntimeError, match="server exited with 23"):
+        benchmark._generate(_args(), server)
+
+
+def test_server_identity_is_auditable(monkeypatch, tmp_path) -> None:
+    process = _FakeProcess(pid=1234)
+    server = _server(tmp_path, process)
+    monkeypatch.setattr(
+        benchmark, "_listening_port_owner_pids", lambda port: {1235}, raising=False
+    )
+    monkeypatch.setattr(
+        benchmark,
+        "_process_tree_pids",
+        lambda root_pid: {root_pid, 1235},
+        raising=False,
+    )
+
+    assert benchmark._assert_server_identity(server) == {
+        "root_pid": 1234,
+        "port": 32000,
+        "process_tree_pids": [1234, 1235],
+        "listener_owner_pids": [1235],
+    }
 
 
 def test_server_command_describes_dp_and_ep_topology() -> None:
@@ -161,6 +299,66 @@ def test_source_probe_requires_enough_samples_for_p95(tmp_path) -> None:
             min_source_probe_samples=5,
             responses_path=tmp_path / "responses.jsonl",
         )
+
+
+def test_manifest_log_contract_requires_the_heterogeneous_loader(tmp_path) -> None:
+    log_path = tmp_path / "manifest.log"
+    log_path.write_text(
+        "TransferEngine memory regions have been successfully registered.\n"
+        "Loaded heterogeneous remote-instance weights: "
+        "manifest_format=placement_binding_v1, transfer_id=transfer-1, "
+        "release_success=true, bytes=4096, "
+        "compact_operations=2, segments=4, elapsed=0.1s\n",
+        encoding="utf-8",
+    )
+
+    evidence = benchmark._assert_reuse_log_contract("manifest", log_path)
+
+    assert evidence["passed"] is True
+    assert (
+        "Loaded heterogeneous remote-instance weights:" in evidence["required_markers"]
+    )
+
+
+def test_manifest_log_contract_rejects_missing_success_marker(tmp_path) -> None:
+    log_path = tmp_path / "manifest.log"
+    log_path.write_text(
+        "TransferEngine memory regions have been successfully registered.\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RuntimeError, match="missing required log marker"):
+        benchmark._assert_reuse_log_contract("manifest", log_path)
+
+
+@pytest.mark.parametrize(
+    "failure_marker",
+    [
+        "Fallback load_format to 'auto'",
+        "using the runtime-v1 target builder",
+        "manifest_format=runtime_v1",
+        "Heterogeneous remote-instance weight loading failed",
+        "completion remains unknown",
+        "Loaded weights but failed to release source transfer session",
+        "Remote weight transfer lease renewal failed",
+    ],
+)
+def test_manifest_log_contract_rejects_fallback_and_transfer_failures(
+    tmp_path, failure_marker
+) -> None:
+    log_path = tmp_path / "manifest.log"
+    log_path.write_text(
+        "TransferEngine memory regions have been successfully registered.\n"
+        "Loaded heterogeneous remote-instance weights: "
+        "manifest_format=placement_binding_v1, transfer_id=transfer-1, "
+        "release_success=true, bytes=4096, "
+        "compact_operations=2, segments=4, elapsed=0.1s\n"
+        f"{failure_marker}\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RuntimeError, match="forbidden log marker"):
+        benchmark._assert_reuse_log_contract("manifest", log_path)
 
 
 def test_execution_schedule_balances_reuse_mode_order() -> None:

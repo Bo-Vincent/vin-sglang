@@ -1298,6 +1298,35 @@ async def begin_remote_instance_weight_transfer(
         )
 
 
+@app.get("/remote_instance_weight_transfer")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def list_remote_instance_weight_transfer_sessions():
+    manager = _global_state.tokenizer_manager
+    sessions = await manager.list_remote_instance_weight_transfer_sessions()
+    return {"sessions": sessions}
+
+
+@app.get("/remote_instance_weight_transfer/{transfer_id}")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def get_remote_instance_weight_transfer_session(transfer_id: str):
+    session = await _global_state.tokenizer_manager.get_remote_instance_weight_transfer_session(
+        transfer_id
+    )
+    if session is None:
+        return ORJSONResponse(
+            {
+                "error": {
+                    "message": (
+                        "Remote instance weight transfer session was not found: "
+                        f"{transfer_id}"
+                    )
+                }
+            },
+            status_code=HTTPStatus.NOT_FOUND,
+        )
+    return session
+
+
 @app.delete("/remote_instance_weight_transfer/{transfer_id}")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def release_remote_instance_weight_transfer(transfer_id: str):

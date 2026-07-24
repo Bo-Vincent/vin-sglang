@@ -39,19 +39,23 @@ class RemoteInstanceWeightTransporter:
     def init_engine(self):
         try:
             from mooncake.engine import TransferEngine
-        except ImportError:
-            logger.warning(
-                "Please install mooncake for using remote instance transfer engine: pip install mooncake-transfer-engine"
-            )
-            return
+        except ImportError as error:
+            raise RuntimeError(
+                "remote instance TransferEngine requires mooncake-transfer-engine"
+            ) from error
         self.engine = TransferEngine()
         local_ip = get_local_ip_auto()
-        self.engine.initialize(
+        status = self.engine.initialize(
             local_ip,
             "P2PHANDSHAKE",
             envs.MOONCAKE_PROTOCOL.get(),
             envs.MOONCAKE_DEVICE.get(),
         )
+        if status != 0:
+            self.engine = None
+            raise RuntimeError(
+                f"remote instance TransferEngine initialization failed: {status}"
+            )
         self.session_id = NetworkAddress(
             local_ip, self.engine.get_rpc_port()
         ).to_host_port_str()
