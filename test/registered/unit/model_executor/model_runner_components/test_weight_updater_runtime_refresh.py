@@ -314,7 +314,9 @@ def _make_updater(module, model, **overrides):
         "get_model": lambda: model,
         "update_model_fields": lambda *args, **kwargs: None,
         "recapture_cuda_graph": lambda: None,
-        "get_model_runner": lambda: object(),
+        "get_model_runner": lambda: SimpleNamespace(
+            server_args=SimpleNamespace(weight_cache_mode="off")
+        ),
     }
     values.update(overrides)
     return module.WeightUpdater(**values)

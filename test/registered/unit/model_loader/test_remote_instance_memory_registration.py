@@ -79,3 +79,7 @@ def test_register_memory_region_rejects_uncovered_parameter(monkeypatch) -> None
 
     with pytest.raises(RuntimeError, match="not covered"):
         register_memory_region_v2(model, FakeEngine())
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

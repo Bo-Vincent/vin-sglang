@@ -1165,6 +1165,29 @@ class TestRemoteInstanceLoadFormat(CustomTestCase):
             args._handle_load_format()
 
 
+class TestWeightSnapshotLoadFormat(CustomTestCase):
+    def test_public_cli_accepts_weight_snapshot(self):
+        parser = server_args_module.argparse.ArgumentParser()
+        ServerArgs.add_cli_args(parser)
+
+        parsed = parser.parse_args(
+            [
+                "--model-path",
+                "dummy",
+                "--load-format",
+                "weight_snapshot",
+            ]
+        )
+
+        self.assertEqual(parsed.load_format, "weight_snapshot")
+        draft_action = next(
+            action
+            for action in parser._actions
+            if action.dest == "speculative_draft_load_format"
+        )
+        self.assertNotIn("weight_snapshot", draft_action.choices)
+
+
 class TestWaterfillArgs(CustomTestCase):
     def test_waterfill_enforces_shared_experts_fusion(self):
         server_args = ServerArgs(

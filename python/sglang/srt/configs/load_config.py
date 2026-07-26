@@ -30,6 +30,7 @@ class LoadFormat(str, enum.Enum):
     JAX = "jax"
     REMOTE = "remote"
     REMOTE_INSTANCE = "remote_instance"
+    WEIGHT_SNAPSHOT = "weight_snapshot"
     RDMA = "rdma"
     LOCAL_CACHED = "local_cached"
     FASTSAFETENSORS = "fastsafetensors"
@@ -83,6 +84,9 @@ class LoadConfig:
     remote_instance_weight_loader_transfer_engine: Optional[Any] = None
     remote_instance_weight_loader_transfer_engine_session_id: Optional[str] = None
     remote_instance_weight_runtime_manifest_builder: Optional[Any] = None
+    remote_instance_weight_transfer_provider_factory: Optional[Any] = None
+    weight_snapshot_backend_factory: Optional[Any] = None
+    weight_snapshot_world_barrier: Optional[Any] = None
     modelexpress_url: Optional[str] = None
     modelexpress_transport: str = "nixl"
 

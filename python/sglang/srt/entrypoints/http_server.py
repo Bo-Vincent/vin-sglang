@@ -126,6 +126,7 @@ from sglang.srt.managers.io_struct import (
     InitWeightsUpdateGroupReqInput,
     LoadLoRAAdapterFromTensorsReqInput,
     LoadLoRAAdapterReqInput,
+    MaterializeWeightsReqInput,
     OpenSessionReqInput,
     ParseFunctionCallReq,
     PauseGenerationReqInput,
@@ -153,6 +154,7 @@ from sglang.srt.managers.multi_tokenizer_mixin import (
     write_data_for_multi_tokenizer,
 )
 from sglang.srt.managers.tokenizer_manager import ServerStatus, TokenizerManager
+from sglang.srt.managers.tokenizer_control_mixin import WeightMaterializationError
 from sglang.srt.observability.func_timer import enable_func_timer
 from sglang.srt.observability.trace import (
     process_tracing_init,
@@ -1270,6 +1272,39 @@ async def remote_instance_transfer_engine_info(rank: int = None):
         {"error": {"message": f"Failed to get transfer engine info for rank {rank}"}},
         status_code=HTTPStatus.BAD_REQUEST,
     )
+
+
+@app.post("/materialize_weights")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def materialize_weights(
+    obj: Annotated[MaterializeWeightsReqInput, Body()],
+    request: Request,
+):
+    try:
+        return await _global_state.tokenizer_manager.materialize_weights(obj, request)
+    except (RuntimeError, ValueError) as error:
+        if isinstance(error, ValueError):
+            status_code = HTTPStatus.BAD_REQUEST
+        elif isinstance(error, WeightMaterializationError):
+            status_code = {
+                "conflict": HTTPStatus.CONFLICT,
+                "not_found": HTTPStatus.NOT_FOUND,
+                "completion_unknown": HTTPStatus.SERVICE_UNAVAILABLE,
+                "cleanup_pending": HTTPStatus.SERVICE_UNAVAILABLE,
+                "disabled": HTTPStatus.SERVICE_UNAVAILABLE,
+            }.get(error.session_state, HTTPStatus.INTERNAL_SERVER_ERROR)
+        else:
+            status_code = HTTPStatus.INTERNAL_SERVER_ERROR
+        return ORJSONResponse(
+            {
+                "materialization_id": getattr(
+                    error, "materialization_id", obj.materialization_id
+                ),
+                "session_state": getattr(error, "session_state", "failed"),
+                "message": str(error),
+            },
+            status_code=status_code,
+        )
 
 
 @app.post("/remote_instance_weight_transfer")

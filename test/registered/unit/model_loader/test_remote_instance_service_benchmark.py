@@ -1,5 +1,6 @@
 import importlib.util
 import socket
+import statistics
 import sys
 import time
 from pathlib import Path
@@ -111,6 +112,64 @@ def test_start_server_rejects_occupied_port_before_spawn(monkeypatch, tmp_path) 
                 load_mode="cold",
                 log_path=tmp_path / "occupied.log",
             )
+
+
+def test_port_probe_uses_server_reuse_address_semantics(monkeypatch) -> None:
+    calls = []
+
+    class Probe:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def setsockopt(self, level, option, value):
+            calls.append(("setsockopt", level, option, value))
+
+        def bind(self, address):
+            calls.append(("bind", address))
+
+    monkeypatch.setattr(benchmark.socket, "socket", lambda *_args: Probe())
+
+    benchmark._assert_port_available(32000)
+
+    assert calls == [
+        ("setsockopt", socket.SOL_SOCKET, socket.SO_REUSEADDR, 1),
+        ("bind", ("127.0.0.1", 32000)),
+    ]
+
+
+def test_wait_port_released_retries_until_the_listener_is_gone(monkeypatch) -> None:
+    attempts = []
+
+    def assert_port_available(port):
+        attempts.append(port)
+        if len(attempts) < 3:
+            raise RuntimeError(f"port {port} is still in use")
+
+    monkeypatch.setattr(benchmark, "_assert_port_available", assert_port_available)
+    monkeypatch.setattr(benchmark.time, "sleep", lambda _seconds: None)
+
+    benchmark._wait_port_released(32000, timeout_s=1.0)
+
+    assert attempts == [32000, 32000, 32000]
+
+
+def test_stop_server_waits_for_its_port_to_be_released(monkeypatch, tmp_path) -> None:
+    waited_ports = []
+    process = _FakeProcess(poll_results=[0])
+    server = _server(tmp_path, process)
+    monkeypatch.setattr(
+        benchmark,
+        "_wait_port_released",
+        lambda port, timeout_s: waited_ports.append((port, timeout_s)),
+        raising=False,
+    )
+
+    benchmark._stop_server(server)
+
+    assert waited_ports == [(server.port, 30.0)]
 
 
 def test_wait_ready_rejects_a_child_that_exits_after_health(
@@ -331,6 +390,98 @@ def test_manifest_log_contract_rejects_missing_success_marker(tmp_path) -> None:
         benchmark._assert_reuse_log_contract("manifest", log_path)
 
 
+def test_manifest_transfer_metrics_include_phases_and_logical_throughput(
+    tmp_path,
+) -> None:
+    log_path = tmp_path / "manifest.log"
+    log_path.write_text(
+        "Loaded heterogeneous remote-instance weights: "
+        "manifest_format=placement_binding_v1, transfer_id=transfer-1, "
+        "release_success=true, bytes=2000000000, compact_operations=12, "
+        "segments=48, elapsed=5.0000s; phases: acquire=0.5000s, "
+        "plan=0.2500s, lowering=0.2500s, data_transfer=4.0000s, "
+        "release=0.0000s\n",
+        encoding="utf-8",
+    )
+
+    metrics = benchmark._parse_manifest_transfer_metrics(log_path)
+
+    assert metrics["logical_bytes"] == 2_000_000_000
+    assert metrics["compact_operations"] == 12
+    assert metrics["segments"] == 48
+    assert metrics["elapsed_s"] == pytest.approx(5.0)
+    assert metrics["phases_s"]["data_transfer"] == pytest.approx(4.0)
+    assert metrics["data_transfer_logical_gb_per_s"] == pytest.approx(0.5)
+    assert metrics["data_transfer_logical_gbps"] == pytest.approx(4.0)
+    assert metrics["end_to_end_logical_gb_per_s"] == pytest.approx(0.4)
+
+
+def test_mode_summary_reports_e2e_p95_cv_and_transfer_statistics() -> None:
+    records = []
+    for value in (1.0, 2.0, 3.0, 4.0, 5.0):
+        records.append(
+            {
+                "spawn_to_ready_s": value,
+                "first_generation_s": value / 10,
+                "source_probe": {
+                    "success_count": 5,
+                    "error_count": 0,
+                    "mismatch_count": 0,
+                },
+                "transfer_metrics": {
+                    "logical_bytes": 1000,
+                    "compact_operations": 2,
+                    "segments": 4,
+                    "elapsed_s": value,
+                    "data_transfer_logical_gb_per_s": value,
+                    "data_transfer_logical_gbps": value * 8,
+                    "end_to_end_logical_gb_per_s": value / 2,
+                    "phases_s": {"plan": value / 100, "data_transfer": value},
+                },
+            }
+        )
+
+    summary = benchmark._mode_summary(records)
+
+    assert summary["spawn_to_ready_p95_s"] == 5.0
+    assert summary["spawn_to_ready_cv"] == pytest.approx(
+        statistics.pstdev([1, 2, 3, 4, 5]) / 3
+    )
+    assert summary["first_generation_p95_s"] == pytest.approx(0.5)
+    assert summary["transfer"]["data_transfer_logical_gb_per_s_p50"] == 3.0
+    assert summary["transfer"]["data_transfer_logical_gb_per_s_p95"] == 5.0
+    assert summary["transfer"]["phases_s"]["plan"]["p50"] == pytest.approx(0.03)
+
+
+def test_performance_threshold_controls_process_exit_code() -> None:
+    failed = {
+        "summary": {
+            "all_executed_reuse_modes_pass_threshold": False,
+        }
+    }
+    passed = {
+        "summary": {
+            "all_executed_reuse_modes_pass_threshold": True,
+        }
+    }
+
+    assert benchmark._benchmark_exit_code(failed, report_only=False) == 2
+    assert benchmark._benchmark_exit_code(failed, report_only=True) == 0
+    assert benchmark._benchmark_exit_code(passed, report_only=False) == 0
+
+
+def test_requested_but_unexecuted_reuse_fails_process_exit_code() -> None:
+    result = {
+        "modes_requested": ["cold", "legacy"],
+        "summary": {
+            "all_executed_reuse_modes_pass_threshold": None,
+        },
+    }
+
+    assert benchmark._benchmark_exit_code(result, report_only=False) == 2
+    assert benchmark._benchmark_exit_code(result, report_only=True) == 0
+
+
 @pytest.mark.parametrize(
     "failure_marker",
     [
@@ -395,6 +546,29 @@ def test_parse_args_counts_only_eligible_reuse_modes(monkeypatch) -> None:
     assert benchmark.parse_args().iterations == 1
 
 
+def test_parse_args_defaults_to_six_balanced_iterations(monkeypatch) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "benchmark",
+            "--model",
+            "model",
+            "--source-gpus",
+            "0,1",
+            "--target-gpus",
+            "2,3",
+            "--source-tp-size",
+            "2",
+            "--target-tp-size",
+            "2",
+            "--drop-page-cache",
+        ],
+    )
+
+    assert benchmark.parse_args().iterations == 6
+
+
 def test_parse_args_requires_complete_reuse_order_cycles(monkeypatch, capsys) -> None:
     monkeypatch.setattr(
         sys,
@@ -420,3 +594,7 @@ def test_parse_args_requires_complete_reuse_order_cycles(monkeypatch, capsys) ->
     with pytest.raises(SystemExit):
         benchmark.parse_args()
     assert "complete reuse-mode ordering cycles" in capsys.readouterr().err
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

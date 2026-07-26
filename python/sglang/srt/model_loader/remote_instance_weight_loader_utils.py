@@ -144,6 +144,8 @@ class RemoteInstanceWeightTransferWorldCoordinator:
         self._finished = False
         self._readiness_checked = False
         self._release_safe = True
+        self._world_release_safe = False
+        self._source_release_confirmed = False
 
     def acquire(self) -> RemoteInstanceWeightTransferSession | None:
         if self._acquired:
@@ -269,7 +271,6 @@ class RemoteInstanceWeightTransferWorldCoordinator:
                 (bool(local_success), bool(local_release_safe))
             )
         except Exception:
-            self._stop_heartbeat()
             logger.exception(
                 "Failed to gather target transfer outcomes; source mutation "
                 "remains blocked until explicit release or recovery"
@@ -284,7 +285,6 @@ class RemoteInstanceWeightTransferWorldCoordinator:
             for outcome in gathered_outcomes
         )
         if not outcomes_valid:
-            self._stop_heartbeat()
             logger.error(
                 "Target world returned invalid transfer outcomes; source mutation "
                 "remains blocked until explicit release or recovery"
@@ -292,32 +292,40 @@ class RemoteInstanceWeightTransferWorldCoordinator:
             return False, False
 
         release_safe = all(outcome[1] for outcome in gathered_outcomes)
+        self._world_release_safe = release_safe
         world_success = release_safe and all(
             outcome[0] for outcome in gathered_outcomes
         )
         release_success = True
         if self.is_owner:
-            if not self._stop_heartbeat():
-                world_success = False
             if release_safe:
-                try:
-                    release_success = release_remote_instance_weight_transfer(
-                        self.seed_url, self.session.transfer_id
-                    )
-                    if not release_success:
-                        logger.error(
+                heartbeat_stopped = self._stop_heartbeat()
+                if not heartbeat_stopped:
+                    world_success = False
+                if not self._source_release_confirmed:
+                    try:
+                        self._source_release_confirmed = bool(
+                            release_remote_instance_weight_transfer(
+                                self.seed_url,
+                                self.session.transfer_id,
+                            )
+                        )
+                        if not self._source_release_confirmed:
+                            logger.error(
+                                "Failed to release source weight transfer %s; "
+                                "source mutation remains blocked until explicit "
+                                "release or recovery",
+                                self.session.transfer_id,
+                            )
+                    except Exception:
+                        release_success = False
+                        logger.exception(
                             "Failed to release source weight transfer %s; source "
                             "mutation remains blocked until explicit release or "
                             "recovery",
                             self.session.transfer_id,
                         )
-                except Exception:
-                    release_success = False
-                    logger.exception(
-                        "Failed to release source weight transfer %s; source "
-                        "mutation remains blocked until explicit release or recovery",
-                        self.session.transfer_id,
-                    )
+                release_success = self._source_release_confirmed
             else:
                 release_success = False
                 logger.error(
@@ -344,18 +352,92 @@ class RemoteInstanceWeightTransferWorldCoordinator:
             return False, False
         return outcome
 
+    @property
+    def world_release_safe(self) -> bool:
+        return self._world_release_safe
+
+    def release_after_terminal_recovery(
+        self,
+        *,
+        completion_ticket: str,
+        local_terminal_status: str,
+    ) -> bool:
+        if not self._acquired or not self._finished or self.session is None:
+            raise RuntimeError(
+                "remote weight transfer is not waiting for terminal recovery"
+            )
+        if type(completion_ticket) is not str or not completion_ticket:
+            raise ValueError("completion_ticket must be a non-empty string")
+        if local_terminal_status not in {
+            "COMPLETED",
+            "FAILED_DRAINED",
+            "NO_SUBMISSION",
+        }:
+            raise ValueError(
+                "local terminal completion status must be COMPLETED, "
+                "FAILED_DRAINED, or NO_SUBMISSION"
+            )
+
+        local_result = None
+        if self.is_owner:
+            heartbeat_stopped = self._stop_heartbeat()
+            if not heartbeat_stopped:
+                logger.error(
+                    "Heartbeat did not stop cleanly for recovered source "
+                    "weight transfer %s; retrying the idempotent source release",
+                    self.session.transfer_id,
+                )
+            if not self._source_release_confirmed:
+                try:
+                    self._source_release_confirmed = bool(
+                        release_remote_instance_weight_transfer(
+                            self.seed_url,
+                            self.session.transfer_id,
+                        )
+                    )
+                except Exception:
+                    self._source_release_confirmed = False
+                    logger.exception(
+                        "Failed to release recovered source weight transfer %s",
+                        self.session.transfer_id,
+                    )
+            local_result = self._source_release_confirmed
+
+        try:
+            result = self.world_group.broadcast_object(
+                local_result,
+                src=0,
+            )
+        except Exception:
+            logger.exception("Failed to broadcast recovered source release outcome")
+            return False
+        if type(result) is not bool:
+            logger.error(
+                "Target world returned invalid recovered source release outcome"
+            )
+            return False
+        if result:
+            self._world_release_safe = True
+        return result
+
     def _stop_heartbeat(self) -> bool:
         if self.heartbeat is None:
             return True
+        heartbeat = self.heartbeat
+        self.heartbeat = None
+        stopped = True
         try:
-            self.heartbeat.stop()
-            self.heartbeat.raise_if_failed()
+            heartbeat.stop()
         except Exception:
-            logger.exception("Remote weight transfer heartbeat failed while stopping")
-            return False
-        finally:
-            self.heartbeat = None
-        return True
+            stopped = False
+            logger.exception("Remote weight transfer heartbeat did not stop cleanly")
+        try:
+            heartbeat.raise_if_failed()
+        except Exception:
+            logger.exception(
+                "Remote weight transfer heartbeat had already failed before stopping"
+            )
+        return stopped
 
 
 def trigger_init_weights_send_group_for_remote_instance_request(

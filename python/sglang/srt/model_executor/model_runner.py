@@ -18,6 +18,7 @@ from __future__ import annotations
 import contextlib
 import inspect
 import logging
+import os
 import time
 from dataclasses import dataclass
 from typing import Any, Optional, Union
@@ -259,6 +260,9 @@ class _RemoteInstanceTargetWeightManifestSession:
         finally:
             if self.manager.has_lease(binding.lease_id):
                 self.manager.release(binding.lease_id)
+
+    def attest_binding(self, binding):
+        self.manager.attest_binding(binding)
 
 
 class ModelRunner:
@@ -787,18 +791,7 @@ class ModelRunner:
     def _select_remote_instance_target_weight_manifest_builder(self):
         if not self.server_args.enable_weight_runtime_manifest or self.is_draft_worker:
             return None
-
-        from sglang.srt.model_executor.weight_runtime_manifest import (
-            local_mooncake_supports_placement_binding,
-        )
-
-        if local_mooncake_supports_placement_binding():
-            return self.build_remote_instance_target_weight_manifest_session
-        logger.info(
-            "Local Mooncake lacks placement/binding manifest APIs; "
-            "using the runtime-v1 target builder."
-        )
-        return self.build_remote_instance_target_weight_runtime_manifest
+        return self.build_remote_instance_target_weight_manifest_session
 
     @contextlib.contextmanager
     def build_remote_instance_target_weight_manifest_session(
@@ -895,6 +888,44 @@ class ModelRunner:
             worker_id=worker_id,
             endpoint=endpoint,
             lease_timeout_sec=lease_timeout_sec,
+        )
+
+    def capture_runtime_weight_snapshot_source(
+        self,
+        *,
+        materialization_id: str,
+        model_id: str,
+        revision: str,
+    ):
+        from sglang.srt.weight_transfer.runtime import RuntimeWeightSnapshotSource
+
+        self.init_weight_runtime_manifest_manager()
+        transporter = self.remote_instance_weight_transporter
+        session_id = getattr(transporter, "session_id", "")
+        worker_id = getattr(transporter, "worker_id", "")
+        has_session = type(session_id) is str and bool(session_id)
+        if has_session:
+            instance_id = f"sglang:{session_id}:{materialization_id}"
+            endpoint = session_id
+        else:
+            runtime_id = f"sglang:runtime:{os.getpid()}:{self.gpu_id}"
+            instance_id = f"{runtime_id}:{materialization_id}"
+            endpoint = f"local://{runtime_id}"
+        if type(worker_id) is not str or not worker_id:
+            worker_id = (
+                f"sglang:{session_id}:worker:{os.getpid()}:{self.gpu_id}"
+                if has_session
+                else runtime_id
+            )
+        return RuntimeWeightSnapshotSource.capture(
+            model=self.model,
+            manager=self.weight_runtime_manifest_manager,
+            model_id=model_id,
+            revision=revision,
+            instance_id=instance_id,
+            worker_id=worker_id,
+            endpoint=endpoint,
+            lease_timeout_sec=None,
         )
 
     def release_weight_runtime_manifest(self, lease_id: str) -> None:
@@ -1296,6 +1327,9 @@ class ModelRunner:
             remote_instance_weight_transporter_session_id=self.remote_instance_weight_transporter.session_id,
             remote_instance_weight_runtime_manifest_builder=(
                 self._select_remote_instance_target_weight_manifest_builder()
+            ),
+            remote_instance_weight_transfer_provider_factory=(
+                self.remote_instance_weight_transporter.create_weight_transfer_provider
             ),
             draft_model_idx=self.draft_model_idx,
             weight_cache_mode=self.server_args.weight_cache_mode,

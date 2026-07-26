@@ -900,6 +900,106 @@ def test_world_transfer_finish_broadcasts_when_release_raises(monkeypatch) -> No
     assert group.broadcasts[-1] == ((True, False), 0)
 
 
+def test_world_transfer_releases_terminal_snapshot_after_heartbeat_failure(
+    monkeypatch,
+) -> None:
+    calls = []
+    session = _session()
+
+    class FailedHeartbeat:
+        def __init__(self, *args, **kwargs):
+            del args, kwargs
+            self.checks = 0
+
+        def start(self):
+            calls.append("heartbeat-started")
+
+        def raise_if_failed(self):
+            self.checks += 1
+            if self.checks >= 2:
+                raise RuntimeError("historical renewal failure")
+
+        def stop(self):
+            calls.append("heartbeat-stopped")
+
+    monkeypatch.setattr(
+        utils, "begin_remote_instance_weight_transfer", lambda seed_url: session
+    )
+    monkeypatch.setattr(
+        utils,
+        "release_remote_instance_weight_transfer",
+        lambda seed_url, transfer_id: calls.append("release") or True,
+    )
+    monkeypatch.setattr(utils, "RemoteInstanceWeightTransferHeartbeat", FailedHeartbeat)
+    coordinator = utils.RemoteInstanceWeightTransferWorldCoordinator(
+        "http://source",
+        _FakeWorldGroup(
+            rank=0,
+            gathered_outcomes=[(False, True)] * 4,
+        ),
+    )
+
+    assert coordinator.acquire() is session
+    assert coordinator.ready_for_transfer(True) is True
+    assert coordinator.finish(local_success=True) == (False, True)
+    assert calls == ["heartbeat-started", "heartbeat-stopped", "release"]
+
+
+def test_world_transfer_retries_terminal_source_release(monkeypatch) -> None:
+    release_results = iter((False, False, True))
+    release_calls = []
+    session = _session()
+
+    class FakeHeartbeat:
+        def __init__(self, *args, **kwargs):
+            del args, kwargs
+
+        def start(self):
+            pass
+
+        def raise_if_failed(self):
+            pass
+
+        def stop(self):
+            pass
+
+    def release(seed_url, transfer_id):
+        release_calls.append((seed_url, transfer_id))
+        return next(release_results)
+
+    monkeypatch.setattr(
+        utils, "begin_remote_instance_weight_transfer", lambda seed_url: session
+    )
+    monkeypatch.setattr(utils, "release_remote_instance_weight_transfer", release)
+    monkeypatch.setattr(utils, "RemoteInstanceWeightTransferHeartbeat", FakeHeartbeat)
+    coordinator = utils.RemoteInstanceWeightTransferWorldCoordinator(
+        "http://source", _FakeWorldGroup(rank=0)
+    )
+
+    assert coordinator.acquire() is session
+    assert coordinator.ready_for_transfer(True) is True
+    assert coordinator.finish(local_success=True) == (True, False)
+    assert (
+        coordinator.release_after_terminal_recovery(
+            completion_ticket="terminal-0",
+            local_terminal_status="COMPLETED",
+        )
+        is False
+    )
+    assert (
+        coordinator.release_after_terminal_recovery(
+            completion_ticket="terminal-0",
+            local_terminal_status="COMPLETED",
+        )
+        is True
+    )
+    assert release_calls == [
+        ("http://source", "transfer-1"),
+        ("http://source", "transfer-1"),
+        ("http://source", "transfer-1"),
+    ]
+
+
 def test_world_transfer_readiness_rejects_partial_world_and_runs_once(
     monkeypatch,
 ) -> None:
@@ -1040,7 +1140,7 @@ def test_world_transfer_unknown_completion_requires_explicit_release(
 
     assert world_success is False
     assert release_success is False
-    assert calls == ["heartbeat-stopped"]
+    assert calls == []
 
 
 def test_world_transfer_session_follower_reuses_broadcast_and_never_calls_source(
@@ -1118,4 +1218,8 @@ def test_world_transfer_session_rejects_invalid_collective_outcomes(
 
     assert coordinator.acquire() is session
     assert coordinator.finish(local_success=True) == (False, False)
-    assert calls == ["heartbeat-stopped"]
+    assert calls == []
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

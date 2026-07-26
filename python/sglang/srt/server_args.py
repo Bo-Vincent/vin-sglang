@@ -129,6 +129,7 @@ LOAD_FORMAT_CHOICES = [
 # It is an internal dispatch format set automatically by ModelRunner when the
 # weight cache is enabled (weight_cache_mode != "off"). Exposing it as a CLI
 # choice let users create contradictory combos (see _handle_load_format).
+MODEL_LOAD_FORMAT_CHOICES = [*LOAD_FORMAT_CHOICES, "weight_snapshot"]
 
 # TODO: this list should likely contain only methods that support online quantization, or that support using custom quantization classes compatible with a given `quant_method` in config.json.
 # Some of the choices here do NOT support online quantization.
@@ -362,6 +363,7 @@ LINEAR_ATTN_KERNEL_BACKEND_CHOICES = ["triton", "cutedsl", "flashinfer", "flashk
 # Allow external code to add more choices
 def add_load_format_choices(choices):
     LOAD_FORMAT_CHOICES.extend(choices)
+    MODEL_LOAD_FORMAT_CHOICES.extend(choices)
 
 
 def add_quantization_method_choices(choices):
@@ -532,7 +534,7 @@ class ServerArgs:
             "draft); each replaces <model_path>/presharded and still gets a "
             "config subfolder appended. Use a writable path when model_path "
             "is read-only (e.g. HF cache mounts).",
-            choices=LOAD_FORMAT_CHOICES,
+            choices=MODEL_LOAD_FORMAT_CHOICES,
         ),
         NS("model"),
     ] = "auto"
@@ -4246,8 +4248,10 @@ class ServerArgs:
             ),
             (
                 "OOT platform without piecewise support",
-                lambda: current_platform.is_out_of_tree()
-                and not current_platform.support_piecewise_cuda_graph(),
+                lambda: (
+                    current_platform.is_out_of_tree()
+                    and not current_platform.support_piecewise_cuda_graph()
+                ),
             ),
             (
                 "MoE A2A backend",
@@ -4256,14 +4260,18 @@ class ServerArgs:
             ("LoRA", lambda: bool(self.lora_paths) or self.enable_lora),
             (
                 "multimodal model",
-                lambda: self.get_model_config().is_multimodal
-                and not self.get_model_config().is_multimodal_piecewise_cuda_graph_supported,
+                lambda: (
+                    self.get_model_config().is_multimodal
+                    and not self.get_model_config().is_multimodal_piecewise_cuda_graph_supported
+                ),
             ),
             (
                 "GGUF quantization",
-                lambda: self.load_format == "gguf"
-                or _resolved_view(self).quantization == "gguf"
-                or check_gguf_file(self.model_path),
+                lambda: (
+                    self.load_format == "gguf"
+                    or _resolved_view(self).quantization == "gguf"
+                    or check_gguf_file(self.model_path)
+                ),
             ),
             ("DLLM (diffusion LLM)", lambda: self.dllm_algorithm is not None),
             (
@@ -4278,8 +4286,10 @@ class ServerArgs:
             ("symmetric memory", lambda: self.enable_symm_mem),
             (
                 "expert distribution recorder",
-                lambda: self.enable_eplb
-                or self.expert_distribution_recorder_mode is not None,
+                lambda: (
+                    self.enable_eplb
+                    or self.expert_distribution_recorder_mode is not None
+                ),
             ),
             (
                 "context parallel (attn_cp_size > 1)",
@@ -4338,8 +4348,10 @@ class ServerArgs:
             # Multimodal prefill replay faults under BCG; allowlisted archs opt back in.
             (
                 "multimodal model",
-                lambda: self.get_model_config().is_multimodal
-                and not self.get_model_config().is_multimodal_breakable_cuda_graph_supported,
+                lambda: (
+                    self.get_model_config().is_multimodal
+                    and not self.get_model_config().is_multimodal_breakable_cuda_graph_supported
+                ),
             ),
         ]
         for name, predicate in rules:
@@ -7513,13 +7525,12 @@ class ServerArgs:
     def _handle_unified_memory_pool(self):
         if not self.enable_unified_memory:
             return
-        assert self.disaggregation_mode == "null", (
-            "--enable-unified-memory is not yet compatible with PD " "disaggregation."
-        )
-        assert self.speculative_algorithm is None, (
-            "--enable-unified-memory is not yet compatible with speculative "
-            "decoding."
-        )
+        assert (
+            self.disaggregation_mode == "null"
+        ), "--enable-unified-memory is not yet compatible with PD disaggregation."
+        assert (
+            self.speculative_algorithm is None
+        ), "--enable-unified-memory is not yet compatible with speculative decoding."
         assert not (self.enable_hierarchical_cache or self.enable_lmcache), (
             "--enable-unified-memory is not yet compatible with hierarchical / "
             "host-tiered KV cache (--enable-hierarchical-cache / --enable-lmcache): "

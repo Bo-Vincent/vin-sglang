@@ -40,6 +40,8 @@ register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
 
 def _manager(runner, *, remote_weight_transfer_cpu_group=None):
+    if not hasattr(runner, "server_args"):
+        runner.server_args = SimpleNamespace(weight_cache_mode="off")
     kwargs = {}
     if remote_weight_transfer_cpu_group is not None:
         kwargs["remote_weight_transfer_cpu_group"] = remote_weight_transfer_cpu_group
@@ -2169,6 +2171,7 @@ def test_tokenizer_renew_fans_out_without_local_session_state() -> None:
             transfer_id="transfer-from-another-worker", lease_timeout_sec=60
         )
     ]
+    assert manager._remote_weight_transfer_events == []
 
 
 def test_tokenizer_lists_active_then_expired_session_without_auto_release(

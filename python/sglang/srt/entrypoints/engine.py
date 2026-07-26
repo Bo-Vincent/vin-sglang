@@ -69,6 +69,7 @@ from sglang.srt.managers.io_struct import (
     InitWeightsUpdateGroupReqInput,
     LoadLoRAAdapterFromTensorsReqInput,
     LoadLoRAAdapterReqInput,
+    MaterializeWeightsReqInput,
     MultimodalDataInputFormat,
     OpenSessionReqInput,
     ProfileReq,
@@ -1239,6 +1240,22 @@ class Engine(EngineScoreMixin, EngineBase):
                 "internal_states": internal_states,
                 "version": __version__,
             }
+        )
+
+    def materialize_weights(
+        self,
+        storage_options: Dict[str, Any],
+        materialization_id: Optional[str] = None,
+        source_external_dp_rank: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Materialize one runtime weight replica into persistent storage."""
+        obj = MaterializeWeightsReqInput(
+            storage_options=storage_options,
+            materialization_id=materialization_id,
+            source_external_dp_rank=source_external_dp_rank,
+        )
+        return self.loop.run_until_complete(
+            self.tokenizer_manager.materialize_weights(obj, None)
         )
 
     def init_weights_update_group(

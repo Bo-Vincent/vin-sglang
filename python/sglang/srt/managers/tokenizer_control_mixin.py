@@ -24,6 +24,8 @@ from sglang.srt.managers.io_struct import (
     ClearHiCacheReqInput,
     ClearHiCacheReqOutput,
     CloseSessionReqInput,
+    CommitWeightMaterializationReqInput,
+    CommitWeightMaterializationReqOutput,
     ContinueGenerationReqInput,
     DestroyWeightsUpdateGroupReqInput,
     DestroyWeightsUpdateGroupReqOutput,
@@ -51,8 +53,11 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqInput,
     LoadLoRAAdapterReqOutput,
     LoRAUpdateOutput,
+    MaterializeWeightsReqInput,
     OpenSessionReqInput,
     PauseGenerationReqInput,
+    PrepareWeightMaterializationReqInput,
+    PrepareWeightMaterializationReqOutput,
     ProfileReq,
     ProfileReqOutput,
     ProfileReqType,
@@ -111,6 +116,19 @@ class RemoteInstanceWeightTransferBeginError(RuntimeError):
     ) -> None:
         super().__init__(message)
         self.transfer_id = transfer_id
+        self.session_state = session_state
+
+
+class WeightMaterializationError(RuntimeError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        materialization_id: str,
+        session_state: str,
+    ) -> None:
+        super().__init__(message)
+        self.materialization_id = materialization_id
         self.session_state = session_state
 
 
@@ -296,6 +314,134 @@ async def _finish_control_task(task: asyncio.Task):
         except asyncio.CancelledError:
             continue
     return task.result()
+
+
+def _weight_materialization_active_ids(manager) -> set[str]:
+    active_ids = getattr(manager, "_weight_materialization_active_ids", None)
+    if active_ids is None:
+        active_ids = set()
+        manager._weight_materialization_active_ids = active_ids
+    return active_ids
+
+
+def _weight_materialization_fan_out(manager) -> int:
+    communicator = manager.prepare_weight_materialization_communicator
+    fan_out = getattr(communicator, "_fan_out", None)
+    if type(fan_out) is int and fan_out > 0:
+        return fan_out
+    return int(getattr(manager.server_args, "dp_size", 1))
+
+
+def _weight_materialization_result_state(results, default: str) -> str:
+    if any(getattr(result, "completion_unknown", False) for result in results):
+        return "completion_unknown"
+    states = {
+        result.session_state
+        for result in results
+        if type(getattr(result, "session_state", None)) is str
+        and result.session_state
+        and result.session_state != "unknown"
+    }
+    for state in ("conflict", "cleanup_pending", "failed"):
+        if state in states:
+            return state
+    if len(states) == 1:
+        return next(iter(states))
+    return default
+
+
+def _ordered_weight_materialization_results(
+    results,
+    *,
+    materialization_id: str,
+    expected_fan_out: int,
+    phase: str,
+    allow_identical_duplicates: bool,
+):
+    if not results:
+        raise WeightMaterializationError(
+            f"{phase} returned no responses",
+            materialization_id=materialization_id,
+            session_state="failed",
+        )
+
+    by_rank = {}
+    for result in results:
+        if result.materialization_id != materialization_id:
+            raise WeightMaterializationError(
+                f"{phase} returned a mismatched materialization_id",
+                materialization_id=materialization_id,
+                session_state="conflict",
+            )
+        rank = result.external_dp_rank
+        if type(rank) is not int or rank < 0 or rank >= expected_fan_out:
+            raise WeightMaterializationError(
+                f"{phase} returned invalid external_dp_rank {rank!r}",
+                materialization_id=materialization_id,
+                session_state="conflict",
+            )
+        by_rank.setdefault(rank, []).append(result)
+
+    expected_ranks = set(range(expected_fan_out))
+    if set(by_rank) != expected_ranks:
+        raise WeightMaterializationError(
+            f"{phase} responses do not cover external DP ranks "
+            f"{sorted(expected_ranks)}",
+            materialization_id=materialization_id,
+            session_state="conflict",
+        )
+
+    ordered = []
+    for rank in sorted(by_rank):
+        rank_results = by_rank[rank]
+        if len(rank_results) > 1:
+            if not allow_identical_duplicates or any(
+                result != rank_results[0] for result in rank_results[1:]
+            ):
+                raise WeightMaterializationError(
+                    f"{phase} returned duplicate responses for external DP rank {rank}",
+                    materialization_id=materialization_id,
+                    session_state="conflict",
+                )
+        ordered.append(rank_results[0])
+    return ordered
+
+
+async def _cleanup_weight_materialization(
+    manager,
+    *,
+    materialization_id: str,
+    storage_options: Dict[str, Any],
+) -> str:
+    request = CommitWeightMaterializationReqInput(
+        materialization_id=materialization_id,
+        selected_external_dp_rank=None,
+        storage_options=storage_options,
+    )
+    cleanup_task = asyncio.create_task(
+        manager.commit_weight_materialization_communicator(request)
+    )
+    try:
+        results = await asyncio.shield(cleanup_task)
+    except asyncio.CancelledError:
+        results = await _finish_control_task(cleanup_task)
+    except Exception:
+        logger.exception(
+            "Failed to clean up weight materialization %s",
+            materialization_id,
+        )
+        return "cleanup_pending"
+
+    if not results or any(
+        not result.success or result.ref is not None for result in results
+    ):
+        logger.error(
+            "Weight materialization cleanup did not complete for %s: %s",
+            materialization_id,
+            " | ".join(getattr(result, "message", "") for result in results),
+        )
+        return _weight_materialization_result_state(results, "cleanup_pending")
+    return _weight_materialization_result_state(results, "released")
 
 
 _RUNTIME_TENSOR_SEMANTIC_FIELDS = (
@@ -512,6 +658,18 @@ _COMMUNICATOR_SPECS = [
         RenewRemoteInstanceWeightTransferReqOutput,
         "queueing",
         "transfer_id",
+    ),
+    (
+        "prepare_weight_materialization",
+        PrepareWeightMaterializationReqOutput,
+        "queueing",
+        "materialization_id",
+    ),
+    (
+        "commit_weight_materialization",
+        CommitWeightMaterializationReqOutput,
+        "queueing",
+        "materialization_id",
     ),
     ("update_weights_from_tensor", UpdateWeightsFromTensorReqOutput),
     ("update_weights_from_ipc", UpdateWeightsFromIPCReqOutput),
@@ -905,6 +1063,238 @@ class TokenizerControlMixin:
         result = (await self.send_weights_to_remote_instance_communicator(obj))[0]
         return result.success, result.message
 
+    async def materialize_weights(
+        self: TokenizerManager,
+        obj: MaterializeWeightsReqInput,
+        request: Optional[fastapi.Request] = None,
+    ) -> Dict[str, Any]:
+        materialization_id = (
+            uuid.uuid4().hex
+            if obj.materialization_id is None
+            else obj.materialization_id
+        )
+        if type(materialization_id) is not str or not materialization_id.strip():
+            raise ValueError("materialization_id must be a non-empty string")
+        if not isinstance(obj.storage_options, dict):
+            raise ValueError("storage_options must be a dictionary")
+
+        if not self.server_args.enable_weight_runtime_manifest:
+            raise WeightMaterializationError(
+                "weight materialization requires --enable-weight-runtime-manifest",
+                materialization_id=materialization_id,
+                session_state="disabled",
+            )
+
+        self.auto_create_handle_loop()
+        expected_fan_out = _weight_materialization_fan_out(self)
+        selected_rank = obj.source_external_dp_rank
+        if selected_rank is not None and (
+            type(selected_rank) is not int
+            or selected_rank < 0
+            or selected_rank >= expected_fan_out
+        ):
+            raise ValueError(
+                f"source_external_dp_rank must be an integer in [0, {expected_fan_out})"
+            )
+
+        active_ids = _weight_materialization_active_ids(self)
+        if materialization_id in active_ids:
+            raise WeightMaterializationError(
+                "weight materialization is already active",
+                materialization_id=materialization_id,
+                session_state="conflict",
+            )
+        active_ids.add(materialization_id)
+        storage_options = dict(obj.storage_options)
+
+        try:
+            async with self.model_update_lock.reader_lock:
+                try:
+                    prepare_results = (
+                        await self.prepare_weight_materialization_communicator(
+                            PrepareWeightMaterializationReqInput(
+                                materialization_id=materialization_id,
+                                model_id=self.server_args.model_path,
+                                revision=(
+                                    getattr(self.server_args, "revision", None)
+                                    or "default"
+                                ),
+                            )
+                        )
+                    )
+                    prepared = _ordered_weight_materialization_results(
+                        prepare_results,
+                        materialization_id=materialization_id,
+                        expected_fan_out=expected_fan_out,
+                        phase="weight materialization prepare",
+                        allow_identical_duplicates=True,
+                    )
+                    prepare_failures = [
+                        result.message for result in prepared if not result.success
+                    ]
+                    if prepare_failures:
+                        raise WeightMaterializationError(
+                            "weight materialization prepare failed: "
+                            + " | ".join(prepare_failures),
+                            materialization_id=materialization_id,
+                            session_state=_weight_materialization_result_state(
+                                prepared, "failed"
+                            ),
+                        )
+
+                    generations = {result.generation for result in prepared}
+                    digests = {result.logical_payload_digest for result in prepared}
+                    byte_counts = {result.total_bytes for result in prepared}
+                    if (
+                        len(generations) != 1
+                        or None in generations
+                        or len(digests) != 1
+                        or None in digests
+                        or not next(iter(digests))
+                        or len(byte_counts) != 1
+                        or None in byte_counts
+                    ):
+                        raise WeightMaterializationError(
+                            "source DP replicas returned inconsistent generation, "
+                            "logical payload digest, or total bytes",
+                            materialization_id=materialization_id,
+                            session_state="conflict",
+                        )
+                    generation = next(iter(generations))
+                    logical_payload_digest = next(iter(digests))
+                    total_bytes = next(iter(byte_counts))
+                    if (
+                        type(generation) is not int
+                        or generation < 0
+                        or type(logical_payload_digest) is not str
+                        or not logical_payload_digest
+                        or type(total_bytes) is not int
+                        or total_bytes < 0
+                    ):
+                        raise WeightMaterializationError(
+                            "source DP replicas returned invalid generation, "
+                            "logical payload digest, or total bytes",
+                            materialization_id=materialization_id,
+                            session_state="conflict",
+                        )
+
+                    selected_rank = (
+                        prepared[0].external_dp_rank
+                        if selected_rank is None
+                        else selected_rank
+                    )
+                    commit_results = (
+                        await self.commit_weight_materialization_communicator(
+                            CommitWeightMaterializationReqInput(
+                                materialization_id=materialization_id,
+                                selected_external_dp_rank=selected_rank,
+                                storage_options=storage_options,
+                            )
+                        )
+                    )
+                    committed = _ordered_weight_materialization_results(
+                        commit_results,
+                        materialization_id=materialization_id,
+                        expected_fan_out=expected_fan_out,
+                        phase="weight materialization commit",
+                        allow_identical_duplicates=False,
+                    )
+                    commit_failures = [
+                        result.message
+                        for result in committed
+                        if not result.success or result.completion_unknown
+                    ]
+                    if commit_failures:
+                        raise WeightMaterializationError(
+                            "weight materialization commit failed: "
+                            + " | ".join(commit_failures),
+                            materialization_id=materialization_id,
+                            session_state=_weight_materialization_result_state(
+                                committed, "failed"
+                            ),
+                        )
+
+                    refs = [
+                        result.ref for result in committed if result.ref is not None
+                    ]
+                    if len(refs) != 1:
+                        raise WeightMaterializationError(
+                            "weight materialization commit must return exactly one "
+                            "storage ref",
+                            materialization_id=materialization_id,
+                            session_state="conflict",
+                        )
+                    selected_results = [
+                        result for result in committed if result.selected
+                    ]
+                    if (
+                        len(selected_results) != 1
+                        or selected_results[0].external_dp_rank != selected_rank
+                        or selected_results[0].ref != refs[0]
+                        or any(
+                            result.selected or result.ref is not None
+                            for result in committed
+                            if result.external_dp_rank != selected_rank
+                        )
+                    ):
+                        raise WeightMaterializationError(
+                            "weight materialization commit returned inconsistent "
+                            "source selection or refs",
+                            materialization_id=materialization_id,
+                            session_state="conflict",
+                        )
+                    if not isinstance(refs[0], dict) or not refs[0]:
+                        raise WeightMaterializationError(
+                            "weight materialization commit returned an invalid "
+                            "storage ref",
+                            materialization_id=materialization_id,
+                            session_state="conflict",
+                        )
+
+                    return {
+                        "materialization_id": materialization_id,
+                        "ref": dict(refs[0]),
+                        "selected_external_dp_rank": selected_rank,
+                        "total_bytes": total_bytes,
+                    }
+                except asyncio.CancelledError:
+                    await _cleanup_weight_materialization(
+                        self,
+                        materialization_id=materialization_id,
+                        storage_options=storage_options,
+                    )
+                    raise
+                except WeightMaterializationError as error:
+                    cleanup_state = await _cleanup_weight_materialization(
+                        self,
+                        materialization_id=materialization_id,
+                        storage_options=storage_options,
+                    )
+                    if cleanup_state in {
+                        "cleanup_pending",
+                        "completion_unknown",
+                    }:
+                        error.session_state = cleanup_state
+                    raise
+                except Exception as error:
+                    cleanup_state = await _cleanup_weight_materialization(
+                        self,
+                        materialization_id=materialization_id,
+                        storage_options=storage_options,
+                    )
+                    raise WeightMaterializationError(
+                        f"weight materialization failed: {error}",
+                        materialization_id=materialization_id,
+                        session_state=(
+                            cleanup_state
+                            if cleanup_state
+                            in {"cleanup_pending", "completion_unknown"}
+                            else "failed"
+                        ),
+                    ) from error
+        finally:
+            active_ids.discard(materialization_id)
+
     async def begin_remote_instance_weight_transfer(
         self: TokenizerManager,
         lease_timeout_sec: int = (
@@ -1207,15 +1597,12 @@ class TokenizerControlMixin:
         self.auto_create_handle_loop()
         deadline_unix_sec = time.time() + lease_timeout_sec
         try:
-            async with TokenizerControlMixin._remote_instance_weight_transfer_pause(
-                self
-            ):
-                results = await self.renew_remote_instance_weight_transfer_communicator(
-                    RenewRemoteInstanceWeightTransferReqInput(
-                        transfer_id=transfer_id,
-                        lease_timeout_sec=lease_timeout_sec,
-                    )
+            results = await self.renew_remote_instance_weight_transfer_communicator(
+                RenewRemoteInstanceWeightTransferReqInput(
+                    transfer_id=transfer_id,
+                    lease_timeout_sec=lease_timeout_sec,
                 )
+            )
             success, message = FanOutCommunicator.merge_results(results)
         except Exception as error:
             success, message = False, str(error)

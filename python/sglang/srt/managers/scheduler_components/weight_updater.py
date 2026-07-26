@@ -1,14 +1,15 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import threading
 import time
 import traceback
 from concurrent.futures import Future, ThreadPoolExecutor
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Tuple
 
 import msgspec
 import torch
@@ -32,6 +33,10 @@ from sglang.srt.managers.io_struct import (
     GetWeightsByNameReqOutput,
     InitWeightsUpdateGroupReqInput,
     InitWeightsUpdateGroupReqOutput,
+    CommitWeightMaterializationReqInput,
+    CommitWeightMaterializationReqOutput,
+    PrepareWeightMaterializationReqInput,
+    PrepareWeightMaterializationReqOutput,
     ReleaseMemoryOccupationReqInput,
     ReleaseMemoryOccupationReqOutput,
     ReleaseRemoteInstanceWeightTransferReqInput,
@@ -49,12 +54,40 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
 )
-from sglang.srt.model_executor.weight_runtime_manifest import WeightManifestError
+from sglang.srt.model_executor.weight_runtime_manifest import (
+    WeightManifestError,
+    WeightPlacementManifest,
+    WeightRuntimeBindingManifest,
+)
+from sglang.srt.weight_transfer.api import materialize_weight_snapshot
+from sglang.srt.weight_transfer.binding import (
+    bind_weight_source,
+    project_source_bindings,
+)
+from sglang.srt.weight_transfer.distributed import (
+    TorchDistributedWeightStoreCoordinator,
+)
+from sglang.srt.weight_transfer.planner import select_weight_storage_placements
+from sglang.srt.weight_transfer.provider import (
+    WeightPayloadIdentity,
+    WeightTransferCompletionUnknownError,
+)
+from sglang.srt.weight_transfer.runtime import (
+    RuntimeWeightSnapshotSource,
+    materialize_distributed_runtime_weight_snapshot,
+)
+from sglang.srt.weight_transfer.store_runtime import (
+    WeightSnapshotWriteSpec,
+    open_weight_snapshot_write_backend,
+)
 
 logger = logging.getLogger(__name__)
 
 _REMOTE_WEIGHT_TRANSFER_TOMBSTONE_TTL_SEC = 300.0
 _REMOTE_WEIGHT_TRANSFER_TOMBSTONE_LIMIT = 4096
+_WEIGHT_MATERIALIZATION_TERMINAL_TTL_SEC = 300.0
+_WEIGHT_MATERIALIZATION_TERMINAL_LIMIT = 4096
+_WEIGHT_STORAGE_OWNER_LIMIT = 4096
 
 
 class _RemoteWeightTransferSessionError(RuntimeError):
@@ -90,6 +123,140 @@ def _merge_checksum_payloads(target: Dict, draft: Dict) -> Dict:
     return target
 
 
+@dataclass(slots=True)
+class _WeightStorageBackendOwner:
+    stack: ExitStack = field(default_factory=ExitStack)
+    closed: bool = False
+    terminal_error: str | None = None
+
+    def enter_context(self, context_manager):
+        if self.closed or self.terminal_error is not None:
+            raise RuntimeError("weight storage backend owner is not open")
+        return self.stack.enter_context(context_manager)
+
+    def close(self) -> None:
+        if self.terminal_error is not None:
+            raise RuntimeError(self.terminal_error)
+        if self.closed:
+            return
+        try:
+            self.stack.close()
+        except Exception as error:
+            self.terminal_error = str(error)
+            raise
+        self.closed = True
+
+
+@dataclass(slots=True)
+class _WeightMaterializationSession:
+    request_identity: tuple[str, str]
+    source: RuntimeWeightSnapshotSource | None
+    selected_placements: tuple[WeightPlacementManifest, ...]
+    selected_bindings: tuple[WeightRuntimeBindingManifest, ...]
+    selected_payload_identity: WeightPayloadIdentity | None
+    local_selected_placement_ids: tuple[str, ...]
+    prepare_output: PrepareWeightMaterializationReqOutput
+    state: str
+    commit_identity: tuple[int | None, str | None] | None = None
+    commit_output: CommitWeightMaterializationReqOutput | None = None
+    backend_owner: _WeightStorageBackendOwner | None = None
+    terminal_at: float | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _NoLocalRuntimeSourceAttestor:
+    placement_fragment_ids: frozenset[str]
+    lease_id: str
+    worker_ids: frozenset[str]
+
+    @classmethod
+    def from_source(
+        cls,
+        source: RuntimeWeightSnapshotSource,
+    ) -> _NoLocalRuntimeSourceAttestor:
+        return cls(
+            placement_fragment_ids=frozenset(
+                tensor.placement_fragment_id for tensor in source.placement.tensors
+            ),
+            lease_id=source.binding.lease_id,
+            worker_ids=frozenset(
+                fragment.worker_id for fragment in source.binding.fragments
+            ),
+        )
+
+    def attest(self, request: Any) -> None:
+        request_fragment_ids = {
+            tensor.placement_fragment_id
+            for placement in request.source_placements
+            for tensor in placement.tensors
+        }
+        if request_fragment_ids & self.placement_fragment_ids:
+            raise RuntimeError(
+                "materialization request unexpectedly includes the local source"
+            )
+        for binding in request.source_bindings:
+            if not isinstance(binding, WeightRuntimeBindingManifest):
+                raise RuntimeError(
+                    "runtime materialization requires runtime source bindings"
+                )
+            if binding.lease_id == self.lease_id or any(
+                fragment.worker_id in self.worker_ids for fragment in binding.fragments
+            ):
+                raise RuntimeError(
+                    "materialization request unexpectedly binds the local source"
+                )
+
+
+def _logical_payload_digest(
+    placements: tuple[WeightPlacementManifest, ...],
+    payload_identity: WeightPayloadIdentity,
+) -> str:
+    checksum_by_id = {
+        fragment.placement_fragment_id: fragment.checksum
+        for fragment in payload_identity.fragments
+    }
+    records = []
+    for placement in placements:
+        for tensor in placement.tensors:
+            checksum = checksum_by_id.get(tensor.placement_fragment_id)
+            if checksum is None:
+                raise ValueError(
+                    "payload identity does not cover selected placement fragments"
+                )
+            records.append(
+                {
+                    "tensor_id": tensor.tensor_id,
+                    "global_offset": tuple(tensor.global_offset),
+                    "local_shape": tuple(tensor.local_shape),
+                    "dtype": tensor.dtype,
+                    "itemsize": tensor.itemsize,
+                    "layout_fingerprint": tensor.layout_fingerprint,
+                    "checksum": checksum,
+                }
+            )
+    payload = json.dumps(
+        {
+            "format": "sglang-logical-weight-payload-v1",
+            "tensors": sorted(
+                records,
+                key=lambda item: (
+                    item["tensor_id"],
+                    item["global_offset"],
+                    item["local_shape"],
+                    item["dtype"],
+                    item["itemsize"],
+                    item["layout_fingerprint"],
+                    item["checksum"],
+                ),
+            ),
+        },
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return f"sha256:{hashlib.sha256(payload).hexdigest()}"
+
+
 @dataclass(kw_only=True, slots=True)
 class SchedulerWeightUpdaterManager:
     tp_worker: Any
@@ -100,6 +267,7 @@ class SchedulerWeightUpdaterManager:
     flush_cache: Callable[..., bool]
     is_fully_idle: Callable[..., bool]
     remote_weight_transfer_cpu_group: Any = None
+    weight_materialization_cpu_group: Any = None
     scheduler: Optional[Any] = None
     metrics_collector: Optional[Any] = None
     offload_tags: set = field(default_factory=set)
@@ -124,6 +292,23 @@ class SchedulerWeightUpdaterManager:
     )
     remote_weight_transfer_pending: List[Tuple[Future, Any]] = field(
         default_factory=list, init=False, repr=False
+    )
+    weight_materialization_executor: Optional[ThreadPoolExecutor] = field(
+        default=None, init=False, repr=False
+    )
+    weight_materialization_pending: List[Tuple[Future, Any]] = field(
+        default_factory=list, init=False, repr=False
+    )
+    weight_materialization_sessions: Dict[
+        str,
+        _WeightMaterializationSession,
+    ] = field(default_factory=dict)
+    weight_storage_owners: Dict[
+        tuple[str, str, str, str, str, str, str],
+        tuple[dict[str, Any], _WeightStorageBackendOwner],
+    ] = field(default_factory=dict, init=False, repr=False)
+    weight_materialization_lock: threading.Lock = field(
+        default_factory=threading.Lock, init=False, repr=False
     )
 
     @contextmanager
@@ -739,6 +924,1247 @@ class SchedulerWeightUpdaterManager:
                 f"Restart with --weight-cache-mode off to use this operation."
             )
 
+    def _external_dp_rank(self) -> int:
+        rank = getattr(getattr(self.scheduler, "ps", None), "dp_rank", 0)
+        if rank is None:
+            return 0
+        if type(rank) is not int or rank < 0:
+            raise RuntimeError("external DP rank must be a non-negative integer")
+        return rank
+
+    def _prepare_materialization_failure(
+        self,
+        recv_req: PrepareWeightMaterializationReqInput,
+        message: str,
+        *,
+        session_state: str = "failed",
+    ) -> PrepareWeightMaterializationReqOutput:
+        return PrepareWeightMaterializationReqOutput(
+            materialization_id=recv_req.materialization_id,
+            success=False,
+            message=message,
+            external_dp_rank=self._external_dp_rank(),
+            session_state=session_state,
+        )
+
+    def _commit_materialization_failure(
+        self,
+        recv_req: CommitWeightMaterializationReqInput,
+        message: str,
+        *,
+        session_state: str = "failed",
+        completion_unknown: bool = False,
+        completion_ticket: str | None = None,
+    ) -> CommitWeightMaterializationReqOutput:
+        external_dp_rank = self._external_dp_rank()
+        return CommitWeightMaterializationReqOutput(
+            materialization_id=recv_req.materialization_id,
+            success=False,
+            message=message,
+            external_dp_rank=external_dp_rank,
+            selected=(
+                recv_req.selected_external_dp_rank is not None
+                and recv_req.selected_external_dp_rank == external_dp_rank
+            ),
+            completion_unknown=completion_unknown,
+            completion_ticket=completion_ticket,
+            session_state=session_state,
+        )
+
+    def _retain_materialization_cleanup_session(
+        self,
+        recv_req: PrepareWeightMaterializationReqInput,
+        source: RuntimeWeightSnapshotSource | None,
+        output: PrepareWeightMaterializationReqOutput,
+    ) -> None:
+        session = _WeightMaterializationSession(
+            request_identity=(recv_req.model_id, recv_req.revision),
+            source=source,
+            selected_placements=(),
+            selected_bindings=(),
+            selected_payload_identity=None,
+            local_selected_placement_ids=(),
+            prepare_output=output,
+            state="cleanup_pending",
+        )
+        with self.weight_materialization_lock:
+            self.weight_materialization_sessions.setdefault(
+                recv_req.materialization_id,
+                session,
+            )
+
+    def _prepare_failure_after_world_cleanup(
+        self,
+        recv_req: PrepareWeightMaterializationReqInput,
+        source: RuntimeWeightSnapshotSource | None,
+        failures: list[str],
+        *,
+        operation: str,
+    ) -> PrepareWeightMaterializationReqOutput:
+        provisional = self._prepare_materialization_failure(
+            recv_req,
+            " | ".join(failures),
+            session_state="cleanup_pending",
+        )
+        session = _WeightMaterializationSession(
+            request_identity=(recv_req.model_id, recv_req.revision),
+            source=source,
+            selected_placements=(),
+            selected_bindings=(),
+            selected_payload_identity=None,
+            local_selected_placement_ids=(),
+            prepare_output=provisional,
+            state="cleanup_pending",
+        )
+        cleanup_errors, _completion_unknown = (
+            self._release_materialization_source_world(
+                session,
+                operation=operation,
+            )
+        )
+        if not cleanup_errors:
+            return self._prepare_materialization_failure(
+                recv_req,
+                " | ".join(failures),
+                session_state="failed",
+            )
+
+        failures.extend(
+            f"source cleanup remains pending: {error}" for error in cleanup_errors
+        )
+        output = self._prepare_materialization_failure(
+            recv_req,
+            " | ".join(failures),
+            session_state="cleanup_pending",
+        )
+        self._retain_materialization_cleanup_session(
+            recv_req,
+            session.source,
+            output,
+        )
+        return output
+
+    def _prune_weight_materialization_sessions_locked(self) -> None:
+        now = time.monotonic()
+        terminal = [
+            (materialization_id, session)
+            for materialization_id, session in self.weight_materialization_sessions.items()
+            if session.terminal_at is not None
+        ]
+        for materialization_id, session in terminal:
+            assert session.terminal_at is not None
+            if now - session.terminal_at >= _WEIGHT_MATERIALIZATION_TERMINAL_TTL_SEC:
+                self.weight_materialization_sessions.pop(materialization_id, None)
+        terminal = sorted(
+            (
+                (materialization_id, session)
+                for materialization_id, session in (
+                    self.weight_materialization_sessions.items()
+                )
+                if session.terminal_at is not None
+            ),
+            key=lambda item: item[1].terminal_at,
+        )
+        for materialization_id, _session in terminal[
+            : max(0, len(terminal) - _WEIGHT_MATERIALIZATION_TERMINAL_LIMIT)
+        ]:
+            self.weight_materialization_sessions.pop(materialization_id, None)
+
+    def _gather_weight_materialization_objects(
+        self,
+        value: Any,
+        *,
+        operation: str,
+    ) -> list[Any]:
+        collective_group = self._weight_materialization_collective_group()
+        try:
+            world_size = torch.distributed.get_world_size(group=collective_group)
+            gathered = [None] * world_size
+            torch.distributed.all_gather_object(
+                gathered,
+                value,
+                group=collective_group,
+            )
+            return gathered
+        except Exception as error:
+            raise RuntimeError(
+                f"failed to gather weight materialization {operation}: {error}"
+            ) from error
+
+    def _weight_materialization_collective_group(self) -> Any:
+        group = self.weight_materialization_cpu_group
+        if group is not None:
+            return group
+        world_size = torch.distributed.get_world_size(group=self.world_cpu_group)
+        if world_size == 1:
+            return self.world_cpu_group
+        raise RuntimeError(
+            "multi-rank weight materialization requires an isolated CPU process group"
+        )
+
+    @staticmethod
+    def _release_materialization_source(source: Any) -> str | None:
+        if source is None:
+            return None
+        if getattr(source, "released", False):
+            return None
+        if getattr(source, "quarantined", False):
+            return "completion-unknown runtime source remains quarantined"
+        try:
+            source.release()
+        except Exception as error:
+            return str(error)
+        return None
+
+    def _release_materialization_session_source(
+        self,
+        session: _WeightMaterializationSession,
+    ) -> str | None:
+        error = self._release_materialization_source(session.source)
+        if error is None:
+            session.source = None
+        return error
+
+    def _release_materialization_source_world(
+        self,
+        session: _WeightMaterializationSession,
+        *,
+        operation: str,
+    ) -> tuple[list[str], bool]:
+        completion_unknown = bool(
+            session.source is not None and getattr(session.source, "quarantined", False)
+        )
+        local_error = self._release_materialization_session_source(session)
+        try:
+            statuses = self._gather_weight_materialization_objects(
+                {
+                    "error": local_error,
+                    "completion_unknown": completion_unknown,
+                },
+                operation=operation,
+            )
+        except Exception as error:
+            return [str(error)], completion_unknown
+
+        errors = []
+        any_completion_unknown = False
+        for rank, status in enumerate(statuses):
+            if (
+                not isinstance(status, dict)
+                or "error" not in status
+                or type(status.get("completion_unknown")) is not bool
+                or (
+                    status.get("error") is not None
+                    and type(status.get("error")) is not str
+                )
+            ):
+                errors.append(f"rank {rank}: invalid source release status")
+                continue
+            any_completion_unknown |= status["completion_unknown"]
+            if status["error"] is not None:
+                errors.append(f"rank {rank}: {status['error']}")
+        return errors, any_completion_unknown
+
+    @staticmethod
+    def _close_materialization_backend(
+        session: _WeightMaterializationSession,
+    ) -> str | None:
+        owner = session.backend_owner
+        if owner is None:
+            return None
+        try:
+            owner.close()
+        except Exception as error:
+            return str(error)
+        session.backend_owner = None
+        return None
+
+    def _close_materialization_backend_world(
+        self,
+        session: _WeightMaterializationSession,
+        *,
+        operation: str,
+    ) -> list[str]:
+        try:
+            ownership = self._gather_weight_materialization_objects(
+                {"present": session.backend_owner is not None},
+                operation=f"{operation} ownership",
+            )
+        except Exception as error:
+            return [str(error)]
+        if any(
+            not isinstance(status, dict)
+            or "present" not in status
+            or type(status.get("present")) is not bool
+            for status in ownership
+        ):
+            return ["model ranks returned invalid Store backend ownership"]
+        if len({status["present"] for status in ownership}) != 1:
+            return ["model ranks disagree on Store backend ownership"]
+
+        local_error = self._close_materialization_backend(session)
+        try:
+            statuses = self._gather_weight_materialization_objects(
+                {"error": local_error},
+                operation=f"{operation} status",
+            )
+        except Exception as error:
+            return [str(error)]
+        errors = []
+        for rank, status in enumerate(statuses):
+            if (
+                not isinstance(status, dict)
+                or "error" not in status
+                or (
+                    status.get("error") is not None
+                    and type(status.get("error")) is not str
+                )
+            ):
+                errors.append(f"rank {rank}: invalid Store backend close status")
+            elif status.get("error") is not None:
+                errors.append(f"rank {rank}: {status['error']}")
+        return errors
+
+    @staticmethod
+    def _weight_storage_owner_key(
+        model_id: str,
+        revision: str,
+        storage_identity: str,
+        ref: Mapping[str, Any],
+    ) -> tuple[str, str, str, str, str, str, str]:
+        return (
+            model_id,
+            revision,
+            storage_identity,
+            ref["provider"],
+            ref["storage_id"],
+            ref["manifest_key"],
+            ref["manifest_digest"],
+        )
+
+    def _retain_weight_storage_owner(
+        self,
+        *,
+        model_id: str,
+        revision: str,
+        storage_identity: str,
+        ref: dict[str, Any],
+        owner: _WeightStorageBackendOwner,
+    ) -> str | None:
+        key = self._weight_storage_owner_key(
+            model_id,
+            revision,
+            storage_identity,
+            ref,
+        )
+        with self.weight_materialization_lock:
+            existing = self.weight_storage_owners.get(key)
+        try:
+            decisions = self._gather_weight_materialization_objects(
+                {
+                    "key": key,
+                    "already_retained": existing is not None,
+                },
+                operation="retained Store owner decision",
+            )
+        except Exception as error:
+            return str(error)
+        if any(
+            not isinstance(decision, dict)
+            or tuple(decision.get("key", ())) != key
+            or type(decision.get("already_retained")) is not bool
+            for decision in decisions
+        ):
+            return "model ranks returned inconsistent Store owner decisions"
+        retained = {decision["already_retained"] for decision in decisions}
+        if len(retained) != 1:
+            return "model ranks disagree on retained Store owner state"
+        if not retained.pop():
+            with self.weight_materialization_lock:
+                if key in self.weight_storage_owners:
+                    return "retained Store owner changed during registration"
+                self.weight_storage_owners[key] = (dict(ref), owner)
+            return None
+
+        local_close_error = None
+        try:
+            owner.close()
+        except Exception as error:
+            local_close_error = str(error)
+        try:
+            close_statuses = self._gather_weight_materialization_objects(
+                {"error": local_close_error},
+                operation="duplicate Store owner close",
+            )
+        except Exception as error:
+            return str(error)
+        errors = []
+        for rank, status in enumerate(close_statuses):
+            if (
+                not isinstance(status, dict)
+                or "error" not in status
+                or (
+                    status.get("error") is not None
+                    and type(status.get("error")) is not str
+                )
+            ):
+                errors.append(f"rank {rank}: invalid Store owner close status")
+            elif status["error"] is not None:
+                errors.append(f"rank {rank}: {status['error']}")
+        return " | ".join(errors) if errors else None
+
+    def _weight_storage_owner_capacity_error(
+        self,
+        *,
+        current_materialization_id: str,
+    ) -> str | None:
+        with self.weight_materialization_lock:
+            session_owned = sum(
+                session.backend_owner is not None
+                or (
+                    session.commit_output is not None
+                    and session.commit_output.completion_unknown
+                )
+                for materialization_id, session in (
+                    self.weight_materialization_sessions.items()
+                )
+                if materialization_id != current_materialization_id
+                and session.terminal_at is None
+            )
+            local_count = len(self.weight_storage_owners) + session_owned
+        try:
+            statuses = self._gather_weight_materialization_objects(
+                {
+                    "count": local_count,
+                    "limit": _WEIGHT_STORAGE_OWNER_LIMIT,
+                },
+                operation="retained Store owner capacity",
+            )
+        except Exception as error:
+            return str(error)
+        if any(
+            not isinstance(status, dict)
+            or type(status.get("count")) is not int
+            or type(status.get("limit")) is not int
+            for status in statuses
+        ):
+            return "model ranks returned invalid Store owner capacity"
+        counts = {status["count"] for status in statuses}
+        limits = {status["limit"] for status in statuses}
+        if len(counts) != 1 or limits != {_WEIGHT_STORAGE_OWNER_LIMIT}:
+            return "model ranks disagree on Store owner capacity"
+        if counts.pop() >= _WEIGHT_STORAGE_OWNER_LIMIT:
+            return (
+                "retained weight storage owner limit reached; release a snapshot "
+                "or restart the source before publishing another ref"
+            )
+        return None
+
+    @staticmethod
+    def _commit_request_identity(
+        recv_req: CommitWeightMaterializationReqInput,
+    ) -> tuple[int | None, str | None]:
+        selected_rank = recv_req.selected_external_dp_rank
+        if selected_rank is not None and (
+            type(selected_rank) is not int or selected_rank < 0
+        ):
+            raise ValueError(
+                "selected_external_dp_rank must be a non-negative integer or None"
+            )
+        if selected_rank is None:
+            return (None, None)
+        if not isinstance(recv_req.storage_options, Mapping):
+            raise ValueError("storage_options must be a mapping")
+        try:
+            payload = json.dumps(
+                recv_req.storage_options,
+                ensure_ascii=True,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+        except (TypeError, ValueError) as error:
+            raise ValueError("storage_options must be JSON-compatible") from error
+        return (
+            selected_rank,
+            f"sha256:{hashlib.sha256(payload).hexdigest()}",
+        )
+
+    @staticmethod
+    def _merge_materialization_sources(
+        gathered: list[Any],
+        *,
+        model_id: str,
+        revision: str,
+        local_source: RuntimeWeightSnapshotSource,
+    ) -> tuple[
+        tuple[WeightPlacementManifest, ...],
+        tuple[WeightRuntimeBindingManifest, ...],
+        WeightPayloadIdentity,
+        tuple[str, ...],
+        int,
+        str,
+    ]:
+        placements = tuple(item["placement"] for item in gathered)
+        bindings = tuple(item["binding"] for item in gathered)
+        identities = tuple(item["payload_identity"] for item in gathered)
+        if not placements or any(
+            not isinstance(item, WeightPlacementManifest) for item in placements
+        ):
+            raise ValueError("model ranks returned invalid weight placements")
+        if any(not isinstance(item, WeightRuntimeBindingManifest) for item in bindings):
+            raise ValueError("model ranks returned invalid runtime bindings")
+        if any(not isinstance(item, WeightPayloadIdentity) for item in identities):
+            raise ValueError("model ranks returned invalid payload identities")
+        model_revisions = {
+            (placement.model_id, placement.revision) for placement in placements
+        }
+        if model_revisions != {(model_id, revision)}:
+            raise ValueError(
+                "model ranks do not describe the requested model and revision"
+            )
+        generations = {binding.generation for binding in bindings}
+        if len(generations) != 1:
+            raise ValueError("model ranks do not describe one weight generation")
+
+        bind_weight_source(placements, bindings)
+        checksums: dict[str, str] = {}
+        for placement, identity in zip(placements, identities):
+            if identity.select((placement,)) != identity:
+                raise ValueError(
+                    "rank payload identity differs from its weight placement"
+                )
+            for fragment in identity.fragments:
+                if fragment.placement_fragment_id in checksums:
+                    raise ValueError("duplicate payload fragment identity")
+                checksums[fragment.placement_fragment_id] = fragment.checksum
+        global_identity = WeightPayloadIdentity.create(placements, checksums)
+
+        selected_placements = select_weight_storage_placements(placements)
+        projected_bindings = project_source_bindings(
+            selected_placements,
+            bindings,
+        )
+        if any(
+            not isinstance(binding, WeightRuntimeBindingManifest)
+            for binding in projected_bindings
+        ):
+            raise ValueError("selected Store sources must use runtime bindings")
+        selected_bindings = tuple(projected_bindings)
+        bind_weight_source(selected_placements, selected_bindings)
+        selected_identity = global_identity.select(selected_placements)
+
+        local_fragment_ids = {
+            tensor.placement_fragment_id for tensor in local_source.placement.tensors
+        }
+        local_selected = tuple(
+            placement
+            for placement in selected_placements
+            if any(
+                tensor.placement_fragment_id in local_fragment_ids
+                for tensor in placement.tensors
+            )
+        )
+        if len(local_selected) > 1:
+            raise ValueError("Store selection split one local runtime source")
+        if local_selected:
+            projected_local_bindings = project_source_bindings(
+                local_selected,
+                (local_source.binding,),
+            )
+            local_placement_ids = {
+                placement.placement_id for placement in local_selected
+            }
+            selected_local_bindings = tuple(
+                binding
+                for binding in selected_bindings
+                if binding.placement_id in local_placement_ids
+            )
+            if selected_local_bindings != projected_local_bindings:
+                raise ValueError(
+                    "Store selection binding differs from the local runtime projection"
+                )
+        local_placement_ids = tuple(
+            placement.placement_id for placement in local_selected
+        )
+        return (
+            tuple(selected_placements),
+            selected_bindings,
+            selected_identity,
+            local_placement_ids,
+            next(iter(generations)),
+            _logical_payload_digest(
+                tuple(selected_placements),
+                selected_identity,
+            ),
+        )
+
+    def prepare_weight_materialization(
+        self,
+        recv_req: PrepareWeightMaterializationReqInput,
+    ) -> PrepareWeightMaterializationReqOutput:
+        """Capture and validate one Store materialization source on every rank."""
+
+        request_identity = (recv_req.model_id, recv_req.revision)
+        with self.weight_materialization_lock:
+            self._prune_weight_materialization_sessions_locked()
+            existing = self.weight_materialization_sessions.get(
+                recv_req.materialization_id
+            )
+        if existing is not None:
+            if existing.request_identity != request_identity:
+                return self._prepare_materialization_failure(
+                    recv_req,
+                    "materialization ID is already bound to another model revision",
+                    session_state="conflict",
+                )
+            return existing.prepare_output
+
+        local_source = None
+        try:
+            local_source = (
+                self.tp_worker.model_runner.capture_runtime_weight_snapshot_source(
+                    materialization_id=recv_req.materialization_id,
+                    model_id=recv_req.model_id,
+                    revision=recv_req.revision,
+                )
+            )
+            local_result = {
+                "success": True,
+                "message": "Success.",
+                "placement": local_source.placement,
+                "binding": local_source.binding,
+                "payload_identity": local_source.payload_identity,
+            }
+        except Exception as error:
+            local_result = {
+                "success": False,
+                "message": str(error),
+                "placement": None,
+                "binding": None,
+                "payload_identity": None,
+            }
+
+        try:
+            gathered = self._gather_weight_materialization_objects(
+                local_result,
+                operation="prepare status",
+            )
+        except Exception as error:
+            cleanup_error = (
+                None
+                if local_source is None
+                else self._release_materialization_source(local_source)
+            )
+            message = str(error)
+            state = "failed"
+            if cleanup_error is not None:
+                message += f"; source cleanup remains pending: {cleanup_error}"
+                state = "cleanup_pending"
+            output = self._prepare_materialization_failure(
+                recv_req,
+                message,
+                session_state=state,
+            )
+            if cleanup_error is not None and local_source is not None:
+                self._retain_materialization_cleanup_session(
+                    recv_req,
+                    local_source,
+                    output,
+                )
+            return output
+
+        failures = []
+        for rank, item in enumerate(gathered):
+            if not isinstance(item, dict):
+                failures.append(f"rank {rank}: invalid capture status")
+            elif not item.get("success", False):
+                failures.append(f"rank {rank}: {item.get('message', 'capture failed')}")
+        if failures:
+            return self._prepare_failure_after_world_cleanup(
+                recv_req,
+                local_source,
+                failures,
+                operation="failed prepare source release",
+            )
+
+        assert local_source is not None
+        merged_sources = None
+        merge_error = None
+        try:
+            merged_sources = self._merge_materialization_sources(
+                gathered,
+                model_id=recv_req.model_id,
+                revision=recv_req.revision,
+                local_source=local_source,
+            )
+        except Exception as error:
+            merge_error = str(error)
+
+        try:
+            merge_statuses = self._gather_weight_materialization_objects(
+                {
+                    "success": merge_error is None,
+                    "message": merge_error or "Success.",
+                },
+                operation="prepare merge status",
+            )
+        except Exception as error:
+            cleanup_error = self._release_materialization_source(local_source)
+            message = str(error)
+            if cleanup_error is not None:
+                message += f"; source cleanup remains pending: {cleanup_error}"
+            output = self._prepare_materialization_failure(
+                recv_req,
+                message,
+                session_state=(
+                    "cleanup_pending" if cleanup_error is not None else "failed"
+                ),
+            )
+            if cleanup_error is not None:
+                self._retain_materialization_cleanup_session(
+                    recv_req,
+                    local_source,
+                    output,
+                )
+            return output
+
+        merge_failures = []
+        for rank, item in enumerate(merge_statuses):
+            if not isinstance(item, dict):
+                merge_failures.append(f"rank {rank}: invalid merge status")
+            elif not item.get("success", False):
+                merge_failures.append(
+                    f"rank {rank}: {item.get('message', 'merge failed')}"
+                )
+        if merge_failures:
+            return self._prepare_failure_after_world_cleanup(
+                recv_req,
+                local_source,
+                merge_failures,
+                operation="failed prepare merge source release",
+            )
+
+        assert merged_sources is not None
+        (
+            selected_placements,
+            selected_bindings,
+            selected_identity,
+            local_placement_ids,
+            generation,
+            logical_digest,
+        ) = merged_sources
+        output = PrepareWeightMaterializationReqOutput(
+            materialization_id=recv_req.materialization_id,
+            success=True,
+            message="Success.",
+            external_dp_rank=self._external_dp_rank(),
+            generation=generation,
+            logical_payload_digest=logical_digest,
+            total_bytes=sum(
+                tensor.nbytes
+                for placement in selected_placements
+                for tensor in placement.tensors
+            ),
+            session_state="prepared",
+        )
+        session = _WeightMaterializationSession(
+            request_identity=request_identity,
+            source=local_source,
+            selected_placements=selected_placements,
+            selected_bindings=selected_bindings,
+            selected_payload_identity=selected_identity,
+            local_selected_placement_ids=local_placement_ids,
+            prepare_output=output,
+            state="prepared",
+        )
+        with self.weight_materialization_lock:
+            existing = self.weight_materialization_sessions.setdefault(
+                recv_req.materialization_id,
+                session,
+            )
+        if existing is not session:
+            cleanup_error = self._release_materialization_source(local_source)
+            if existing.request_identity == request_identity and cleanup_error is None:
+                return existing.prepare_output
+            message = "materialization ID raced with another prepare request"
+            if cleanup_error is not None:
+                message += f"; source cleanup remains pending: {cleanup_error}"
+            return self._prepare_materialization_failure(
+                recv_req,
+                message,
+                session_state="conflict",
+            )
+        return output
+
+    @staticmethod
+    def _weight_storage_ref_builtins(ref: Any) -> dict[str, Any]:
+        return {
+            "provider": ref.provider,
+            "storage_id": ref.storage_id,
+            "manifest_key": ref.manifest_key,
+            "manifest_digest": ref.manifest_digest,
+        }
+
+    def _record_materialization_commit(
+        self,
+        session: _WeightMaterializationSession,
+        output: CommitWeightMaterializationReqOutput,
+    ) -> CommitWeightMaterializationReqOutput:
+        with self.weight_materialization_lock:
+            session.state = output.session_state
+            session.commit_output = output
+            if (
+                session.source is None
+                and session.backend_owner is None
+                and output.session_state
+                not in {"cleanup_pending", "completion_unknown"}
+            ):
+                session.terminal_at = time.monotonic()
+            self._prune_weight_materialization_sessions_locked()
+        return output
+
+    def _cleanup_weight_materialization_session(
+        self,
+        recv_req: CommitWeightMaterializationReqInput,
+        session: _WeightMaterializationSession,
+    ) -> CommitWeightMaterializationReqOutput:
+        previous = session.commit_output
+        if previous is not None and previous.completion_unknown:
+            return previous
+        source_errors, completion_unknown = self._release_materialization_source_world(
+            session,
+            operation="cleanup source release",
+        )
+        if source_errors:
+            return self._record_materialization_commit(
+                session,
+                self._commit_materialization_failure(
+                    recv_req,
+                    " | ".join(source_errors),
+                    session_state=(
+                        "completion_unknown"
+                        if completion_unknown
+                        else "cleanup_pending"
+                    ),
+                    completion_unknown=completion_unknown,
+                ),
+            )
+        backend_errors = self._close_materialization_backend_world(
+            session,
+            operation="cleanup Store backend close",
+        )
+        output = CommitWeightMaterializationReqOutput(
+            materialization_id=recv_req.materialization_id,
+            success=not backend_errors,
+            message=("Success." if not backend_errors else " | ".join(backend_errors)),
+            external_dp_rank=self._external_dp_rank(),
+            selected=False,
+            session_state="released" if not backend_errors else "cleanup_pending",
+        )
+        return self._record_materialization_commit(session, output)
+
+    def commit_weight_materialization(
+        self,
+        recv_req: CommitWeightMaterializationReqInput,
+    ) -> CommitWeightMaterializationReqOutput:
+        """Materialize the selected external DP replica into Mooncake Store."""
+
+        try:
+            commit_identity = self._commit_request_identity(recv_req)
+        except Exception as error:
+            return self._commit_materialization_failure(recv_req, str(error))
+        with self.weight_materialization_lock:
+            self._prune_weight_materialization_sessions_locked()
+            session = self.weight_materialization_sessions.get(
+                recv_req.materialization_id
+            )
+            if session is None:
+                return self._commit_materialization_failure(
+                    recv_req,
+                    "weight materialization session was not prepared",
+                    session_state="not_found",
+                )
+            if session.commit_output is not None:
+                if (
+                    session.commit_identity == commit_identity
+                    or recv_req.selected_external_dp_rank is None
+                ):
+                    if recv_req.selected_external_dp_rank is None:
+                        pass
+                    else:
+                        return session.commit_output
+                else:
+                    return self._commit_materialization_failure(
+                        recv_req,
+                        "materialization ID is already bound to another destination",
+                        session_state="conflict",
+                    )
+            elif (
+                session.commit_identity is not None
+                and session.commit_identity != commit_identity
+                and recv_req.selected_external_dp_rank is not None
+            ):
+                return self._commit_materialization_failure(
+                    recv_req,
+                    "materialization ID is already bound to another destination",
+                    session_state="conflict",
+                )
+            session.commit_identity = commit_identity
+            session.state = "committing"
+
+        if recv_req.selected_external_dp_rank is None:
+            return self._cleanup_weight_materialization_session(recv_req, session)
+
+        external_dp_rank = self._external_dp_rank()
+        if external_dp_rank != recv_req.selected_external_dp_rank:
+            source_error = self._release_materialization_session_source(session)
+            output = CommitWeightMaterializationReqOutput(
+                materialization_id=recv_req.materialization_id,
+                success=source_error is None,
+                message="Success." if source_error is None else source_error,
+                external_dp_rank=external_dp_rank,
+                selected=False,
+                session_state=(
+                    "skipped" if source_error is None else "cleanup_pending"
+                ),
+            )
+            return self._record_materialization_commit(session, output)
+
+        if (
+            not session.selected_placements
+            or not session.selected_bindings
+            or session.selected_payload_identity is None
+        ):
+            return self._record_materialization_commit(
+                session,
+                self._commit_materialization_failure(
+                    recv_req,
+                    "weight materialization session is not fully prepared",
+                ),
+            )
+
+        capacity_error = self._weight_storage_owner_capacity_error(
+            current_materialization_id=recv_req.materialization_id,
+        )
+        if capacity_error is not None:
+            cleanup_errors, completion_unknown = (
+                self._release_materialization_source_world(
+                    session,
+                    operation="capacity rejection source release",
+                )
+            )
+            errors = [capacity_error, *cleanup_errors]
+            cleanup_pending = bool(cleanup_errors) or session.source is not None
+            return self._record_materialization_commit(
+                session,
+                self._commit_materialization_failure(
+                    recv_req,
+                    " | ".join(errors),
+                    session_state=(
+                        "completion_unknown"
+                        if completion_unknown
+                        else ("cleanup_pending" if cleanup_pending else "failed")
+                    ),
+                    completion_unknown=completion_unknown,
+                ),
+            )
+
+        owner = _WeightStorageBackendOwner()
+        backend = None
+        setup_error = None
+        try:
+            if session.source is None:
+                raise RuntimeError("weight materialization source was already released")
+            coordinator = TorchDistributedWeightStoreCoordinator(
+                self._weight_materialization_collective_group()
+            )
+            spec = WeightSnapshotWriteSpec.from_mapping(recv_req.storage_options)
+            backend = owner.enter_context(
+                open_weight_snapshot_write_backend(
+                    spec,
+                    local_placement_ids=session.local_selected_placement_ids,
+                    payload_checksum_verifier=session.source.payload_checksum,
+                    coordinator=coordinator,
+                )
+            )
+        except Exception as error:
+            setup_error = str(error)
+
+        try:
+            setup_results = self._gather_weight_materialization_objects(
+                {
+                    "success": setup_error is None,
+                    "message": setup_error or "Success.",
+                },
+                operation="Store backend setup",
+            )
+        except Exception as error:
+            setup_results = [{"success": False, "message": str(error)}]
+        setup_failures = []
+        for rank, item in enumerate(setup_results):
+            if not isinstance(item, dict):
+                setup_failures.append(
+                    f"rank {rank}: invalid Store backend setup status"
+                )
+            elif not item.get("success", False):
+                setup_failures.append(
+                    f"rank {rank}: {item.get('message', 'Store backend setup failed')}"
+                )
+        if setup_failures:
+            session.backend_owner = owner
+            cleanup_errors, completion_unknown = (
+                self._release_materialization_source_world(
+                    session,
+                    operation="failed Store setup source release",
+                )
+            )
+            setup_failures.extend(cleanup_errors)
+            if not cleanup_errors:
+                setup_failures.extend(
+                    self._close_materialization_backend_world(
+                        session,
+                        operation="failed Store setup backend close",
+                    )
+                )
+            cleanup_pending = (
+                session.source is not None or session.backend_owner is not None
+            )
+            return self._record_materialization_commit(
+                session,
+                self._commit_materialization_failure(
+                    recv_req,
+                    " | ".join(setup_failures),
+                    session_state=(
+                        "completion_unknown"
+                        if completion_unknown
+                        else ("cleanup_pending" if cleanup_pending else "failed")
+                    ),
+                    completion_unknown=completion_unknown,
+                ),
+            )
+
+        assert backend is not None
+        publication = None
+        materialization_error = None
+        completion_unknown_error = None
+        try:
+            if session.local_selected_placement_ids:
+                assert session.source is not None
+                publication = materialize_distributed_runtime_weight_snapshot(
+                    session.source,
+                    global_placements=session.selected_placements,
+                    global_bindings=session.selected_bindings,
+                    payload_identity=session.selected_payload_identity,
+                    destination=spec.destination,
+                    provider=backend.provider,
+                    catalog=backend.catalog,
+                    publication_id=recv_req.materialization_id,
+                    release_source=False,
+                )
+            else:
+                assert session.source is not None
+                attestor = _NoLocalRuntimeSourceAttestor.from_source(session.source)
+                publication = materialize_weight_snapshot(
+                    source_placements=session.selected_placements,
+                    source_bindings=session.selected_bindings,
+                    destination=spec.destination,
+                    provider=backend.provider,
+                    catalog=backend.catalog,
+                    payload_identity=session.selected_payload_identity,
+                    publication_id=recv_req.materialization_id,
+                    attestor=attestor,
+                )
+        except WeightTransferCompletionUnknownError as error:
+            completion_unknown_error = error
+            materialization_error = str(error)
+        except Exception as error:
+            materialization_error = str(error)
+
+        local_ref = (
+            None
+            if publication is None
+            else self._weight_storage_ref_builtins(publication.snapshot.ref)
+        )
+        try:
+            materialization_statuses = self._gather_weight_materialization_objects(
+                {
+                    "success": publication is not None,
+                    "message": materialization_error or "Success.",
+                    "completion_unknown": completion_unknown_error is not None,
+                    "completion_ticket": (
+                        None
+                        if completion_unknown_error is None
+                        else completion_unknown_error.completion_ticket
+                    ),
+                    "ref": local_ref,
+                },
+                operation="Store materialization outcome",
+            )
+        except Exception as error:
+            session.backend_owner = owner
+            return self._record_materialization_commit(
+                session,
+                self._commit_materialization_failure(
+                    recv_req,
+                    str(error),
+                    session_state="completion_unknown",
+                    completion_unknown=True,
+                ),
+            )
+
+        status_errors = []
+        success_refs = []
+        completion_tickets = []
+        unknown_outcome = False
+        success_count = 0
+        for rank, status in enumerate(materialization_statuses):
+            if (
+                not isinstance(status, dict)
+                or type(status.get("success")) is not bool
+                or type(status.get("completion_unknown")) is not bool
+                or type(status.get("message")) is not str
+                or (
+                    status.get("completion_ticket") is not None
+                    and type(status.get("completion_ticket")) is not str
+                )
+                or (
+                    status.get("ref") is not None
+                    and not isinstance(status.get("ref"), dict)
+                )
+            ):
+                status_errors.append(
+                    f"rank {rank}: invalid Store materialization status"
+                )
+                unknown_outcome = True
+                continue
+            if status["completion_unknown"]:
+                unknown_outcome = True
+                if status["completion_ticket"] is not None:
+                    completion_tickets.append(status["completion_ticket"])
+            if status["success"]:
+                success_count += 1
+                if status["ref"] is None:
+                    status_errors.append(
+                        f"rank {rank}: successful materialization has no ref"
+                    )
+                    unknown_outcome = True
+                else:
+                    success_refs.append(status["ref"])
+            else:
+                status_errors.append(f"rank {rank}: {status['message']}")
+
+        if success_count and success_count != len(materialization_statuses):
+            unknown_outcome = True
+            status_errors.append(
+                "model ranks disagree on Store materialization completion"
+            )
+        ref = success_refs[0] if success_refs else None
+        if ref is not None and any(item != ref for item in success_refs):
+            unknown_outcome = True
+            status_errors.append("model ranks published different weight storage refs")
+
+        if unknown_outcome:
+            session.backend_owner = owner
+            return self._record_materialization_commit(
+                session,
+                self._commit_materialization_failure(
+                    recv_req,
+                    " | ".join(status_errors)
+                    or "Store materialization completion is unknown",
+                    session_state="completion_unknown",
+                    completion_unknown=True,
+                    completion_ticket=(
+                        completion_tickets[0] if completion_tickets else None
+                    ),
+                ),
+            )
+
+        if status_errors or ref is None:
+            session.backend_owner = owner
+            cleanup_errors, release_completion_unknown = (
+                self._release_materialization_source_world(
+                    session,
+                    operation="failed materialization source release",
+                )
+            )
+            status_errors.extend(cleanup_errors)
+            if not cleanup_errors:
+                status_errors.extend(
+                    self._close_materialization_backend_world(
+                        session,
+                        operation="failed materialization backend close",
+                    )
+                )
+            cleanup_pending = (
+                session.source is not None or session.backend_owner is not None
+            )
+            return self._record_materialization_commit(
+                session,
+                self._commit_materialization_failure(
+                    recv_req,
+                    " | ".join(status_errors),
+                    session_state=(
+                        "completion_unknown"
+                        if release_completion_unknown
+                        else ("cleanup_pending" if cleanup_pending else "failed")
+                    ),
+                    completion_unknown=release_completion_unknown,
+                ),
+            )
+
+        placement = session.selected_placements[0]
+        storage_identity = commit_identity[1]
+        assert isinstance(storage_identity, str)
+        retain_error = self._retain_weight_storage_owner(
+            model_id=placement.model_id,
+            revision=placement.revision,
+            storage_identity=storage_identity,
+            ref=ref,
+            owner=owner,
+        )
+        if retain_error is not None:
+            session.backend_owner = owner
+            return self._record_materialization_commit(
+                session,
+                self._commit_materialization_failure(
+                    recv_req,
+                    retain_error,
+                    session_state="completion_unknown",
+                    completion_unknown=True,
+                ),
+            )
+
+        cleanup_errors, completion_unknown = self._release_materialization_source_world(
+            session,
+            operation="post-publication source release",
+        )
+        if cleanup_errors:
+            return self._record_materialization_commit(
+                session,
+                self._commit_materialization_failure(
+                    recv_req,
+                    " | ".join(cleanup_errors),
+                    session_state=(
+                        "completion_unknown"
+                        if completion_unknown
+                        else "cleanup_pending"
+                    ),
+                    completion_unknown=completion_unknown,
+                ),
+            )
+        return self._record_materialization_commit(
+            session,
+            CommitWeightMaterializationReqOutput(
+                materialization_id=recv_req.materialization_id,
+                success=True,
+                message="Success.",
+                external_dp_rank=external_dp_rank,
+                selected=True,
+                ref=ref,
+                session_state="published",
+            ),
+        )
+
     def _defer_remote_instance_weight_transfer(self, operation, recv_req) -> None:
         if self.remote_weight_transfer_executor is None:
             self.remote_weight_transfer_executor = ThreadPoolExecutor(
@@ -747,6 +2173,23 @@ class SchedulerWeightUpdaterManager:
             )
         future = self.remote_weight_transfer_executor.submit(operation, recv_req)
         self.remote_weight_transfer_pending.append((future, recv_req))
+
+    def _defer_weight_materialization(self, operation, recv_req) -> None:
+        if self.weight_materialization_executor is None:
+            self.weight_materialization_executor = ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix="sglang-weight-materialization",
+            )
+        future = self.weight_materialization_executor.submit(
+            self._run_weight_materialization,
+            operation,
+            recv_req,
+        )
+        self.weight_materialization_pending.append((future, recv_req))
+
+    def _run_weight_materialization(self, operation, recv_req):
+        torch.distributed.barrier(group=self._weight_materialization_collective_group())
+        return operation(recv_req)
 
     def defer_begin_remote_instance_weight_transfer(
         self, recv_req: BeginRemoteInstanceWeightTransferReqInput
@@ -769,8 +2212,29 @@ class SchedulerWeightUpdaterManager:
             self.renew_remote_instance_weight_transfer, recv_req
         )
 
-    @staticmethod
-    def _remote_instance_weight_transfer_failure(recv_req, error: Exception):
+    def defer_prepare_weight_materialization(
+        self,
+        recv_req: PrepareWeightMaterializationReqInput,
+    ) -> None:
+        self._defer_weight_materialization(
+            self.prepare_weight_materialization,
+            recv_req,
+        )
+
+    def defer_commit_weight_materialization(
+        self,
+        recv_req: CommitWeightMaterializationReqInput,
+    ) -> None:
+        self._defer_weight_materialization(
+            self.commit_weight_materialization,
+            recv_req,
+        )
+
+    def _remote_instance_weight_transfer_failure(self, recv_req, error: Exception):
+        if isinstance(recv_req, PrepareWeightMaterializationReqInput):
+            return self._prepare_materialization_failure(recv_req, str(error))
+        if isinstance(recv_req, CommitWeightMaterializationReqInput):
+            return self._commit_materialization_failure(recv_req, str(error))
         kwargs = {
             "transfer_id": recv_req.transfer_id,
             "success": False,
@@ -785,25 +2249,84 @@ class SchedulerWeightUpdaterManager:
     def check_pending_remote_instance_weight_transfers(self):
         self._prune_remote_weight_transfer_bookkeeping()
         completed = []
-        remaining = []
-        for future, recv_req in self.remote_weight_transfer_pending:
-            if not future.done():
-                remaining.append((future, recv_req))
-                continue
-            try:
-                output = future.result()
-            except Exception as error:
-                logger.exception("Remote instance weight transfer control failed")
-                output = self._remote_instance_weight_transfer_failure(recv_req, error)
-            completed.append((output, recv_req))
-        self.remote_weight_transfer_pending = remaining
+        for pending_name in (
+            "remote_weight_transfer_pending",
+            "weight_materialization_pending",
+        ):
+            remaining = []
+            for future, recv_req in getattr(self, pending_name):
+                if not future.done():
+                    remaining.append((future, recv_req))
+                    continue
+                try:
+                    output = future.result()
+                except Exception as error:
+                    logger.exception("Remote instance weight transfer control failed")
+                    output = self._remote_instance_weight_transfer_failure(
+                        recv_req, error
+                    )
+                if isinstance(
+                    recv_req,
+                    (
+                        PrepareWeightMaterializationReqInput,
+                        CommitWeightMaterializationReqInput,
+                    ),
+                ):
+                    try:
+                        model_rank = torch.distributed.get_rank(
+                            group=self._weight_materialization_collective_group()
+                        )
+                    except Exception:
+                        model_rank = "unknown"
+                    log = logger.info if output.success else logger.warning
+                    log(
+                        "Weight materialization phase completed on model rank %s: "
+                        "id=%s state=%s success=%s message=%s",
+                        model_rank,
+                        recv_req.materialization_id,
+                        output.session_state,
+                        output.success,
+                        output.message,
+                    )
+                completed.append((output, recv_req))
+            setattr(self, pending_name, remaining)
         return completed
 
     def close_remote_instance_weight_transfer_executor(self) -> None:
-        if self.remote_weight_transfer_executor is None:
-            return
-        self.remote_weight_transfer_executor.shutdown(wait=True)
-        self.remote_weight_transfer_executor = None
+        if self.remote_weight_transfer_executor is not None:
+            self.remote_weight_transfer_executor.shutdown(wait=True)
+            self.remote_weight_transfer_executor = None
+        if self.weight_materialization_executor is not None:
+            self.weight_materialization_executor.shutdown(wait=True)
+            self.weight_materialization_executor = None
+
+        with self.weight_materialization_lock:
+            sessions = tuple(self.weight_materialization_sessions.values())
+        for session in sessions:
+            source_error = self._release_materialization_session_source(session)
+            backend_error = self._close_materialization_backend(session)
+            if source_error is not None:
+                logger.warning(
+                    "Weight materialization source cleanup failed during shutdown: %s",
+                    source_error,
+                )
+            if backend_error is not None:
+                logger.warning(
+                    "Weight materialization backend cleanup failed during shutdown: %s",
+                    backend_error,
+                )
+        with self.weight_materialization_lock:
+            retained_owners = tuple(self.weight_storage_owners.values())
+            self.weight_storage_owners.clear()
+        for _ref, owner in retained_owners:
+            try:
+                owner.close()
+            except Exception as error:
+                logger.warning(
+                    "Retained weight storage backend cleanup failed during "
+                    "shutdown: %s",
+                    error,
+                )
 
     def begin_remote_instance_weight_transfer(
         self, recv_req: BeginRemoteInstanceWeightTransferReqInput

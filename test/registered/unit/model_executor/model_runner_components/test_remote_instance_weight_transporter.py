@@ -173,6 +173,42 @@ def test_transfer_engine_initialization_failure_is_fatal(monkeypatch) -> None:
     assert transporter.session_id == ""
 
 
+def test_weight_transfer_provider_rejects_a_different_engine() -> None:
+    registered_engine = _FakeEngine()
+    transporter = RemoteInstanceWeightTransporter(
+        server_args=_FakeServerArgs(),
+        get_model=lambda: object(),
+        tp_rank=0,
+        gpu_id=0,
+        engine=registered_engine,
+    )
+
+    with pytest.raises(RuntimeError, match="different transport instance"):
+        transporter.create_weight_transfer_provider(_FakeEngine())
+
+
+def test_weight_transfer_provider_constructs_mooncake_adapter() -> None:
+    from sglang.srt.weight_transfer.mooncake import MooncakeWeightTransferProvider
+
+    engine = _FakeEngine()
+    transporter = RemoteInstanceWeightTransporter(
+        server_args=_FakeServerArgs(),
+        get_model=lambda: object(),
+        tp_rank=0,
+        gpu_id=0,
+        engine=engine,
+    )
+
+    provider = transporter.create_weight_transfer_provider(
+        engine,
+        max_batch_operations=17,
+    )
+
+    assert isinstance(provider, MooncakeWeightTransferProvider)
+    assert provider.transfer_engine is engine
+    assert provider.max_batch_operations == 17
+
+
 def test_engine_info_bootstrap_keeps_legacy_index(monkeypatch) -> None:
     class FakeUvicornServer:
         should_exit = False
@@ -275,3 +311,7 @@ def test_runtime_manifest_must_stay_inside_registered_memory() -> None:
         transporter.validate_runtime_manifest_addresses(
             SimpleNamespace(tensors=[SimpleNamespace(address=0x10018, nbytes=16)])
         )
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

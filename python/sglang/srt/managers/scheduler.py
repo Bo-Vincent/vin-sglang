@@ -90,6 +90,7 @@ from sglang.srt.managers.io_struct import (
     BatchTokenizedEmbeddingReqInput,
     BatchTokenizedGenerateReqInput,
     BeginRemoteInstanceWeightTransferReqInput,
+    CommitWeightMaterializationReqInput,
     CheckWeightsReqInput,
     ClearHiCacheReqInput,
     ClearHiCacheReqOutput,
@@ -121,6 +122,7 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqOutput,
     OpenSessionReqInput,
     PauseGenerationReqInput,
+    PrepareWeightMaterializationReqInput,
     ProfileReq,
     ReleaseMemoryOccupationReqInput,
     ReleaseRemoteInstanceWeightTransferReqInput,
@@ -1426,6 +1428,14 @@ class Scheduler(
                     self.weight_updater.defer_renew_remote_instance_weight_transfer,
                 ),
                 (
+                    PrepareWeightMaterializationReqInput,
+                    self.weight_updater.defer_prepare_weight_materialization,
+                ),
+                (
+                    CommitWeightMaterializationReqInput,
+                    self.weight_updater.defer_commit_weight_materialization,
+                ),
+                (
                     UpdateWeightsFromDistributedReqInput,
                     self.weight_updater.update_weights_from_distributed,
                 ),
@@ -1519,6 +1529,7 @@ class Scheduler(
     def release_host_resources(self) -> None:
         # Release pinned host buffers in userspace on graceful shutdown; see
         # HostKVCache.destroy. Called from run_scheduler_process's finally.
+        self.weight_updater.close_remote_instance_weight_transfer_executor()
         if self.hisparse_coordinator is not None:
             self.hisparse_coordinator.destroy()
         self.tree_cache.release_host_resources()
@@ -1772,11 +1783,16 @@ class Scheduler(
 
     def init_weight_updater(self) -> None:
         remote_weight_transfer_cpu_group = self.world_group.cpu_group
+        weight_materialization_cpu_group = self.world_group.cpu_group
         if (
             self.server_args.enable_weight_runtime_manifest
             and len(self.world_group.ranks) > 1
         ):
             remote_weight_transfer_cpu_group = torch.distributed.new_group(
+                ranks=self.world_group.ranks,
+                backend="gloo",
+            )
+            weight_materialization_cpu_group = torch.distributed.new_group(
                 ranks=self.world_group.ranks,
                 backend="gloo",
             )
@@ -1789,6 +1805,7 @@ class Scheduler(
             flush_cache=self.flush_cache,
             is_fully_idle=self.is_fully_idle,
             remote_weight_transfer_cpu_group=remote_weight_transfer_cpu_group,
+            weight_materialization_cpu_group=weight_materialization_cpu_group,
             scheduler=self,
             metrics_collector=self.metrics_collector,
         )

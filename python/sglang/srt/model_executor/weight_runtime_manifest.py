@@ -13,6 +13,10 @@ DEFAULT_REMOTE_INSTANCE_WEIGHT_TRANSFER_LEASE_TIMEOUT_SEC = 300
 MIN_REMOTE_INSTANCE_WEIGHT_TRANSFER_LEASE_TIMEOUT_SEC = 30
 MAX_REMOTE_INSTANCE_WEIGHT_TRANSFER_LEASE_TIMEOUT_SEC = 3600
 
+_WEIGHT_RUNTIME_MANIFEST_FORMAT_VERSION = 2
+_WEIGHT_PLACEMENT_MANIFEST_FORMAT_VERSION = 2
+_WEIGHT_RUNTIME_BINDING_MANIFEST_FORMAT_VERSION = 1
+
 _MOONCAKE_PLACEMENT_BINDING_CAPABILITY = "placement_binding_v1"
 _MOONCAKE_PLACEMENT_BINDING_APIS = (
     "RuntimeBindingManifest",
@@ -70,6 +74,18 @@ def validate_remote_instance_weight_transfer_lease_timeout(
 
 class WeightManifestError(RuntimeError):
     pass
+
+
+def _validate_manifest_format_version(
+    format_version: int,
+    *,
+    expected: int,
+    manifest_name: str,
+) -> None:
+    if type(format_version) is not int or format_version != expected:
+        raise WeightManifestError(
+            f"unsupported {manifest_name} format_version: {format_version}"
+        )
 
 
 class WeightParallelRank(msgspec.Struct, frozen=True, kw_only=True):
@@ -172,7 +188,14 @@ class WeightRuntimeManifest(msgspec.Struct, frozen=True, kw_only=True):
     generation: int
     lease_id: str
     tensors: tuple[RuntimeWeightTensor, ...]
-    format_version: int = 2
+    format_version: int = _WEIGHT_RUNTIME_MANIFEST_FORMAT_VERSION
+
+    def __post_init__(self) -> None:
+        _validate_manifest_format_version(
+            self.format_version,
+            expected=_WEIGHT_RUNTIME_MANIFEST_FORMAT_VERSION,
+            manifest_name="runtime manifest",
+        )
 
 
 class WeightPlacementTensor(msgspec.Struct, frozen=True, kw_only=True):
@@ -200,7 +223,15 @@ class WeightPlacementManifest(msgspec.Struct, frozen=True, kw_only=True):
     revision: str
     placement_id: str
     tensors: tuple[WeightPlacementTensor, ...]
-    format_version: int = 2
+    format_version: int = _WEIGHT_PLACEMENT_MANIFEST_FORMAT_VERSION
+
+    def __post_init__(self) -> None:
+        _validate_manifest_format_version(
+            self.format_version,
+            expected=_WEIGHT_PLACEMENT_MANIFEST_FORMAT_VERSION,
+            manifest_name="placement manifest",
+        )
+        _validate_weight_placement_manifest(self)
 
 
 # Compatibility name used by the target-side session introduced in v2.
@@ -227,7 +258,15 @@ class WeightRuntimeBindingManifest(msgspec.Struct, frozen=True, kw_only=True):
     generation: int
     lease_id: str
     fragments: tuple[RuntimeWeightBinding, ...]
-    format_version: int = 1
+    format_version: int = _WEIGHT_RUNTIME_BINDING_MANIFEST_FORMAT_VERSION
+
+    def __post_init__(self) -> None:
+        _validate_manifest_format_version(
+            self.format_version,
+            expected=_WEIGHT_RUNTIME_BINDING_MANIFEST_FORMAT_VERSION,
+            manifest_name="runtime binding manifest",
+        )
+        _validate_weight_runtime_binding_manifest(self)
 
 
 class WeightRuntimeManifestParts(msgspec.Struct, frozen=True, kw_only=True):
@@ -432,15 +471,69 @@ def _placement_fragment_id(
     return hashlib.sha256(repr(value).encode()).hexdigest()[:24]
 
 
-def _placement_id(
-    *,
-    tensors: tuple[WeightPlacementTensor, ...],
+def compute_weight_placement_id(
+    tensors: Sequence[WeightPlacementTensor],
 ) -> str:
+    tensors = tuple(tensors)
+    if not tensors or not all(
+        isinstance(tensor, WeightPlacementTensor) for tensor in tensors
+    ):
+        raise ValueError("placement tensors must not be empty")
     identity = (
         "weight-placement-v2",
         tensors,
     )
     return hashlib.sha256(msgspec.json.encode(identity)).hexdigest()[:32]
+
+
+def _validate_weight_placement_manifest(
+    manifest: WeightPlacementManifest,
+) -> None:
+    if not manifest.placement_id:
+        raise WeightManifestError("placement_id must not be empty")
+    if not manifest.tensors:
+        raise WeightManifestError("placement tensors must not be empty")
+    fragment_ids = tuple(tensor.placement_fragment_id for tensor in manifest.tensors)
+    if any(not fragment_id for fragment_id in fragment_ids):
+        raise WeightManifestError("placement fragment identity must not be empty")
+    if len(fragment_ids) != len(set(fragment_ids)):
+        raise WeightManifestError("duplicate placement fragment identity")
+    if manifest.placement_id != compute_weight_placement_id(manifest.tensors):
+        raise WeightManifestError(
+            "placement_id does not match canonical tensor geometry"
+        )
+
+
+def _validate_weight_runtime_binding_manifest(
+    manifest: WeightRuntimeBindingManifest,
+) -> None:
+    if not manifest.placement_id:
+        raise WeightManifestError("placement_id must not be empty")
+    if type(manifest.generation) is not int or manifest.generation <= 0:
+        raise WeightManifestError("generation must be a positive integer")
+    if not manifest.fragments:
+        raise WeightManifestError("runtime binding fragments must not be empty")
+    placement_fragment_ids = tuple(
+        fragment.placement_fragment_id for fragment in manifest.fragments
+    )
+    runtime_fragment_ids = tuple(
+        fragment.fragment_id for fragment in manifest.fragments
+    )
+    if any(not fragment_id for fragment_id in placement_fragment_ids):
+        raise WeightManifestError("placement fragment identity must not be empty")
+    if any(not fragment_id for fragment_id in runtime_fragment_ids):
+        raise WeightManifestError("runtime fragment identity must not be empty")
+    if len(placement_fragment_ids) != len(set(placement_fragment_ids)):
+        raise WeightManifestError("duplicate placement fragment identity")
+    if len(runtime_fragment_ids) != len(set(runtime_fragment_ids)):
+        raise WeightManifestError("duplicate runtime fragment identity")
+
+
+def _placement_id(
+    *,
+    tensors: tuple[WeightPlacementTensor, ...],
+) -> str:
+    return compute_weight_placement_id(tensors)
 
 
 def _physical_signature(physical: tuple[_PhysicalParameter, ...]) -> tuple:
@@ -477,6 +570,8 @@ def compose_weight_runtime_manifest(
     placement: WeightPlacementManifest,
     binding: WeightRuntimeBindingManifest,
 ) -> WeightRuntimeManifest:
+    _validate_weight_placement_manifest(placement)
+    _validate_weight_runtime_binding_manifest(binding)
     if placement.model_id != binding.model_id:
         raise WeightManifestError("placement and runtime binding model_id differ")
     if placement.revision != binding.revision:
@@ -549,6 +644,7 @@ class _SnapshotLease(msgspec.Struct, kw_only=True):
     generation: int
     deadline: float | None
     expired: bool = False
+    restore_only: bool = False
 
 
 class WeightSnapshotLeaseStatus(msgspec.Struct, frozen=True, kw_only=True):
@@ -556,6 +652,7 @@ class WeightSnapshotLeaseStatus(msgspec.Struct, frozen=True, kw_only=True):
     generation: int
     deadline: float | None
     expired: bool
+    restore_only: bool = False
 
 
 class WeightSnapshotCoordinator:
@@ -628,6 +725,85 @@ class WeightSnapshotCoordinator:
                 )
             self._update_fence_pending = False
             return token
+
+    def begin_update_from_snapshot(
+        self,
+        lease_id: str,
+        expected_generation: int,
+        *,
+        full_restore: bool = False,
+    ) -> str:
+        """Atomically consume a target binding lease and reserve mutation."""
+
+        if type(lease_id) is not str or not lease_id:
+            raise ValueError("lease_id must be a non-empty string")
+        if (
+            isinstance(expected_generation, bool)
+            or not isinstance(expected_generation, int)
+            or expected_generation <= 0
+        ):
+            raise ValueError("expected_generation must be a positive integer")
+        if not isinstance(full_restore, bool):
+            raise TypeError("full_restore must be a boolean")
+        with self._lock:
+            self._refresh_expired_leases_locked()
+            if self._update_token is not None:
+                raise WeightManifestError("a weight update is already in progress")
+            lease = self._leases.get(lease_id)
+            if lease is None or lease.expired:
+                raise WeightManifestError("target binding lease is not active")
+            if (
+                lease.generation != expected_generation
+                or expected_generation != self._generation
+            ):
+                raise WeightManifestError("target binding generation is stale")
+            if lease.restore_only and not full_restore:
+                raise WeightManifestError(
+                    "restore-only target binding requires a full restore"
+                )
+            if len(self._leases) != 1:
+                raise WeightManifestError("another weight snapshot lease is active")
+            del self._leases[lease_id]
+            token = uuid4().hex
+            self._update_token = token
+            self._update_full_restore = full_restore
+            self._update_fence_pending = True
+
+        try:
+            self._completion_fence()
+        except BaseException:
+            with self._lock:
+                if token == self._update_token:
+                    self._update_token = None
+                    self._update_full_restore = False
+                    self._update_fence_pending = False
+            raise
+
+        with self._lock:
+            if (
+                token != self._update_token
+                or expected_generation != self._generation
+                or not self._update_fence_pending
+            ):
+                raise WeightManifestError(
+                    "target update reservation changed during completion fence"
+                )
+            self._update_fence_pending = False
+            return token
+
+    def begin_target_update(
+        self,
+        binding: WeightRuntimeBindingManifest,
+        *,
+        full_restore: bool,
+    ) -> str:
+        if not isinstance(binding, WeightRuntimeBindingManifest):
+            raise WeightManifestError("runtime binding has an invalid type")
+        return self.begin_update_from_snapshot(
+            binding.lease_id,
+            binding.generation,
+            full_restore=full_restore,
+        )
 
     def finish_update(self, token: str, *, success: bool) -> int:
         if not isinstance(success, bool):
@@ -780,6 +956,37 @@ class WeightSnapshotCoordinator:
             )
             return lease_id, self._generation
 
+    def acquire_target_snapshot(
+        self,
+        *,
+        full_restore: bool,
+        lease_timeout_sec: int | None = None,
+    ) -> tuple[str, int]:
+        """Issue a write-only target lease, including for poisoned restores."""
+
+        if not isinstance(full_restore, bool):
+            raise TypeError("full_restore must be a boolean")
+        if not full_restore:
+            return self.acquire_snapshot(lease_timeout_sec=lease_timeout_sec)
+        if lease_timeout_sec is not None:
+            validate_remote_instance_weight_transfer_lease_timeout(lease_timeout_sec)
+        with self._lock:
+            self._refresh_expired_leases_locked()
+            if self._update_token is not None:
+                raise WeightManifestError("a weight update is in progress")
+            if self._leases:
+                raise WeightManifestError("a weight snapshot lease is active")
+            lease_id = uuid4().hex
+            deadline = (
+                None if lease_timeout_sec is None else self._clock() + lease_timeout_sec
+            )
+            self._leases[lease_id] = _SnapshotLease(
+                generation=self._generation,
+                deadline=deadline,
+                restore_only=True,
+            )
+            return lease_id, self._generation
+
     def renew_snapshot(self, lease_id: str, *, lease_timeout_sec: int) -> None:
         validate_remote_instance_weight_transfer_lease_timeout(lease_timeout_sec)
         with self._lock:
@@ -792,6 +999,27 @@ class WeightSnapshotCoordinator:
                     "weight snapshot lease expired and requires explicit release"
                 )
             lease.deadline = self._clock() + lease_timeout_sec
+
+    def attest_snapshot(self, lease_id: str, generation: int) -> None:
+        if not lease_id:
+            raise WeightManifestError("weight snapshot lease ID must not be empty")
+        if type(generation) is not int or generation <= 0:
+            raise WeightManifestError(
+                "weight snapshot generation must be a positive integer"
+            )
+        with self._lock:
+            self._refresh_expired_leases_locked()
+            lease = self._leases.get(lease_id)
+            if lease is None:
+                raise WeightManifestError("weight snapshot lease does not exist")
+            if lease.expired:
+                raise WeightManifestError("weight snapshot lease expired")
+            if lease.restore_only:
+                raise WeightManifestError(
+                    "restore-only target binding cannot attest source weights"
+                )
+            if lease.generation != generation or self._generation != generation:
+                raise WeightManifestError("weight snapshot generation is stale")
 
     def has_snapshot(self, lease_id: str) -> bool:
         with self._lock:
@@ -807,6 +1035,7 @@ class WeightSnapshotCoordinator:
                     generation=lease.generation,
                     deadline=lease.deadline,
                     expired=lease.expired,
+                    restore_only=lease.restore_only,
                 )
                 for lease_id, lease in sorted(self._leases.items())
             )
@@ -856,13 +1085,22 @@ class WeightRuntimeManifestManager:
         self._last_generation: int | None = None
         self._placements: dict[tuple[str, str], WeightPlacementManifest] = {}
         self._placement_layouts: dict[tuple[str, str], tuple] = {}
+        self._issued_bindings: dict[str, WeightRuntimeBindingManifest] = {}
         self._lock = threading.Lock()
 
     def invalidate(self) -> None:
         self.coordinator.invalidate()
+        with self._lock:
+            self._issued_bindings.clear()
+
+    @property
+    def generation(self) -> int:
+        return self.coordinator.generation
 
     def release(self, lease_id: str) -> None:
         self.coordinator.release_snapshot(lease_id)
+        with self._lock:
+            self._issued_bindings.pop(lease_id, None)
 
     def renew(self, lease_id: str, *, lease_timeout_sec: int) -> None:
         self.coordinator.renew_snapshot(lease_id, lease_timeout_sec=lease_timeout_sec)
@@ -870,11 +1108,136 @@ class WeightRuntimeManifestManager:
     def has_lease(self, lease_id: str) -> bool:
         return self.coordinator.has_snapshot(lease_id)
 
+    def attest_binding(self, binding: WeightRuntimeBindingManifest) -> None:
+        if not isinstance(binding, WeightRuntimeBindingManifest):
+            raise WeightManifestError("runtime binding has an invalid type")
+        if not binding.fragments:
+            raise WeightManifestError("runtime binding fragments must not be empty")
+        workers = {fragment.worker_id for fragment in binding.fragments}
+        endpoints = {fragment.endpoint for fragment in binding.fragments}
+        if (
+            len(workers) != 1
+            or len(endpoints) != 1
+            or not next(iter(workers))
+            or not next(iter(endpoints))
+        ):
+            raise WeightManifestError(
+                "runtime binding fragments must use one worker_id and endpoint"
+            )
+        self.coordinator.attest_snapshot(
+            binding.lease_id,
+            binding.generation,
+        )
+        key = (binding.model_id, binding.revision)
+        with self._lock:
+            placement = self._placements.get(key)
+            if placement is None or placement.placement_id != binding.placement_id:
+                raise WeightManifestError("runtime binding placement is not current")
+            issued_binding = self._issued_bindings.get(binding.lease_id)
+            if issued_binding != binding:
+                raise WeightManifestError(
+                    "runtime binding differs from issued runtime binding"
+                )
+            physical = self._collect_physical_parameters()
+            if self._placement_layouts.get(key) != _physical_layout_signature(physical):
+                raise WeightManifestError(
+                    "runtime binding physical layout differs from placement"
+                )
+            self._accept_physical_snapshot(
+                physical=physical,
+                lease_id=binding.lease_id,
+                generation=binding.generation,
+            )
+            expected_fragments = self._build_binding_fragments(
+                placement=placement,
+                physical=physical,
+                instance_id=binding.instance_id,
+                worker_id=issued_binding.fragments[0].worker_id,
+                endpoint=issued_binding.fragments[0].endpoint,
+                generation=binding.generation,
+            )
+            if expected_fragments != binding.fragments:
+                raise WeightManifestError(
+                    "runtime binding differs from current parameter storage"
+                )
+        self.coordinator.attest_snapshot(
+            binding.lease_id,
+            binding.generation,
+        )
+
     def list_leases(self) -> tuple[WeightSnapshotLeaseStatus, ...]:
         return self.coordinator.list_snapshot_leases()
 
-    def commit_revision(self) -> int:
-        return self.coordinator.commit_revision()
+    def commit_revision(self, *, expected_generation: int | None = None) -> int:
+        return self.coordinator.commit_revision(
+            expected_generation=expected_generation,
+        )
+
+    def cancel_update(self, token: str) -> None:
+        self.coordinator.cancel_update(token)
+
+    def finish_update(self, token: str, *, success: bool) -> int:
+        return self.coordinator.finish_update(token, success=success)
+
+    def poison_global_update_failure(self, *, expected_generation: int) -> None:
+        self.coordinator.poison_global_update_failure(
+            expected_generation=expected_generation,
+        )
+
+    def begin_target_update(
+        self,
+        binding: WeightRuntimeBindingManifest,
+        *,
+        full_restore: bool,
+    ) -> str:
+        """Validate and atomically upgrade an issued binding into write access."""
+
+        if not isinstance(binding, WeightRuntimeBindingManifest):
+            raise WeightManifestError("runtime binding has an invalid type")
+        key = (binding.model_id, binding.revision)
+        try:
+            with self._lock:
+                placement = self._placements.get(key)
+                issued_binding = self._issued_bindings.get(binding.lease_id)
+                if (
+                    placement is None
+                    or placement.placement_id != binding.placement_id
+                    or issued_binding != binding
+                ):
+                    raise WeightManifestError(
+                        "target binding was not issued for the current placement"
+                    )
+                physical = self._collect_physical_parameters()
+                if self._placement_layouts.get(key) != _physical_layout_signature(
+                    physical
+                ):
+                    raise WeightManifestError(
+                        "target binding physical layout differs from placement"
+                    )
+                expected_fragments = self._build_binding_fragments(
+                    placement=placement,
+                    physical=physical,
+                    instance_id=binding.instance_id,
+                    worker_id=binding.fragments[0].worker_id,
+                    endpoint=binding.fragments[0].endpoint,
+                    generation=binding.generation,
+                )
+                if expected_fragments != binding.fragments:
+                    raise WeightManifestError(
+                        "target binding differs from current parameter storage"
+                    )
+                token = self.coordinator.begin_update_from_snapshot(
+                    binding.lease_id,
+                    binding.generation,
+                    full_restore=full_restore,
+                )
+                self._issued_bindings.pop(binding.lease_id, None)
+                return token
+        except BaseException:
+            if not self.coordinator.has_snapshot(binding.lease_id):
+                with self._lock:
+                    self._issued_bindings.pop(binding.lease_id, None)
+            raise
 
     def snapshot(
         self,
@@ -900,7 +1263,7 @@ class WeightRuntimeManifestManager:
             return compose_weight_runtime_manifest(parts.placement, parts.binding)
         except BaseException:
             if self.coordinator.has_snapshot(parts.binding.lease_id):
-                self.coordinator.release_snapshot(parts.binding.lease_id)
+                self.release(parts.binding.lease_id)
             raise
 
     def snapshot_parts(
@@ -958,13 +1321,17 @@ class WeightRuntimeManifestManager:
                     lease_id=lease_id,
                     fragments=fragments,
                 )
+                self._issued_bindings[lease_id] = binding
             if not self.coordinator.has_snapshot(lease_id):
                 raise WeightManifestError("weight snapshot lease expired")
             release_on_error = False
             return WeightRuntimeManifestParts(placement=placement, binding=binding)
         finally:
-            if release_on_error and self.coordinator.has_snapshot(lease_id):
-                self.coordinator.release_snapshot(lease_id)
+            if release_on_error:
+                with self._lock:
+                    self._issued_bindings.pop(lease_id, None)
+                if self.coordinator.has_snapshot(lease_id):
+                    self.coordinator.release_snapshot(lease_id)
 
     def placement(
         self,
@@ -1009,6 +1376,7 @@ class WeightRuntimeManifestManager:
         worker_id: str,
         endpoint: str,
         lease_timeout_sec: int | None = None,
+        full_restore: bool = False,
     ) -> WeightRuntimeBindingManifest:
         if not all((instance_id, worker_id, endpoint)):
             raise WeightManifestError("runtime binding identifiers must not be empty")
@@ -1020,8 +1388,9 @@ class WeightRuntimeManifestManager:
                 "runtime binding placement was not produced by this manager"
             )
 
-        lease_id, generation = self.coordinator.acquire_snapshot(
-            lease_timeout_sec=lease_timeout_sec
+        lease_id, generation = self.coordinator.acquire_target_snapshot(
+            full_restore=full_restore,
+            lease_timeout_sec=lease_timeout_sec,
         )
         release_on_error = True
         try:
@@ -1057,13 +1426,17 @@ class WeightRuntimeManifestManager:
                     lease_id=lease_id,
                     fragments=fragments,
                 )
+                self._issued_bindings[lease_id] = binding
             if not self.coordinator.has_snapshot(lease_id):
                 raise WeightManifestError("weight snapshot lease expired")
             release_on_error = False
             return binding
         finally:
-            if release_on_error and self.coordinator.has_snapshot(lease_id):
-                self.coordinator.release_snapshot(lease_id)
+            if release_on_error:
+                with self._lock:
+                    self._issued_bindings.pop(lease_id, None)
+                if self.coordinator.has_snapshot(lease_id):
+                    self.coordinator.release_snapshot(lease_id)
 
     def _placement_from_physical_locked(
         self,
@@ -1390,6 +1763,10 @@ def create_weight_runtime_manifest_manager(
             "Qwen3-Next weight manifests require the canonical triton MoE "
             f"runner backend; got {moe_runner_backend!r}"
         )
+    if model_type == "qwen3_next" and topology.pp_size != 1:
+        return UnavailableWeightRuntimeManifestManager(
+            "Qwen3-Next runtime requires PP=1; pipeline parallelism is unsupported"
+        )
 
     from sglang.srt.model_executor.weight_semantics.qwen3_5 import (
         Qwen35MultimodalWeightSemanticsAdapter,
@@ -1403,9 +1780,14 @@ def create_weight_runtime_manifest_manager(
     )
 
     up_first_w13_parameters = set()
+    num_fused_shared_experts = int(getattr(model, "num_fused_shared_experts", 0))
     modules = getattr(model, "modules", None)
     if modules is not None:
         for module in modules():
+            num_fused_shared_experts = max(
+                num_fused_shared_experts,
+                int(getattr(module, "num_fused_shared_experts", 0)),
+            )
             parameter = getattr(module, "w13_weight", None)
             if parameter is None:
                 continue
@@ -1414,6 +1796,19 @@ def create_weight_runtime_manifest_manager(
                 getattr(quant_method, "load_up_proj_weight_first", False)
             ):
                 up_first_w13_parameters.add(id(parameter))
+    if (
+        model_type
+        in (
+            "qwen3_5_text",
+            "qwen3_5_moe_text",
+            "qwen3_5",
+            "qwen3_5_moe",
+        )
+        and num_fused_shared_experts
+    ):
+        return UnavailableWeightRuntimeManifestManager(
+            "Qwen3.5 fused shared-expert runtime allocations are unsupported"
+        )
 
     if is_multimodal:
         text_config = getattr(config, "text_config", None)
@@ -1433,7 +1828,7 @@ def create_weight_runtime_manifest_manager(
             config=config,
             dynamic_expert_placement=dynamic_expert_placement,
             up_first_w13_parameter_ids=up_first_w13_parameters,
-            num_fused_shared_experts=int(getattr(model, "num_fused_shared_experts", 0)),
+            num_fused_shared_experts=num_fused_shared_experts,
         )
     elif model_type in ("qwen3", "qwen3_moe"):
         adapter = Qwen3WeightSemanticsAdapter(

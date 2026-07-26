@@ -1616,6 +1616,47 @@ class UpdateWeightsFromTensorReqOutput(BaseReq, kw_only=True):
     message: str
 
 
+class MaterializeWeightsReqInput(BaseReq, kw_only=True):
+    storage_options: Dict[str, Any]
+    materialization_id: Optional[str] = None
+    source_external_dp_rank: Optional[int] = None
+
+
+class PrepareWeightMaterializationReqInput(BaseReq, kw_only=True):
+    materialization_id: str
+    model_id: str
+    revision: str
+
+
+class PrepareWeightMaterializationReqOutput(BaseReq, kw_only=True):
+    materialization_id: str
+    success: bool
+    message: str
+    external_dp_rank: int
+    generation: Optional[int] = None
+    logical_payload_digest: Optional[str] = None
+    total_bytes: Optional[int] = None
+    session_state: str = "unknown"
+
+
+class CommitWeightMaterializationReqInput(BaseReq, kw_only=True):
+    materialization_id: str
+    selected_external_dp_rank: Optional[int]
+    storage_options: Dict[str, Any]
+
+
+class CommitWeightMaterializationReqOutput(BaseReq, kw_only=True):
+    materialization_id: str
+    success: bool
+    message: str
+    external_dp_rank: int
+    selected: bool = False
+    ref: Optional[Dict[str, Any]] = None
+    completion_unknown: bool = False
+    completion_ticket: Optional[str] = None
+    session_state: str = "unknown"
+
+
 class InitWeightsSendGroupForRemoteInstanceReqInput(BaseReq, kw_only=True):
     # The master address
     master_address: str

@@ -19,20 +19,20 @@ Homogeneous example (runs all three modes by default):
 
 PYTHONPATH=python python test/manual/benchmark_remote_instance_service_startup.py \
   --model /models/Qwen3.5-0.8B --source-gpus 0,1 --target-gpus 2,3 \
-  --source-tp-size 2 --target-tp-size 2 --drop-page-cache --iterations 4
+  --source-tp-size 2 --target-tp-size 2 --drop-page-cache --iterations 6
 
 Large-model legacy example (runtime-manifest semantics may be model-specific):
 
 PYTHONPATH=python python test/manual/benchmark_remote_instance_service_startup.py \
   --model /models/Qwen2-72B --source-gpus 0,1 --target-gpus 2,3 \
   --source-tp-size 2 --target-tp-size 2 --modes cold,legacy \
-  --drop-page-cache --iterations 3
+  --drop-page-cache --iterations 5
 
 Heterogeneous example (legacy is reported as ineligible when TPs differ):
 
 PYTHONPATH=python python test/manual/benchmark_remote_instance_service_startup.py \
   --model /models/Qwen3.5-0.8B --source-gpus 0,1 --target-gpus 2,3,4,5 \
-  --source-tp-size 2 --target-tp-size 4 --drop-page-cache --iterations 3
+  --source-tp-size 2 --target-tp-size 4 --drop-page-cache --iterations 5
 """
 
 from __future__ import annotations
@@ -41,6 +41,7 @@ import argparse
 import json
 import math
 import os
+import re
 import signal
 import socket
 import statistics
@@ -90,6 +91,26 @@ def _p95(values: list[float]) -> float | None:
         return None
     ordered = sorted(values)
     return ordered[max(0, math.ceil(len(ordered) * 0.95) - 1)]
+
+
+def _coefficient_of_variation(values: list[float]) -> float | None:
+    if not values:
+        return None
+    mean = statistics.mean(values)
+    if mean == 0:
+        return None
+    return statistics.pstdev(values) / mean
+
+
+def _series_summary(values: list[float]) -> dict[str, float | None]:
+    return {
+        "p50": statistics.median(values),
+        "p95": _p95(values),
+        "mean": statistics.mean(values),
+        "min": min(values),
+        "max": max(values),
+        "cv": _coefficient_of_variation(values),
+    }
 
 
 @dataclass
@@ -440,11 +461,27 @@ def _assert_process_alive(server: ServerProcess) -> None:
 def _assert_port_available(port: int) -> None:
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             probe.bind(("127.0.0.1", port))
     except OSError as error:
         owners = sorted(_listening_port_owner_pids(port))
         owner_text = f" by listening PID(s) {owners}" if owners else ""
         raise RuntimeError(f"port {port} is already in use{owner_text}") from error
+
+
+def _wait_port_released(port: int, timeout_s: float) -> None:
+    deadline = time.monotonic() + timeout_s
+    while True:
+        try:
+            _assert_port_available(port)
+            return
+        except RuntimeError as error:
+            remaining_s = deadline - time.monotonic()
+            if remaining_s <= 0:
+                raise RuntimeError(
+                    f"port {port} was not released within {timeout_s:.1f}s"
+                ) from error
+            time.sleep(min(0.1, remaining_s))
 
 
 def _assert_server_identity(
@@ -501,6 +538,54 @@ def _assert_reuse_log_contract(mode: str, log_path: Path) -> dict[str, Any]:
         "passed": True,
         "required_markers": list(required),
         "forbidden_markers_checked": list(REUSE_FORBIDDEN_LOG_MARKERS),
+    }
+
+
+def _parse_manifest_transfer_metrics(log_path: Path) -> dict[str, Any]:
+    marker = "Loaded heterogeneous remote-instance weights:"
+    lines = [
+        line
+        for line in log_path.read_text(errors="replace").splitlines()
+        if marker in line
+    ]
+    if not lines:
+        raise RuntimeError(f"manifest transfer metrics are missing: {log_path}")
+
+    match = re.search(
+        r"\bbytes=(\d+), compact_operations=(\d+), segments=(\d+), "
+        r"elapsed=([0-9]+(?:\.[0-9]+)?)s; phases: (.+)$",
+        lines[-1],
+    )
+    if match is None:
+        raise RuntimeError(
+            f"manifest transfer metrics are malformed in {log_path}: {lines[-1]}"
+        )
+
+    logical_bytes = int(match.group(1))
+    elapsed_s = float(match.group(4))
+    phases_s = {
+        name: float(value)
+        for name, value in re.findall(
+            r"\b([a-z_]+)=([0-9]+(?:\.[0-9]+)?)s", match.group(5)
+        )
+    }
+    data_transfer_s = phases_s.get("data_transfer")
+    if data_transfer_s is None or data_transfer_s <= 0 or elapsed_s <= 0:
+        raise RuntimeError(
+            f"manifest transfer durations must be positive in {log_path}: "
+            f"elapsed={elapsed_s}, data_transfer={data_transfer_s}"
+        )
+
+    data_transfer_gb_per_s = logical_bytes / data_transfer_s / 1e9
+    return {
+        "logical_bytes": logical_bytes,
+        "compact_operations": int(match.group(2)),
+        "segments": int(match.group(3)),
+        "elapsed_s": elapsed_s,
+        "phases_s": phases_s,
+        "data_transfer_logical_gb_per_s": data_transfer_gb_per_s,
+        "data_transfer_logical_gbps": data_transfer_gb_per_s * 8,
+        "end_to_end_logical_gb_per_s": logical_bytes / elapsed_s / 1e9,
     }
 
 
@@ -747,14 +832,17 @@ def _collect_source_baseline(
 
 
 def _stop_server(server: ServerProcess) -> None:
-    if server.process.poll() is None:
-        os.killpg(server.process.pid, signal.SIGTERM)
-        try:
-            server.process.wait(timeout=30)
-        except subprocess.TimeoutExpired:
-            os.killpg(server.process.pid, signal.SIGKILL)
-            server.process.wait(timeout=30)
-    server.log_file.close()
+    try:
+        if server.process.poll() is None:
+            os.killpg(server.process.pid, signal.SIGTERM)
+            try:
+                server.process.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                os.killpg(server.process.pid, signal.SIGKILL)
+                server.process.wait(timeout=30)
+        _wait_port_released(server.port, timeout_s=30.0)
+    finally:
+        server.log_file.close()
 
 
 def _assert_iteration_consistency(
@@ -884,6 +972,11 @@ def _run_target(
             if mode in REUSE_MODES
             else None
         )
+        transfer_metrics = (
+            _parse_manifest_transfer_metrics(server.log_path)
+            if mode == "manifest"
+            else None
+        )
         return {
             "mode": mode,
             "iteration": iteration,
@@ -897,6 +990,7 @@ def _run_target(
             },
             "source_probe": probe_summary,
             "reuse_log_contract": reuse_log_contract,
+            "transfer_metrics": transfer_metrics,
             "server_identity": {
                 "root_pid": server.process.pid,
                 "port": server.port,
@@ -916,12 +1010,16 @@ def _run_target(
 def _mode_summary(records: list[dict[str, Any]]) -> dict[str, Any]:
     ready = [record["spawn_to_ready_s"] for record in records]
     first_generation = [record["first_generation_s"] for record in records]
-    return {
+    summary = {
         "iterations": len(records),
         "spawn_to_ready_p50_s": statistics.median(ready),
+        "spawn_to_ready_p95_s": _p95(ready),
         "spawn_to_ready_mean_s": statistics.mean(ready),
+        "spawn_to_ready_cv": _coefficient_of_variation(ready),
         "first_generation_p50_s": statistics.median(first_generation),
+        "first_generation_p95_s": _p95(first_generation),
         "first_generation_mean_s": statistics.mean(first_generation),
+        "first_generation_cv": _coefficient_of_variation(first_generation),
         "source_probe_success_count": sum(
             record["source_probe"]["success_count"] for record in records
         ),
@@ -932,6 +1030,65 @@ def _mode_summary(records: list[dict[str, Any]]) -> dict[str, Any]:
             record["source_probe"]["mismatch_count"] for record in records
         ),
     }
+    transfer_metrics = [
+        record["transfer_metrics"]
+        for record in records
+        if record.get("transfer_metrics") is not None
+    ]
+    if transfer_metrics:
+        phases = sorted(
+            {name for metrics in transfer_metrics for name in metrics["phases_s"]}
+        )
+        summary["transfer"] = {
+            "iterations": len(transfer_metrics),
+            "logical_bytes": _series_summary(
+                [metrics["logical_bytes"] for metrics in transfer_metrics]
+            ),
+            "compact_operations": _series_summary(
+                [metrics["compact_operations"] for metrics in transfer_metrics]
+            ),
+            "segments": _series_summary(
+                [metrics["segments"] for metrics in transfer_metrics]
+            ),
+            "elapsed_s": _series_summary(
+                [metrics["elapsed_s"] for metrics in transfer_metrics]
+            ),
+            "data_transfer_logical_gb_per_s_p50": statistics.median(
+                [
+                    metrics["data_transfer_logical_gb_per_s"]
+                    for metrics in transfer_metrics
+                ]
+            ),
+            "data_transfer_logical_gb_per_s_p95": _p95(
+                [
+                    metrics["data_transfer_logical_gb_per_s"]
+                    for metrics in transfer_metrics
+                ]
+            ),
+            "data_transfer_logical_gb_per_s_cv": _coefficient_of_variation(
+                [
+                    metrics["data_transfer_logical_gb_per_s"]
+                    for metrics in transfer_metrics
+                ]
+            ),
+            "data_transfer_logical_gbps_p50": statistics.median(
+                [metrics["data_transfer_logical_gbps"] for metrics in transfer_metrics]
+            ),
+            "end_to_end_logical_gb_per_s_p50": statistics.median(
+                [metrics["end_to_end_logical_gb_per_s"] for metrics in transfer_metrics]
+            ),
+            "phases_s": {
+                phase: _series_summary(
+                    [
+                        metrics["phases_s"][phase]
+                        for metrics in transfer_metrics
+                        if phase in metrics["phases_s"]
+                    ]
+                )
+                for phase in phases
+            },
+        }
+    return summary
 
 
 def _reuse_comparison(
@@ -941,16 +1098,21 @@ def _reuse_comparison(
     max_reuse_to_cold_ratio: float,
 ) -> dict[str, Any]:
     cold_p50 = cold["spawn_to_ready_p50_s"]
+    cold_p95 = cold["spawn_to_ready_p95_s"]
     cold_mean = cold["spawn_to_ready_mean_s"]
     reuse_p50 = reuse["spawn_to_ready_p50_s"]
+    reuse_p95 = reuse["spawn_to_ready_p95_s"]
     reuse_mean = reuse["spawn_to_ready_mean_s"]
     threshold_s = cold_p50 * max_reuse_to_cold_ratio
     return {
         "cold_spawn_to_ready_p50_s": cold_p50,
         "reuse_spawn_to_ready_p50_s": reuse_p50,
+        "cold_spawn_to_ready_p95_s": cold_p95,
+        "reuse_spawn_to_ready_p95_s": reuse_p95,
         "cold_spawn_to_ready_mean_s": cold_mean,
         "reuse_spawn_to_ready_mean_s": reuse_mean,
         "p50_speedup": cold_p50 / reuse_p50,
+        "p95_speedup": cold_p95 / reuse_p95,
         "mean_speedup": cold_mean / reuse_mean,
         "reuse_to_cold_p50_ratio": reuse_p50 / cold_p50,
         "p50_improvement_ratio": (cold_p50 - reuse_p50) / cold_p50,
@@ -1182,6 +1344,18 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     return result
 
 
+def _benchmark_exit_code(
+    result: dict[str, Any],
+    *,
+    report_only: bool,
+) -> int:
+    if report_only:
+        return 0
+    passed = result["summary"]["all_executed_reuse_modes_pass_threshold"]
+    reuse_requested = bool(set(result.get("modes_requested", ())) & set(REUSE_MODES))
+    return 2 if passed is False or (reuse_requested and passed is None) else 0
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -1214,7 +1388,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--disable-custom-all-reduce", action="store_true")
     parser.add_argument("--disable-shared-experts-fusion", action="store_true")
     parser.add_argument("--moe-runner-backend", default="")
-    parser.add_argument("--iterations", type=int, default=4)
+    parser.add_argument("--iterations", type=int, default=6)
     parser.add_argument("--timeout-s", type=float, default=1200)
     parser.add_argument("--request-timeout-s", type=float, default=120)
     parser.add_argument("--probe-interval-s", type=float, default=0.2)
@@ -1245,6 +1419,11 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--drop-page-cache", action="store_true")
+    parser.add_argument(
+        "--report-only",
+        action="store_true",
+        help="Write measurements without failing the process on the speed gate.",
+    )
     parser.add_argument("--output-dir", default="remote-instance-service-benchmark")
     args = parser.parse_args()
 
@@ -1317,4 +1496,12 @@ def parse_args() -> argparse.Namespace:
 
 
 if __name__ == "__main__":
-    print("REMOTE_INSTANCE_SERVICE_BENCHMARK_JSON=" + json.dumps(run(parse_args())))
+    parsed_args = parse_args()
+    benchmark_result = run(parsed_args)
+    print("REMOTE_INSTANCE_SERVICE_BENCHMARK_JSON=" + json.dumps(benchmark_result))
+    raise SystemExit(
+        _benchmark_exit_code(
+            benchmark_result,
+            report_only=parsed_args.report_only,
+        )
+    )
