@@ -1232,6 +1232,9 @@ class Engine(EngineScoreMixin, EngineBase):
         its GPU context so the caller can immediately reallocate on the same
         device."""
         try:
+            if isinstance(self.tokenizer_manager, MultiTokenizerRouter):
+                self.tokenizer_manager.close()
+
             if (
                 self.tokenizer_manager is not None
                 and self.tokenizer_manager._subprocess_watchdog is not None
