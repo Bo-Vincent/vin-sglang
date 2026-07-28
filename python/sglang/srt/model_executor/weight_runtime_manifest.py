@@ -16,42 +16,7 @@ MAX_REMOTE_INSTANCE_WEIGHT_TRANSFER_LEASE_TIMEOUT_SEC = 3600
 _WEIGHT_RUNTIME_MANIFEST_FORMAT_VERSION = 2
 _WEIGHT_PLACEMENT_MANIFEST_FORMAT_VERSION = 2
 _WEIGHT_RUNTIME_BINDING_MANIFEST_FORMAT_VERSION = 1
-
-_MOONCAKE_PLACEMENT_BINDING_CAPABILITY = "placement_binding_v1"
-_MOONCAKE_PLACEMENT_BINDING_APIS = (
-    "RuntimeBindingManifest",
-    "SourcePlacementManifest",
-    "TargetPlacementManifest",
-    "bind_logical_transfer_plan",
-    "bind_runtime_manifest",
-    "placement_manifest_from_runtime_manifest",
-    "plan_placement_transfer_to_local_target",
-    "runtime_binding_from_runtime_manifest",
-)
-
-
-def local_mooncake_supports_placement_binding(
-    weight_transfer_module: Any | None = None,
-) -> bool:
-    try:
-        if weight_transfer_module is None:
-            from mooncake import weight_transfer as weight_transfer_module
-        supports = getattr(
-            weight_transfer_module,
-            "supports_weight_transfer_capability",
-            None,
-        )
-        if (
-            not callable(supports)
-            or supports(_MOONCAKE_PLACEMENT_BINDING_CAPABILITY) is not True
-        ):
-            return False
-        return all(
-            callable(getattr(weight_transfer_module, name, None))
-            for name in _MOONCAKE_PLACEMENT_BINDING_APIS
-        )
-    except Exception:
-        return False
+_UINT64_MAX = (1 << 64) - 1
 
 
 def validate_remote_instance_weight_transfer_lease_timeout(
@@ -79,10 +44,11 @@ class WeightManifestError(RuntimeError):
 def _validate_manifest_format_version(
     format_version: int,
     *,
-    expected: int,
+    expected: int | tuple[int, ...],
     manifest_name: str,
 ) -> None:
-    if type(format_version) is not int or format_version != expected:
+    supported = (expected,) if type(expected) is int else expected
+    if type(format_version) is not int or format_version not in supported:
         raise WeightManifestError(
             f"unsupported {manifest_name} format_version: {format_version}"
         )
@@ -93,6 +59,7 @@ class WeightParallelRank(msgspec.Struct, frozen=True, kw_only=True):
     tp: int = 0
     pp: int = 0
     ep: int = 0
+    moe_dp: int = 0
 
 
 class WeightParallelTopology(msgspec.Struct, frozen=True, kw_only=True):
@@ -104,6 +71,8 @@ class WeightParallelTopology(msgspec.Struct, frozen=True, kw_only=True):
     pp_size: int = 1
     ep_rank: int = 0
     ep_size: int = 1
+    moe_dp_rank: int = 0
+    moe_dp_size: int = 1
     moe_tp_rank: int = 0
     moe_tp_size: int = 1
     attention_tp_rank: int = 0
@@ -115,6 +84,7 @@ class WeightParallelTopology(msgspec.Struct, frozen=True, kw_only=True):
             self.tp_rank,
             self.pp_rank,
             self.ep_rank,
+            self.moe_dp_rank,
             self.moe_tp_rank,
             self.attention_tp_rank,
         )
@@ -123,6 +93,7 @@ class WeightParallelTopology(msgspec.Struct, frozen=True, kw_only=True):
             self.tp_size,
             self.pp_size,
             self.ep_size,
+            self.moe_dp_size,
             self.moe_tp_size,
             self.attention_tp_size,
         )
@@ -137,7 +108,15 @@ class WeightParallelTopology(msgspec.Struct, frozen=True, kw_only=True):
             tp=self.tp_rank,
             pp=self.pp_rank,
             ep=self.ep_rank,
+            moe_dp=self.moe_dp_rank,
         )
+
+
+def weight_parallel_rank_identity(rank: WeightParallelRank) -> tuple:
+    base = (rank.dp, rank.tp, rank.pp, rank.ep)
+    if rank.moe_dp == 0:
+        return base
+    return (*base, ("moe_dp", rank.moe_dp))
 
 
 class LogicalTensorView(msgspec.Struct, frozen=True, kw_only=True):
@@ -151,6 +130,7 @@ class LogicalTensorView(msgspec.Struct, frozen=True, kw_only=True):
     expert_id: int | None
     layout_fingerprint: str
     shard_dims: tuple[int, ...] | None = None
+    expert_axis: int | None = None
 
 
 class RuntimeWeightTensor(msgspec.Struct, frozen=True, kw_only=True):
@@ -164,7 +144,7 @@ class RuntimeWeightTensor(msgspec.Struct, frozen=True, kw_only=True):
     dtype: str
     itemsize: int
     partition_dim: int | None
-    shard_dims: tuple[int, ...]
+    shard_dims: tuple[int, ...] = ()
     layer_id: int | None
     expert_id: int | None
     layout_fingerprint: str
@@ -179,6 +159,7 @@ class RuntimeWeightTensor(msgspec.Struct, frozen=True, kw_only=True):
     endpoint: str
     rank: WeightParallelRank
     lease_generation: int
+    expert_axis: int | None = None
 
 
 class WeightRuntimeManifest(msgspec.Struct, frozen=True, kw_only=True):
@@ -193,7 +174,7 @@ class WeightRuntimeManifest(msgspec.Struct, frozen=True, kw_only=True):
     def __post_init__(self) -> None:
         _validate_manifest_format_version(
             self.format_version,
-            expected=_WEIGHT_RUNTIME_MANIFEST_FORMAT_VERSION,
+            expected=(1, _WEIGHT_RUNTIME_MANIFEST_FORMAT_VERSION),
             manifest_name="runtime manifest",
         )
 
@@ -216,6 +197,7 @@ class WeightPlacementTensor(msgspec.Struct, frozen=True, kw_only=True):
     nbytes: int
     byte_offset: int
     rank: WeightParallelRank
+    expert_axis: int | None = None
 
 
 class WeightPlacementManifest(msgspec.Struct, frozen=True, kw_only=True):
@@ -228,7 +210,7 @@ class WeightPlacementManifest(msgspec.Struct, frozen=True, kw_only=True):
     def __post_init__(self) -> None:
         _validate_manifest_format_version(
             self.format_version,
-            expected=_WEIGHT_PLACEMENT_MANIFEST_FORMAT_VERSION,
+            expected=(1, _WEIGHT_PLACEMENT_MANIFEST_FORMAT_VERSION),
             manifest_name="placement manifest",
         )
         _validate_weight_placement_manifest(self)
@@ -248,6 +230,9 @@ class RuntimeWeightBinding(msgspec.Struct, frozen=True, kw_only=True):
     is_contiguous: bool
     worker_id: str
     endpoint: str
+
+    def __post_init__(self) -> None:
+        _validate_runtime_weight_binding(self)
 
 
 class WeightRuntimeBindingManifest(msgspec.Struct, frozen=True, kw_only=True):
@@ -400,6 +385,10 @@ def _validate_view(view: LogicalTensorView, physical: _PhysicalParameter) -> int
         type(view.partition_dim) is not int or not 0 <= view.partition_dim < ndim
     ):
         raise WeightManifestError(f"invalid partition axis for {view.tensor_id}")
+    if view.expert_axis is not None and (
+        type(view.expert_axis) is not int or not 0 <= view.expert_axis < ndim
+    ):
+        raise WeightManifestError(f"invalid expert axis for {view.tensor_id}")
     shard_dims = _view_shard_dims(view)
     if any(dim < 0 or dim >= ndim for dim in shard_dims):
         raise WeightManifestError(f"invalid shard axes for {view.tensor_id}")
@@ -459,14 +448,16 @@ def _placement_fragment_id(
         view.byte_offset,
         view.layer_id,
         view.expert_id,
+    )
+    if view.expert_axis is not None:
+        value = (*value, "expert_axis", view.expert_axis)
+    value = (
+        *value,
         view.layout_fingerprint,
         names,
         dtype,
         itemsize,
-        rank.dp,
-        rank.tp,
-        rank.pp,
-        rank.ep,
+        *weight_parallel_rank_identity(rank),
     )
     return hashlib.sha256(repr(value).encode()).hexdigest()[:24]
 
@@ -486,6 +477,91 @@ def compute_weight_placement_id(
     return hashlib.sha256(msgspec.json.encode(identity)).hexdigest()[:32]
 
 
+def _compute_legacy_weight_placement_id(
+    tensors: Sequence[WeightPlacementTensor],
+) -> str:
+    legacy_tensors = []
+    for tensor in tensors:
+        record = msgspec.to_builtins(tensor)
+        record["rank"].pop("moe_dp", None)
+        record.pop("expert_axis", None)
+        legacy_tensors.append(record)
+    identity = ("weight-placement-v2", tuple(legacy_tensors))
+    return hashlib.sha256(msgspec.json.encode(identity)).hexdigest()[:32]
+
+
+def validate_weight_placement_tensor_geometry(
+    tensor: WeightPlacementTensor,
+) -> None:
+    if not tensor.tensor_id or not tensor.dtype or not tensor.layout_fingerprint:
+        raise WeightManifestError("placement tensor descriptor is incomplete")
+    global_shape = tuple(tensor.global_shape)
+    global_offset = tuple(tensor.global_offset)
+    local_shape = tuple(tensor.local_shape)
+    ndim = len(global_shape)
+    if (
+        ndim == 0
+        or len(global_offset) != ndim
+        or len(local_shape) != ndim
+        or any(type(extent) is not int or extent <= 0 for extent in global_shape)
+        or any(type(offset) is not int for offset in global_offset)
+        or any(type(extent) is not int or extent <= 0 for extent in local_shape)
+    ):
+        raise WeightManifestError("placement tensor geometry is invalid")
+    if any(
+        offset < 0 or offset + extent > global_extent
+        for offset, extent, global_extent in zip(
+            global_offset,
+            local_shape,
+            global_shape,
+            strict=True,
+        )
+    ):
+        raise WeightManifestError("placement tensor fragment is out of bounds")
+
+    shard_dims = tuple(tensor.shard_dims)
+    if not shard_dims and tensor.partition_dim is not None:
+        shard_dims = (tensor.partition_dim,)
+    if (
+        len(shard_dims) != len(set(shard_dims))
+        or tuple(sorted(shard_dims)) != shard_dims
+        or any(type(dim) is not int or dim < 0 or dim >= ndim for dim in shard_dims)
+        or (tensor.partition_dim is not None and shard_dims != (tensor.partition_dim,))
+    ):
+        raise WeightManifestError("placement tensor shard dimensions are invalid")
+    if tensor.expert_axis is not None and (
+        type(tensor.expert_axis) is not int or not 0 <= tensor.expert_axis < ndim
+    ):
+        raise WeightManifestError("placement tensor expert axis is invalid")
+    sharded = frozenset(shard_dims)
+    if any(
+        dim not in sharded
+        and (global_offset[dim] != 0 or local_shape[dim] != global_shape[dim])
+        for dim in range(ndim)
+    ):
+        raise WeightManifestError("placement tensor slices a non-shard dimension")
+    if (
+        type(tensor.itemsize) is not int
+        or tensor.itemsize <= 0
+        or tensor.nbytes != prod(local_shape) * tensor.itemsize
+        or type(tensor.byte_offset) is not int
+        or tensor.byte_offset < 0
+        or tensor.byte_offset % tensor.itemsize
+    ):
+        raise WeightManifestError("placement tensor byte geometry is invalid")
+    if any(
+        type(value) is not int or value < 0
+        for value in (
+            tensor.rank.dp,
+            tensor.rank.tp,
+            tensor.rank.pp,
+            tensor.rank.ep,
+            tensor.rank.moe_dp,
+        )
+    ):
+        raise WeightManifestError("placement tensor parallel rank is invalid")
+
+
 def _validate_weight_placement_manifest(
     manifest: WeightPlacementManifest,
 ) -> None:
@@ -498,21 +574,60 @@ def _validate_weight_placement_manifest(
         raise WeightManifestError("placement fragment identity must not be empty")
     if len(fragment_ids) != len(set(fragment_ids)):
         raise WeightManifestError("duplicate placement fragment identity")
-    if manifest.placement_id != compute_weight_placement_id(manifest.tensors):
+    for tensor in manifest.tensors:
+        validate_weight_placement_tensor_geometry(tensor)
+    canonical_id = compute_weight_placement_id(manifest.tensors)
+    legacy_id = _compute_legacy_weight_placement_id(manifest.tensors)
+    legacy_compatible = all(tensor.rank.moe_dp == 0 for tensor in manifest.tensors)
+    if manifest.placement_id != canonical_id and not (
+        legacy_compatible and manifest.placement_id == legacy_id
+    ):
         raise WeightManifestError(
             "placement_id does not match canonical tensor geometry"
         )
 
 
+def _require_runtime_nonempty_string(value: object, name: str) -> None:
+    if type(value) is not str or not value:
+        raise WeightManifestError(f"{name} must be a non-empty string")
+
+
+def _validate_runtime_weight_binding(binding: RuntimeWeightBinding) -> None:
+    for name in (
+        "placement_fragment_id",
+        "fragment_id",
+        "device",
+        "worker_id",
+        "endpoint",
+    ):
+        _require_runtime_nonempty_string(getattr(binding, name), name)
+    for name in ("address", "nbytes"):
+        value = getattr(binding, name)
+        if type(value) is not int or value <= 0 or value > _UINT64_MAX:
+            raise WeightManifestError(f"{name} must be a positive uint64")
+    if binding.nbytes > _UINT64_MAX - binding.address:
+        raise WeightManifestError("runtime address range exceeds uint64")
+    if type(binding.storage_offset) is not int or binding.storage_offset < 0:
+        raise WeightManifestError("storage_offset must be a non-negative integer")
+    if type(binding.is_contiguous) is not bool:
+        raise WeightManifestError("is_contiguous must be a boolean")
+
+
 def _validate_weight_runtime_binding_manifest(
     manifest: WeightRuntimeBindingManifest,
 ) -> None:
-    if not manifest.placement_id:
+    for name in ("model_id", "revision", "instance_id", "lease_id"):
+        _require_runtime_nonempty_string(getattr(manifest, name), name)
+    if type(manifest.placement_id) is not str or not manifest.placement_id:
         raise WeightManifestError("placement_id must not be empty")
-    if type(manifest.generation) is not int or manifest.generation <= 0:
-        raise WeightManifestError("generation must be a positive integer")
+    if type(manifest.generation) is not int or manifest.generation < 0:
+        raise WeightManifestError("generation must be a non-negative integer")
     if not manifest.fragments:
         raise WeightManifestError("runtime binding fragments must not be empty")
+    if not all(
+        isinstance(fragment, RuntimeWeightBinding) for fragment in manifest.fragments
+    ):
+        raise WeightManifestError("runtime binding fragments are invalid")
     placement_fragment_ids = tuple(
         fragment.placement_fragment_id for fragment in manifest.fragments
     )
@@ -616,6 +731,7 @@ def compose_weight_runtime_manifest(
                 shard_dims=item.shard_dims,
                 layer_id=item.layer_id,
                 expert_id=item.expert_id,
+                expert_axis=item.expert_axis,
                 layout_fingerprint=item.layout_fingerprint,
                 address=fragment.address,
                 nbytes=fragment.nbytes,
@@ -1000,7 +1116,13 @@ class WeightSnapshotCoordinator:
                 )
             lease.deadline = self._clock() + lease_timeout_sec
 
-    def attest_snapshot(self, lease_id: str, generation: int) -> None:
+    def attest_snapshot(
+        self,
+        lease_id: str,
+        generation: int,
+        *,
+        allow_restore_only: bool = False,
+    ) -> None:
         if not lease_id:
             raise WeightManifestError("weight snapshot lease ID must not be empty")
         if type(generation) is not int or generation <= 0:
@@ -1014,7 +1136,7 @@ class WeightSnapshotCoordinator:
                 raise WeightManifestError("weight snapshot lease does not exist")
             if lease.expired:
                 raise WeightManifestError("weight snapshot lease expired")
-            if lease.restore_only:
+            if lease.restore_only and not allow_restore_only:
                 raise WeightManifestError(
                     "restore-only target binding cannot attest source weights"
                 )
@@ -1322,8 +1444,7 @@ class WeightRuntimeManifestManager:
                     fragments=fragments,
                 )
                 self._issued_bindings[lease_id] = binding
-            if not self.coordinator.has_snapshot(lease_id):
-                raise WeightManifestError("weight snapshot lease expired")
+            self.coordinator.attest_snapshot(lease_id, generation)
             release_on_error = False
             return WeightRuntimeManifestParts(placement=placement, binding=binding)
         finally:
@@ -1427,8 +1548,11 @@ class WeightRuntimeManifestManager:
                     fragments=fragments,
                 )
                 self._issued_bindings[lease_id] = binding
-            if not self.coordinator.has_snapshot(lease_id):
-                raise WeightManifestError("weight snapshot lease expired")
+            self.coordinator.attest_snapshot(
+                lease_id,
+                generation,
+                allow_restore_only=True,
+            )
             release_on_error = False
             return binding
         finally:
@@ -1550,6 +1674,7 @@ class WeightRuntimeManifestManager:
                         shard_dims=_view_shard_dims(view),
                         layer_id=view.layer_id,
                         expert_id=view.expert_id,
+                        expert_axis=view.expert_axis,
                         layout_fingerprint=view.layout_fingerprint,
                         nbytes=nbytes,
                         byte_offset=view.byte_offset,
@@ -1661,8 +1786,8 @@ def _topology_from_sglang(
         dp_rank = parallel_state.dp_rank
         dp_size = parallel_state.dp_size
     else:
-        dp_rank = parallel_state.moe_dp_rank or 0
-        dp_size = parallel_state.moe_dp_size
+        dp_rank = 0
+        dp_size = 1
     return WeightParallelTopology(
         dp_rank=dp_rank,
         dp_size=dp_size,
@@ -1672,6 +1797,8 @@ def _topology_from_sglang(
         pp_size=parallel_state.pp_size,
         ep_rank=parallel_state.moe_ep_rank,
         ep_size=parallel_state.moe_ep_size,
+        moe_dp_rank=parallel_state.moe_dp_rank or 0,
+        moe_dp_size=parallel_state.moe_dp_size,
         moe_tp_rank=parallel.moe_tp_rank,
         moe_tp_size=parallel.moe_tp_size,
         attention_tp_rank=parallel_state.attn_tp_rank,
@@ -1768,12 +1895,12 @@ def create_weight_runtime_manifest_manager(
             "Qwen3-Next runtime requires PP=1; pipeline parallelism is unsupported"
         )
 
+    from sglang.srt.model_executor.weight_semantics.qwen3 import (
+        Qwen3WeightSemanticsAdapter,
+    )
     from sglang.srt.model_executor.weight_semantics.qwen3_5 import (
         Qwen35MultimodalWeightSemanticsAdapter,
         Qwen35WeightSemanticsAdapter,
-    )
-    from sglang.srt.model_executor.weight_semantics.qwen3 import (
-        Qwen3WeightSemanticsAdapter,
     )
     from sglang.srt.model_executor.weight_semantics.qwen3_next import (
         Qwen3NextWeightSemanticsAdapter,

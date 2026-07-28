@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import hashlib
+import sys
 from dataclasses import dataclass
 
 import pytest
 import torch
-
 from sglang.srt.model_executor.weight_runtime_manifest import (
     RuntimeWeightBinding,
     WeightParallelRank,
@@ -495,3 +495,8 @@ def test_runtime_snapshot_source_retains_lease_until_terminal_proof() -> None:
     assert source.released is True
     assert manager.released is True
     assert source not in quarantined_runtime_weight_snapshots()
+
+
+if __name__ == "__main__":
+    pytest_args = ["-x" if argument == "-f" else argument for argument in sys.argv[1:]]
+    raise SystemExit(pytest.main([__file__, *pytest_args]))

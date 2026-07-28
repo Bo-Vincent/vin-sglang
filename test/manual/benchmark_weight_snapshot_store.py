@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import statistics
 import threading
 import time
@@ -53,7 +54,7 @@ def _stable_response(response: dict[str, Any]) -> dict[str, Any]:
 
 def _percentile(values: list[float], percentile: float) -> float:
     ordered = sorted(values)
-    index = min(len(ordered) - 1, int((len(ordered) - 1) * percentile))
+    index = min(len(ordered) - 1, max(0, math.ceil(len(ordered) * percentile) - 1))
     return ordered[index]
 
 
@@ -62,19 +63,87 @@ def _probe_overlaps_window(
     window_start_s: float,
     window_end_s: float,
 ) -> bool:
+    completed_at_s = probe.get("completed_at_s")
     return (
         probe["started_at_s"] <= window_end_s
-        and probe["completed_at_s"] >= window_start_s
+        and (completed_at_s is None or completed_at_s >= window_start_s)
+    )
+
+
+def _collect_warmed_baseline(
+    url: str,
+    generation: dict[str, Any],
+    *,
+    timeout: float,
+    warmup_samples: int,
+    sample_count: int,
+) -> tuple[dict[str, Any], list[float]]:
+    for _ in range(warmup_samples):
+        _post_json(url, generation, timeout)
+
+    baseline = None
+    latencies = []
+    for _ in range(sample_count):
+        started = time.perf_counter()
+        response = _stable_response(_post_json(url, generation, timeout))
+        latencies.append(time.perf_counter() - started)
+        if baseline is None:
+            baseline = response
+        elif response != baseline:
+            raise RuntimeError("warmed baseline responses are inconsistent")
+    assert baseline is not None
+    return baseline, latencies
+
+
+def _probe_latency_limit(
+    *,
+    warmed_baseline_p95_s: float,
+    max_ratio: float,
+    absolute_limit_s: float,
+) -> float:
+    return min(warmed_baseline_p95_s * max_ratio, absolute_limit_s)
+
+
+def _source_serving_continuity_passed(
+    *,
+    in_window: list[dict[str, Any]],
+    min_samples: int,
+    materialization_published: bool,
+    post_consistent: bool,
+    probe_worker_stopped: bool,
+    latency_limit_s: float,
+) -> bool:
+    return (
+        probe_worker_stopped
+        and len(in_window) >= min_samples
+        and all(probe.get("completed_at_s") is not None for probe in in_window)
+        and all(probe.get("success") is True for probe in in_window)
+        and all(probe.get("consistent") is True for probe in in_window)
+        and materialization_published
+        and all(
+            probe.get("latency_s") is not None
+            and probe["latency_s"] <= latency_limit_s
+            for probe in in_window
+        )
+        and post_consistent
     )
 
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
     source_url = args.source_url.rstrip("/")
     generation = _generation_request(args.prompt)
-    baseline_raw = _post_json(f"{source_url}/generate", generation, args.timeout)
-    baseline = _stable_response(baseline_raw)
+    baseline, baseline_latencies_s = _collect_warmed_baseline(
+        f"{source_url}/generate",
+        generation,
+        timeout=args.timeout,
+        warmup_samples=args.baseline_warmup_samples,
+        sample_count=args.baseline_samples,
+    )
+    baseline_latency_s = statistics.median(baseline_latencies_s)
+    baseline_latency_p95_s = _percentile(baseline_latencies_s, 0.95)
 
     probes: list[dict[str, Any]] = []
+    probes_lock = threading.Lock()
     stop = threading.Event()
 
     def probe_source() -> None:
@@ -84,22 +153,29 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             record: dict[str, Any] = {
                 "sequence": sequence,
                 "started_at_s": time.time(),
+                "completed_at_s": None,
+                "success": None,
+                "consistent": None,
             }
+            with probes_lock:
+                probes.append(record)
+            completed: dict[str, Any] = {}
             try:
                 response = _post_json(
                     f"{source_url}/generate",
                     generation,
                     args.timeout,
                 )
-                record["success"] = True
-                record["consistent"] = _stable_response(response) == baseline
+                completed["success"] = True
+                completed["consistent"] = _stable_response(response) == baseline
             except Exception as error:
-                record["success"] = False
-                record["consistent"] = False
-                record["error"] = str(error)
-            record["latency_s"] = time.perf_counter() - started
-            record["completed_at_s"] = time.time()
-            probes.append(record)
+                completed["success"] = False
+                completed["consistent"] = False
+                completed["error"] = str(error)
+            completed["latency_s"] = time.perf_counter() - started
+            completed["completed_at_s"] = time.time()
+            with probes_lock:
+                record.update(completed)
             sequence += 1
             stop.wait(args.probe_interval)
 
@@ -154,26 +230,54 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         time.sleep(args.probe_interval)
         stop.set()
         thread.join(timeout=args.timeout)
+    probe_worker_stopped = not thread.is_alive()
 
-    post_raw = _post_json(f"{source_url}/generate", generation, args.timeout)
-    post = _stable_response(post_raw)
+    post = None
+    post_error = None
+    if probe_worker_stopped:
+        try:
+            post_raw = _post_json(f"{source_url}/generate", generation, args.timeout)
+            post = _stable_response(post_raw)
+        except Exception as error:
+            post_error = str(error)
+    else:
+        post_error = "source probe worker did not stop before its timeout"
+    with probes_lock:
+        probe_records = [dict(probe) for probe in probes]
     in_window = [
         probe
-        for probe in probes
+        for probe in probe_records
         if _probe_overlaps_window(
             probe,
             materialize_started_at,
             materialize_finished_at,
         )
     ]
-    latencies = [probe["latency_s"] for probe in in_window]
-    successful = [probe for probe in in_window if probe["success"]]
-
-    source_serving_continuity_passed = (
-        bool(in_window)
-        and len(successful) == len(in_window)
-        and all(bool(probe["consistent"]) for probe in in_window)
-        and post == baseline
+    latencies = [
+        probe["latency_s"]
+        for probe in in_window
+        if probe.get("latency_s") is not None
+    ]
+    successful = [probe for probe in in_window if probe.get("success") is True]
+    materialization_published = (
+        isinstance(materialize_response, dict)
+        and materialize_response.get("session_state") == "published"
+        and materialize_response.get("completion_unknown") is False
+        and isinstance(materialize_response.get("ref"), dict)
+    )
+    probe_latency_limit_s = _probe_latency_limit(
+        warmed_baseline_p95_s=baseline_latency_p95_s,
+        max_ratio=args.max_probe_latency_ratio,
+        absolute_limit_s=args.max_probe_latency_seconds,
+    )
+    post_consistent = post == baseline
+    source_serving_continuity_passed = _source_serving_continuity_passed(
+        in_window=in_window,
+        min_samples=args.min_source_probe_samples,
+        materialization_published=materialization_published,
+        post_consistent=post_consistent,
+        probe_worker_stopped=probe_worker_stopped,
+        latency_limit_s=probe_latency_limit_s,
     )
     result = {
         "source_url": source_url,
@@ -181,10 +285,16 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "revision": args.revision,
         "materialization_id": args.materialization_id,
         "materialize_e2e_s": materialize_e2e_s,
+        "baseline_latency_s": baseline_latency_s,
+        "baseline_latency_p95_s": baseline_latency_p95_s,
+        "baseline_latencies_s": baseline_latencies_s,
+        "baseline_warmup_samples": args.baseline_warmup_samples,
         "materialize_response": materialize_response,
+        "materialization_published": materialization_published,
         "baseline": baseline,
         "post_materialization": post,
-        "post_materialization_consistent": post == baseline,
+        "post_materialization_error": post_error,
+        "post_materialization_consistent": post_consistent,
         "source_during_materialization": {
             "requests": len(in_window),
             "successes": len(successful),
@@ -193,16 +303,22 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "latency_p50_s": statistics.median(latencies) if latencies else None,
             "latency_p95_s": _percentile(latencies, 0.95) if latencies else None,
             "latency_max_s": max(latencies) if latencies else None,
+            "latency_limit_s": probe_latency_limit_s,
+            "probe_worker_stopped": probe_worker_stopped,
         },
         "summary": {
             "source_serving_continuity_passed": (source_serving_continuity_passed),
             "gate": (
-                "at least one source request overlaps materialization; "
+                "at least the configured number of source requests overlap "
+                "materialization; "
                 "all overlapping requests succeed and match the baseline; "
+                "the materialization is published without unknown completion; "
+                "the probe worker has no unfinished request; source probe max "
+                "latency stays within the warmed ratio and absolute cap; "
                 "the post-materialization response matches the baseline"
             ),
         },
-        "probes": probes,
+        "probes": probe_records,
         "request": request,
     }
     Path(args.output).write_text(
@@ -244,7 +360,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-ranges-per-request", type=int, default=1024)
     parser.add_argument("--max-region-segments", type=int, default=1_000_000)
     parser.add_argument("--max-total-operations", type=int, default=10_000_000)
+    parser.add_argument("--baseline-warmup-samples", type=int, default=2)
+    parser.add_argument("--baseline-samples", type=int, default=5)
     parser.add_argument("--probe-interval", type=float, default=0.05)
+    parser.add_argument("--min-source-probe-samples", type=int, default=5)
+    parser.add_argument("--max-probe-latency-ratio", type=float, default=10.0)
+    parser.add_argument("--max-probe-latency-seconds", type=float, default=10.0)
     parser.add_argument("--timeout", type=float, default=120.0)
     parser.add_argument("--materialize-timeout", type=float, default=1800.0)
     parser.add_argument(
@@ -261,6 +382,16 @@ def parse_args() -> argparse.Namespace:
         parser.error("--store-buffer-bytes must be positive")
     if args.probe_interval <= 0:
         parser.error("--probe-interval must be positive")
+    if args.baseline_warmup_samples < 0:
+        parser.error("--baseline-warmup-samples must be non-negative")
+    if args.baseline_samples <= 0:
+        parser.error("--baseline-samples must be positive")
+    if args.min_source_probe_samples <= 0:
+        parser.error("--min-source-probe-samples must be positive")
+    if args.max_probe_latency_ratio <= 0:
+        parser.error("--max-probe-latency-ratio must be positive")
+    if args.max_probe_latency_seconds <= 0:
+        parser.error("--max-probe-latency-seconds must be positive")
     return args
 
 

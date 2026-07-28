@@ -18,6 +18,7 @@ from __future__ import annotations
 import contextlib
 import inspect
 import logging
+import math
 import os
 import time
 from dataclasses import dataclass
@@ -25,8 +26,7 @@ from typing import Any, Optional, Union
 
 import torch
 import torch.distributed as dist
-
-from sglang.srt.configs.load_config import LoadConfig
+from sglang.srt.configs.load_config import LoadConfig, LoadFormat
 from sglang.srt.configs.model_config import (
     AttentionArch,
     ModelConfig,
@@ -415,9 +415,9 @@ class ModelRunner:
         )
 
         if self.ps.pp_size > 1:
-            assert (
-                self.support_pp
-            ), "Pipeline Parallel is not compatible with this model."
+            assert self.support_pp, (
+                "Pipeline Parallel is not compatible with this model."
+            )
 
         # For weight updates
         self.init_weight_updater()
@@ -610,6 +610,13 @@ class ModelRunner:
             )
 
     def initialize(self):
+        try:
+            self._initialize()
+        except BaseException:
+            ModelRunner.close_pending_weight_snapshot_activation(self)
+            raise
+
+    def _initialize(self):
         self.init_memory_saver_adapter()
         self.maybe_init_remote_instance_transfer_engine()
         self.maybe_init_expert_location_metadata()
@@ -788,10 +795,185 @@ class ModelRunner:
             coordinator=coordinator,
         )
 
+    def activate_pending_weight_snapshot(self) -> None:
+        if self.load_config.load_format is not LoadFormat.WEIGHT_SNAPSHOT:
+            return
+        from sglang.srt.managers.io_struct import (
+            get_weight_snapshot_activation_context,
+            set_weight_snapshot_activation_result,
+        )
+
+        context = get_weight_snapshot_activation_context()
+        pending = getattr(self, "pending_weight_snapshot_activation", None)
+        if context is not None and context.phase in {
+            "prepare",
+            "commit",
+            "reconcile",
+            "abort",
+            "close",
+        }:
+            if context.transaction_id is None:
+                raise RuntimeError("weight snapshot activation transaction is missing")
+            transaction_id = context.transaction_id
+            deadline_unix_sec = context.deadline_unix_sec
+
+            def require_live_deadline() -> None:
+                if (
+                    isinstance(deadline_unix_sec, bool)
+                    or not isinstance(deadline_unix_sec, (int, float))
+                    or not math.isfinite(deadline_unix_sec)
+                ):
+                    raise RuntimeError("weight snapshot activation deadline is invalid")
+                if time.time() >= deadline_unix_sec:
+                    raise TimeoutError("weight snapshot activation deadline expired")
+
+            if context.phase == "close":
+                require_live_deadline()
+                ModelRunner.close_pending_weight_snapshot_activation(self)
+                return
+            if context.phase == "abort":
+                if pending is None:
+                    set_weight_snapshot_activation_result("aborted")
+                    return
+                require_live_deadline()
+                state = pending.abort(
+                    transaction_id,
+                    deadline_unix_sec=deadline_unix_sec,
+                )
+                set_weight_snapshot_activation_result(state)
+                if state == "aborted":
+                    self.pending_weight_snapshot_activation = None
+                return
+            if pending is None:
+                state = "not_ready" if context.phase == "prepare" else "commit_unknown"
+                set_weight_snapshot_activation_result(state)
+                raise RuntimeError("weight snapshot activation handle is missing")
+            if context.phase == "prepare":
+                require_live_deadline()
+                local_status = {
+                    "ready": all(
+                        callable(getattr(pending, name, None))
+                        for name in ("prepare", "commit", "reconcile", "abort")
+                    ),
+                    "error": None,
+                }
+                if not local_status["ready"]:
+                    local_status["error"] = (
+                        "weight snapshot activation handle is incomplete"
+                    )
+                if not local_status["ready"]:
+                    set_weight_snapshot_activation_result("not_ready")
+                    raise RuntimeError(local_status["error"])
+                try:
+                    head = pending.prepare(
+                        transaction_id,
+                        deadline_unix_sec=deadline_unix_sec,
+                    )
+                except BaseException:
+                    set_weight_snapshot_activation_result("not_ready")
+                    raise
+                state = getattr(getattr(head, "state", None), "value", "prepared")
+                set_weight_snapshot_activation_result(
+                    "serving" if state == "serving" else "prepared"
+                )
+                return
+            if context.phase == "commit":
+                require_live_deadline()
+                try:
+                    pending.commit(
+                        transaction_id,
+                        deadline_unix_sec=deadline_unix_sec,
+                    )
+                    state = "serving"
+                except BaseException:
+                    set_weight_snapshot_activation_result("commit_unknown")
+                    raise
+                set_weight_snapshot_activation_result(state)
+                return
+            require_live_deadline()
+            state = pending.reconcile(
+                transaction_id,
+                deadline_unix_sec=deadline_unix_sec,
+            )
+            set_weight_snapshot_activation_result(state)
+            if state == "conflict":
+                raise RuntimeError(
+                    "weight snapshot activation reconciliation found a conflict"
+                )
+            return
+
+        activate_pending = getattr(pending, "activate", None)
+        close_pending = getattr(pending, "close", None)
+        local_status = {
+            "ready": (
+                pending is not None
+                and callable(activate_pending)
+                and callable(close_pending)
+            ),
+            "error": None,
+        }
+        if not local_status["ready"]:
+            local_status["error"] = "weight snapshot activation handle is missing"
+
+        try:
+            if not dist.is_initialized():
+                statuses = [local_status]
+                rank = 0
+            else:
+                rank = dist.get_rank()
+                statuses = [None] * dist.get_world_size()
+                dist.all_gather_object(statuses, local_status)
+            failures = [
+                f"rank {index}: {status.get('error', 'not ready')}"
+                for index, status in enumerate(statuses)
+                if not isinstance(status, dict) or not status.get("ready", False)
+            ]
+            if failures:
+                raise RuntimeError(
+                    "weight snapshot activation readiness failed: "
+                    + " | ".join(failures)
+                )
+
+            if rank == 0:
+                activate_pending()
+        except BaseException:
+            ModelRunner.close_pending_weight_snapshot_activation(self)
+            raise
+
+    def close_pending_weight_snapshot_activation(self) -> None:
+        from sglang.srt.managers.io_struct import (
+            set_weight_snapshot_activation_result,
+        )
+
+        pending = getattr(self, "pending_weight_snapshot_activation", None)
+        if pending is None:
+            set_weight_snapshot_activation_result("closed")
+            return
+        try:
+            pending.close()
+        except BaseException:
+            set_weight_snapshot_activation_result(getattr(pending, "_state", "closed"))
+            if getattr(pending, "backend", None) is None:
+                if self.pending_weight_snapshot_activation is pending:
+                    self.pending_weight_snapshot_activation = None
+            raise
+        set_weight_snapshot_activation_result(getattr(pending, "_state", "closed"))
+        if self.pending_weight_snapshot_activation is pending:
+            self.pending_weight_snapshot_activation = None
+
     def _select_remote_instance_target_weight_manifest_builder(self):
         if not self.server_args.enable_weight_runtime_manifest or self.is_draft_worker:
             return None
         return self.build_remote_instance_target_weight_manifest_session
+
+    def _select_remote_instance_weight_transfer_hooks(self):
+        manifest_builder = self._select_remote_instance_target_weight_manifest_builder()
+        provider_factory = (
+            self.remote_instance_weight_transporter.create_weight_transfer_provider
+            if manifest_builder is not None
+            else None
+        )
+        return manifest_builder, provider_factory
 
     @contextlib.contextmanager
     def build_remote_instance_target_weight_manifest_session(
@@ -896,6 +1078,9 @@ class ModelRunner:
         materialization_id: str,
         model_id: str,
         revision: str,
+        lease_timeout_sec: int,
+        execution_context=None,
+        defer_payload_identity: bool = False,
     ):
         from sglang.srt.weight_transfer.runtime import RuntimeWeightSnapshotSource
 
@@ -917,15 +1102,21 @@ class ModelRunner:
                 if has_session
                 else runtime_id
             )
+        capture_kwargs = {
+            "model": self.model,
+            "manager": self.weight_runtime_manifest_manager,
+            "model_id": model_id,
+            "revision": revision,
+            "instance_id": instance_id,
+            "worker_id": worker_id,
+            "endpoint": endpoint,
+            "lease_timeout_sec": lease_timeout_sec,
+            "execution_context": execution_context,
+        }
+        if defer_payload_identity:
+            capture_kwargs["defer_payload_identity"] = True
         return RuntimeWeightSnapshotSource.capture(
-            model=self.model,
-            manager=self.weight_runtime_manifest_manager,
-            model_id=model_id,
-            revision=revision,
-            instance_id=instance_id,
-            worker_id=worker_id,
-            endpoint=endpoint,
-            lease_timeout_sec=None,
+            **capture_kwargs,
         )
 
     def release_weight_runtime_manifest(self, lease_id: str) -> None:
@@ -1320,17 +1511,16 @@ class ModelRunner:
 
         set_cuda_arch()
 
+        manifest_builder, provider_factory = (
+            self._select_remote_instance_weight_transfer_hooks()
+        )
         self.load_config = build_load_config(
             server_args=self.server_args,
             tp_rank=self.ps.tp_rank,
             remote_instance_weight_transporter_engine=self.remote_instance_weight_transporter.engine,
             remote_instance_weight_transporter_session_id=self.remote_instance_weight_transporter.session_id,
-            remote_instance_weight_runtime_manifest_builder=(
-                self._select_remote_instance_target_weight_manifest_builder()
-            ),
-            remote_instance_weight_transfer_provider_factory=(
-                self.remote_instance_weight_transporter.create_weight_transfer_provider
-            ),
+            remote_instance_weight_runtime_manifest_builder=manifest_builder,
+            remote_instance_weight_transfer_provider_factory=provider_factory,
             draft_model_idx=self.draft_model_idx,
             weight_cache_mode=self.server_args.weight_cache_mode,
             weight_cache_socket=self.server_args.weight_cache_socket,
@@ -1365,6 +1555,9 @@ class ModelRunner:
         )
         self.loader = loaded.loader
         self.model = loaded.model
+        self.pending_weight_snapshot_activation = (
+            loaded.pending_weight_snapshot_activation
+        )
         if loaded.remote_instance_weight_info is not None:
             self.remote_instance_weight_transporter.weight_info = (
                 loaded.remote_instance_weight_info

@@ -6,16 +6,24 @@ from itertools import product
 from math import prod
 
 import pytest
-
 from sglang.srt.model_executor.weight_runtime_manifest import (
     RuntimeWeightBinding,
+    WeightManifestError,
     WeightParallelRank,
     WeightPlacementManifest,
     WeightPlacementTensor,
     WeightRuntimeBindingManifest,
     compute_weight_placement_id,
 )
-from sglang.srt.weight_transfer.binding import bind_weight_transfer_plan
+from sglang.srt.weight_transfer._geometry import (
+    GeometryWorkBudget,
+    boxes_exactly_cover,
+    find_box_overlap,
+)
+from sglang.srt.weight_transfer.binding import (
+    bind_weight_transfer_plan,
+    project_source_bindings,
+)
 from sglang.srt.weight_transfer.contracts import (
     LogicalWeightTransferRegion,
     WeightStorageBindingManifest,
@@ -24,6 +32,9 @@ from sglang.srt.weight_transfer.contracts import (
 from sglang.srt.weight_transfer.planner import (
     WeightPlannerLimits,
     plan_weight_transfer,
+    plan_weight_transfer_to_local_target,
+    project_weight_transfer_plan_to_target,
+    project_weight_transfer_plan_to_targets,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -41,6 +52,7 @@ class TensorSpec:
     shard_dims: tuple[int, ...]
     layer_id: int | None = 0
     expert_id: int | None = None
+    expert_axis: int | None = None
     dtype: str = "bfloat16"
     itemsize: int = 2
     layout_fingerprint: str = "framework:logical-contiguous:v2"
@@ -62,6 +74,7 @@ def tensor_spec(
     shard_dims: tuple[int, ...],
     layer_id: int | None = 0,
     expert_id: int | None = None,
+    expert_axis: int | None = None,
     aliases: tuple[str, ...] | None = None,
 ) -> TensorSpec:
     return TensorSpec(
@@ -70,6 +83,7 @@ def tensor_spec(
         shard_dims=shard_dims,
         layer_id=layer_id,
         expert_id=expert_id,
+        expert_axis=expert_axis,
         aliases=aliases,
     )
 
@@ -112,6 +126,7 @@ def build_placements(
                     shard_dims=(() if legacy_partition_only else tensor.shard_dims),
                     layer_id=tensor.layer_id,
                     expert_id=tensor.expert_id,
+                    expert_axis=tensor.expert_axis,
                     layout_fingerprint=tensor.layout_fingerprint,
                     nbytes=nbytes,
                     byte_offset=0,
@@ -282,6 +297,71 @@ def assert_plan_copies_logical_contents(
         assert target_payloads[fragment_id] == fragment_payload(tensor)
 
 
+def assert_plan_exactly_covers_targets(
+    plan,
+    source_manifests: tuple[WeightPlacementManifest, ...],
+    target_manifests: tuple[WeightPlacementManifest, ...],
+) -> None:
+    source_tensors = placement_tensors(source_manifests)
+    target_tensors = placement_tensors(target_manifests)
+    regions_by_target = {}
+
+    for region in plan.regions:
+        source = source_tensors[region.source.placement_fragment_id]
+        target = target_tensors[region.target.placement_fragment_id]
+        overlap_end = tuple(
+            begin + extent
+            for begin, extent in zip(
+                region.overlap_offset,
+                region.overlap_shape,
+                strict=True,
+            )
+        )
+        for fragment in (source, target):
+            fragment_end = tuple(
+                begin + extent
+                for begin, extent in zip(
+                    fragment.global_offset,
+                    fragment.local_shape,
+                    strict=True,
+                )
+            )
+            assert all(
+                fragment_begin <= overlap_begin and overlap_end_dim <= fragment_end_dim
+                for fragment_begin, overlap_begin, overlap_end_dim, fragment_end_dim in zip(
+                    fragment.global_offset,
+                    region.overlap_offset,
+                    overlap_end,
+                    fragment_end,
+                    strict=True,
+                )
+            )
+        regions_by_target.setdefault(
+            region.target.placement_fragment_id,
+            [],
+        ).append(region)
+
+    assert set(regions_by_target) == set(target_tensors)
+    for fragment_id, target in target_tensors.items():
+        regions = regions_by_target[fragment_id]
+        assert sum(prod(region.overlap_shape) for region in regions) == prod(
+            target.local_shape
+        )
+        for index, left in enumerate(regions):
+            for right in regions[index + 1 :]:
+                assert any(
+                    left_begin + left_extent <= right_begin
+                    or right_begin + right_extent <= left_begin
+                    for left_begin, left_extent, right_begin, right_extent in zip(
+                        left.overlap_offset,
+                        left.overlap_shape,
+                        right.overlap_offset,
+                        right.overlap_shape,
+                        strict=True,
+                    )
+                )
+
+
 def brute_force_region_keys(
     source_manifests: tuple[WeightPlacementManifest, ...],
     target_manifests: tuple[WeightPlacementManifest, ...],
@@ -411,6 +491,274 @@ def test_tp_split_and_merge_preserve_logical_bytes(
     assert_plan_copies_logical_contents(plan, sources, targets)
 
 
+def test_full_plan_projects_to_one_target_without_unreferenced_sources() -> None:
+    tensor = tensor_spec(
+        "layers.0.mlp.down_proj.weight",
+        global_shape=(64, 16),
+        shard_dims=(0,),
+    )
+    owner = {tensor.tensor_id: 0}
+    sources = build_placements(
+        "source",
+        ep_tp_fragments(
+            (tensor,),
+            dp=1,
+            pp_owner=owner,
+            ep=1,
+            tp=2,
+            tp_dim=0,
+        ),
+    )
+    targets = build_placements(
+        "target",
+        ep_tp_fragments(
+            (tensor,),
+            dp=1,
+            pp_owner=owner,
+            ep=1,
+            tp=4,
+            tp_dim=0,
+        ),
+    )
+    full = plan_weight_transfer(sources, targets)
+
+    projected = project_weight_transfer_plan_to_target(
+        full,
+        targets[1].placement_id,
+    )
+
+    assert projected.target_placements == (targets[1],)
+    assert {item.placement_id for item in projected.source_placements} == {
+        region.source.placement_id for region in projected.regions
+    }
+    assert {region.target.placement_id for region in projected.regions} == {
+        targets[1].placement_id
+    }
+    assert len(projected.target_executors) == 1
+    assert projected.total_bytes == sum(tensor.nbytes for tensor in targets[1].tensors)
+    assert_plan_copies_logical_contents(
+        projected,
+        projected.source_placements,
+        projected.target_placements,
+    )
+
+
+def test_local_target_plan_has_exact_source_fragment_closure() -> None:
+    tensors = tuple(
+        tensor_spec(
+            f"layers.{layer}.weight",
+            global_shape=(8,),
+            shard_dims=(),
+            layer_id=layer,
+        )
+        for layer in range(2)
+    )
+    sources = build_placements(
+        "source",
+        pp_fragments(
+            tensors,
+            {tensor.tensor_id: 0 for tensor in tensors},
+        ),
+    )
+    targets = build_placements(
+        "target",
+        pp_fragments(
+            tensors,
+            {tensor.tensor_id: layer for layer, tensor in enumerate(tensors)},
+        ),
+    )
+
+    local_plan = plan_weight_transfer_to_local_target(sources, targets[0])
+    referenced_fragments = {
+        region.source.placement_fragment_id for region in local_plan.regions
+    }
+    planned_fragments = {
+        tensor.placement_fragment_id
+        for placement in local_plan.source_placements
+        for tensor in placement.tensors
+    }
+
+    assert planned_fragments == referenced_fragments
+    assert all(
+        placement.placement_id == compute_weight_placement_id(placement.tensors)
+        for placement in local_plan.source_placements
+    )
+
+
+def test_pp1_to_ppn_batch_projection_is_linear_and_binding_closed() -> None:
+    layer_count = 64
+    tensors = tuple(
+        tensor_spec(
+            f"layers.{layer}.weight",
+            global_shape=(8,),
+            shard_dims=(),
+            layer_id=layer,
+        )
+        for layer in range(layer_count)
+    )
+    sources = build_placements(
+        "source",
+        pp_fragments(
+            tensors,
+            {tensor.tensor_id: 0 for tensor in tensors},
+        ),
+    )
+    targets = build_placements(
+        "target",
+        pp_fragments(
+            tensors,
+            {tensor.tensor_id: layer for layer, tensor in enumerate(tensors)},
+        ),
+    )
+    full = plan_weight_transfer(sources, targets)
+    original_regions = full.regions
+    original_source_placements = full.source_placements
+    original_target_placements = full.target_placements
+    expected_target_ids = tuple(
+        placement.placement_id for placement in original_target_placements
+    )
+
+    class CountingSequence:
+        def __init__(self, values) -> None:
+            self.values = values
+            self.iterations = 0
+
+        def __len__(self) -> int:
+            return len(self.values)
+
+        def __iter__(self):
+            self.iterations += 1
+            return iter(self.values)
+
+    counting_regions = CountingSequence(original_regions)
+    counting_source_placements = CountingSequence(original_source_placements)
+    counting_target_placements = CountingSequence(original_target_placements)
+    object.__setattr__(full, "regions", counting_regions)
+    object.__setattr__(full, "source_placements", counting_source_placements)
+    object.__setattr__(full, "target_placements", counting_target_placements)
+
+    projected_by_target = project_weight_transfer_plan_to_targets(full)
+
+    assert counting_regions.iterations == 1
+    assert counting_source_placements.iterations <= 3
+    assert counting_target_placements.iterations == 1
+    assert tuple(projected_by_target) == expected_target_ids
+    assert (
+        sum(
+            len(placement.tensors)
+            for local_plan in projected_by_target.values()
+            for placement in local_plan.source_placements
+        )
+        == layer_count
+    )
+    assert (
+        sum(local_plan.total_bytes for local_plan in projected_by_target.values())
+        == full.total_bytes
+    )
+
+    source_addresses = {
+        tensor.placement_fragment_id: 0x10000 + index * 0x100
+        for index, tensor in enumerate(sources[0].tensors)
+    }
+    source_bindings = (
+        runtime_binding(
+            sources[0],
+            addresses=source_addresses,
+            worker_id="source",
+            endpoint="source:1",
+        ),
+    )
+    target_bindings = {
+        placement.placement_id: runtime_binding(
+            placement,
+            addresses={
+                tensor.placement_fragment_id: 0x100000 + index * 0x100
+                for tensor in placement.tensors
+            },
+            worker_id=f"target-{index}",
+            endpoint=f"target-{index}:1",
+        )
+        for index, placement in enumerate(targets)
+    }
+    for target_placement_id, local_plan in projected_by_target.items():
+        referenced_source_fragments = {
+            region.source.placement_fragment_id for region in local_plan.regions
+        }
+        source_records = tuple(
+            tensor
+            for placement in local_plan.source_placements
+            for tensor in placement.tensors
+        )
+        assert {
+            tensor.placement_fragment_id for tensor in source_records
+        } == referenced_source_fragments
+        assert all(
+            placement.placement_id == compute_weight_placement_id(placement.tensors)
+            for placement in local_plan.source_placements
+        )
+
+        local_source_bindings = project_source_bindings(
+            local_plan.source_placements,
+            source_bindings,
+        )
+        assert {
+            fragment.placement_fragment_id
+            for binding in local_source_bindings
+            for fragment in binding.fragments
+        } == referenced_source_fragments
+        bound = bind_weight_transfer_plan(
+            local_plan,
+            source_bindings=local_source_bindings,
+            target_bindings=(target_bindings[target_placement_id],),
+        )
+        assert bound.total_bytes == local_plan.total_bytes
+
+    object.__setattr__(full, "regions", original_regions)
+    object.__setattr__(full, "source_placements", original_source_placements)
+    object.__setattr__(full, "target_placements", original_target_placements)
+    first_target_id = full.target_placements[0].placement_id
+    assert (
+        project_weight_transfer_plan_to_target(full, first_target_id)
+        == projected_by_target[first_target_id]
+    )
+
+
+def test_full_plan_projection_rejects_unknown_target() -> None:
+    tensor = tensor_spec(
+        "opaque.weight",
+        global_shape=(8, 4),
+        shard_dims=(0,),
+    )
+    placements = build_placements(
+        "source",
+        [
+            (
+                tensor,
+                WeightParallelRank(),
+                (0, 0),
+                tensor.global_shape,
+            )
+        ],
+    )
+    target = build_placements(
+        "target",
+        [
+            (
+                tensor,
+                WeightParallelRank(),
+                (0, 0),
+                tensor.global_shape,
+            )
+        ],
+    )
+
+    with pytest.raises(ValueError, match="exactly one"):
+        project_weight_transfer_plan_to_target(
+            plan_weight_transfer(placements, target),
+            "missing",
+        )
+
+
 def test_legacy_partition_dim_supports_source_target_cross_dimension() -> None:
     source_tensor = tensor_spec(
         "opaque.weight",
@@ -463,6 +811,81 @@ def test_legacy_partition_dim_supports_source_target_cross_dimension() -> None:
     } == {(2, ())}
     assert len(plan.regions) == 4
     assert_plan_copies_logical_contents(plan, sources, targets)
+
+
+def test_moe_dp_is_not_treated_as_full_model_dp_replica() -> None:
+    tensor = tensor_spec(
+        "layers.0.self_attn.q_proj.weight",
+        global_shape=(8, 4),
+        shard_dims=(0,),
+    )
+    sources = build_placements(
+        "source",
+        [
+            (
+                tensor,
+                WeightParallelRank(tp=0, moe_dp=0),
+                (0, 0),
+                (4, 4),
+            ),
+            (
+                tensor,
+                WeightParallelRank(tp=1, moe_dp=1),
+                (4, 0),
+                (4, 4),
+            ),
+        ],
+    )
+    targets = build_placements(
+        "target",
+        [
+            (
+                tensor,
+                WeightParallelRank(tp=0),
+                (0, 0),
+                tensor.global_shape,
+            )
+        ],
+    )
+
+    plan = plan_weight_transfer(sources, targets)
+
+    assert_plan_copies_logical_contents(plan, sources, targets)
+
+
+def test_moe_dp_is_part_of_expert_owner_identity() -> None:
+    tensor = tensor_spec(
+        "layers.0.experts.0.w1",
+        global_shape=(8, 4),
+        shard_dims=(0,),
+        expert_axis=0,
+    )
+    sources = build_placements(
+        "source",
+        [
+            (
+                tensor,
+                WeightParallelRank(tp=moe_dp, ep=0, moe_dp=moe_dp),
+                (moe_dp * 4, 0),
+                (4, 4),
+            )
+            for moe_dp in range(2)
+        ],
+    )
+    targets = build_placements(
+        "target",
+        [
+            (
+                tensor,
+                WeightParallelRank(ep=0, moe_dp=0),
+                (0, 0),
+                tensor.global_shape,
+            )
+        ],
+    )
+
+    with pytest.raises(ValueError, match="no complete DP replica"):
+        plan_weight_transfer(sources, targets)
 
 
 @pytest.mark.parametrize(
@@ -688,6 +1111,7 @@ def test_ep_tp_cross_dimension_reshard(target_dim: int) -> None:
         assert selected.outer_loop_counts == (2, 6)
         assert selected.source_strides == (96, 16)
         assert selected.target_strides == (48, 8)
+    assert_plan_exactly_covers_targets(plan, sources, targets)
     assert_plan_copies_logical_contents(plan, sources, targets)
 
 
@@ -737,10 +1161,18 @@ def test_four_axis_reshard_is_complete_and_deterministic() -> None:
         ),
     )
 
-    first = plan_weight_transfer(sources, targets)
-    second = plan_weight_transfer(tuple(reversed(sources)), tuple(reversed(targets)))
+    limits = replace(WeightPlannerLimits(), max_regions=8_192)
+    first = plan_weight_transfer(sources, targets, limits=limits)
+    repeated = plan_weight_transfer(sources, targets, limits=limits)
+    reordered = plan_weight_transfer(
+        tuple(reversed(sources)),
+        tuple(reversed(targets)),
+        limits=limits,
+    )
 
-    assert first.digest == second.digest
+    assert first.digest == repeated.digest == reordered.digest
+    assert first.regions == repeated.regions == reordered.regions
+    assert len(first.operations) == len(first.regions) <= limits.max_regions
     assert first.total_bytes == 4 * 8 * 16 * 16 * 2 * 4
     assert {region.source.rank.dp for region in first.regions} == {0, 1}
     assert {region.target.rank.dp for region in first.regions} == {0, 1, 2, 3}
@@ -754,6 +1186,7 @@ def test_four_axis_reshard_is_complete_and_deterministic() -> None:
         (1, 2),
         (1, 3),
     }
+    assert_plan_exactly_covers_targets(first, sources, targets)
     assert_plan_copies_logical_contents(first, sources, targets)
 
 
@@ -791,9 +1224,7 @@ def test_plan_digest_commits_tensor_semantics() -> None:
     assert build_plan(float16).digest != build_plan(bfloat16).digest
 
 
-def test_cross_dimension_plan_keeps_operation_and_region_counts_bounded(
-    monkeypatch,
-) -> None:
+def test_cross_dimension_plan_keeps_operation_and_region_counts_bounded() -> None:
     source_tensor = tensor_spec(
         "layers.0.experts.w1",
         global_shape=(8, 8192, 8192),
@@ -829,22 +1260,112 @@ def test_cross_dimension_plan_keeps_operation_and_region_counts_bounded(
         ],
     )
 
-    def reject_segment_expansion(_self):
-        raise AssertionError("planner must not expand a region into segments")
-
-    monkeypatch.setattr(
-        LogicalWeightTransferRegion,
-        "iter_segments",
-        reject_segment_expansion,
+    limits = replace(
+        WeightPlannerLimits(),
+        max_regions=64,
+        max_segments_per_region=8_192,
+        max_total_segments=64 * 8_192,
     )
 
-    plan = plan_weight_transfer(sources, targets)
+    plan = plan_weight_transfer(sources, targets, limits=limits)
 
-    assert len(plan.regions) == 64
-    assert len(plan.operations) == len(plan.regions)
+    assert len(plan.operations) == len(plan.regions) == 64
+    assert len(plan.operations) <= limits.max_regions
+    assert len(plan.operations) < source_tensor.global_shape[1]
     assert {region.segment_count for region in plan.regions} == {8192}
     assert plan.total_segments == 64 * 8192
+    assert all(
+        region.segment_count <= limits.max_segments_per_region
+        for region in plan.regions
+    )
+    assert plan.total_segments <= limits.max_total_segments
     assert len(plan.operations) < plan.total_segments
+    assert_plan_exactly_covers_targets(plan, sources, targets)
+
+
+def test_planner_limits_preserve_legacy_positional_order() -> None:
+    limits = WeightPlannerLimits(
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+    )
+
+    assert limits.max_tensor_ndim == 1
+    assert limits.max_candidate_visits == 2
+    assert limits.max_regions == 3
+    assert limits.max_segments_per_region == 4
+    assert limits.max_total_segments == 5
+    assert limits.max_geometry_comparisons == 6
+    assert limits.max_geometry_boxes == 7
+    assert limits.max_geometry_events == 8
+    assert limits.max_sort_work == 9
+    assert limits.max_source_placements == 10
+    assert limits.max_target_placements == 11
+    assert limits.max_source_fragments == 12
+    assert limits.max_target_fragments == 13
+
+
+def test_sort_work_budget_formula_has_one_geometry_owner() -> None:
+    from sglang.srt.weight_transfer import _geometry as geometry_module
+    from sglang.srt.weight_transfer import planner as planner_module
+
+    assert planner_module._sort_work is geometry_module._sort_work
+
+
+@pytest.mark.parametrize(
+    ("field", "message"),
+    (
+        ("max_source_placements", "source placement limit"),
+        ("max_target_placements", "target placement limit"),
+        ("max_source_fragments", "source fragment limit"),
+        ("max_target_fragments", "target fragment limit"),
+    ),
+)
+def test_planner_preflights_placement_counts_before_collection(
+    monkeypatch,
+    field: str,
+    message: str,
+) -> None:
+    from sglang.srt.weight_transfer import planner as planner_module
+
+    tensor = tensor_spec(
+        "weight",
+        global_shape=(8,),
+        shard_dims=(0,),
+    )
+    placements = build_placements(
+        "placement",
+        [
+            (tensor, WeightParallelRank(tp=0), (0,), (4,)),
+            (tensor, WeightParallelRank(tp=1), (4,), (4,)),
+        ],
+    )
+
+    def reject_collection(*_args, **_kwargs):
+        raise AssertionError("count limit must fail before placement collection")
+
+    monkeypatch.setattr(
+        planner_module,
+        "_collect_placements",
+        reject_collection,
+    )
+
+    with pytest.raises(ValueError, match=message):
+        plan_weight_transfer(
+            placements,
+            placements,
+            limits=replace(WeightPlannerLimits(), **{field: 1}),
+        )
 
 
 @pytest.mark.parametrize(
@@ -936,23 +1457,433 @@ def test_candidate_index_bounds_overlap_checks(monkeypatch) -> None:
         ],
     )
     original_overlap_box = planner_module._overlap_box
+    original_entry_intersects_target = planner_module._entry_intersects_target
     overlap_checks = 0
+    entry_checks = 0
 
     def counting_overlap_box(source, target):
         nonlocal overlap_checks
         overlap_checks += 1
         return original_overlap_box(source, target)
 
+    def counting_entry_intersects_target(entry, target):
+        nonlocal entry_checks
+        entry_checks += 1
+        return original_entry_intersects_target(entry, target)
+
     monkeypatch.setattr(
         planner_module,
         "_overlap_box",
         counting_overlap_box,
     )
+    monkeypatch.setattr(
+        planner_module,
+        "_entry_intersects_target",
+        counting_entry_intersects_target,
+    )
 
     plan = plan_weight_transfer(sources, targets)
 
     assert len(plan.regions) == parts
+    assert entry_checks == parts
     assert overlap_checks <= parts * 2
+
+
+def test_overlap_budget_rejects_100k_stripes_before_event_creation(
+    monkeypatch,
+) -> None:
+    from sglang.srt.weight_transfer import _geometry as geometry_module
+
+    boxes = tuple(((index,), (1,)) for index in range(100_000))
+
+    def reject_event_creation(*_args, **_kwargs):
+        raise AssertionError("geometry budget must fail before event creation")
+
+    monkeypatch.setattr(
+        geometry_module,
+        "_peak_active_intervals",
+        reject_event_creation,
+    )
+
+    with pytest.raises(ValueError, match="geometry event limit"):
+        find_box_overlap(
+            boxes,
+            budget=GeometryWorkBudget(max_events=1),
+        )
+
+
+@pytest.mark.parametrize(
+    ("budget_kwargs", "message"),
+    (
+        ({"max_boxes": 1}, "geometry box limit"),
+        ({"max_sort_work": 1}, "geometry sort work limit"),
+    ),
+)
+def test_overlap_budget_preflights_box_and_sort_work(
+    monkeypatch,
+    budget_kwargs: dict[str, int],
+    message: str,
+) -> None:
+    from sglang.srt.weight_transfer import _geometry as geometry_module
+
+    def reject_event_creation(*_args, **_kwargs):
+        raise AssertionError("geometry budget must fail before event creation")
+
+    monkeypatch.setattr(
+        geometry_module,
+        "_peak_active_intervals",
+        reject_event_creation,
+    )
+
+    with pytest.raises(ValueError, match=message):
+        find_box_overlap(
+            (((0,), (1,)), ((1,), (1,))),
+            budget=GeometryWorkBudget(**budget_kwargs),
+        )
+
+
+def test_exact_cover_box_budget_fails_before_normalization() -> None:
+    class RejectingBoxes:
+        def __len__(self) -> int:
+            return 2
+
+        def __iter__(self):
+            raise AssertionError("box budget must fail before normalization")
+
+    with pytest.raises(ValueError, match="geometry box limit"):
+        boxes_exactly_cover(
+            (0,),
+            (2,),
+            RejectingBoxes(),
+            budget=GeometryWorkBudget(max_boxes=1),
+        )
+
+
+def test_exact_cover_receipt_lookup_does_not_scan_prior_receipts() -> None:
+    class CountingTuple(tuple):
+        comparisons = 0
+
+        def __eq__(self, other) -> bool:
+            type(self).comparisons += 1
+            return super().__eq__(other)
+
+        __hash__ = tuple.__hash__
+
+    part_count = 128
+    budget = GeometryWorkBudget(limit=1)
+    with budget.request_scope():
+        for split in range(1, part_count):
+            boxes = (
+                (
+                    CountingTuple((0,)),
+                    CountingTuple((split,)),
+                ),
+                (
+                    CountingTuple((split,)),
+                    CountingTuple((part_count - split,)),
+                ),
+            )
+            assert boxes_exactly_cover(
+                (0,),
+                (part_count,),
+                boxes,
+                budget=budget,
+            )
+
+    assert CountingTuple.comparisons < part_count * 4
+
+
+def test_candidate_budget_applies_before_index_sort_or_query(monkeypatch) -> None:
+    from sglang.srt.weight_transfer import planner as planner_module
+
+    tensor = tensor_spec(
+        "weight",
+        global_shape=(1,),
+        shard_dims=(),
+    )
+    sources = build_placements(
+        "source",
+        [
+            (
+                tensor,
+                WeightParallelRank(),
+                (0,),
+                (1,),
+            )
+        ],
+    )
+    targets = build_placements(
+        "target",
+        [(tensor, WeightParallelRank(), (0,), (1,))],
+    )
+
+    def reject_index_work(*_args, **_kwargs):
+        raise AssertionError("candidate budget must fail before index work")
+
+    monkeypatch.setattr(
+        planner_module._SourceCandidateIndex,
+        "_representatives",
+        reject_index_work,
+    )
+    monkeypatch.setattr(
+        planner_module._IntervalNode,
+        "build",
+        reject_index_work,
+    )
+    monkeypatch.setattr(
+        planner_module._SourceCandidateIndex,
+        "query",
+        reject_index_work,
+    )
+
+    with pytest.raises(ValueError, match="candidate visit limit"):
+        plan_weight_transfer(
+            sources,
+            targets,
+            limits=WeightPlannerLimits(max_candidate_visits=1),
+        )
+
+
+def test_candidate_query_budget_fails_before_result_allocation() -> None:
+    from sglang.srt.weight_transfer import planner as planner_module
+
+    entry = planner_module._IntervalEntry(
+        begin=0,
+        end=1,
+        geometry=((0,), (1,)),
+    )
+    node = planner_module._IntervalNode(
+        center=0,
+        by_begin=(entry,),
+        begins=(0,),
+        by_end=(entry,),
+        ends=(1,),
+        left=None,
+        right=None,
+    )
+
+    class RejectingResult(list):
+        def extend(self, _values) -> None:
+            raise AssertionError("candidate budget must fail before result allocation")
+
+    budget = planner_module._CandidateWorkBudget(
+        1,
+        GeometryWorkBudget(),
+    )
+
+    with pytest.raises(ValueError, match="candidate visit limit"):
+        node.query(0, 1, RejectingResult(), budget)
+
+
+def test_candidate_count_visits_left_subtree_once() -> None:
+    from sglang.srt.weight_transfer import planner as planner_module
+
+    entry = planner_module._IntervalEntry(
+        begin=0,
+        end=1,
+        geometry=((0,), (1,)),
+    )
+    left = planner_module._IntervalNode(
+        center=0,
+        by_begin=(entry,),
+        begins=(0,),
+        by_end=(entry,),
+        ends=(1,),
+        left=None,
+        right=None,
+    )
+    root = planner_module._IntervalNode(
+        center=5,
+        by_begin=(),
+        begins=(),
+        by_end=(),
+        ends=(),
+        left=left,
+        right=None,
+    )
+    budget = planner_module._CandidateWorkBudget(
+        2,
+        GeometryWorkBudget(),
+    )
+
+    assert root.count(0, 1, budget) == 1
+    assert budget.visits == 2
+
+
+def test_candidate_filter_budget_fails_before_geometry_sort(monkeypatch) -> None:
+    from sglang.srt.weight_transfer import planner as planner_module
+
+    tensor = tensor_spec(
+        "weight",
+        global_shape=(1,),
+        shard_dims=(),
+    )
+    sources = build_placements(
+        "source",
+        [(tensor, WeightParallelRank(), (0,), (1,))],
+    )
+    targets = build_placements(
+        "target",
+        [(tensor, WeightParallelRank(), (0,), (1,))],
+    )
+    descriptors, source_fragments = planner_module._collect_placements(
+        sources,
+        "source",
+    )
+    _, target_fragments = planner_module._collect_placements(
+        targets,
+        "target",
+    )
+    source = source_fragments[0]
+    index = planner_module._SourceCandidateIndex(
+        {(source.global_offset, source.local_shape): [source]},
+        descriptors[source.tensor_id],
+        planner_module._CandidateWorkBudget(
+            100,
+            GeometryWorkBudget(),
+        ),
+    )
+    index._budget = planner_module._CandidateWorkBudget(
+        3,
+        GeometryWorkBudget(),
+    )
+
+    def reject_geometry_sort(*_args, **_kwargs):
+        raise AssertionError("candidate budget must fail before geometry sort")
+
+    monkeypatch.setattr(
+        planner_module,
+        "sorted",
+        reject_geometry_sort,
+        raising=False,
+    )
+
+    with pytest.raises(ValueError, match="candidate visit limit"):
+        index.query(
+            target_fragments[0],
+            source_dp=0,
+            owner=(0, None),
+        )
+
+
+def test_index_sort_budget_fails_before_index_allocation_or_query(
+    monkeypatch,
+) -> None:
+    from sglang.srt.weight_transfer import planner as planner_module
+
+    tensor = tensor_spec(
+        "weight",
+        global_shape=(1,),
+        shard_dims=(),
+    )
+    sources = build_placements(
+        "source",
+        [(tensor, WeightParallelRank(), (0,), (1,))],
+    )
+    targets = build_placements(
+        "target",
+        [(tensor, WeightParallelRank(), (0,), (1,))],
+    )
+
+    def reject_index_work(*_args, **_kwargs):
+        raise AssertionError("sort budget must fail before index work")
+
+    monkeypatch.setattr(
+        planner_module._SourceCandidateIndex,
+        "_representatives",
+        reject_index_work,
+    )
+    monkeypatch.setattr(
+        planner_module._IntervalNode,
+        "build",
+        reject_index_work,
+    )
+    monkeypatch.setattr(
+        planner_module._SourceCandidateIndex,
+        "query",
+        reject_index_work,
+    )
+
+    with pytest.raises(ValueError, match="geometry sort work limit"):
+        plan_weight_transfer(
+            sources,
+            targets,
+            limits=WeightPlannerLimits(max_sort_work=1),
+        )
+
+
+def test_planner_reuses_positive_coverage_validation_in_contract(
+    monkeypatch,
+) -> None:
+    from sglang.srt.weight_transfer import _geometry as geometry_module
+
+    tensor = tensor_spec(
+        "weight",
+        global_shape=(2,),
+        shard_dims=(0,),
+    )
+    sources = build_placements(
+        "source",
+        [
+            (tensor, WeightParallelRank(tp=0), (0,), (1,)),
+            (tensor, WeightParallelRank(tp=1), (1,), (1,)),
+        ],
+    )
+    targets = build_placements(
+        "target",
+        [(tensor, WeightParallelRank(), (0,), (2,))],
+    )
+    original_peak_active_intervals = geometry_module._peak_active_intervals
+    sweep_count = 0
+
+    def count_sweeps(*args, **kwargs):
+        nonlocal sweep_count
+        sweep_count += 1
+        return original_peak_active_intervals(*args, **kwargs)
+
+    monkeypatch.setattr(
+        geometry_module,
+        "_peak_active_intervals",
+        count_sweeps,
+    )
+
+    plan = plan_weight_transfer(
+        sources,
+        targets,
+        limits=WeightPlannerLimits(max_geometry_events=8),
+    )
+
+    assert len(plan.regions) == 2
+    assert sweep_count == 2
+
+
+def test_planner_bounds_target_coverage_comparisons() -> None:
+    tensor = tensor_spec(
+        "weight",
+        global_shape=(2, 2),
+        shard_dims=(0, 1),
+    )
+    source = build_placements(
+        "source",
+        [(tensor, WeightParallelRank(), (0, 0), (2, 2))],
+    )
+    targets = build_placements(
+        "target",
+        [
+            (
+                tensor,
+                WeightParallelRank(tp=row * 2 + column),
+                (row, column),
+                (1, 1),
+            )
+            for row in range(2)
+            for column in range(2)
+        ],
+    )
+    limits = WeightPlannerLimits(max_geometry_comparisons=1)
+
+    with pytest.raises(ValueError, match="geometry comparison limit"):
+        plan_weight_transfer(source, targets, limits=limits)
 
 
 def test_nd_candidate_index_is_output_sensitive(monkeypatch) -> None:
@@ -1326,21 +2257,16 @@ def test_planner_rejects_mixed_rank_placement() -> None:
 
 
 @pytest.mark.parametrize("axis", ("dp", "tp", "pp", "ep"))
-def test_planner_rejects_negative_parallel_rank(axis: str) -> None:
+def test_placement_manifest_rejects_negative_parallel_rank(axis: str) -> None:
     tensor = tensor_spec("weight", global_shape=(8,), shard_dims=())
     values = {"dp": 0, "tp": 0, "pp": 0, "ep": 0}
     values[axis] = -1
-    source = build_placements(
-        "source",
-        [(tensor, WeightParallelRank(**values), (0,), (8,))],
-    )
-    target = build_placements(
-        "target",
-        [(tensor, WeightParallelRank(), (0,), (8,))],
-    )
 
-    with pytest.raises(ValueError, match="parallel rank"):
-        plan_weight_transfer(source, target)
+    with pytest.raises(WeightManifestError, match="parallel rank"):
+        build_placements(
+            "source",
+            [(tensor, WeightParallelRank(**values), (0,), (8,))],
+        )
 
 
 def test_planner_fails_closed_on_descriptor_mismatch() -> None:
@@ -1445,6 +2371,33 @@ def test_planner_accepts_complete_expected_target_topology() -> None:
     )
 
     assert {region.target.rank.dp for region in plan.regions} == {0, 1, 2, 3}
+
+
+def test_planner_rejects_target_rank_shared_by_multiple_placements() -> None:
+    first = tensor_spec("first", global_shape=(8,), shard_dims=())
+    second = tensor_spec("second", global_shape=(8,), shard_dims=())
+    rank = WeightParallelRank()
+    sources = build_placements(
+        "source",
+        [
+            (first, rank, (0,), (8,)),
+            (second, rank, (0,), (8,)),
+        ],
+    )
+    first_target = build_placements(
+        "target-first",
+        [(first, rank, (0,), (8,))],
+    )
+    second_target = build_placements(
+        "target-second",
+        [(second, rank, (0,), (8,))],
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="target parallel rank maps to multiple placements",
+    ):
+        plan_weight_transfer(sources, (*first_target, *second_target))
 
 
 def test_planner_without_expected_topology_plans_supplied_placements() -> None:

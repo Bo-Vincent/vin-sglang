@@ -1,7 +1,12 @@
 import importlib.util
+import os
+import select
+import signal
 import socket
 import statistics
+import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -83,6 +88,11 @@ class _FakeProcess:
         self.returncode = self._last_poll
         return self._last_poll
 
+    def wait(self, timeout=None):
+        del timeout
+        self.returncode = 0
+        return 0
+
 
 class _Response:
     status_code = 200
@@ -157,9 +167,17 @@ def test_wait_port_released_retries_until_the_listener_is_gone(monkeypatch) -> N
 
 
 def test_stop_server_waits_for_its_port_to_be_released(monkeypatch, tmp_path) -> None:
+    signals = []
     waited_ports = []
     process = _FakeProcess(poll_results=[0])
     server = _server(tmp_path, process)
+
+    def killpg(process_group, sig):
+        if sig == 0:
+            raise ProcessLookupError
+        signals.append((process_group, sig))
+
+    monkeypatch.setattr(benchmark.os, "killpg", killpg)
     monkeypatch.setattr(
         benchmark,
         "_wait_port_released",
@@ -169,7 +187,94 @@ def test_stop_server_waits_for_its_port_to_be_released(monkeypatch, tmp_path) ->
 
     benchmark._stop_server(server)
 
+    assert signals == [(process.pid, benchmark.signal.SIGTERM)]
     assert waited_ports == [(server.port, 30.0)]
+
+
+def test_stop_server_kills_residual_child_that_ignores_sigterm_without_a_listener(
+    monkeypatch, tmp_path
+) -> None:
+    signals = []
+    real_killpg = os.killpg
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import subprocess, sys, time; "
+                "child = subprocess.Popen("
+                "[sys.executable, '-c', "
+                '"import signal, time; '
+                "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                "print('ready', flush=True); time.sleep(60)\"], "
+                "stdout=subprocess.PIPE, text=True); "
+                "assert child.stdout.readline().strip() == 'ready'; "
+                "print(child.pid, flush=True); "
+                "time.sleep(60)"
+            ),
+        ],
+        stdout=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+
+    def fallback_kill():
+        try:
+            real_killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+    fallback = None
+    try:
+        assert process.stdout is not None
+        readable, _, _ = select.select([process.stdout], [], [], 5)
+        assert readable, "child did not report readiness"
+        child_pid = int(process.stdout.readline().strip())
+        server = _server(tmp_path, process)
+
+        def record_signal(process_group, sig):
+            if sig != 0:
+                signals.append((process_group, sig))
+            real_killpg(process_group, sig)
+
+        fallback = threading.Timer(0.5, fallback_kill)
+        fallback.daemon = True
+        fallback.start()
+        monkeypatch.setattr(benchmark.os, "killpg", record_signal)
+        monkeypatch.setattr(
+            benchmark, "SERVER_TERMINATION_GRACE_S", 0.05, raising=False
+        )
+        monkeypatch.setattr(
+            benchmark, "_wait_port_released", lambda _port, timeout_s: None
+        )
+        benchmark._stop_server(server)
+    finally:
+        if fallback is not None:
+            fallback.cancel()
+            fallback.join(timeout=1)
+        fallback_kill()
+        process.wait(timeout=5)
+        if process.stdout is not None:
+            process.stdout.close()
+
+    assert signals == [
+        (process.pid, benchmark.signal.SIGTERM),
+        (process.pid, benchmark.signal.SIGKILL),
+    ]
+    assert not benchmark.psutil.pid_exists(child_pid)
+
+
+def test_stop_server_ignores_missing_process_group(monkeypatch, tmp_path) -> None:
+    process = _FakeProcess(poll_results=[0])
+    server = _server(tmp_path, process)
+
+    def missing_group(_process_group, _sig):
+        raise ProcessLookupError
+
+    monkeypatch.setattr(benchmark.os, "killpg", missing_group)
+    monkeypatch.setattr(benchmark, "_wait_port_released", lambda _port, timeout_s: None)
+
+    benchmark._stop_server(server)
 
 
 def test_wait_ready_rejects_a_child_that_exits_after_health(
@@ -416,6 +521,32 @@ def test_manifest_transfer_metrics_include_phases_and_logical_throughput(
     assert metrics["end_to_end_logical_gb_per_s"] == pytest.approx(0.4)
 
 
+def test_manifest_transfer_metrics_aggregate_rank_records(tmp_path) -> None:
+    log_path = tmp_path / "manifest.log"
+    log_path.write_text(
+        "Loaded heterogeneous remote-instance weights: "
+        "manifest_format=placement_binding_v1, transfer_id=transfer-1, "
+        "target_rank=0, release_success=true, bytes=1000, "
+        "compact_operations=2, segments=4, elapsed=2.0000s; phases: "
+        "plan=0.1000s, data_transfer=1.5000s\n"
+        "Loaded heterogeneous remote-instance weights: "
+        "manifest_format=placement_binding_v1, transfer_id=transfer-1, "
+        "target_rank=1, release_success=true, bytes=2000, "
+        "compact_operations=3, segments=5, elapsed=1.5000s; phases: "
+        "plan=0.2000s, data_transfer=1.0000s\n",
+        encoding="utf-8",
+    )
+
+    metrics = benchmark._parse_manifest_transfer_metrics(log_path)
+
+    assert metrics["logical_bytes"] == 3000
+    assert metrics["compact_operations"] == 5
+    assert metrics["segments"] == 9
+    assert metrics["elapsed_s"] == pytest.approx(2.0)
+    assert metrics["data_transfer_logical_gb_per_s"] == pytest.approx(2e-6)
+    assert [item["target_rank"] for item in metrics["rank_metrics"]] == [0, 1]
+
+
 def test_mode_summary_reports_e2e_p95_cv_and_transfer_statistics() -> None:
     records = []
     for value in (1.0, 2.0, 3.0, 4.0, 5.0):
@@ -455,14 +586,24 @@ def test_mode_summary_reports_e2e_p95_cv_and_transfer_statistics() -> None:
 
 def test_performance_threshold_controls_process_exit_code() -> None:
     failed = {
+        "modes_executed": ["cold", "manifest"],
         "summary": {
+            "by_mode": {
+                "cold": {"iterations": 5},
+                "manifest": {"iterations": 5},
+            },
             "all_executed_reuse_modes_pass_threshold": False,
-        }
+        },
     }
     passed = {
+        "modes_executed": ["cold", "manifest"],
         "summary": {
+            "by_mode": {
+                "cold": {"iterations": 5},
+                "manifest": {"iterations": 5},
+            },
             "all_executed_reuse_modes_pass_threshold": True,
-        }
+        },
     }
 
     assert benchmark._benchmark_exit_code(failed, report_only=False) == 2
@@ -473,11 +614,43 @@ def test_performance_threshold_controls_process_exit_code() -> None:
 def test_requested_but_unexecuted_reuse_fails_process_exit_code() -> None:
     result = {
         "modes_requested": ["cold", "legacy"],
+        "modes_executed": ["cold"],
         "summary": {
+            "by_mode": {"cold": {"iterations": 5}},
             "all_executed_reuse_modes_pass_threshold": None,
         },
     }
 
+    assert benchmark._benchmark_exit_code(result, report_only=False) == 2
+    assert benchmark._benchmark_exit_code(result, report_only=True) == 0
+
+
+def test_single_sample_cannot_pass_gate_or_report_distribution() -> None:
+    summary = benchmark._mode_summary(
+        [
+            {
+                "spawn_to_ready_s": 1.0,
+                "first_generation_s": 0.1,
+                "source_probe": {
+                    "success_count": 5,
+                    "error_count": 0,
+                    "mismatch_count": 0,
+                },
+                "transfer_metrics": None,
+            }
+        ]
+    )
+    result = {
+        "modes_requested": ["cold"],
+        "modes_executed": ["cold"],
+        "summary": {
+            "by_mode": {"cold": summary},
+            "all_executed_reuse_modes_pass_threshold": None,
+        },
+    }
+
+    assert summary["spawn_to_ready_p95_s"] is None
+    assert summary["spawn_to_ready_cv"] is None
     assert benchmark._benchmark_exit_code(result, report_only=False) == 2
     assert benchmark._benchmark_exit_code(result, report_only=True) == 0
 
@@ -512,16 +685,49 @@ def test_manifest_log_contract_rejects_fallback_and_transfer_failures(
         benchmark._assert_reuse_log_contract("manifest", log_path)
 
 
-def test_execution_schedule_balances_reuse_mode_order() -> None:
-    assert benchmark._execution_schedule(("manifest", "cold", "legacy"), 4) == [
+def test_execution_schedule_rotates_all_modes_after_warmup() -> None:
+    assert benchmark._execution_schedule(("manifest", "cold", "legacy"), 6) == [
         ["cold", "manifest", "legacy"],
-        ["cold", "legacy", "manifest"],
+        ["manifest", "legacy", "cold"],
+        ["legacy", "cold", "manifest"],
         ["cold", "manifest", "legacy"],
-        ["cold", "legacy", "manifest"],
+        ["manifest", "legacy", "cold"],
+        ["legacy", "cold", "manifest"],
     ]
 
 
+def test_execution_schedule_rejects_partial_rotation_block() -> None:
+    with pytest.raises(ValueError, match="3 executed modes"):
+        benchmark._execution_schedule(("manifest", "cold", "legacy"), 5)
+
+
 def test_parse_args_counts_only_eligible_reuse_modes(monkeypatch) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "benchmark",
+            "--model",
+            "model",
+            "--source-gpus",
+            "0,1",
+            "--target-gpus",
+            "2,3,4,5",
+            "--source-tp-size",
+            "2",
+            "--target-tp-size",
+            "4",
+            "--iterations",
+            "4",
+            "--drop-page-cache",
+            "--report-only",
+        ],
+    )
+
+    assert benchmark.parse_args().iterations == 4
+
+
+def test_parse_args_rejects_single_measured_iteration(monkeypatch, capsys) -> None:
     monkeypatch.setattr(
         sys,
         "argv",
@@ -543,7 +749,9 @@ def test_parse_args_counts_only_eligible_reuse_modes(monkeypatch) -> None:
         ],
     )
 
-    assert benchmark.parse_args().iterations == 1
+    with pytest.raises(SystemExit):
+        benchmark.parse_args()
+    assert "iterations must be at least 5" in capsys.readouterr().err
 
 
 def test_parse_args_defaults_to_six_balanced_iterations(monkeypatch) -> None:
@@ -569,7 +777,7 @@ def test_parse_args_defaults_to_six_balanced_iterations(monkeypatch) -> None:
     assert benchmark.parse_args().iterations == 6
 
 
-def test_parse_args_requires_complete_reuse_order_cycles(monkeypatch, capsys) -> None:
+def test_parse_args_rejects_partial_rotation_cycle(monkeypatch, capsys) -> None:
     monkeypatch.setattr(
         sys,
         "argv",
@@ -586,14 +794,16 @@ def test_parse_args_requires_complete_reuse_order_cycles(monkeypatch, capsys) ->
             "--target-tp-size",
             "2",
             "--iterations",
-            "3",
+            "5",
             "--drop-page-cache",
         ],
     )
 
     with pytest.raises(SystemExit):
         benchmark.parse_args()
-    assert "complete reuse-mode ordering cycles" in capsys.readouterr().err
+    assert (
+        "complete rotation blocks for the 3 executed modes" in capsys.readouterr().err
+    )
 
 
 if __name__ == "__main__":

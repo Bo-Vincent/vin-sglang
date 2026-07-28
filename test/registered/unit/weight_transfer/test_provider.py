@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+from dataclasses import replace
+from inspect import Parameter, signature
 from itertools import product
 from math import prod
 
 import pytest
-
 from sglang.srt.model_executor.weight_runtime_manifest import (
     RuntimeWeightBinding,
     WeightParallelRank,
@@ -13,16 +14,28 @@ from sglang.srt.model_executor.weight_runtime_manifest import (
     WeightRuntimeBindingManifest,
     compute_weight_placement_id,
 )
+from sglang.srt.weight_transfer.api import (
+    load_weights,
+    materialize_weights,
+    prepare_weight_materialization,
+)
 from sglang.srt.weight_transfer.binding import project_source_bindings
+from sglang.srt.weight_transfer.checkpoint_provider import (
+    CheckpointStorageToRuntimeProvider,
+)
+from sglang.srt.weight_transfer.mooncake import MooncakeWeightTransferProvider
+from sglang.srt.weight_transfer.mooncake_store import MooncakeWeightStoreProvider
 from sglang.srt.weight_transfer.planner import (
     select_weight_storage_placements,
 )
-from sglang.srt.weight_transfer.api import load_weights, materialize_weights
 from sglang.srt.weight_transfer.provider import (
     LocalWeightBufferRegistry,
     LocalWeightTransferProvider,
+    WeightMaterializeRequest,
+    WeightProviderCapabilities,
     WeightStorageDestination,
     WeightTargetLoadMode,
+    WeightTransferProvider,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -144,6 +157,124 @@ def register_runtime_buffers(
         registry.register_runtime(fragment.address, buffer)
         result[binding.placement_id] = buffer
     return result
+
+
+def test_local_reference_provider_does_not_claim_bounded_execution() -> None:
+    provider = LocalWeightTransferProvider(LocalWeightBufferRegistry())
+
+    assert provider.probe(object()).supports_bounded_execution is False
+
+
+@pytest.mark.parametrize(
+    "provider_type",
+    [
+        WeightTransferProvider,
+        LocalWeightTransferProvider,
+        CheckpointStorageToRuntimeProvider,
+        MooncakeWeightTransferProvider,
+        MooncakeWeightStoreProvider,
+    ],
+)
+def test_provider_synchronize_accepts_execution_context(provider_type) -> None:
+    parameter = signature(provider_type.synchronize).parameters["execution_context"]
+
+    assert parameter.kind is Parameter.KEYWORD_ONLY
+    assert parameter.default is None
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "supports_nd_regions",
+        "supports_strided_regions",
+        "supports_safe_cancel",
+        "supports_completion_ticket",
+        "supports_transactional_publish",
+        "supports_bounded_execution",
+    ],
+)
+def test_provider_capability_booleans_are_strict(name: str) -> None:
+    values = {
+        "provider": "strict",
+        "load_profiles": frozenset(),
+        "materialize_profiles": frozenset(),
+        "supports_nd_regions": True,
+        "supports_strided_regions": True,
+        "supports_safe_cancel": False,
+        "supports_completion_ticket": False,
+        "supports_transactional_publish": True,
+        "supports_bounded_execution": False,
+    }
+    values[name] = 1
+
+    with pytest.raises(ValueError, match=f"{name} must be a boolean"):
+        WeightProviderCapabilities(**values)
+
+
+def test_provider_capability_profiles_are_immutable() -> None:
+    load_profiles = {"runtime_to_runtime"}
+    materialize_profiles = {"runtime_to_storage"}
+
+    capabilities = WeightProviderCapabilities(
+        provider="strict",
+        load_profiles=load_profiles,
+        materialize_profiles=materialize_profiles,
+        supports_nd_regions=True,
+        supports_strided_regions=True,
+        supports_safe_cancel=False,
+        supports_completion_ticket=False,
+        supports_transactional_publish=True,
+    )
+    load_profiles.clear()
+    materialize_profiles.clear()
+
+    assert capabilities.load_profiles == frozenset({"runtime_to_runtime"})
+    assert capabilities.materialize_profiles == frozenset({"runtime_to_storage"})
+
+
+def test_materialize_request_normalizes_sequences_and_validates_locations() -> None:
+    sources = placements("source", global_shape=(8, 8), shard_dim=0, parts=2)
+    source_bindings = bindings(sources, address_base=0x100000)
+    prepared = prepare_weight_materialization(
+        source_placements=sources,
+        source_bindings=source_bindings,
+        destination=WeightStorageDestination(
+            provider="local",
+            storage_id="weights:revision",
+            object_prefix="weights/revision",
+        ),
+    )
+    mutable_placements = list(prepared.source_placements)
+    mutable_bindings = list(prepared.source_bindings)
+    mutable_locations = list(prepared.source_locations)
+
+    request = WeightMaterializeRequest(
+        operation_id=prepared.operation_id,
+        source_placements=mutable_placements,
+        source_bindings=mutable_bindings,
+        source_locations=mutable_locations,
+        destination=prepared.destination,
+        profile=prepared.profile,
+    )
+    mutable_placements.clear()
+    mutable_bindings.clear()
+    mutable_locations.clear()
+
+    assert request.source_placements == prepared.source_placements
+    assert request.source_bindings == prepared.source_bindings
+    assert request.source_locations == prepared.source_locations
+    assert isinstance(request.source_placements, tuple)
+    assert isinstance(request.source_bindings, tuple)
+    assert isinstance(request.source_locations, tuple)
+
+    with pytest.raises(ValueError, match="source locations differ"):
+        replace(
+            request,
+            source_locations=(
+                replace(request.source_locations[0], address=0xDEADBEEF),
+                *request.source_locations[1:],
+            ),
+        )
 
 
 def test_local_provider_executes_cross_dimension_runtime_load() -> None:

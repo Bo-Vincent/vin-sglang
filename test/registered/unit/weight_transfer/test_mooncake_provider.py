@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+import threading
+import time
+from dataclasses import dataclass, replace
 from itertools import product
 from math import prod
 from types import SimpleNamespace
 
 import pytest
-
 from sglang.srt.model_executor.weight_runtime_manifest import (
     RuntimeWeightBinding,
     WeightParallelRank,
@@ -20,14 +21,17 @@ from sglang.srt.weight_transfer.api import (
     prepare_weight_load,
     prepare_weight_load_from_plan,
 )
-from sglang.srt.weight_transfer.mooncake import (
-    MooncakeWeightTransferCompletionUnknownError,
-    MooncakeWeightTransferProvider,
-)
+from sglang.srt.weight_transfer.binding import project_source_bindings
+from sglang.srt.weight_transfer.mooncake import MooncakeWeightTransferProvider
 from sglang.srt.weight_transfer.planner import (
     plan_weight_transfer_to_local_target,
 )
-from sglang.srt.weight_transfer.provider import WeightTargetLoadMode
+from sglang.srt.weight_transfer.provider import (
+    WeightTargetLoadMode,
+    WeightTransferCompletionUnknownError,
+    WeightTransferError,
+    WeightTransferExecutionContext,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -470,6 +474,20 @@ def fake_backend(calls, *, completion_unknown=False):
     )
 
 
+def runtime_load_request():
+    source = placement("source", shard_dim=0, rank=0)
+    source_peer = placement("source", shard_dim=0, rank=1)
+    target = placement("target", shard_dim=2, rank=0)
+    return prepare_weight_load_from_plan(
+        plan_weight_transfer_to_local_target((source, source_peer), target),
+        source_bindings=(
+            binding(source, address=0x10000),
+            binding(source_peer, address=0x11000),
+        ),
+        target_bindings=(binding(target, address=0x20000),),
+    )
+
+
 def copying_backend(memory: dict[int, bytearray], calls: dict):
     backend = fake_backend(calls)
 
@@ -691,7 +709,7 @@ def test_mooncake_provider_exposes_pending_ticket_for_drain(monkeypatch) -> None
     )
     provider = MooncakeWeightTransferProvider("engine")
 
-    with pytest.raises(MooncakeWeightTransferCompletionUnknownError) as raised:
+    with pytest.raises(WeightTransferCompletionUnknownError) as raised:
         execute_weight_load(
             request,
             provider=provider,
@@ -699,11 +717,398 @@ def test_mooncake_provider_exposes_pending_ticket_for_drain(monkeypatch) -> None
             attestor=ALLOW_ALL_ATTESTOR,
         )
 
-    assert raised.value.pending_transfer_id == "pending-1"
-    assert provider.drain_pending_transfer("pending-1", timeout_ms=10) == (
-        "FAILED_DRAINED"
+    assert raised.value.completion_ticket == "pending-1"
+    assert provider.drain_pending_transfer(
+        raised.value.completion_ticket,
+        timeout_ms=10,
+    ) == ("FAILED_DRAINED")
+    assert calls["drain"][0] == "pending-1"
+    assert 0 <= calls["drain"][1] <= 10
+
+
+def test_mooncake_provider_bounds_wait_and_drains_background_call(monkeypatch) -> None:
+    source = placement("source", shard_dim=0, rank=0)
+    source_peer = placement("source", shard_dim=0, rank=1)
+    target = placement("target", shard_dim=2, rank=0)
+    request = prepare_weight_load_from_plan(
+        plan_weight_transfer_to_local_target((source, source_peer), target),
+        source_bindings=(
+            binding(source, address=0x10000),
+            binding(source_peer, address=0x11000),
+        ),
+        target_bindings=(binding(target, address=0x20000),),
     )
-    assert calls["drain"] == ("pending-1", 10)
+    calls = {}
+    backend = fake_backend(calls)
+    reader_type = backend.MooncakeTransferEngineReader
+    started = threading.Event()
+    unblock = threading.Event()
+
+    class BlockingReader(reader_type):
+        def execute(self, *args, **kwargs):
+            started.set()
+            unblock.wait()
+            return super().execute(*args, **kwargs)
+
+    backend.MooncakeTransferEngineReader = BlockingReader
+    monkeypatch.setattr(
+        MooncakeWeightTransferProvider,
+        "_load_backend",
+        staticmethod(lambda: backend),
+    )
+    provider = MooncakeWeightTransferProvider("engine")
+
+    with pytest.raises(WeightTransferCompletionUnknownError) as raised:
+        execute_weight_load(
+            request,
+            provider=provider,
+            target_mode=WeightTargetLoadMode.COLD_START,
+            attestor=ALLOW_ALL_ATTESTOR,
+            execution_context=WeightTransferExecutionContext(
+                deadline_unix_sec=time.time() + 0.05
+            ),
+        )
+
+    assert started.wait(timeout=1)
+    unblock.set()
+    assert (
+        provider.drain_pending_transfer(
+            raised.value.completion_ticket,
+            timeout_ms=1000,
+        )
+        == "COMPLETED"
+    )
+
+
+def test_mooncake_provider_does_not_start_rdma_after_deadline(monkeypatch) -> None:
+    request = runtime_load_request()
+    calls = {}
+    backend = fake_backend(calls)
+    monkeypatch.setattr(
+        MooncakeWeightTransferProvider,
+        "_load_backend",
+        staticmethod(lambda: backend),
+    )
+    provider = MooncakeWeightTransferProvider("engine")
+    submission = provider.prepare(request)
+
+    with pytest.raises(WeightTransferError) as raised:
+        provider.wait(
+            submission,
+            execution_context=WeightTransferExecutionContext(
+                deadline_unix_sec=time.time() - 1,
+            ),
+        )
+
+    assert raised.value.code == "DEADLINE_EXCEEDED"
+    assert "execute" not in calls
+
+
+def test_mooncake_provider_rejects_n_plus_one_before_backend_call(
+    monkeypatch,
+) -> None:
+    request = runtime_load_request()
+    calls = {}
+    backend = fake_backend(calls)
+    reader_type = backend.MooncakeTransferEngineReader
+    entered = threading.Barrier(3)
+    release = threading.Event()
+    execute_count = 0
+    execute_lock = threading.Lock()
+
+    class BlockingReader(reader_type):
+        def execute(self, *args, **kwargs):
+            nonlocal execute_count
+            with execute_lock:
+                execute_count += 1
+            entered.wait(timeout=2)
+            release.wait(timeout=2)
+            return super().execute(*args, **kwargs)
+
+    backend.MooncakeTransferEngineReader = BlockingReader
+    monkeypatch.setattr(
+        MooncakeWeightTransferProvider,
+        "_load_backend",
+        staticmethod(lambda: backend),
+    )
+    provider = MooncakeWeightTransferProvider("engine", max_concurrent_calls=2)
+    submissions = tuple(
+        provider.prepare(replace(request, operation_id=f"operation-{index}"))
+        for index in range(3)
+    )
+    errors = []
+
+    def wait_for(index):
+        try:
+            provider.wait(
+                submissions[index],
+                execution_context=WeightTransferExecutionContext(
+                    deadline_unix_sec=time.time() + 2
+                ),
+            )
+        except BaseException as error:
+            errors.append(error)
+
+    workers = tuple(
+        threading.Thread(target=wait_for, args=(index,)) for index in range(2)
+    )
+    for worker in workers:
+        worker.start()
+    entered.wait(timeout=2)
+
+    started_at = time.monotonic()
+    with pytest.raises(WeightTransferError) as raised:
+        provider.wait(
+            submissions[2],
+            execution_context=WeightTransferExecutionContext(
+                deadline_unix_sec=time.time() + 2
+            ),
+        )
+    elapsed = time.monotonic() - started_at
+
+    assert raised.value.code == "EXECUTION_ADMISSION_REJECTED"
+    assert raised.value.completion_known is True
+    assert elapsed < 0.1
+    assert execute_count == 2
+    release.set()
+    for worker in workers:
+        worker.join(timeout=2)
+        assert not worker.is_alive()
+    assert errors == []
+
+
+def test_mooncake_provider_retry_reuses_pending_completion_ticket(
+    monkeypatch,
+) -> None:
+    request = runtime_load_request()
+    calls = {}
+    backend = fake_backend(calls)
+    reader_type = backend.MooncakeTransferEngineReader
+    started = threading.Event()
+    release = threading.Event()
+    execute_count = 0
+
+    class BlockingReader(reader_type):
+        def execute(self, *args, **kwargs):
+            nonlocal execute_count
+            execute_count += 1
+            started.set()
+            release.wait(timeout=2)
+            return super().execute(*args, **kwargs)
+
+    backend.MooncakeTransferEngineReader = BlockingReader
+    monkeypatch.setattr(
+        MooncakeWeightTransferProvider,
+        "_load_backend",
+        staticmethod(lambda: backend),
+    )
+    provider = MooncakeWeightTransferProvider("engine", max_concurrent_calls=1)
+    submission = provider.prepare(request)
+
+    tickets = []
+    for _ in range(2):
+        with pytest.raises(WeightTransferCompletionUnknownError) as raised:
+            provider.wait(
+                submission,
+                execution_context=WeightTransferExecutionContext(
+                    deadline_unix_sec=time.time() + 0.03
+                ),
+            )
+        tickets.append(raised.value.completion_ticket)
+
+    assert started.wait(timeout=1)
+    assert tickets == [
+        f"sglang-weight-transfer:{request.operation_id}",
+        f"sglang-weight-transfer:{request.operation_id}",
+    ]
+    assert execute_count == 1
+    release.set()
+    assert provider.drain_pending_transfer(tickets[0], timeout_ms=1000) == "COMPLETED"
+
+
+def test_mooncake_provider_rejects_ticket_reuse_for_different_submission(
+    monkeypatch,
+) -> None:
+    request = runtime_load_request()
+    calls = {}
+    backend = fake_backend(calls)
+    reader_type = backend.MooncakeTransferEngineReader
+    started = threading.Event()
+    release = threading.Event()
+    execute_count = 0
+
+    class BlockingReader(reader_type):
+        def execute(self, *args, **kwargs):
+            nonlocal execute_count
+            execute_count += 1
+            started.set()
+            release.wait(timeout=2)
+            return super().execute(*args, **kwargs)
+
+    backend.MooncakeTransferEngineReader = BlockingReader
+    monkeypatch.setattr(
+        MooncakeWeightTransferProvider,
+        "_load_backend",
+        staticmethod(lambda: backend),
+    )
+    provider = MooncakeWeightTransferProvider("engine", max_concurrent_calls=1)
+    original = provider.prepare(request)
+    conflicting = provider.prepare(request)
+
+    with pytest.raises(WeightTransferCompletionUnknownError) as first:
+        provider.wait(
+            original,
+            execution_context=WeightTransferExecutionContext(
+                deadline_unix_sec=time.time() + 0.03
+            ),
+        )
+    assert started.wait(timeout=1)
+
+    with pytest.raises(WeightTransferCompletionUnknownError) as conflict:
+        provider.wait(
+            conflicting,
+            execution_context=WeightTransferExecutionContext(
+                deadline_unix_sec=time.time() + 1
+            ),
+        )
+
+    assert conflict.value.completion_ticket == first.value.completion_ticket
+    assert execute_count == 1
+    release.set()
+    assert (
+        provider.drain_pending_transfer(
+            first.value.completion_ticket,
+            timeout_ms=1000,
+        )
+        == "COMPLETED"
+    )
+
+
+def test_mooncake_provider_seal_rejects_new_calls_but_keeps_pending_drainable(
+    monkeypatch,
+) -> None:
+    request = runtime_load_request()
+    calls = {}
+    backend = fake_backend(calls)
+    reader_type = backend.MooncakeTransferEngineReader
+    started = threading.Event()
+    release = threading.Event()
+    execute_count = 0
+
+    class BlockingReader(reader_type):
+        def execute(self, *args, **kwargs):
+            nonlocal execute_count
+            execute_count += 1
+            started.set()
+            release.wait(timeout=2)
+            return super().execute(*args, **kwargs)
+
+    backend.MooncakeTransferEngineReader = BlockingReader
+    monkeypatch.setattr(
+        MooncakeWeightTransferProvider,
+        "_load_backend",
+        staticmethod(lambda: backend),
+    )
+    provider = MooncakeWeightTransferProvider("engine", max_concurrent_calls=1)
+    pending = provider.prepare(request)
+
+    with pytest.raises(WeightTransferCompletionUnknownError) as raised:
+        provider.wait(
+            pending,
+            execution_context=WeightTransferExecutionContext(
+                deadline_unix_sec=time.time() + 0.03
+            ),
+        )
+    ticket = raised.value.completion_ticket
+    assert started.wait(timeout=1)
+    assert provider.seal_pending_transfers() == (ticket,)
+
+    new_submission = provider.prepare(replace(request, operation_id="new-operation"))
+    with pytest.raises(WeightTransferError) as rejected:
+        provider.wait(
+            new_submission,
+            execution_context=WeightTransferExecutionContext(
+                deadline_unix_sec=time.time() + 1
+            ),
+        )
+    assert rejected.value.code == "EXECUTION_ADMISSION_REJECTED"
+    assert execute_count == 1
+
+    release.set()
+    assert provider.drain_pending_transfer(ticket, timeout_ms=1000) == "COMPLETED"
+
+
+def test_mooncake_provider_drain_uses_one_total_timeout_budget(monkeypatch) -> None:
+    request = runtime_load_request()
+    calls = {}
+    backend = fake_backend(calls)
+    reader_type = backend.MooncakeTransferEngineReader
+    started = threading.Event()
+    release = threading.Event()
+    drain_ready = threading.Barrier(2)
+    native_timeouts = []
+    native_drains = 0
+
+    class TwoPhaseReader(reader_type):
+        def execute(self, *args, **kwargs):
+            started.set()
+            release.wait(timeout=2)
+            raise FakeTransferCompletionUnknownError("native pending")
+
+        def drain_pending_transfer(self, pending_transfer_id, *, timeout_ms):
+            nonlocal native_drains
+            del pending_transfer_id
+            native_drains += 1
+            native_timeouts.append(timeout_ms)
+            if native_drains == 1:
+                time.sleep(timeout_ms / 1000)
+                return "COMPLETION_UNKNOWN"
+            return "COMPLETED"
+
+    backend.MooncakeTransferEngineReader = TwoPhaseReader
+    monkeypatch.setattr(
+        MooncakeWeightTransferProvider,
+        "_load_backend",
+        staticmethod(lambda: backend),
+    )
+    provider = MooncakeWeightTransferProvider("engine", max_concurrent_calls=1)
+    submission = provider.prepare(request)
+
+    with pytest.raises(WeightTransferCompletionUnknownError) as raised:
+        provider.wait(
+            submission,
+            execution_context=WeightTransferExecutionContext(
+                deadline_unix_sec=time.time() + 0.03
+            ),
+        )
+    assert started.wait(timeout=1)
+
+    def release_during_drain():
+        drain_ready.wait(timeout=2)
+        time.sleep(0.1)
+        release.set()
+
+    releaser = threading.Thread(target=release_during_drain)
+    releaser.start()
+    drain_ready.wait(timeout=2)
+    started_at = time.monotonic()
+    status = provider.drain_pending_transfer(
+        raised.value.completion_ticket,
+        timeout_ms=300,
+    )
+    elapsed = time.monotonic() - started_at
+    releaser.join(timeout=2)
+
+    assert status == "COMPLETION_UNKNOWN"
+    assert native_timeouts[0] < 250
+    assert elapsed <= 0.35
+    assert (
+        provider.drain_pending_transfer(
+            raised.value.completion_ticket,
+            timeout_ms=0,
+        )
+        == "COMPLETED"
+    )
 
 
 def test_mooncake_provider_derives_registration_leases_from_bound_plan(
@@ -891,11 +1296,24 @@ def test_real_mooncake_contract_projects_local_source_snapshots(
         mixed_tp_placement("source", rank=rank, tp_size=2) for rank in range(2)
     )
     target = mixed_tp_placement("target", rank=target_rank, tp_size=4)
+    local_plan = plan_weight_transfer_to_local_target(sources, target)
+    referenced_source_fragments = {
+        region.source.placement_fragment_id for region in local_plan.regions
+    }
+    assert {
+        tensor.placement_fragment_id
+        for placement in local_plan.source_placements
+        for tensor in placement.tensors
+    } == referenced_source_fragments
+    source_bindings = tuple(
+        multi_tensor_binding(source, address=0x10000 + rank * 0x1000)
+        for rank, source in enumerate(sources)
+    )
     request = prepare_weight_load_from_plan(
-        plan_weight_transfer_to_local_target(sources, target),
-        source_bindings=tuple(
-            multi_tensor_binding(source, address=0x10000 + rank * 0x1000)
-            for rank, source in enumerate(sources)
+        local_plan,
+        source_bindings=project_source_bindings(
+            local_plan.source_placements,
+            source_bindings,
         ),
         target_bindings=(multi_tensor_binding(target, address=0x20000),),
     )

@@ -3,11 +3,12 @@ from __future__ import annotations
 from dataclasses import replace
 
 import pytest
-
 from sglang.srt.model_executor.weight_runtime_manifest import (
+    RuntimeWeightBinding,
     WeightParallelRank,
     WeightPlacementManifest,
     WeightPlacementTensor,
+    WeightRuntimeBindingManifest,
     compute_weight_placement_id,
 )
 from sglang.srt.weight_transfer.contracts import (
@@ -17,10 +18,13 @@ from sglang.srt.weight_transfer.contracts import (
 from sglang.srt.weight_transfer.storage import (
     InMemoryWeightStorageCatalog,
     StoredWeightSnapshot,
+    WeightMaterializationIntent,
     WeightRevisionHead,
     WeightRevisionState,
     WeightSnapshotPublicationState,
     WeightStorageRef,
+    weight_placement_set_digest,
+    weight_source_snapshot_digest,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -118,6 +122,68 @@ def storage_binding(
     )
 
 
+def runtime_binding(
+    manifest: WeightPlacementManifest,
+    *,
+    generation: int = 1,
+    instance_id: str = "runtime-instance",
+    lease_id: str = "runtime-lease",
+    address: int = 0x10000,
+    endpoint: str = "runtime-endpoint",
+    worker_id: str = "runtime-worker",
+    fragment_id: str | None = None,
+    storage_offset: int = 0,
+    device: str = "cuda:0",
+    is_contiguous: bool = True,
+    nbytes_delta: int = 0,
+) -> WeightRuntimeBindingManifest:
+    tensor = manifest.tensors[0]
+    return WeightRuntimeBindingManifest(
+        model_id=manifest.model_id,
+        revision=manifest.revision,
+        placement_id=manifest.placement_id,
+        instance_id=instance_id,
+        generation=generation,
+        lease_id=lease_id,
+        fragments=(
+            RuntimeWeightBinding(
+                placement_fragment_id=tensor.placement_fragment_id,
+                fragment_id=fragment_id or f"runtime:{tensor.placement_fragment_id}",
+                address=address,
+                nbytes=tensor.nbytes + nbytes_delta,
+                storage_offset=storage_offset,
+                device=device,
+                is_contiguous=is_contiguous,
+                worker_id=worker_id,
+                endpoint=endpoint,
+            ),
+        ),
+    )
+
+
+def materialization_intent(
+    manifest: WeightPlacementManifest,
+    binding: WeightRuntimeBindingManifest,
+    *,
+    payload_digest: str = "sha256:" + "1" * 64,
+) -> WeightMaterializationIntent:
+    return WeightMaterializationIntent(
+        provider="test-store",
+        storage_id="weights/revision",
+        object_prefix="weights/revision",
+        model_id=manifest.model_id,
+        revision=manifest.revision,
+        source_digest=weight_placement_set_digest((manifest,)),
+        total_bytes=sum(tensor.nbytes for tensor in manifest.tensors),
+        fragment_count=len(manifest.tensors),
+        source_snapshot_digest=weight_source_snapshot_digest(
+            (manifest,),
+            (binding,),
+        ),
+        payload_digest=payload_digest,
+    )
+
+
 def multi_fragment_binding(
     manifest: WeightPlacementManifest,
     *,
@@ -170,6 +236,151 @@ def test_storage_ref_requires_canonical_sha256_digest() -> None:
             storage_id="weights/revision",
             manifest_key="weights/revision/manifest.json",
             manifest_digest="not-a-digest",
+        )
+
+
+def test_durable_recovery_identity_allows_runtime_generation_change() -> None:
+    manifest = placement(0)
+    original = runtime_binding(manifest)
+    rebound = runtime_binding(
+        manifest,
+        generation=2,
+        instance_id="replacement-instance",
+        lease_id="replacement-lease",
+        address=0x20000,
+        endpoint="replacement-endpoint",
+        worker_id="replacement-worker",
+        fragment_id="replacement-fragment",
+        storage_offset=32,
+        device="cuda:1",
+        is_contiguous=False,
+    )
+    original_intent = materialization_intent(manifest, original)
+    rebound_intent = materialization_intent(manifest, rebound)
+
+    assert rebound_intent.source_snapshot_digest != (
+        original_intent.source_snapshot_digest
+    )
+    assert rebound_intent != original_intent
+    assert original_intent.matches_durable_recovery(rebound_intent)
+
+
+def test_strict_same_id_intent_rejects_runtime_generation_change() -> None:
+    manifest = placement(0)
+    original = runtime_binding(manifest)
+    original_intent = materialization_intent(manifest, original)
+    rebound_intent = materialization_intent(
+        manifest,
+        runtime_binding(manifest, generation=2),
+    )
+    catalog = InMemoryWeightStorageCatalog()
+    attempt = catalog.begin_materialization(
+        "recover-runtime",
+        original_intent,
+    )
+
+    assert original_intent != rebound_intent
+    with pytest.raises(ValueError, match="another intent"):
+        catalog.begin_materialization(
+            "recover-runtime",
+            rebound_intent,
+        )
+    assert catalog.get_materialization("recover-runtime") == attempt
+
+
+@pytest.mark.parametrize(
+    "changes",
+    (
+        pytest.param({"model_id": "other-model"}, id="model"),
+        pytest.param({"revision": "other-revision"}, id="revision"),
+        pytest.param(
+            {"source_digest": "sha256:" + "2" * 64},
+            id="placement",
+        ),
+        pytest.param({"provider": "other-store"}, id="destination-provider"),
+        pytest.param(
+            {"storage_id": "weights/other"},
+            id="destination-storage",
+        ),
+        pytest.param(
+            {"object_prefix": "weights/other"},
+            id="destination-prefix",
+        ),
+        pytest.param({"total_bytes": 32}, id="size"),
+        pytest.param({"fragment_count": 2}, id="fragment-count"),
+        pytest.param({"payload_digest": None}, id="payload-missing"),
+        pytest.param(
+            {"payload_digest": "sha256:" + "2" * 64},
+            id="payload-different",
+        ),
+    ),
+)
+def test_materialization_durable_recovery_identity_fails_closed(
+    changes: dict,
+) -> None:
+    manifest = placement(0)
+    original = materialization_intent(manifest, runtime_binding(manifest))
+
+    assert not original.matches_durable_recovery(replace(original, **changes))
+
+
+@pytest.mark.parametrize(
+    "field",
+    (
+        "provider",
+        "storage_id",
+        "fragment_id",
+        "object_key",
+        "object_offset",
+        "checksum",
+    ),
+)
+def test_source_snapshot_digest_keeps_store_object_identity(field: str) -> None:
+    manifest = placement(0)
+    original = storage_binding(
+        manifest,
+        object_key="objects/original",
+        object_offset=16,
+        checksum="sha256:" + "1" * 64,
+    )
+    fragment = original.fragments[0]
+    replacements = {
+        "provider": replace(original, provider="replacement-store"),
+        "storage_id": replace(original, storage_id="weights/replacement"),
+        "fragment_id": replace(
+            original,
+            fragments=(replace(fragment, fragment_id="stored:replacement"),),
+        ),
+        "object_key": replace(
+            original,
+            fragments=(replace(fragment, object_key="objects/replacement"),),
+        ),
+        "object_offset": replace(
+            original,
+            fragments=(replace(fragment, object_offset=32),),
+        ),
+        "checksum": replace(
+            original,
+            fragments=(replace(fragment, checksum="sha256:" + "2" * 64),),
+        ),
+    }
+
+    assert weight_source_snapshot_digest(
+        (manifest,),
+        (original,),
+    ) != weight_source_snapshot_digest(
+        (manifest,),
+        (replacements[field],),
+    )
+
+
+def test_source_snapshot_digest_rejects_runtime_fragment_size_mismatch() -> None:
+    manifest = placement(0)
+
+    with pytest.raises(ValueError, match="byte size"):
+        weight_source_snapshot_digest(
+            (manifest,),
+            (runtime_binding(manifest, nbytes_delta=1),),
         )
 
 
@@ -358,7 +569,7 @@ def test_catalog_publishes_atomically_and_queries_by_full_ref() -> None:
     assert catalog.recoverable_publications() == ()
 
 
-def test_catalog_abort_is_terminal_and_cannot_hide_published_snapshot() -> None:
+def test_catalog_abort_is_terminal_and_preserves_referenced_snapshot() -> None:
     stored = snapshot()
     catalog = InMemoryWeightStorageCatalog()
     catalog.prepare_publish("aborted", stored)
@@ -372,8 +583,22 @@ def test_catalog_abort_is_terminal_and_cannot_hide_published_snapshot() -> None:
 
     catalog.prepare_publish("published", stored)
     catalog.publish("published")
+    rolled_back = catalog.abort("published")
+    assert rolled_back.state is WeightSnapshotPublicationState.ABORTED
+    assert catalog.get_snapshot(stored.ref) is None
+
+    catalog = InMemoryWeightStorageCatalog()
+    catalog.prepare_publish("referenced", stored)
+    catalog.publish("referenced")
+    catalog.compare_and_set_revision(
+        model_id="model",
+        revision="revision",
+        expected=None,
+        new_ref=stored.ref,
+        new_state=WeightRevisionState.READY,
+    )
     with pytest.raises(ValueError, match="published"):
-        catalog.abort("published")
+        catalog.abort("referenced")
     assert catalog.get_snapshot(stored.ref) == stored
 
 

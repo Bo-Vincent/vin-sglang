@@ -7,7 +7,6 @@ from dataclasses import dataclass, field
 from typing import Any, List, Optional, Union
 
 import orjson
-
 from sglang.srt.configs.modelopt_config import ModelOptConfig
 from sglang.srt.utils import is_hip
 
@@ -83,10 +82,6 @@ class LoadConfig:
     remote_instance_weight_loader_backend: Optional[str] = None
     remote_instance_weight_loader_transfer_engine: Optional[Any] = None
     remote_instance_weight_loader_transfer_engine_session_id: Optional[str] = None
-    remote_instance_weight_runtime_manifest_builder: Optional[Any] = None
-    remote_instance_weight_transfer_provider_factory: Optional[Any] = None
-    weight_snapshot_backend_factory: Optional[Any] = None
-    weight_snapshot_world_barrier: Optional[Any] = None
     modelexpress_url: Optional[str] = None
     modelexpress_transport: str = "nixl"
 
@@ -115,6 +110,10 @@ class LoadConfig:
     weight_cache_mode: str = "off"  # "off", "daemon", "client"
     weight_cache_socket: Optional[str] = None  # Path to daemon socket (for client mode)
     fallback_load_format: Union[str, "LoadFormat"] = LoadFormat.AUTO
+    remote_instance_weight_runtime_manifest_builder: Optional[Any] = None
+    remote_instance_weight_transfer_provider_factory: Optional[Any] = None
+    weight_snapshot_backend_factory: Optional[Any] = None
+    weight_snapshot_world_barrier: Optional[Any] = None
 
     def __post_init__(self):
         model_loader_extra_config = self.model_loader_extra_config or {}

@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass
+import math
+import time
+from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Mapping, Protocol, Sequence
+from typing import Any, Mapping, Protocol, Sequence, runtime_checkable
 from uuid import uuid4
 
 from sglang.srt.model_executor.weight_runtime_manifest import (
@@ -41,10 +43,31 @@ class WeightProviderCapabilities:
     max_batch_operations: int | None = None
     max_batch_bytes: int | None = None
     max_total_bytes: int | None = None
+    supports_bounded_execution: bool = False
 
     def __post_init__(self) -> None:
-        if not self.provider:
+        if type(self.provider) is not str or not self.provider:
             raise ValueError("provider name must not be empty")
+        load_profiles = frozenset(self.load_profiles)
+        materialize_profiles = frozenset(self.materialize_profiles)
+        if any(type(profile) is not str or not profile for profile in load_profiles):
+            raise ValueError("load profiles are invalid")
+        if any(
+            type(profile) is not str or not profile for profile in materialize_profiles
+        ):
+            raise ValueError("materialize profiles are invalid")
+        object.__setattr__(self, "load_profiles", load_profiles)
+        object.__setattr__(self, "materialize_profiles", materialize_profiles)
+        for name in (
+            "supports_nd_regions",
+            "supports_strided_regions",
+            "supports_safe_cancel",
+            "supports_completion_ticket",
+            "supports_transactional_publish",
+            "supports_bounded_execution",
+        ):
+            if type(getattr(self, name)) is not bool:
+                raise ValueError(f"{name} must be a boolean")
         for name in (
             "max_regions",
             "max_segments_per_region",
@@ -56,6 +79,47 @@ class WeightProviderCapabilities:
             value = getattr(self, name)
             if value is not None and (type(value) is not int or value <= 0):
                 raise ValueError(f"{name} must be a positive integer")
+
+
+class WeightTransferCancellationSignal(Protocol):
+    def is_set(self) -> bool: ...
+
+
+@dataclass(frozen=True, slots=True)
+class WeightTransferExecutionContext:
+    deadline_unix_sec: float
+    cancel_signal: WeightTransferCancellationSignal | None = None
+    _deadline_monotonic: float = field(init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.deadline_unix_sec, (int, float))
+            or isinstance(self.deadline_unix_sec, bool)
+            or not math.isfinite(self.deadline_unix_sec)
+            or self.deadline_unix_sec <= 0
+        ):
+            raise ValueError(
+                "weight transfer deadline must be a positive finite number"
+            )
+        if self.cancel_signal is not None and not callable(
+            getattr(self.cancel_signal, "is_set", None)
+        ):
+            raise ValueError("weight transfer cancellation signal is invalid")
+        remaining = max(0.0, float(self.deadline_unix_sec) - time.time())
+        object.__setattr__(
+            self,
+            "_deadline_monotonic",
+            time.monotonic() + remaining,
+        )
+
+    def remaining_seconds(self) -> float:
+        return max(0.0, self._deadline_monotonic - time.monotonic())
+
+    def cancelled(self) -> bool:
+        return self.cancel_signal is not None and bool(self.cancel_signal.is_set())
+
+    def expired(self) -> bool:
+        return self.cancelled() or self.remaining_seconds() <= 0
 
 
 class WeightTransferError(RuntimeError):
@@ -113,19 +177,31 @@ class WeightTransferReleaseError(WeightTransferError):
         self,
         message: str,
         *,
-        receipt: WeightProviderReceipt,
+        receipt: WeightProviderReceipt | None,
+        provider: str | None = None,
+        operation_id: str | None = None,
+        release_error: BaseException | None = None,
     ) -> None:
+        if receipt is not None:
+            provider = receipt.provider
+            operation_id = receipt.operation_id
+        if not provider or not operation_id:
+            raise ValueError(
+                "release failure requires a receipt or provider operation identity"
+            )
         super().__init__(
             message,
             code="RELEASE_FAILED",
-            provider=receipt.provider,
+            provider=provider,
             phase="release",
-            operation_id=receipt.operation_id,
+            operation_id=operation_id,
             retryable=True,
             completion_known=True,
             cleanup_required=True,
         )
         self.receipt = receipt
+        self.release_error = release_error
+        self.materialized_candidate = None
         self.publication = None
 
 
@@ -285,6 +361,61 @@ class WeightPayloadIdentity:
         )
 
 
+def _normalize_materialize_source_contract(
+    placements: Sequence[WeightPlacementManifest],
+    bindings: Sequence[SourceBindingManifest],
+    locations: Sequence[RuntimeWeightLocation | StorageWeightLocation],
+) -> tuple[
+    tuple[WeightPlacementManifest, ...],
+    tuple[SourceBindingManifest, ...],
+    tuple[RuntimeWeightLocation | StorageWeightLocation, ...],
+    str,
+]:
+    placements = tuple(placements)
+    bindings = tuple(bindings)
+    locations = tuple(locations)
+    if not placements or not all(
+        isinstance(item, WeightPlacementManifest) for item in placements
+    ):
+        raise ValueError("materialization source placements are invalid")
+    if not bindings or not all(
+        isinstance(
+            item,
+            (WeightRuntimeBindingManifest, WeightStorageBindingManifest),
+        )
+        for item in bindings
+    ):
+        raise ValueError("materialization source bindings are invalid")
+    if not locations or not all(
+        isinstance(item, (RuntimeWeightLocation, StorageWeightLocation))
+        for item in locations
+    ):
+        raise ValueError("materialization source locations are invalid")
+
+    placements = tuple(sorted(placements, key=lambda item: item.placement_id))
+    bindings = tuple(sorted(bindings, key=lambda item: item.placement_id))
+    locations = tuple(
+        sorted(
+            locations,
+            key=lambda item: (
+                item.placement_id,
+                item.placement_fragment_id,
+            ),
+        )
+    )
+    from sglang.srt.weight_transfer.binding import bind_weight_source
+
+    expected_locations = bind_weight_source(placements, bindings)
+    if locations != expected_locations:
+        raise ValueError("materialization source locations differ from source bindings")
+    profile = (
+        "runtime_to_storage"
+        if isinstance(expected_locations[0], RuntimeWeightLocation)
+        else "storage_to_storage"
+    )
+    return placements, bindings, expected_locations, profile
+
+
 @dataclass(frozen=True)
 class WeightMaterializeRequest:
     operation_id: str
@@ -296,6 +427,24 @@ class WeightMaterializeRequest:
     payload_identity: WeightPayloadIdentity | None = None
 
     def __post_init__(self) -> None:
+        if type(self.operation_id) is not str or not self.operation_id:
+            raise ValueError("materialization operation ID must not be empty")
+        if not isinstance(self.destination, WeightStorageDestination):
+            raise ValueError("materialization destination is invalid")
+        if type(self.profile) is not str or not self.profile:
+            raise ValueError("materialization profile must not be empty")
+        placements, bindings, locations, profile = (
+            _normalize_materialize_source_contract(
+                self.source_placements,
+                self.source_bindings,
+                self.source_locations,
+            )
+        )
+        if self.profile != profile:
+            raise ValueError("materialization profile differs from source locations")
+        object.__setattr__(self, "source_placements", placements)
+        object.__setattr__(self, "source_bindings", bindings)
+        object.__setattr__(self, "source_locations", locations)
         if self.payload_identity is not None:
             if not isinstance(self.payload_identity, WeightPayloadIdentity):
                 raise ValueError("payload_identity is invalid")
@@ -309,6 +458,33 @@ class WeightMaterializeRequest:
     @property
     def total_bytes(self) -> int:
         return sum(location.nbytes for location in self.source_locations)
+
+
+def validate_weight_materialize_request(request: WeightMaterializeRequest) -> None:
+    if not isinstance(request, WeightMaterializeRequest):
+        raise ValueError("materialization request is invalid")
+    if (
+        type(request.source_placements) is not tuple
+        or type(request.source_bindings) is not tuple
+        or type(request.source_locations) is not tuple
+        or not request.source_placements
+        or not request.source_bindings
+        or not request.source_locations
+    ):
+        raise ValueError("materialization source sequences are invalid")
+    placements, bindings, locations, profile = _normalize_materialize_source_contract(
+        request.source_placements,
+        request.source_bindings,
+        request.source_locations,
+    )
+    if (
+        placements != request.source_placements
+        or bindings != request.source_bindings
+        or locations != request.source_locations
+    ):
+        raise ValueError("materialization source sequences are not canonical")
+    if request.profile != profile:
+        raise ValueError("materialization profile differs from source locations")
 
 
 WeightProviderRequest = WeightLoadRequest | WeightMaterializeRequest
@@ -622,27 +798,77 @@ class WeightMaterializeReceipt:
 WeightProviderReceipt = WeightLoadReceipt | WeightMaterializeReceipt
 
 
+@runtime_checkable
+class WeightMaterializationRecoveryProvider(Protocol):
+    def recover_materialization(
+        self,
+        request: WeightMaterializeRequest,
+        *,
+        completion_ticket: str | None,
+        execution_context: WeightTransferExecutionContext | None = None,
+    ) -> WeightMaterializeReceipt | None: ...
+
+
+@runtime_checkable
+class WeightMaterializationCompletionTicketProvider(
+    WeightMaterializationRecoveryProvider,
+    Protocol,
+):
+    def materialization_recovery_ticket(self, prepared: Any) -> str: ...
+
+
+@runtime_checkable
+class WeightMaterializationRecoveryCleanupProvider(Protocol):
+    def discard_materialization_recovery(
+        self,
+        request: WeightMaterializeRequest,
+        *,
+        completion_ticket: str,
+        execution_context: WeightTransferExecutionContext | None = None,
+    ) -> None: ...
+
+
 class WeightTransferProvider(Protocol):
     name: str
     requires_runtime_attestation: bool
 
     def probe(self, request: WeightProviderRequest) -> WeightProviderCapabilities: ...
 
-    def prepare(self, request: WeightProviderRequest) -> Any: ...
+    def prepare(
+        self,
+        request: WeightProviderRequest,
+        *,
+        execution_context: WeightTransferExecutionContext | None = None,
+    ) -> Any: ...
 
     def submit(self, prepared: Any) -> Any: ...
 
-    def wait(self, submission: Any) -> WeightProviderReceipt: ...
+    def wait(
+        self,
+        submission: Any,
+        *,
+        execution_context: WeightTransferExecutionContext | None = None,
+    ) -> WeightProviderReceipt: ...
 
     def cancel(self, submission: Any) -> None: ...
 
-    def synchronize(self, receipt: WeightProviderReceipt) -> None: ...
+    def synchronize(
+        self,
+        receipt: WeightProviderReceipt,
+        *,
+        execution_context: WeightTransferExecutionContext | None = None,
+    ) -> None: ...
 
     def release(
         self,
         prepared: Any,
         receipt: WeightProviderReceipt | None,
-    ) -> None: ...
+        *,
+        execution_context: WeightTransferExecutionContext | None = None,
+    ) -> None:
+        """Release resources within a cancellation-independent terminal context."""
+
+        ...
 
 
 class LocalWeightBufferRegistry:
@@ -742,7 +968,13 @@ class LocalWeightTransferProvider:
             max_batch_bytes=self.lowering_limits.max_batch_bytes,
         )
 
-    def prepare(self, request: WeightProviderRequest) -> WeightProviderRequest:
+    def prepare(
+        self,
+        request: WeightProviderRequest,
+        *,
+        execution_context: WeightTransferExecutionContext | None = None,
+    ) -> WeightProviderRequest:
+        del execution_context
         return request
 
     def submit(self, prepared: WeightProviderRequest) -> _LocalSubmission:
@@ -753,7 +985,13 @@ class LocalWeightTransferProvider:
             submission.receipt = self._execute_materialize(prepared)
         return submission
 
-    def wait(self, submission: _LocalSubmission) -> WeightProviderReceipt:
+    def wait(
+        self,
+        submission: _LocalSubmission,
+        *,
+        execution_context: WeightTransferExecutionContext | None = None,
+    ) -> WeightProviderReceipt:
+        del execution_context
         if submission.receipt is None:
             raise WeightTransferCompletionUnknownError(
                 "local submission has no receipt",
@@ -766,15 +1004,22 @@ class LocalWeightTransferProvider:
     def cancel(self, submission: _LocalSubmission) -> None:
         del submission
 
-    def synchronize(self, receipt: WeightProviderReceipt) -> None:
-        del receipt
+    def synchronize(
+        self,
+        receipt: WeightProviderReceipt,
+        *,
+        execution_context: WeightTransferExecutionContext | None = None,
+    ) -> None:
+        del receipt, execution_context
 
     def release(
         self,
         prepared: WeightProviderRequest,
         receipt: WeightProviderReceipt | None,
+        *,
+        execution_context: WeightTransferExecutionContext | None = None,
     ) -> None:
-        del prepared, receipt
+        del prepared, receipt, execution_context
 
     def _read_source(
         self,
@@ -826,6 +1071,7 @@ class LocalWeightTransferProvider:
         request: WeightMaterializeRequest,
         *,
         completion_ticket: str | None = None,
+        execution_context: WeightTransferExecutionContext | None = None,
     ) -> WeightMaterializeReceipt | None:
         del completion_ticket
         staged_objects, receipt = self._stage_materialization(request)
@@ -841,6 +1087,14 @@ class LocalWeightTransferProvider:
                 raise ValueError(
                     "local materialization recovery found conflicting payload"
                 )
+        if execution_context is None:
+            self.release(request, receipt)
+        else:
+            self.release(
+                request,
+                receipt,
+                execution_context=execution_context,
+            )
         return receipt
 
     def _stage_materialization(

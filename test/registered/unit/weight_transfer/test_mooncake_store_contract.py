@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-# ruff: noqa: E402
-
 import ctypes
 import hashlib
 import json
@@ -12,10 +10,24 @@ from math import prod
 
 import pytest
 
-mooncake_backend = pytest.importorskip("mooncake.weight_transfer")
-from mooncake.weight_transfer import WeightManifest, WeightStore, WeightStoreError
-from mooncake.weight_transfer import planner as mooncake_planner_module
-from mooncake.weight_transfer import store as mooncake_store_module
+# ruff: noqa: E402
+
+try:
+    import mooncake.weight_transfer as mooncake_backend
+    from mooncake.weight_transfer import WeightManifest, WeightStore, WeightStoreError
+    from mooncake.weight_transfer import planner as mooncake_planner_module
+    from mooncake.weight_transfer import store as mooncake_store_module
+except ModuleNotFoundError as error:
+    if error.name not in {"mooncake", "mooncake.weight_transfer"}:
+        raise
+    if __name__ == "__main__":
+        print("SKIPPED: mooncake.weight_transfer is not installed")
+        raise SystemExit(0)
+    pytest.skip(
+        "mooncake.weight_transfer is not installed",
+        allow_module_level=True,
+    )
+
 from sglang.srt.model_executor.weight_runtime_manifest import (
     RuntimeWeightBinding,
     WeightParallelRank,
@@ -30,30 +42,30 @@ from sglang.srt.weight_transfer.api import (
     load_weight_snapshot,
     materialize_weight_snapshot,
     materialize_weights,
-    prepare_weight_materialization,
     prepare_weight_load_from_plan,
+    prepare_weight_materialization,
 )
 from sglang.srt.weight_transfer.contracts import RuntimeWeightLocation
 from sglang.srt.weight_transfer.mooncake_store import (
     MooncakeWeightStoreProvider,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 from sglang.srt.weight_transfer.planner import (
     plan_weight_transfer_to_local_target,
 )
 from sglang.srt.weight_transfer.provider import (
     WeightPayloadIdentity,
+    WeightStorageDestination,
     WeightTargetLoadMode,
     WeightTargetLoadSession,
     WeightTargetLoadState,
-    WeightStorageDestination,
     WeightTransferCompletionUnknownError,
     WeightTransferError,
 )
 from sglang.srt.weight_transfer.storage import InMemoryWeightStorageCatalog
 from sglang.srt.weight_transfer.storage_file import FileWeightStorageCatalog
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 _GLOBAL_SHAPE = (4, 6, 8)
 _ITEMSIZE = 2
@@ -83,11 +95,13 @@ class _InMemoryStore:
         *,
         fail_payload_write: int | None = None,
         fail_manifest_put: bool = False,
+        fail_decision_put: bool = False,
         fail_range_get: int | None = None,
     ) -> None:
         self.objects: dict[str, bytes] = {}
         self.fail_payload_write = fail_payload_write
         self.fail_manifest_put = fail_manifest_put
+        self.fail_decision_put = fail_decision_put
         self.fail_range_get = fail_range_get
         self.payload_write_attempts = 0
         self.payload_addresses: list[int] = []
@@ -145,6 +159,8 @@ class _InMemoryStore:
     ) -> int:
         del config
         if self.fail_manifest_put and key.endswith("/manifest"):
+            return -1
+        if self.fail_decision_put and key.endswith("/decision"):
             return -1
         if key not in self.objects:
             self.objects[key] = bytes(value)
@@ -543,7 +559,7 @@ def _publish_conflicting_winner(
     )
 
 
-def test_real_mooncake_store_round_trip_preserves_nd_cross_dim_bytes(
+def test_mooncake_wrapper_round_trip_preserves_nd_cross_dim_bytes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     store = _InMemoryStore()
@@ -689,7 +705,7 @@ def test_real_mooncake_store_round_trip_preserves_nd_cross_dim_bytes(
         ) == _box_payload(tensor.global_offset, tensor.local_shape)
 
 
-def test_real_mooncake_store_rejects_payload_identity_mismatch_before_upload() -> None:
+def test_mooncake_wrapper_rejects_payload_mismatch_before_upload() -> None:
     store = _InMemoryStore()
     sources, source_bindings, source_owners = _runtime_world(
         "source",
@@ -731,7 +747,97 @@ def test_real_mooncake_store_rejects_payload_identity_mismatch_before_upload() -
     assert f"{_STORAGE_ID}/manifest" not in store.objects
 
 
-def test_real_mooncake_store_failed_upload_aborts_fail_closed() -> None:
+def test_mooncake_wrapper_ticket_failure_aborts_prepared_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _InMemoryStore()
+    sources, source_bindings, _source_owners = _runtime_world(
+        "source",
+        shard_dim=0,
+        shard_count=4,
+        dp_count=1,
+        source_payload=True,
+    )
+    provider = MooncakeWeightStoreProvider(
+        _weight_store(store),
+        payload_checksum_verifier=_runtime_payload_checksum,
+    )
+
+    def fail_ticket(_prepared, *, execution_context):
+        assert execution_context is None
+        raise ValueError("ticket encoding failed")
+
+    monkeypatch.setattr(provider, "_build_recovery_ticket", fail_ticket)
+
+    with pytest.raises(WeightTransferError, match="ticket encoding failed") as raised:
+        materialize_weights(
+            source_placements=sources,
+            source_bindings=source_bindings,
+            destination=WeightStorageDestination(
+                provider=provider.name,
+                storage_id=_STORAGE_ID,
+                object_prefix=_STORAGE_ID,
+            ),
+            provider=provider,
+            payload_identity=_payload_identity(sources, source_bindings),
+            attestor=_ALLOW_ALL_ATTESTOR,
+        )
+
+    assert raised.value.completion_known is True
+    assert f"{_STORAGE_ID}/manifest" not in store.objects
+    assert not any("/payload/" in key for key in store.objects)
+    decision_keys = [key for key in store.objects if key.endswith("/decision")]
+    assert len(decision_keys) == 1
+    assert json.loads(store.objects[decision_keys[0]])["decision"] == "abort"
+    assert store.registered == {}
+
+
+def test_mooncake_wrapper_ticket_cleanup_is_known_without_upload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _InMemoryStore(fail_decision_put=True)
+    sources, source_bindings, _source_owners = _runtime_world(
+        "source",
+        shard_dim=0,
+        shard_count=4,
+        dp_count=1,
+        source_payload=True,
+    )
+    provider = MooncakeWeightStoreProvider(
+        _weight_store(store),
+        payload_checksum_verifier=_runtime_payload_checksum,
+    )
+
+    def fail_ticket(_prepared):
+        raise ValueError("ticket encoding failed")
+
+    monkeypatch.setattr(provider, "_build_recovery_ticket", fail_ticket)
+
+    with pytest.raises(WeightTransferError) as raised:
+        materialize_weights(
+            source_placements=sources,
+            source_bindings=source_bindings,
+            destination=WeightStorageDestination(
+                provider=provider.name,
+                storage_id=_STORAGE_ID,
+                object_prefix=_STORAGE_ID,
+            ),
+            provider=provider,
+            payload_identity=_payload_identity(sources, source_bindings),
+            attestor=_ALLOW_ALL_ATTESTOR,
+        )
+
+    assert raised.value.completion_known is True
+    assert raised.value.code == "PREFLIGHT_CLEANUP_FAILED"
+    assert "upload decision is not complete" in str(raised.value)
+    assert "upload session has no terminal decision" in str(raised.value)
+    assert f"{_STORAGE_ID}/manifest" not in store.objects
+    assert not any("/payload/" in key for key in store.objects)
+    assert not any(key.endswith("/decision") for key in store.objects)
+    assert store.registered == {}
+
+
+def test_mooncake_wrapper_failed_upload_aborts_fail_closed() -> None:
     store = _InMemoryStore(fail_payload_write=2)
     weight_store = _weight_store(store)
     provider = MooncakeWeightStoreProvider(
@@ -788,7 +894,7 @@ def test_real_mooncake_store_failed_upload_aborts_fail_closed() -> None:
         weight_store.load_manifest(f"{_STORAGE_ID}/manifest")
 
 
-def test_real_mooncake_store_manifest_publish_failure_is_fail_closed() -> None:
+def test_mooncake_wrapper_manifest_publish_failure_is_fail_closed() -> None:
     store = _InMemoryStore(fail_manifest_put=True)
     weight_store = _weight_store(store)
     provider = MooncakeWeightStoreProvider(
@@ -822,8 +928,9 @@ def test_real_mooncake_store_manifest_publish_failure_is_fail_closed() -> None:
     assert error.completion_known is False
     assert error.cleanup_required is True
     assert error.completion_ticket is not None
-    assert isinstance(error.__cause__, WeightStoreError)
-    assert "manifest put failed: -1" in str(error.__cause__)
+    assert isinstance(error.__cause__, WeightTransferCompletionUnknownError)
+    assert isinstance(error.__cause__.__cause__, WeightStoreError)
+    assert "manifest put failed: -1" in str(error.__cause__.__cause__)
     assert f"{_STORAGE_ID}/manifest" not in store.objects
     assert len([key for key in store.objects if "/payload/" in key]) == 4
 
@@ -838,7 +945,7 @@ def test_real_mooncake_store_manifest_publish_failure_is_fail_closed() -> None:
         _weight_store(store).load_manifest(f"{_STORAGE_ID}/manifest")
 
 
-def test_real_mooncake_store_recovery_aborts_if_upload_never_started() -> None:
+def test_mooncake_wrapper_recovery_aborts_before_upload() -> None:
     store = _InMemoryStore()
     sources, source_bindings, _source_owners = _runtime_world(
         "source",
@@ -881,7 +988,7 @@ def test_real_mooncake_store_recovery_aborts_if_upload_never_started() -> None:
     assert json.loads(store.objects[decision_keys[0]])["decision"] == "abort"
 
 
-def test_real_mooncake_store_recovers_committed_upload_after_provider_restart(
+def test_mooncake_wrapper_recovers_commit_after_provider_restart(
     tmp_path,
 ) -> None:
     store = _InMemoryStore(fail_manifest_put=True)
@@ -943,9 +1050,7 @@ def test_real_mooncake_store_recovers_committed_upload_after_provider_restart(
     assert f"{_STORAGE_ID}/manifest" in store.objects
 
 
-def test_real_mooncake_store_recovery_accepts_rebound_runtime_without_reupload() -> (
-    None
-):
+def test_mooncake_wrapper_rejects_rebound_runtime_without_reupload() -> None:
     store = _InMemoryStore()
     sources, source_bindings, _source_owners = _runtime_world(
         "source",
@@ -988,27 +1093,26 @@ def test_real_mooncake_store_recovery_accepts_rebound_runtime_without_reupload()
         )
     )
 
-    receipt = MooncakeWeightStoreProvider(_weight_store(store)).recover_materialization(
-        restarted_request,
-        completion_ticket=ticket,
-    )
+    with pytest.raises(
+        WeightTransferError,
+        match="ticket differs from the request",
+    ) as raised:
+        MooncakeWeightStoreProvider(_weight_store(store)).recover_materialization(
+            restarted_request,
+            completion_ticket=ticket,
+        )
 
-    assert receipt is not None
-    assert receipt.completion_ticket == ticket
+    assert raised.value.code == "INVALID_COMPLETION_TICKET"
+    assert raised.value.phase == "recover"
+    assert raised.value.completion_known is True
+    assert raised.value.cleanup_required is True
     assert store.payload_write_attempts == payload_writes_before_recovery
-    assert f"{_STORAGE_ID}/manifest" in store.objects
-    expected_checksums = {
-        fragment.placement_fragment_id: fragment.checksum
-        for fragment in request.payload_identity.fragments
-    }
-    assert {
-        fragment.placement_fragment_id: fragment.checksum
-        for binding in receipt.storage_bindings
-        for fragment in binding.fragments
-    } == expected_checksums
+    assert payload_keys <= set(store.objects)
+    assert f"{_STORAGE_ID}/manifest" not in store.objects
+    assert not any(key.endswith("/decision") for key in store.objects)
 
 
-def test_real_mooncake_store_conflict_is_known_and_keeps_first_payload() -> None:
+def test_mooncake_wrapper_conflict_keeps_first_payload() -> None:
     store = _InMemoryStore()
     first_sources, first_bindings, _first_owners = _runtime_world(
         "first",
@@ -1066,7 +1170,7 @@ def test_real_mooncake_store_conflict_is_known_and_keeps_first_payload() -> None
     assert len([key for key in store.objects if "/payload/" in key]) == 4
 
 
-def test_real_mooncake_store_conflict_recovery_cleans_exact_loser_plan(
+def test_mooncake_wrapper_conflict_cleans_exact_loser_plan(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     store = _InMemoryStore()
@@ -1144,7 +1248,7 @@ def test_real_mooncake_store_conflict_recovery_cleans_exact_loser_plan(
     assert store.objects[manifest_key] == winner_manifest
 
 
-def test_real_mooncake_store_conflict_recovery_cleanup_failure_is_unknown(
+def test_mooncake_wrapper_conflict_cleanup_failure_is_unknown(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     store = _InMemoryStore()
@@ -1217,7 +1321,7 @@ def test_real_mooncake_store_conflict_recovery_cleanup_failure_is_unknown(
     assert store.objects[manifest_key] == winner_manifest
 
 
-def test_real_mooncake_store_partial_load_poisoned_target_is_not_ready() -> None:
+def test_mooncake_wrapper_partial_load_target_is_not_ready() -> None:
     store = _InMemoryStore()
     sources, source_bindings, _source_owners = _runtime_world(
         "source",

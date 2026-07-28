@@ -1,14 +1,13 @@
 from __future__ import annotations
 
-from pathlib import Path
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable, Sequence, TypeVar
 
 import msgspec
-
 from sglang.srt.model_executor.weight_runtime_manifest import (
-    WeightParallelRank,
     WeightManifestError,
+    WeightParallelRank,
     WeightPlacementManifest,
     WeightPlacementTensor,
     WeightRuntimeBindingManifest,
@@ -45,15 +44,22 @@ from sglang.srt.weight_transfer.storage import (
 T = TypeVar("T")
 _SIDECAR_FORMAT = "sglang-semantic-checkpoint"
 _SIDECAR_VERSION = 1
+_SIDECAR_MOE_DP_VERSION = 2
 _DEFAULT_MAX_SIDECAR_BYTES = 64 * 1024 * 1024
 _MAX_SIDECAR_BYTES = 256 * 1024 * 1024
 
 
-class _RankRecord(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
+class _RankRecord(
+    msgspec.Struct,
+    frozen=True,
+    forbid_unknown_fields=True,
+    omit_defaults=True,
+):
     dp: int
     tp: int
     pp: int
     ep: int
+    moe_dp: int = 0
 
 
 class _PlacementTensorRecord(
@@ -78,6 +84,7 @@ class _PlacementTensorRecord(
     nbytes: int
     byte_offset: int
     rank: _RankRecord
+    expert_axis: int | None = None
 
 
 class _PlacementRecord(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
@@ -135,7 +142,13 @@ def _validate_sidecar_limit(max_bytes: int) -> int:
 
 
 def _rank_record(rank: WeightParallelRank) -> _RankRecord:
-    return _RankRecord(dp=rank.dp, tp=rank.tp, pp=rank.pp, ep=rank.ep)
+    return _RankRecord(
+        dp=rank.dp,
+        tp=rank.tp,
+        pp=rank.pp,
+        ep=rank.ep,
+        moe_dp=rank.moe_dp,
+    )
 
 
 def _placement_record(placement: WeightPlacementManifest) -> _PlacementRecord:
@@ -158,6 +171,7 @@ def _placement_record(placement: WeightPlacementManifest) -> _PlacementRecord:
                 shard_dims=tensor.shard_dims,
                 layer_id=tensor.layer_id,
                 expert_id=tensor.expert_id,
+                expert_axis=tensor.expert_axis,
                 layout_fingerprint=tensor.layout_fingerprint,
                 nbytes=tensor.nbytes,
                 byte_offset=tensor.byte_offset,
@@ -213,6 +227,7 @@ def _placement_from_record(record: _PlacementRecord) -> WeightPlacementManifest:
                 shard_dims=tensor.shard_dims,
                 layer_id=tensor.layer_id,
                 expert_id=tensor.expert_id,
+                expert_axis=tensor.expert_axis,
                 layout_fingerprint=tensor.layout_fingerprint,
                 nbytes=tensor.nbytes,
                 byte_offset=tensor.byte_offset,
@@ -221,6 +236,7 @@ def _placement_from_record(record: _PlacementRecord) -> WeightPlacementManifest:
                     tp=tensor.rank.tp,
                     pp=tensor.rank.pp,
                     ep=tensor.rank.ep,
+                    moe_dp=tensor.rank.moe_dp,
                 ),
             )
             for tensor in record.tensors
@@ -317,7 +333,15 @@ class SemanticCheckpointSource:
         payload = msgspec.json.encode(
             _SemanticCheckpointEnvelope(
                 format=_SIDECAR_FORMAT,
-                version=_SIDECAR_VERSION,
+                version=(
+                    _SIDECAR_MOE_DP_VERSION
+                    if any(
+                        tensor.rank.moe_dp
+                        for placement in self.placements
+                        for tensor in placement.tensors
+                    )
+                    else _SIDECAR_VERSION
+                ),
                 placements=tuple(
                     _placement_record(placement) for placement in self.placements
                 ),
@@ -352,9 +376,9 @@ class SemanticCheckpointSource:
                 encoded,
                 type=_SemanticCheckpointEnvelope,
             )
-            if (
-                envelope.format != _SIDECAR_FORMAT
-                or envelope.version != _SIDECAR_VERSION
+            if envelope.format != _SIDECAR_FORMAT or envelope.version not in (
+                _SIDECAR_VERSION,
+                _SIDECAR_MOE_DP_VERSION,
             ):
                 raise ValueError("unsupported semantic checkpoint sidecar")
             return cls(

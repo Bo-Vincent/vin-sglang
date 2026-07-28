@@ -5,7 +5,6 @@ import json
 from dataclasses import dataclass
 
 import pytest
-
 from sglang.srt.model_executor.weight_runtime_manifest import (
     RuntimeWeightBinding,
     WeightParallelRank,
@@ -154,6 +153,25 @@ def owned_runtime_source(
         ),
         owner,
     )
+
+
+def test_runtime_snapshot_source_preserves_released_positional_argument() -> None:
+    manifest = placement("source")
+    source, _owner = owned_runtime_source(
+        manifest,
+        runtime_binding(manifest, 0x1000),
+    )
+    positional = RuntimeWeightSnapshotSource(
+        source.model,
+        source.manager,
+        source.parts,
+        source.payload_hasher,
+        source.payload_identity,
+        True,
+    )
+
+    assert positional.released is True
+    assert positional.hash_deadline_unix_sec is None
 
 
 def checkpoint_source(

@@ -4,14 +4,19 @@ import hashlib
 from typing import Sequence
 
 from sglang.srt.model_executor.weight_runtime_manifest import (
-    RuntimeWeightTensor,
     RuntimeWeightBinding,
+    RuntimeWeightTensor,
     WeightPlacementManifest,
     WeightPlacementTensor,
     WeightRuntimeBindingManifest,
     WeightRuntimeManifest,
     WeightRuntimeManifestParts,
     compute_weight_placement_id,
+    weight_parallel_rank_identity,
+)
+from sglang.srt.weight_transfer._geometry import (
+    TargetAliasCandidate,
+    analyze_target_aliases,
 )
 from sglang.srt.weight_transfer.contracts import (
     BoundWeightTransferPlan,
@@ -41,14 +46,16 @@ def _legacy_placement_fragment_id(tensor: RuntimeWeightTensor) -> str:
         tensor.byte_offset,
         tensor.layer_id,
         tensor.expert_id,
+    )
+    if tensor.expert_axis is not None:
+        identity = (*identity, "expert_axis", tensor.expert_axis)
+    identity = (
+        *identity,
         tensor.layout_fingerprint,
         tuple(tensor.aliases),
         tensor.dtype,
         tensor.itemsize,
-        tensor.rank.dp,
-        tensor.rank.tp,
-        tensor.rank.pp,
-        tensor.rank.ep,
+        *weight_parallel_rank_identity(tensor.rank),
     )
     return hashlib.sha256(repr(identity).encode()).hexdigest()[:24]
 
@@ -84,6 +91,7 @@ def runtime_manifest_to_parts(
             ),
             layer_id=tensor.layer_id,
             expert_id=tensor.expert_id,
+            expert_axis=tensor.expert_axis,
             layout_fingerprint=tensor.layout_fingerprint,
             nbytes=tensor.nbytes,
             byte_offset=tensor.byte_offset,
@@ -291,22 +299,12 @@ def _validate_target_allocations(
             location
         )
     for scoped in by_address_space.values():
-        ordered = sorted(scoped, key=lambda item: (item.address, item.nbytes))
-        for index, left in enumerate(ordered):
-            left_end = left.address + left.nbytes
-            for right in ordered[index + 1 :]:
-                if right.address >= left_end:
-                    break
-                same_alias = (
-                    left.address == right.address
-                    and left.nbytes == right.nbytes
-                    and len(left.aliases) > 1
-                    and left.aliases == right.aliases
-                    and left.global_offset == right.global_offset
-                    and left.local_shape == right.local_shape
-                )
-                if not same_alias:
-                    raise ValueError("overlapping target physical allocations")
+        allocations = sorted({(item.address, item.nbytes) for item in scoped})
+        previous_end = 0
+        for address, nbytes in allocations:
+            if address < previous_end:
+                raise ValueError("overlapping target physical allocations")
+            previous_end = address + nbytes
 
 
 def _validate_runtime_source_target_allocations(
@@ -365,18 +363,24 @@ def _source_identity(region: BoundWeightTransferRegion) -> tuple:
             "runtime",
             source.worker_id,
             source.endpoint,
+            source.device,
             source.generation,
-            source.address + region.source_base_offset,
+            source.lease_id,
+            source.address,
+            source.nbytes,
         )
     else:
         location = (
             "storage",
             source.provider,
+            source.storage_id,
             source.object_key,
-            source.object_offset + region.source_base_offset,
+            source.object_offset,
+            source.nbytes,
         )
     return (
         location,
+        region.source_base_offset,
         region.inner_bytes,
         region.outer_loop_counts,
         region.source_strides,
@@ -399,63 +403,64 @@ def _storage_payload_identity(
     )
 
 
-def _sources_have_identical_payload(
-    left: BoundWeightTransferRegion,
-    right: BoundWeightTransferRegion,
-) -> bool:
-    if _source_identity(left) == _source_identity(right):
-        return True
-    left_storage = _storage_payload_identity(left)
-    return left_storage is not None and left_storage == _storage_payload_identity(right)
-
-
-def _target_identity(region: BoundWeightTransferRegion) -> tuple:
-    return (
-        region.target.worker_id,
-        region.target.endpoint,
-        region.target.address + region.target_base_offset,
-        region.inner_bytes,
-        region.outer_loop_counts,
-        region.target_strides,
+def _target_alias_candidate(
+    region: BoundWeightTransferRegion,
+) -> TargetAliasCandidate:
+    target = region.target
+    logical = region.logical_region
+    return TargetAliasCandidate(
+        allocation_identity=(
+            target.worker_id,
+            target.endpoint,
+            target.device,
+            target.address,
+            target.nbytes,
+        ),
+        snapshot_identity=(target.generation, target.lease_id),
+        target_view_identity=(
+            target.aliases,
+            target.global_offset,
+            target.local_shape,
+        ),
+        logical_box=(logical.overlap_offset, logical.overlap_shape),
+        source_identity=_source_identity(region),
+        source_payload_identity=_storage_payload_identity(region),
+        alias_declared=len(target.aliases) > 1,
     )
 
 
 def _deduplicate_aliases(
     regions: Sequence[BoundWeightTransferRegion],
 ) -> tuple[BoundWeightTransferRegion, ...]:
-    result = []
-    by_target: dict[tuple, BoundWeightTransferRegion] = {}
-    for region in regions:
-        target_key = _target_identity(region)
-        previous = by_target.get(target_key)
-        if previous is None:
-            by_target[target_key] = region
-            result.append(region)
-            continue
-        exact_alias = (
-            len(previous.target.aliases) > 1
-            and previous.target.aliases == region.target.aliases
-            and previous.source.aliases == region.source.aliases
-            and _sources_have_identical_payload(previous, region)
-            and previous.logical_region.overlap_offset
-            == region.logical_region.overlap_offset
-            and previous.logical_region.overlap_shape
-            == region.logical_region.overlap_shape
+    candidates = tuple(_target_alias_candidate(region) for region in regions)
+    analysis = analyze_target_aliases(
+        candidates,
+        validate_overlaps=False,
+    )
+    conflict = analysis.conflict
+    if conflict is not None:
+        previous = regions[conflict.left_index]
+        region = regions[conflict.right_index]
+        previous_candidate = candidates[conflict.left_index]
+        candidate = candidates[conflict.right_index]
+        raise ValueError(
+            f"{conflict.classification.value}: "
+            f"tensor={region.tensor_id!r}, "
+            f"target_fragments=("
+            f"{previous.target.placement_fragment_id!r}, "
+            f"{region.target.placement_fragment_id!r}), "
+            f"target_allocation={candidate.allocation_identity!r}, "
+            f"target_snapshots=("
+            f"{previous_candidate.snapshot_identity!r}, "
+            f"{candidate.snapshot_identity!r}), "
+            f"source_fragments=("
+            f"{previous.source.placement_fragment_id!r}, "
+            f"{region.source.placement_fragment_id!r}), "
+            f"logical_regions=("
+            f"{previous_candidate.logical_box!r}, "
+            f"{candidate.logical_box!r})"
         )
-        if not exact_alias:
-            raise ValueError(
-                "overlapping target writes: "
-                f"tensor={region.tensor_id!r}, "
-                f"target_address={region.target.address + region.target_base_offset}, "
-                f"source_fragments=({previous.source.placement_fragment_id!r}, "
-                f"{region.source.placement_fragment_id!r}), "
-                f"logical_regions=("
-                f"{previous.logical_region.overlap_offset}/"
-                f"{previous.logical_region.overlap_shape}, "
-                f"{region.logical_region.overlap_offset}/"
-                f"{region.logical_region.overlap_shape})"
-            )
-    return tuple(result)
+    return tuple(regions[index] for index in analysis.keep_indices)
 
 
 def bind_weight_transfer_plan(

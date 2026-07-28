@@ -40,10 +40,11 @@ from unittest.mock import patch
 
 import torch
 import torch.distributed
-from torch.distributed import Backend, ProcessGroup
-
 from sglang.srt import platforms
 from sglang.srt.compilation.compilation_config import register_split_op
+from sglang.srt.distributed.bounded_object_collectives import (
+    BoundedObjectCollectiveCoordinator,
+)
 from sglang.srt.distributed.utils import set_global_tcp_store
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
@@ -70,6 +71,7 @@ from sglang.srt.utils import (
 from sglang.srt.utils.custom_op import register_custom_op
 from sglang.srt.utils.network import get_local_ip_auto
 from sglang.srt.utils.stale_shm_cleanup import make_shm_name
+from torch.distributed import Backend, ProcessGroup
 
 _is_npu = is_npu()
 _is_cpu = is_cpu()
@@ -216,6 +218,9 @@ def reg_all_to_all_single(
     if group is None:
         raise ValueError(f"Group {group_name} is destroyed.")
     group._all_to_all_single(output, input)
+
+
+_BoundedObjectCollectiveCoordinator = BoundedObjectCollectiveCoordinator
 
 
 class GroupCoordinator:
@@ -393,6 +398,8 @@ class GroupCoordinator:
         self.use_xpu_communicator = use_xpu_communicator
         self.use_npu_communicator = use_npu_communicator
         self.use_message_queue_broadcaster = use_message_queue_broadcaster
+        self._bounded_object_collective_coordinator = None
+        self._bounded_object_collective_poisoned = None
 
         # Lazy import to avoid documentation build error
         from sglang.srt.distributed.device_communicators.custom_all_reduce import (
@@ -966,9 +973,9 @@ class GroupCoordinator:
         # Bypass the function if we are using only 1 GPU.
         if world_size == 1:
             return input_
-        assert (
-            -input_.dim() <= dim < input_.dim()
-        ), f"Invalid dim ({dim}) for input tensor with shape {input_.size()}"
+        assert -input_.dim() <= dim < input_.dim(), (
+            f"Invalid dim ({dim}) for input tensor with shape {input_.size()}"
+        )
 
         if dim < 0:
             # Convert negative dim to positive.
@@ -1104,9 +1111,9 @@ class GroupCoordinator:
         pynccl_comm = self.pynccl_comm
 
         with pynccl_comm.change_state(enable=True):
-            assert (
-                pynccl_comm is not None and not pynccl_comm.disabled
-            ), "pynccl is required for reduce_scatterv"
+            assert pynccl_comm is not None and not pynccl_comm.disabled, (
+                "pynccl is required for reduce_scatterv"
+            )
 
             if sizes is not None:
                 assert len(sizes) == world_size
@@ -1228,9 +1235,9 @@ class GroupCoordinator:
                 output_tensor_list, input_, group=self.device_group
             )
 
-        assert (
-            -input_.dim() <= dim < input_.dim()
-        ), f"Invalid dim ({dim}) for input tensor with shape {input_.size()}"
+        assert -input_.dim() <= dim < input_.dim(), (
+            f"Invalid dim ({dim}) for input tensor with shape {input_.size()}"
+        )
 
         # For HPUs, use HPU communicator.
         hpu_comm = self.hpu_communicator
@@ -1294,9 +1301,9 @@ class GroupCoordinator:
         pynccl_comm = self.pynccl_comm
 
         with pynccl_comm.change_state(enable=True):
-            assert (
-                pynccl_comm is not None and not pynccl_comm.disabled
-            ), "pynccl is required for all_gatherv"
+            assert pynccl_comm is not None and not pynccl_comm.disabled, (
+                "pynccl is required for all_gatherv"
+            )
 
             def _all_gather_allocate_output(
                 input_: torch.Tensor,
@@ -1360,9 +1367,9 @@ class GroupCoordinator:
         # Bypass the function if we are using only 1 GPU.
         if world_size == 1:
             return input_
-        assert (
-            -input_.dim() <= dim < input_.dim()
-        ), f"Invalid dim ({dim}) for input tensor with shape {input_.size()}"
+        assert -input_.dim() <= dim < input_.dim(), (
+            f"Invalid dim ({dim}) for input tensor with shape {input_.size()}"
+        )
         if dim < 0:
             # Convert negative dim to positive.
             dim += input_.dim()
@@ -1398,11 +1405,93 @@ class GroupCoordinator:
         )
         return input_
 
-    def broadcast_object(self, obj: Optional[Any] = None, src: int = 0):
+    @property
+    def bounded_object_collectives_poisoned(self) -> bool:
+        return bool(getattr(self, "_bounded_object_collective_poisoned", None))
+
+    def _get_bounded_object_collective_coordinator(
+        self,
+    ) -> _BoundedObjectCollectiveCoordinator:
+        coordinator = getattr(
+            self,
+            "_bounded_object_collective_coordinator",
+            None,
+        )
+        if coordinator is None:
+            coordinator = _BoundedObjectCollectiveCoordinator(self.cpu_group)
+            if (
+                coordinator.rank != self.rank_in_group
+                or coordinator.world_size != self.world_size
+            ):
+                raise RuntimeError(
+                    "bounded object collective coordinator does not match the group"
+                )
+            self._bounded_object_collective_coordinator = coordinator
+        return coordinator
+
+    def _run_bounded_object_collective(self, phase: str, operation):
+        poisoned = getattr(self, "_bounded_object_collective_poisoned", None)
+        if poisoned is not None:
+            raise RuntimeError(
+                f"bounded object collective process group is poisoned: {poisoned}"
+            )
+        try:
+            return operation(self._get_bounded_object_collective_coordinator())
+        except BaseException as error:
+            if bool(getattr(error, "completion_unknown", False)):
+                self._bounded_object_collective_poisoned = (
+                    f"{phase}: {type(error).__name__}: {error}"
+                )
+                abort = getattr(self.cpu_group, "abort", None)
+                if callable(abort):
+                    try:
+                        abort()
+                    except BaseException:
+                        logger.exception(
+                            "Failed to abort poisoned bounded object process group"
+                        )
+            raise
+
+    def synchronize_object_collective_deadline(
+        self,
+        *,
+        phase: str,
+        execution_context: Any,
+    ) -> float:
+        if not phase:
+            raise ValueError("bounded object deadline synchronization requires a phase")
+        return self._run_bounded_object_collective(
+            phase,
+            lambda coordinator: coordinator.synchronize_deadline(
+                phase=phase,
+                execution_context=execution_context,
+            ),
+        )
+
+    def broadcast_object(
+        self,
+        obj: Optional[Any] = None,
+        src: int = 0,
+        *,
+        phase: Optional[str] = None,
+        execution_context: Optional[Any] = None,
+    ):
         """Broadcast the input object.
         NOTE: `src` is the local rank of the source rank.
         """
         assert src < self.world_size, f"Invalid src rank ({src})"
+        if execution_context is not None:
+            if not phase:
+                raise ValueError("bounded object broadcast requires a phase")
+            return self._run_bounded_object_collective(
+                phase,
+                lambda coordinator: coordinator.broadcast_object(
+                    obj,
+                    src=src,
+                    phase=phase,
+                    execution_context=execution_context,
+                ),
+            )
 
         # Bypass the function if we are using only 1 GPU.
         if self.world_size == 1:
@@ -1439,10 +1528,106 @@ class GroupCoordinator:
         )
         return obj_list
 
-    def all_gather_object(self, obj: Any) -> List[Any]:
+    def all_gather_object(
+        self,
+        obj: Any,
+        *,
+        phase: Optional[str] = None,
+        execution_context: Optional[Any] = None,
+    ) -> List[Any]:
+        if execution_context is not None:
+            if not phase:
+                raise ValueError("bounded object all-gather requires a phase")
+            return self._run_bounded_object_collective(
+                phase,
+                lambda coordinator: coordinator.all_gather_object(
+                    obj,
+                    phase=phase,
+                    execution_context=execution_context,
+                ),
+            )
         objs = [None] * self.world_size
         torch.distributed.all_gather_object(objs, obj, group=self.cpu_group)
         return objs
+
+    def gather_object(
+        self,
+        obj: Any,
+        dst: int = 0,
+        *,
+        phase: Optional[str] = None,
+        execution_context: Optional[Any] = None,
+    ) -> Optional[List[Any]]:
+        """Gather objects on a group-local destination rank."""
+        assert 0 <= dst < self.world_size, f"Invalid dst rank ({dst})"
+        if execution_context is not None:
+            if not phase:
+                raise ValueError("bounded object gather requires a phase")
+            return self._run_bounded_object_collective(
+                phase,
+                lambda coordinator: coordinator.gather_object(
+                    obj,
+                    dst=dst,
+                    phase=phase,
+                    execution_context=execution_context,
+                ),
+            )
+
+        if self.world_size == 1:
+            return [obj]
+
+        outputs: Optional[List[Any]] = (
+            [None] * self.world_size if self.rank_in_group == dst else None
+        )
+        torch.distributed.gather_object(
+            obj,
+            outputs,
+            dst=self.ranks[dst],
+            group=self.cpu_group,
+        )
+        return outputs
+
+    def scatter_object(
+        self,
+        objects: Optional[List[Any]],
+        src: int = 0,
+        *,
+        phase: Optional[str] = None,
+        execution_context: Optional[Any] = None,
+    ) -> Any:
+        """Scatter objects from a group-local source rank."""
+        assert 0 <= src < self.world_size, f"Invalid src rank ({src})"
+        if execution_context is not None:
+            if not phase:
+                raise ValueError("bounded object scatter requires a phase")
+            return self._run_bounded_object_collective(
+                phase,
+                lambda coordinator: coordinator.scatter_object(
+                    objects,
+                    src=src,
+                    phase=phase,
+                    execution_context=execution_context,
+                ),
+            )
+
+        if self.rank_in_group == src:
+            assert objects is not None, "Source rank must provide objects"
+            assert len(objects) == self.world_size, (
+                f"Expected {self.world_size} objects, got {len(objects)}"
+            )
+
+        if self.world_size == 1:
+            assert objects is not None
+            return objects[0]
+
+        output: List[Any] = [None]
+        torch.distributed.scatter_object_list(
+            output,
+            objects,
+            src=self.ranks[src],
+            group=self.cpu_group,
+        )
+        return output[0]
 
     def send_object(
         self,
@@ -1505,9 +1690,9 @@ class GroupCoordinator:
         """NOTE: `src` is the local rank of the source rank."""
 
         assert src < self.world_size, f"Invalid src rank ({src})"
-        assert (
-            src != self.rank_in_group
-        ), "Invalid source rank. Source rank is the same as the current rank."
+        assert src != self.rank_in_group, (
+            "Invalid source rank. Source rank is the same as the current rank."
+        )
 
         size_tensor = torch.empty(1, dtype=torch.long, device="cpu")
 
@@ -1554,9 +1739,9 @@ class GroupCoordinator:
         rank_in_group = self.rank_in_group
         if rank_in_group == src:
             metadata_list: List[Tuple[Any, Any]] = []
-            assert isinstance(
-                tensor_dict, dict
-            ), f"Expecting a dictionary, got {type(tensor_dict)}"
+            assert isinstance(tensor_dict, dict), (
+                f"Expecting a dictionary, got {type(tensor_dict)}"
+            )
             metadata_list, tensor_list = _split_tensor_dict(tensor_dict)
             # `metadata_list` lives in CPU memory.
             # `broadcast_object_list` has serialization & deserialization,
@@ -1641,9 +1826,9 @@ class GroupCoordinator:
             dst = (self.rank_in_group + 1) % self.world_size
         assert dst < self.world_size, f"Invalid dst rank ({dst})"
 
-        assert isinstance(
-            tensor_dict, dict
-        ), f"Expecting a dictionary, got {type(tensor_dict)}"
+        assert isinstance(tensor_dict, dict), (
+            f"Expecting a dictionary, got {type(tensor_dict)}"
+        )
         metadata_list, tensor_list = _split_tensor_dict(tensor_dict)
         # Note: While switching to Device-to-Device (D2D) would introduce an extra
         # Device-to-Host (D2H) memory copy overhead for serialization, our benchmarks
@@ -1872,25 +2057,25 @@ def set_pdmux_status(enable_prefill_multiplexing: bool):
 
 def get_tp_group() -> GroupCoordinator:
     if _ENABLE_PDMUX_P_TP:
-        assert (
-            _PDMUX_PREFILL_TP_GROUP is not None
-        ), "tensor model parallel group for PD-Multiplexing Prefill is not initialized"
+        assert _PDMUX_PREFILL_TP_GROUP is not None, (
+            "tensor model parallel group for PD-Multiplexing Prefill is not initialized"
+        )
         return _PDMUX_PREFILL_TP_GROUP
     assert _TP is not None, "tensor model parallel group is not initialized"
     return _TP
 
 
 def get_attn_tp_group() -> GroupCoordinator:
-    assert (
-        _ATTN_TP is not None
-    ), "attention tensor model parallel group is not initialized"
+    assert _ATTN_TP is not None, (
+        "attention tensor model parallel group is not initialized"
+    )
     return _ATTN_TP
 
 
 def get_attn_cp_group() -> GroupCoordinator:
-    assert (
-        _ATTN_CP is not None
-    ), "attention context model parallel group is not initialized"
+    assert _ATTN_CP is not None, (
+        "attention context model parallel group is not initialized"
+    )
     return _ATTN_CP
 
 
@@ -2092,7 +2277,7 @@ def init_distributed_environment(
     max_world_size: Optional[int] = None,
 ):
     logger.debug(
-        "world_size=%d rank=%d local_rank=%d " "distributed_init_method=%s backend=%s",
+        "world_size=%d rank=%d local_rank=%d distributed_init_method=%s backend=%s",
         world_size,
         rank,
         local_rank,
@@ -2167,9 +2352,9 @@ def init_distributed_environment(
             ranks, local_rank, backend, recovered_rank=recovered_rank
         )
     else:
-        assert (
-            _WORLD.world_size == torch.distributed.get_world_size()
-        ), "world group already initialized with a different world size"
+        assert _WORLD.world_size == torch.distributed.get_world_size(), (
+            "world group already initialized with a different world size"
+        )
 
 
 def initialize_model_parallel(
@@ -2298,9 +2483,9 @@ def initialize_model_parallel(
 
     if duplicate_tp_group:
         global _PDMUX_PREFILL_TP_GROUP
-        assert (
-            _PDMUX_PREFILL_TP_GROUP is None
-        ), "tensor model parallel group for PD-Multiplexing Prefill is already initialized"
+        assert _PDMUX_PREFILL_TP_GROUP is None, (
+            "tensor model parallel group for PD-Multiplexing Prefill is already initialized"
+        )
         _PDMUX_PREFILL_TP_GROUP = init_model_parallel_group(
             group_ranks,
             get_world_group().local_rank,
@@ -2343,9 +2528,9 @@ def initialize_model_parallel(
     attn_tp_size = tensor_model_parallel_size // attn_cp_size // attn_dp_size
 
     global _ATTN_CP
-    assert (
-        _ATTN_CP is None
-    ), "attention context model parallel group is already initialized"
+    assert _ATTN_CP is None, (
+        "attention context model parallel group is already initialized"
+    )
     if attn_cp_size == tensor_model_parallel_size:
         _ATTN_CP = _TP
     else:
@@ -2379,9 +2564,9 @@ def initialize_model_parallel(
     from sglang.srt.layers.sampler import SYNC_TOKEN_IDS_ACROSS_TP
 
     global _ATTN_TP
-    assert (
-        _ATTN_TP is None
-    ), "attention tensor model parallel group is already initialized"
+    assert _ATTN_TP is None, (
+        "attention tensor model parallel group is already initialized"
+    )
     if attn_tp_size == tensor_model_parallel_size:
         _ATTN_TP = _TP
     else:
@@ -2614,9 +2799,9 @@ def ensure_model_parallel_initialized(
     )
     if decode_context_parallel_size > 1:
         dcp_world_size = get_dcp_group().world_size
-        assert (
-            dcp_world_size == decode_context_parallel_size
-        ), f"decode context parallel group already initialized, but of unexpected size: {dcp_world_size=} {decode_context_parallel_size=}"
+        assert dcp_world_size == decode_context_parallel_size, (
+            f"decode context parallel group already initialized, but of unexpected size: {dcp_world_size=} {decode_context_parallel_size=}"
+        )
 
 
 def model_parallel_is_initialized():
@@ -2842,9 +3027,9 @@ def in_the_same_node_as(pg: ProcessGroup, source_rank: int = 0) -> List[bool]:
     as the source rank. It tests if processes are attached to the same
     memory system (shared access to shared memory).
     """
-    assert (
-        torch.distributed.get_backend(pg) != torch.distributed.Backend.NCCL
-    ), "in_the_same_node_as should be tested with a non-NCCL group."
+    assert torch.distributed.get_backend(pg) != torch.distributed.Backend.NCCL, (
+        "in_the_same_node_as should be tested with a non-NCCL group."
+    )
     # local rank inside the group
     rank = torch.distributed.get_rank(group=pg)
     world_size = torch.distributed.get_world_size(group=pg)

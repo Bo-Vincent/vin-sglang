@@ -236,11 +236,20 @@ def _validate_and_normalize_snapshot(
 
 
 def _tensor_identity(tensor: WeightPlacementTensor) -> dict[str, object]:
+    rank_identity = {
+        "dp": tensor.rank.dp,
+        "ep": tensor.rank.ep,
+        "pp": tensor.rank.pp,
+        "tp": tensor.rank.tp,
+    }
+    if tensor.rank.moe_dp:
+        rank_identity["moe_dp"] = tensor.rank.moe_dp
     return {
         "aliases": sorted(tensor.aliases),
         "byte_offset": tensor.byte_offset,
         "dtype": tensor.dtype,
         "expert_id": tensor.expert_id,
+        "expert_axis": tensor.expert_axis,
         "global_offset": list(tensor.global_offset),
         "global_shape": list(tensor.global_shape),
         "itemsize": tensor.itemsize,
@@ -250,12 +259,7 @@ def _tensor_identity(tensor: WeightPlacementTensor) -> dict[str, object]:
         "nbytes": tensor.nbytes,
         "partition_dim": tensor.partition_dim,
         "placement_fragment_id": tensor.placement_fragment_id,
-        "rank": {
-            "dp": tensor.rank.dp,
-            "ep": tensor.rank.ep,
-            "pp": tensor.rank.pp,
-            "tp": tensor.rank.tp,
-        },
+        "rank": rank_identity,
         "runtime_name": tensor.runtime_name,
         "shard_dims": list(tensor.shard_dims),
         "tensor_id": tensor.tensor_id,
@@ -436,7 +440,7 @@ def weight_source_snapshot_digest(
     placements: Sequence[WeightPlacementManifest],
     bindings: Sequence[WeightRuntimeBindingManifest | WeightStorageBindingManifest],
 ) -> str:
-    """Digest one immutable source snapshot without coupling it to an address."""
+    """Digest one strict source snapshot without coupling it to raw addresses."""
 
     placements = tuple(placements)
     bindings = tuple(bindings)
@@ -455,13 +459,22 @@ def weight_source_snapshot_digest(
         ):
             raise ValueError("weight source binding model identity differs")
         placement_fragments = {
-            tensor.placement_fragment_id for tensor in placement.tensors
+            tensor.placement_fragment_id: tensor for tensor in placement.tensors
         }
         binding_fragments = {
-            fragment.placement_fragment_id for fragment in binding.fragments
+            fragment.placement_fragment_id: fragment for fragment in binding.fragments
         }
-        if placement_fragments != binding_fragments:
+        if (
+            len(placement_fragments) != len(placement.tensors)
+            or len(binding_fragments) != len(binding.fragments)
+            or set(placement_fragments) != set(binding_fragments)
+        ):
             raise ValueError("weight source binding fragments differ")
+        if any(
+            binding_fragments[fragment_id].nbytes != tensor.nbytes
+            for fragment_id, tensor in placement_fragments.items()
+        ):
+            raise ValueError("weight source binding byte size differs")
     payload = json.dumps(
         {
             "format": "sglang-weight-source-snapshot-v1",
@@ -717,6 +730,37 @@ class WeightMaterializationIntent:
         if type(self.fragment_count) is not int or self.fragment_count <= 0:
             raise ValueError("materialization fragment_count must be positive")
 
+    def matches_durable_recovery(self, other: object) -> bool:
+        """Compare provider-neutral identity that survives runtime rebinding."""
+
+        if (
+            not isinstance(other, WeightMaterializationIntent)
+            or self.payload_digest is None
+            or other.payload_digest is None
+        ):
+            return False
+        return (
+            self.provider,
+            self.storage_id,
+            self.object_prefix,
+            self.model_id,
+            self.revision,
+            self.source_digest,
+            self.total_bytes,
+            self.fragment_count,
+            self.payload_digest,
+        ) == (
+            other.provider,
+            other.storage_id,
+            other.object_prefix,
+            other.model_id,
+            other.revision,
+            other.source_digest,
+            other.total_bytes,
+            other.fragment_count,
+            other.payload_digest,
+        )
+
 
 class WeightMaterializationAttemptState(str, Enum):
     PREPARING = "preparing"
@@ -806,6 +850,12 @@ class WeightStorageCatalog(Protocol):
     ) -> WeightMaterializationAttempt: ...
 
     def set_materialization_completion_ticket(
+        self,
+        materialization_id: str,
+        completion_ticket: str,
+    ) -> WeightMaterializationAttempt: ...
+
+    def clear_materialization_completion_ticket(
         self,
         materialization_id: str,
         completion_ticket: str,
@@ -998,7 +1048,6 @@ class InMemoryWeightStorageCatalog:
                 current,
                 state=WeightMaterializationAttemptState.MATERIALIZED,
                 snapshot=snapshot,
-                completion_ticket=None,
             )
             self._materializations[materialization_id] = materialized
             return materialized
@@ -1047,6 +1096,22 @@ class InMemoryWeightStorageCatalog:
             self._materializations[materialization_id] = updated
             return updated
 
+    def clear_materialization_completion_ticket(
+        self,
+        materialization_id: str,
+        completion_ticket: str,
+    ) -> WeightMaterializationAttempt:
+        _require_nonempty_string(completion_ticket, "completion_ticket")
+        with self._lock:
+            current = self._require_materialization(materialization_id)
+            if current.completion_ticket is None:
+                return current
+            if current.completion_ticket != completion_ticket:
+                raise ValueError("materialization has another completion ticket")
+            updated = replace(current, completion_ticket=None)
+            self._materializations[materialization_id] = updated
+            return updated
+
     def get_materialization(
         self,
         materialization_id: str,
@@ -1089,7 +1154,14 @@ class InMemoryWeightStorageCatalog:
             if current.state is WeightSnapshotPublicationState.ABORTED:
                 return current
             if current.state is WeightSnapshotPublicationState.PUBLISHED:
-                raise ValueError("published publication cannot be aborted")
+                if any(
+                    head.ref == current.snapshot.ref
+                    for head in self._revision_heads.values()
+                ):
+                    raise ValueError(
+                        "published publication referenced by a revision cannot be aborted"
+                    )
+                self._snapshots.pop(current.snapshot.ref, None)
             aborted = replace(
                 current,
                 state=WeightSnapshotPublicationState.ABORTED,

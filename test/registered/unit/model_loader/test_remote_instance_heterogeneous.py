@@ -1,7 +1,6 @@
-import builtins
 import contextlib
-import logging
 import sys
+import time
 from types import ModuleType, SimpleNamespace
 
 import pytest
@@ -14,21 +13,40 @@ from sglang.srt.model_executor.weight_runtime_manifest import (
     WeightPlacementManifest,
     WeightPlacementTensor,
     WeightRuntimeBindingManifest,
+    compose_weight_runtime_manifest,
     compute_weight_placement_id,
 )
-from sglang.srt.model_loader import remote_instance_weight_loader_utils
 from sglang.srt.model_loader import loader as loader_module
+from sglang.srt.model_loader import remote_instance_weight_loader_utils
 from sglang.srt.model_loader.loader import RemoteInstanceModelLoader
+from sglang.srt.weight_transfer.binding import runtime_manifest_to_parts
+from sglang.srt.weight_transfer.planner import (
+    plan_weight_transfer as build_full_world_plan,
+)
+from sglang.srt.weight_transfer.planner import (
+    project_weight_transfer_plan_to_target,
+)
 from sglang.srt.weight_transfer.provider import (
     WeightLoadReceipt,
     WeightProviderCapabilities,
+    WeightTransferExecutionContext,
+)
+from sglang.srt.weight_transfer.remote_protocol import (
+    ARTIFACT_WEIGHT_VERSION_V1,
+    HF_REVISION_V1,
+    PLACEMENT_BINDING_V1,
+    RUNTIME_MANIFEST_V1,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
 _TARGET_MODEL_ID = "Qwen/Qwen3.5-0.8B"
-_TARGET_REVISION = "main"
+_TARGET_ARTIFACT_REVISION = "weights-v7"
+_TARGET_HF_REVISION = "main"
+_REAL_LEGACY_RUNTIME_V1_SUPPORTS_BOUNDED_EXECUTION = (
+    loader_module._legacy_runtime_v1_supports_bounded_execution
+)
 
 
 class _TransferEngineError(RuntimeError):
@@ -53,14 +71,188 @@ def _runtime_server_args(monkeypatch):
         "_HETEROGENEOUS_UNKNOWN_TRANSFER_QUARANTINE",
         [],
     )
+    monkeypatch.setattr(
+        loader_module,
+        "probe_remote_instance_weight_transfer_capabilities",
+        lambda **_kwargs: (
+            remote_instance_weight_loader_utils.RemoteInstanceWeightTransferCapabilities(
+                native_executor=False,
+                canonical_adapter=True,
+                legacy_planner=True,
+            )
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        loader_module,
+        "_legacy_runtime_v1_supports_bounded_execution",
+        lambda _backend: True,
+        raising=False,
+    )
 
 
 def _load_heterogeneous(loader, *args, **kwargs):
     kwargs.setdefault("target_model_id", _TARGET_MODEL_ID)
-    kwargs.setdefault("target_revision", _TARGET_REVISION)
+    kwargs.setdefault("target_artifact_revision", _TARGET_ARTIFACT_REVISION)
+    kwargs.setdefault("target_hf_revision", _TARGET_HF_REVISION)
     return loader.load_model_from_remote_instance_by_transfer_engine_heterogeneous(
         *args,
         **kwargs,
+    )
+
+
+def _capability_probe_provider(*, validate_environment=lambda: None):
+    return SimpleNamespace(
+        name="test-provider",
+        bounded_execution_contract_version=1,
+        validate_environment=validate_environment,
+        probe=lambda request: request,
+        prepare=lambda request: request,
+        submit=lambda request: request,
+        wait=lambda request: request,
+        cancel=lambda request: None,
+        synchronize=lambda receipt, **kwargs: None,
+        release=lambda prepared, receipt: None,
+    )
+
+
+@pytest.mark.parametrize("failure", ["unavailable", "unsupported"])
+def test_explicit_provider_probe_does_not_use_legacy_defaults(
+    monkeypatch,
+    failure,
+) -> None:
+    def unavailable():
+        raise RuntimeError("provider unavailable")
+
+    provider = _capability_probe_provider(
+        validate_environment=unavailable if failure == "unavailable" else lambda: None
+    )
+    if failure == "unsupported":
+        provider.release = None
+    monkeypatch.setattr(
+        remote_instance_weight_loader_utils,
+        "_load_legacy_mooncake_weight_backend",
+        lambda: pytest.fail("explicit provider probe must not load the legacy backend"),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        remote_instance_weight_loader_utils,
+        "supports_mooncake_placement_binding_v1",
+        lambda: pytest.fail("explicit provider probe must not use legacy capabilities"),
+        raising=False,
+    )
+
+    capabilities = remote_instance_weight_loader_utils.probe_remote_instance_weight_transfer_capabilities(
+        provider=provider,
+    )
+
+    assert capabilities.native_executor is False
+    assert capabilities.legacy_planner is False
+
+
+def test_target_artifact_revision_is_not_the_hf_revision(monkeypatch) -> None:
+    monkeypatch.setattr(
+        loader_module,
+        "get_server_args",
+        lambda: SimpleNamespace(weight_version="weights-v7"),
+    )
+
+    assert loader_module._configured_weight_artifact_revision() == "weights-v7"
+
+
+def test_legacy_target_revision_alias_preserves_prior_identity() -> None:
+    assert loader_module._resolve_target_weight_revisions(
+        target_artifact_revision=None,
+        target_hf_revision=None,
+        target_revision="main",
+    ) == ("main", "main")
+
+
+def test_target_revision_alias_rejects_ambiguous_identity() -> None:
+    with pytest.raises(ValueError, match="cannot be combined"):
+        loader_module._resolve_target_weight_revisions(
+            target_artifact_revision="weights-v7",
+            target_hf_revision="main",
+            target_revision="legacy",
+        )
+
+
+@pytest.mark.parametrize(
+    "source_revision_semantics",
+    ("legacy_hf_unattested", HF_REVISION_V1),
+)
+def test_artifact_policy_rejects_hf_fallback(source_revision_semantics) -> None:
+    with pytest.raises(RuntimeError, match="did not attest artifact weight version"):
+        loader_module._resolve_remote_manifest_revision(
+            manifest_format=RUNTIME_MANIFEST_V1,
+            source_revision_semantics=source_revision_semantics,
+            allow_legacy_hf_fallback=False,
+            target_artifact_revision="default",
+            target_hf_revision=_TARGET_HF_REVISION,
+        )
+
+
+def test_runtime_artifact_attestation_uses_artifact_revision() -> None:
+    assert (
+        loader_module._resolve_remote_manifest_revision(
+            manifest_format=RUNTIME_MANIFEST_V1,
+            source_revision_semantics=ARTIFACT_WEIGHT_VERSION_V1,
+            allow_legacy_hf_fallback=False,
+            target_artifact_revision=_TARGET_ARTIFACT_REVISION,
+            target_hf_revision=_TARGET_HF_REVISION,
+        )
+        == _TARGET_ARTIFACT_REVISION
+    )
+
+
+@pytest.mark.parametrize(
+    "source_revision_semantics",
+    (HF_REVISION_V1, "legacy_hf_unattested"),
+)
+def test_explicit_legacy_policy_uses_hf_revision(source_revision_semantics) -> None:
+    assert (
+        loader_module._resolve_remote_manifest_revision(
+            manifest_format=RUNTIME_MANIFEST_V1,
+            source_revision_semantics=source_revision_semantics,
+            allow_legacy_hf_fallback=True,
+            target_artifact_revision=_TARGET_ARTIFACT_REVISION,
+            target_hf_revision=_TARGET_HF_REVISION,
+        )
+        == _TARGET_HF_REVISION
+    )
+
+
+def test_unattested_revision_requires_runtime_hf_compatibility() -> None:
+    assert (
+        loader_module._resolve_remote_manifest_revision(
+            manifest_format=PLACEMENT_BINDING_V1,
+            source_revision_semantics="legacy_hf_unattested",
+            allow_legacy_hf_fallback=True,
+            target_artifact_revision=_TARGET_ARTIFACT_REVISION,
+            target_hf_revision=_TARGET_HF_REVISION,
+        )
+        == _TARGET_HF_REVISION
+    )
+
+
+def test_native_legacy_revision_policy_requires_unambiguous_identity() -> None:
+    capabilities = (
+        remote_instance_weight_loader_utils.RemoteInstanceWeightTransferCapabilities(
+            native_executor=True,
+            canonical_adapter=True,
+            legacy_planner=False,
+        )
+    )
+
+    assert loader_module._allow_legacy_hf_manifest_revision(
+        capabilities,
+        target_artifact_revision="main",
+        target_hf_revision="main",
+    )
+    assert not loader_module._allow_legacy_hf_manifest_revision(
+        capabilities,
+        target_artifact_revision="weights-v7",
+        target_hf_revision="main",
     )
 
 
@@ -76,7 +268,7 @@ def test_heterogeneous_loader_rejects_source_model_identity_mismatch() -> None:
                 ),
             ),
             model_id=_TARGET_MODEL_ID,
-            revision=_TARGET_REVISION,
+            revision=_TARGET_HF_REVISION,
             role="source",
         )
 
@@ -89,7 +281,7 @@ def test_heterogeneous_loader_builds_local_plan_and_reads_from_source(
     calls = {}
     source_inventory = {
         "model_id": _TARGET_MODEL_ID,
-        "revision": _TARGET_REVISION,
+        "revision": _TARGET_HF_REVISION,
         "lease_id": "source-runtime-lease",
         "fragments": [SimpleNamespace(fragment_id="source-fragment")],
     }
@@ -125,10 +317,11 @@ def test_heterogeneous_loader_builds_local_plan_and_reads_from_source(
         manifests=[source_inventory],
         lease_timeout_sec=90,
         manifest_format="runtime_v1",
+        deadline_unix_sec=time.time() + 120,
     )
 
     class FakeCoordinator:
-        def __init__(self, seed_url, world_group):
+        def __init__(self, seed_url, world_group, **_kwargs):
             calls["coordinator"] = (seed_url, world_group)
             self.world_release_safe = True
 
@@ -211,18 +404,23 @@ def test_heterogeneous_loader_builds_local_plan_and_reads_from_source(
         "http://seed:30000",
         "target-session",
         target_builder,
+        target_artifact_revision=_TARGET_ARTIFACT_REVISION,
+        target_hf_revision=_TARGET_HF_REVISION,
     )
 
     assert success is release_success
     assert calls["builder"] == {
         "model": model,
         "model_id": _TARGET_MODEL_ID,
-        "revision": _TARGET_REVISION,
+        "revision": _TARGET_HF_REVISION,
         "instance_id": "sglang:target-session",
         "endpoint": "target-session",
     }
     assert calls["plan"][1].revision == source_inventory["revision"]
     _, _, _, execute_kwargs = calls["execute"]
+    execution_context = execute_kwargs.pop("execution_context")
+    assert isinstance(execution_context, WeightTransferExecutionContext)
+    assert execution_context.remaining_seconds() > 0
     assert execute_kwargs == {
         "source_pre_registered": True,
         "source_registrations": ("lease:source-fragment:source-runtime-lease",),
@@ -255,13 +453,13 @@ def test_heterogeneous_loader_recovers_readiness_failure_without_submission(
     calls = {}
     source_inventory = {
         "model_id": _TARGET_MODEL_ID,
-        "revision": _TARGET_REVISION,
+        "revision": _TARGET_HF_REVISION,
         "lease_id": "source-runtime-lease",
         "fragments": [SimpleNamespace(fragment_id="source-fragment")],
     }
     target_inventory = {
         "model_id": _TARGET_MODEL_ID,
-        "revision": _TARGET_REVISION,
+        "revision": _TARGET_HF_REVISION,
         "lease_id": "target-runtime-lease",
         "fragments": [SimpleNamespace(fragment_id="target-fragment")],
     }
@@ -287,7 +485,7 @@ def test_heterogeneous_loader_recovers_readiness_failure_without_submission(
     class FakeCoordinator:
         world_release_safe = False
 
-        def __init__(self, seed_url, world_group):
+        def __init__(self, seed_url, world_group, **_kwargs):
             del seed_url, world_group
 
         def acquire(self):
@@ -295,6 +493,7 @@ def test_heterogeneous_loader_recovers_readiness_failure_without_submission(
                 transfer_id="transfer-1",
                 manifests=[source_inventory],
                 manifest_format="runtime_v1",
+                deadline_unix_sec=time.time() + 120,
             )
 
         def ready_for_transfer(self, local_ready):
@@ -380,264 +579,322 @@ def test_heterogeneous_loader_recovers_readiness_failure_without_submission(
     assert quarantine == []
 
 
-def test_heterogeneous_loader_plans_placement_before_acquiring_target_binding(
+def test_strict_artifact_identity_rejects_unattested_runtime_before_adapter(
     monkeypatch,
-    caplog,
 ) -> None:
-    caplog.set_level(logging.INFO)
     events = []
-    tensor = WeightPlacementTensor(
-        placement_fragment_id="source-fragment",
-        tensor_id="weight",
-        runtime_name="weight",
-        aliases=("weight",),
-        global_shape=(8,),
-        global_offset=(0,),
-        local_shape=(8,),
-        dtype="bfloat16",
-        itemsize=2,
-        partition_dim=None,
-        shard_dims=(),
-        layer_id=0,
-        expert_id=None,
-        layout_fingerprint="layout:v1",
-        nbytes=16,
-        byte_offset=0,
-        rank=WeightParallelRank(),
-    )
-    source_placement_id = compute_weight_placement_id((tensor,))
-    source_placement_inventory = WeightPlacementManifest(
-        model_id=_TARGET_MODEL_ID,
-        revision=_TARGET_REVISION,
-        placement_id=source_placement_id,
-        tensors=(tensor,),
-    )
-    source_binding_inventory = WeightRuntimeBindingManifest(
-        model_id=_TARGET_MODEL_ID,
-        revision=_TARGET_REVISION,
-        placement_id=source_placement_id,
-        instance_id="source-instance",
-        generation=1,
-        lease_id="source-runtime-lease",
-        fragments=(
-            RuntimeWeightBinding(
-                placement_fragment_id="source-fragment",
-                fragment_id="source-fragment",
-                address=0x10000,
-                nbytes=16,
-                storage_offset=0,
-                device="cuda:0",
-                is_contiguous=True,
-                worker_id="source-worker",
-                endpoint="source:1",
-            ),
-        ),
-    )
-    target_tensor = WeightPlacementTensor(
-        placement_fragment_id="target-fragment",
-        tensor_id="weight",
-        runtime_name="weight",
-        aliases=("weight",),
-        global_shape=(8,),
-        global_offset=(0,),
-        local_shape=(8,),
-        dtype="bfloat16",
-        itemsize=2,
-        partition_dim=None,
-        shard_dims=(),
-        layer_id=0,
-        expert_id=None,
-        layout_fingerprint="layout:v1",
-        nbytes=16,
-        byte_offset=0,
-        rank=WeightParallelRank(),
-    )
-    target_placement_id = compute_weight_placement_id((target_tensor,))
-    placement_inventory = WeightPlacementManifest(
-        model_id=_TARGET_MODEL_ID,
-        revision=_TARGET_REVISION,
-        placement_id=target_placement_id,
-        tensors=(target_tensor,),
-    )
-    binding_inventory = WeightRuntimeBindingManifest(
-        model_id=_TARGET_MODEL_ID,
-        revision=_TARGET_REVISION,
-        placement_id=target_placement_id,
-        instance_id="target-instance",
-        generation=1,
-        lease_id="target-runtime-lease",
-        fragments=(
-            RuntimeWeightBinding(
-                placement_fragment_id="target-fragment",
-                fragment_id="target-fragment",
-                address=0x20000,
-                nbytes=16,
-                storage_offset=0,
-                device="cuda:0",
-                is_contiguous=True,
-                worker_id="target-worker",
-                endpoint="target:1",
-            ),
-        ),
-    )
-    source_inventory = {
-        "model_id": _TARGET_MODEL_ID,
-        "revision": _TARGET_REVISION,
-        "lease_id": "source-runtime-lease",
-        "fragments": [SimpleNamespace(fragment_id="source-fragment")],
-    }
-    target_runtime = SimpleNamespace(
-        model_id=source_inventory["model_id"],
-        revision=source_inventory["revision"],
-        lease_id="target-runtime-lease",
-        fragments=[SimpleNamespace(fragment_id="target-fragment")],
-    )
-
-    class FakeRuntimeManifest:
-        @classmethod
-        def from_runtime_inventory(cls, inventory):
-            return SimpleNamespace(**inventory)
-
-    class FakeTargetPlacementManifest:
-        @classmethod
-        def from_runtime_inventory(cls, inventory):
-            events.append("placement")
-            return SimpleNamespace(
-                model_id=inventory.model_id,
-                revision=inventory.revision,
-                placement_id=inventory.placement_id,
-            )
-
-    class FakeSourcePlacementManifest:
-        @classmethod
-        def from_runtime_inventory(cls, inventory):
-            events.append("source-placement")
-            return SimpleNamespace(
-                model_id=inventory.model_id,
-                revision=inventory.revision,
-                placement_id=inventory.placement_id,
-            )
-
-    class FakeRuntimeBindingManifest:
-        @classmethod
-        def from_runtime_inventory(cls, inventory):
-            events.append("binding")
-            return SimpleNamespace(
-                model_id=inventory.model_id,
-                revision=inventory.revision,
-                placement_id=inventory.placement_id,
-                instance_id=inventory.instance_id,
-                lease_id=inventory.lease_id,
-            )
-
-    class FakeRegistrationLease:
-        @classmethod
-        def from_fragment(cls, fragment, *, runtime_lease_id=None):
-            return (fragment.fragment_id, runtime_lease_id)
 
     class FakeCoordinator:
-        def __init__(self, seed_url, world_group):
+        def __init__(self, seed_url, world_group, **_kwargs):
             del seed_url, world_group
 
         def acquire(self):
             return SimpleNamespace(
                 transfer_id="transfer-1",
-                manifests=[],
-                source_placements=[source_placement_inventory],
-                source_bindings=[source_binding_inventory],
-                manifest_format="placement_binding_v1",
+                manifests=[{"model_id": _TARGET_MODEL_ID}],
+                source_placements=None,
+                source_bindings=None,
+                manifest_format="runtime_v1",
+                deadline_unix_sec=time.time() + 120,
             )
 
         def ready_for_transfer(self, local_ready):
             events.append(("ready", local_ready))
             return local_ready
 
-        def raise_if_failed(self):
-            events.append("source-attest")
-
         def finish(self, *, local_success, local_release_safe=True):
+            events.append(("finish", local_success, local_release_safe))
             return local_success, local_release_safe
 
-    fake_weight_transfer = ModuleType("mooncake.weight_transfer")
-    fake_weight_transfer.MemoryRegistrationLease = FakeRegistrationLease
-    fake_weight_transfer.MooncakeTransferEngineReader = object
-    fake_weight_transfer.RuntimeManifest = FakeRuntimeManifest
-    fake_weight_transfer.RuntimeBindingManifest = FakeRuntimeBindingManifest
-    fake_weight_transfer.SourcePlacementManifest = FakeSourcePlacementManifest
-    fake_weight_transfer.TargetPlacementManifest = FakeTargetPlacementManifest
-    fake_weight_transfer.TransferCompletionUnknownError = _CompletionUnknownError
-    fake_weight_transfer.TransferEngineError = _TransferEngineError
+    def fail_adapter(self, inventories):
+        del self, inventories
+        raise AssertionError("unattested identity must fail before adaptation")
 
-    def bind_runtime_manifest(placement, binding):
-        if placement.placement_id == source_placement_id:
-            events.append("source-runtime-bind")
-            return SimpleNamespace(**source_inventory)
-        events.append("target-runtime-bind")
-        return target_runtime
+    def reject_legacy(self, **kwargs):
+        del self, kwargs
+        raise AssertionError("unattested identity must fail before planning")
 
-    fake_weight_transfer.bind_runtime_manifest = bind_runtime_manifest
-
-    fake_weight_transfer.plan_placement_transfer_to_local_target = (
-        lambda *args, **kwargs: (_ for _ in ()).throw(
-            AssertionError("the v4 path must use the SGLang planner")
-        )
-    )
-    fake_weight_transfer.bind_logical_transfer_plan = object
-    fake_weight_transfer.plan_runtime_transfer_to_local_target = (
-        lambda sources, target: (_ for _ in ()).throw(
-            AssertionError("the session path must not use the legacy planner")
-        )
-    )
-    monkeypatch.setitem(sys.modules, "mooncake.weight_transfer", fake_weight_transfer)
-    real_import = builtins.__import__
-
-    def reject_legacy_mooncake_import(name, *args, **kwargs):
-        if name == "mooncake.weight_transfer":
-            raise AssertionError(
-                "placement_binding_v1 must not import the Mooncake legacy runtime"
-            )
-        return real_import(name, *args, **kwargs)
-
-    monkeypatch.setattr(builtins, "__import__", reject_legacy_mooncake_import)
     monkeypatch.setattr(
         loader_module,
         "RemoteInstanceWeightTransferWorldCoordinator",
         FakeCoordinator,
     )
     monkeypatch.setattr(loader_module, "get_world_group", lambda: object())
-    monkeypatch.setattr(loader_module.current_platform, "synchronize", lambda: None)
-    monkeypatch.setattr(loader_module, "_post_load_weights", lambda model: None)
-
-    from sglang.srt.weight_transfer import api as weight_api
-    from sglang.srt.weight_transfer import planner as weight_planner
-
-    native_plan = weight_planner.plan_weight_transfer_to_local_target
-    native_bind = weight_api.prepare_weight_load_from_plan
-
-    def record_plan(*args, **kwargs):
-        events.append("logical-plan")
-        return native_plan(*args, **kwargs)
-
-    def record_bind(*args, **kwargs):
-        events.append("plan-bind")
-        return native_bind(*args, **kwargs)
-
     monkeypatch.setattr(
-        weight_planner,
-        "plan_weight_transfer_to_local_target",
-        record_plan,
+        loader_module,
+        "probe_remote_instance_weight_transfer_capabilities",
+        lambda **_kwargs: (
+            remote_instance_weight_loader_utils.RemoteInstanceWeightTransferCapabilities(
+                native_executor=True,
+                canonical_adapter=True,
+                legacy_planner=True,
+            )
+        ),
     )
     monkeypatch.setattr(
-        weight_api,
-        "prepare_weight_load_from_plan",
-        record_bind,
+        RemoteInstanceModelLoader,
+        "_adapt_runtime_v1_source_inventories",
+        fail_adapter,
     )
+    monkeypatch.setattr(
+        RemoteInstanceModelLoader,
+        "_prepare_legacy_heterogeneous_weight_load",
+        reject_legacy,
+    )
+
+    loader = RemoteInstanceModelLoader.__new__(RemoteInstanceModelLoader)
+    success = _load_heterogeneous(
+        loader,
+        object(),
+        object(),
+        "http://seed:30000",
+        "target-session",
+        object(),
+        provider_factory=lambda *_args, **_kwargs: object(),
+        target_artifact_revision="default",
+    )
+
+    assert success is False
+    assert events == [
+        ("ready", False),
+        ("finish", False, True),
+    ]
+
+
+def _legacy_runtime_v1_inventory(partition_dim):
+    return {
+        "format_version": 1,
+        "model_id": _TARGET_MODEL_ID,
+        "revision": _TARGET_ARTIFACT_REVISION,
+        "instance_id": "source-instance",
+        "generation": 1,
+        "lease_id": "source-lease",
+        "tensors": [
+            {
+                "fragment_id": "source-fragment",
+                "tensor_id": "weight",
+                "runtime_name": "weight",
+                "aliases": ["weight"],
+                "global_shape": [8],
+                "global_offset": [0],
+                "local_shape": [8],
+                "dtype": "bfloat16",
+                "itemsize": 2,
+                "partition_dim": partition_dim,
+                "layer_id": 0,
+                "expert_id": None,
+                "layout_fingerprint": "layout:v1",
+                "address": 0x10000,
+                "nbytes": 16,
+                "byte_offset": 0,
+                "stride": [1],
+                "storage_offset": 0,
+                "device": "cuda:0",
+                "is_contiguous": True,
+                "worker_id": "source-worker",
+                "endpoint": "source:1",
+                "rank": {"dp": 0, "tp": 0, "pp": 0, "ep": 0},
+                "lease_generation": 1,
+            }
+        ],
+    }
+
+
+@pytest.mark.parametrize(
+    ("partition_dim", "expected_shard_dims"),
+    [(0, (0,)), (None, ())],
+)
+def test_runtime_v1_adapter_migrates_pre_shard_dims_wire(
+    partition_dim,
+    expected_shard_dims,
+) -> None:
+    inventory = _legacy_runtime_v1_inventory(partition_dim)
+    loader = RemoteInstanceModelLoader.__new__(RemoteInstanceModelLoader)
+
+    placements, bindings = loader._adapt_runtime_v1_source_inventories((inventory,))
+
+    assert placements[0].tensors[0].shard_dims == expected_shard_dims
+    assert placements[0].tensors[0].rank.moe_dp == 0
+    assert bindings[0].fragments[0].fragment_id == "source-fragment"
+    assert "shard_dims" not in inventory["tensors"][0]
+
+
+def _canonical_manifest_parts(
+    side: str,
+    *,
+    address: int,
+    revision: str = _TARGET_ARTIFACT_REVISION,
+    parallel_rank: WeightParallelRank = WeightParallelRank(),
+    global_offset: int = 0,
+    local_size: int = 8,
+):
+    sharded = global_offset != 0 or local_size != 8
+    tensor = WeightPlacementTensor(
+        placement_fragment_id=f"{side}-fragment",
+        tensor_id="weight",
+        runtime_name="weight",
+        aliases=("weight",),
+        global_shape=(8,),
+        global_offset=(global_offset,),
+        local_shape=(local_size,),
+        dtype="bfloat16",
+        itemsize=2,
+        partition_dim=0 if sharded else None,
+        shard_dims=(0,) if sharded else (),
+        layer_id=0,
+        expert_id=None,
+        layout_fingerprint="layout:v1",
+        nbytes=local_size * 2,
+        byte_offset=0,
+        rank=parallel_rank,
+    )
+    placement_id = compute_weight_placement_id((tensor,))
+    placement = WeightPlacementManifest(
+        model_id=_TARGET_MODEL_ID,
+        revision=revision,
+        placement_id=placement_id,
+        tensors=(tensor,),
+    )
+    binding = WeightRuntimeBindingManifest(
+        model_id=_TARGET_MODEL_ID,
+        revision=revision,
+        placement_id=placement_id,
+        instance_id=f"{side}-instance",
+        generation=1,
+        lease_id=f"{side}-runtime-lease",
+        fragments=(
+            RuntimeWeightBinding(
+                placement_fragment_id=f"{side}-fragment",
+                fragment_id=f"{side}-fragment",
+                address=address,
+                nbytes=local_size * 2,
+                storage_offset=0,
+                device="cuda:0",
+                is_contiguous=True,
+                worker_id=f"{side}-worker",
+                endpoint=f"{side}:1",
+            ),
+        ),
+    )
+    return placement, binding
+
+
+def _run_canonical_remote_load(
+    monkeypatch,
+    *,
+    manifest_format: str,
+    manifest_revision: str = _TARGET_ARTIFACT_REVISION,
+    revision_semantics: str = ARTIFACT_WEIGHT_VERSION_V1,
+    allow_legacy_hf_fallback: bool = False,
+    target_artifact_revision: str = _TARGET_ARTIFACT_REVISION,
+    target_hf_revision: str = _TARGET_HF_REVISION,
+    include_session_deadline: bool = True,
+    include_coordinator_deadline: bool = True,
+    provider_supports_bounded_execution: bool = True,
+):
+    source_placement, source_binding = _canonical_manifest_parts(
+        "source",
+        address=0x10000,
+        revision=manifest_revision,
+    )
+    target_placement, target_binding = _canonical_manifest_parts(
+        "target",
+        address=0x20000,
+        revision=manifest_revision,
+    )
+    source_runtime = compose_weight_runtime_manifest(
+        source_placement,
+        source_binding,
+    )
+    calls = {
+        "attestations": 0,
+        "binding_close": 0,
+        "binding_open": 0,
+        "coordinator_finish": [],
+        "coordinator_ready": [],
+        "post_load": [],
+        "provider_lifecycle": [],
+        "runtime_adapter": [],
+        "target_close": 0,
+        "target_open": 0,
+    }
+    shared_deadline_unix_sec = time.time() + 120
+    transfer_session = SimpleNamespace(
+        transfer_id="transfer-1",
+        lease_timeout_sec=300,
+        manifests=(source_runtime,) if manifest_format == RUNTIME_MANIFEST_V1 else (),
+        source_placements=(
+            None if manifest_format == RUNTIME_MANIFEST_V1 else (source_placement,)
+        ),
+        source_bindings=(
+            None if manifest_format == RUNTIME_MANIFEST_V1 else (source_binding,)
+        ),
+        manifest_format=manifest_format,
+        manifest_revision_semantics=revision_semantics,
+        allow_legacy_hf_fallback=allow_legacy_hf_fallback,
+        deadline_unix_sec=(
+            shared_deadline_unix_sec if include_session_deadline else None
+        ),
+    )
+    transfer_handle = (
+        remote_instance_weight_loader_utils.RemoteInstanceWeightTransferSessionHandle(
+            transfer_id=transfer_session.transfer_id,
+            lease_timeout_sec=transfer_session.lease_timeout_sec,
+            manifest_format=transfer_session.manifest_format,
+            manifest_revision_semantics=(transfer_session.manifest_revision_semantics),
+            allow_legacy_hf_fallback=(transfer_session.allow_legacy_hf_fallback),
+            deadline_unix_sec=(
+                shared_deadline_unix_sec if include_session_deadline else None
+            ),
+        )
+        if manifest_format == PLACEMENT_BINDING_V1
+        else transfer_session
+    )
+
+    class FakeCoordinator:
+        world_release_safe = True
+
+        def __init__(self, seed_url, world_group, **kwargs):
+            calls["coordinator"] = (seed_url, world_group, kwargs)
+            self.execution_context = (
+                WeightTransferExecutionContext(
+                    deadline_unix_sec=shared_deadline_unix_sec
+                )
+                if include_coordinator_deadline
+                else None
+            )
+            self.owner_source_session = (
+                transfer_session if manifest_format == PLACEMENT_BINDING_V1 else None
+            )
+
+        def acquire(self):
+            return transfer_handle
+
+        def clear_owner_source_session(self):
+            if self.owner_source_session is not None:
+                calls["owner_source_session_cleared"] = (
+                    calls.get("owner_source_session_cleared", 0) + 1
+                )
+            self.owner_source_session = None
+
+        def ready_for_transfer(self, local_ready):
+            calls["coordinator_ready"].append(local_ready)
+            return local_ready
+
+        def raise_if_failed(self):
+            calls["attestations"] += 1
+
+        def finish(self, *, local_success, local_release_safe=True):
+            calls["coordinator_finish"].append((local_success, local_release_safe))
+            return local_success, local_release_safe
 
     class FakeNativeProvider:
         name = "mooncake-te"
+        bounded_execution_contract_version = 1
 
         def probe(self, request):
-            events.append("probe")
+            calls["provider_request"] = request
+            calls["provider_lifecycle"].append("probe")
             return WeightProviderCapabilities(
                 provider=self.name,
                 load_profiles=frozenset({"runtime_to_runtime"}),
@@ -647,18 +904,21 @@ def test_heterogeneous_loader_plans_placement_before_acquiring_target_binding(
                 supports_safe_cancel=False,
                 supports_completion_ticket=True,
                 supports_transactional_publish=False,
+                supports_bounded_execution=provider_supports_bounded_execution,
             )
 
-        def prepare(self, request):
-            events.append("prepare")
+        def prepare(self, request, *, execution_context=None):
+            calls["provider_lifecycle"].append("prepare")
+            calls.setdefault("execution_contexts", []).append(execution_context)
             return request
 
         def submit(self, request):
-            events.append("submit")
+            calls["provider_lifecycle"].append("submit")
             return request
 
-        def wait(self, request):
-            events.append("execute")
+        def wait(self, request, *, execution_context=None):
+            calls["provider_lifecycle"].append("wait")
+            calls.setdefault("execution_contexts", []).append(execution_context)
             return WeightLoadReceipt(
                 operation_id=request.operation_id,
                 provider=self.name,
@@ -668,69 +928,1310 @@ def test_heterogeneous_loader_plans_placement_before_acquiring_target_binding(
                 backend_receipts=(SimpleNamespace(nbytes=16, operation_count=1),),
             )
 
-        def synchronize(self, receipt):
-            events.append("provider-sync")
+        def synchronize(self, receipt, *, execution_context=None):
+            calls["provider_lifecycle"].append("synchronize")
+            calls.setdefault("execution_contexts", []).append(execution_context)
 
-        def release(self, prepared, receipt):
-            events.append("provider-release")
+        def release(self, prepared, receipt, *, execution_context=None):
+            calls["provider_lifecycle"].append("release")
+            calls.setdefault("execution_contexts", []).append(execution_context)
 
         def cancel(self, submission):
             raise AssertionError("successful transfer must not be cancelled")
 
     def provider_factory(engine, **kwargs):
-        events.append(("provider", engine, kwargs))
+        calls["provider_factory"] = (engine, kwargs)
         return FakeNativeProvider()
 
     class TargetSession:
-        placement = placement_inventory
+        placement = target_placement
 
         @contextlib.contextmanager
         def bind(self):
-            events.append("binding-lease-open")
+            calls["binding_open"] += 1
             try:
-                yield binding_inventory
+                yield target_binding
             finally:
-                events.append("binding-lease-close")
+                calls["binding_close"] += 1
 
         def attest_binding(self, binding):
-            assert binding is binding_inventory
-            events.append("target-attest")
+            assert binding is target_binding
+            calls["attestations"] += 1
 
     @contextlib.contextmanager
     def target_builder(**kwargs):
-        del kwargs
-        yield TargetSession()
+        calls["target_builder"] = kwargs
+        calls["target_open"] += 1
+        try:
+            yield TargetSession()
+        finally:
+            calls["target_close"] += 1
 
+    real_plan = loader_module.plan_weight_transfer_to_local_target
+
+    def record_plan(source_placements, target):
+        calls["local_planner"] = (source_placements, target)
+        return real_plan(source_placements, target)
+
+    def record_full_world_plan(
+        source_placements,
+        target_placements,
+        *,
+        expected_target_topology,
+    ):
+        calls["global_planner"] = (
+            source_placements,
+            target_placements,
+            expected_target_topology,
+        )
+        return build_full_world_plan(
+            source_placements,
+            target_placements,
+            expected_target_topology=expected_target_topology,
+        )
+
+    def record_runtime_adapter(manifest):
+        calls["runtime_adapter"].append(manifest)
+        return runtime_manifest_to_parts(manifest)
+
+    def reject_legacy_backend():
+        raise AssertionError("canonical loading must not initialize the legacy backend")
+
+    def record_platform_synchronize():
+        calls["platform_synchronize"] = calls.get("platform_synchronize", 0) + 1
+
+    class SingleRankWorld:
+        rank_in_group = 0
+        world_size = 1
+
+        def gather_object(self, value, dst=0):
+            calls.setdefault("gathered_target_placements", []).append((value, dst))
+            return [value]
+
+        def scatter_object(self, values, src=0):
+            calls.setdefault("scattered_plans", []).append((values, src))
+            return values[0]
+
+    world_group = SingleRankWorld()
+    monkeypatch.setattr(
+        loader_module,
+        "RemoteInstanceWeightTransferWorldCoordinator",
+        FakeCoordinator,
+    )
+    monkeypatch.setattr(loader_module, "get_world_group", lambda: world_group)
+    monkeypatch.setattr(
+        loader_module,
+        "probe_remote_instance_weight_transfer_capabilities",
+        lambda **_kwargs: (
+            remote_instance_weight_loader_utils.RemoteInstanceWeightTransferCapabilities(
+                native_executor=True,
+                canonical_adapter=True,
+                legacy_planner=True,
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        loader_module,
+        "_load_legacy_mooncake_weight_backend",
+        reject_legacy_backend,
+    )
+    monkeypatch.setattr(
+        loader_module,
+        "plan_weight_transfer_to_local_target",
+        record_plan,
+    )
+    monkeypatch.setattr(
+        loader_module,
+        "plan_weight_transfer",
+        record_full_world_plan,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        loader_module,
+        "runtime_manifest_to_parts",
+        record_runtime_adapter,
+    )
+    monkeypatch.setattr(
+        loader_module.current_platform,
+        "synchronize",
+        record_platform_synchronize,
+    )
+    monkeypatch.setattr(
+        loader_module,
+        "_post_load_weights",
+        lambda model: calls["post_load"].append(model),
+    )
     loader = RemoteInstanceModelLoader.__new__(RemoteInstanceModelLoader)
+    model = object()
     engine = object()
     success = _load_heterogeneous(
         loader,
-        object(),
+        model,
         engine,
         "http://seed:30000",
         "target-session",
         target_builder,
         provider_factory=provider_factory,
+        target_artifact_revision=target_artifact_revision,
+        target_hf_revision=target_hf_revision,
+    )
+    return SimpleNamespace(
+        calls=calls,
+        engine=engine,
+        model=model,
+        source_binding=source_binding,
+        source_placement=source_placement,
+        source_runtime=source_runtime,
+        success=success,
+        target_binding=target_binding,
+        target_placement=target_placement,
+        world_group=world_group,
+        manifest_format=manifest_format,
+        shared_deadline_unix_sec=shared_deadline_unix_sec,
     )
 
-    assert success is True
-    assert events.index("logical-plan") < events.index("binding-lease-open")
-    assert events.index("plan-bind") > events.index("binding-lease-open")
-    assert events.index(("ready", True)) < events.index("execute")
-    assert events.index("source-attest") < events.index("probe")
-    assert events.index("target-attest") < events.index("probe")
-    assert events[-1] == "binding-lease-close"
-    provider_event = next(
-        item for item in events if isinstance(item, tuple) and item[0] == "provider"
+
+def _assert_canonical_remote_load(
+    result,
+    *,
+    expected_source_placement=None,
+    expected_source_binding=None,
+    expected_revision: str = _TARGET_ARTIFACT_REVISION,
+    expected_legacy_hf_fallback: bool = False,
+) -> None:
+    expected_source_placement = (
+        result.source_placement
+        if expected_source_placement is None
+        else expected_source_placement
     )
-    assert provider_event == (
-        "provider",
-        engine,
+    expected_source_binding = (
+        result.source_binding
+        if expected_source_binding is None
+        else expected_source_binding
+    )
+    assert result.success is True
+    assert result.calls["target_builder"] == {
+        "model": result.model,
+        "model_id": _TARGET_MODEL_ID,
+        "revision": expected_revision,
+        "instance_id": "sglang:target-session",
+        "endpoint": "target-session",
+    }
+    if result.manifest_format == PLACEMENT_BINDING_V1:
+        assert result.calls["global_planner"] == (
+            (expected_source_placement,),
+            (result.target_placement,),
+            (WeightParallelRank(),),
+        )
+        assert "local_planner" not in result.calls
+        assert result.calls["owner_source_session_cleared"] == 1
+    else:
+        assert result.calls["local_planner"] == (
+            (expected_source_placement,),
+            result.target_placement,
+        )
+        assert "global_planner" not in result.calls
+    request = result.calls["provider_request"]
+    assert request.plan.logical_plan.revision == expected_revision
+    assert request.plan.source_bindings == (expected_source_binding,)
+    assert request.plan.target_bindings == (result.target_binding,)
+    assert result.calls["provider_factory"] == (
+        result.engine,
         {"max_batch_operations": 8192},
     )
-    assert "binding=" in caplog.text
-    assert "lowering=" in caplog.text
-    assert "data_transfer=" in caplog.text
+    assert result.calls["provider_lifecycle"].count("probe") == 1
+    assert result.calls["provider_lifecycle"].count("prepare") == 1
+    assert result.calls["provider_lifecycle"].count("submit") == 1
+    assert result.calls["provider_lifecycle"].count("wait") == 1
+    assert result.calls["provider_lifecycle"].count("synchronize") == 1
+    assert result.calls["provider_lifecycle"].count("release") == 1
+    contexts = result.calls["execution_contexts"]
+    assert len(contexts) == 4
+    assert all(
+        isinstance(context, WeightTransferExecutionContext) for context in contexts
+    )
+    assert contexts[0] is contexts[1] is contexts[2]
+    assert contexts[0].deadline_unix_sec == result.shared_deadline_unix_sec
+    assert 0 < contexts[0].remaining_seconds() <= 120
+    assert contexts[3] is not contexts[0]
+    assert contexts[3].cancel_signal is None
+    assert 0 < contexts[3].remaining_seconds() <= 5
+    assert result.calls["coordinator_ready"] == [True]
+    assert result.calls["coordinator_finish"] == [(True, True)]
+    seed_url, world_group, coordinator_options = result.calls["coordinator"]
+    assert seed_url == "http://seed:30000"
+    assert world_group is result.world_group
+    assert (
+        coordinator_options["manifest_revision_semantics"] == ARTIFACT_WEIGHT_VERSION_V1
+    )
+    assert (
+        coordinator_options["allow_legacy_hf_fallback"] is expected_legacy_hf_fallback
+    )
+    assert result.calls["attestations"] == 4
+    assert result.calls["binding_open"] == 1
+    assert result.calls["binding_close"] == 1
+    assert result.calls["target_open"] == 1
+    assert result.calls["target_close"] == 1
+    assert result.calls["platform_synchronize"] == 1
+    assert result.calls["post_load"] == [result.model]
+    assert loader_module._HETEROGENEOUS_UNKNOWN_TRANSFER_QUARANTINE == []
+
+
+def test_placement_binding_v1_uses_native_planner_provider_and_leases(
+    monkeypatch,
+) -> None:
+    result = _run_canonical_remote_load(
+        monkeypatch,
+        manifest_format=PLACEMENT_BINDING_V1,
+    )
+
+    _assert_canonical_remote_load(result)
+    assert result.calls["runtime_adapter"] == []
+
+
+def test_native_load_rejects_session_without_absolute_deadline(
+    monkeypatch,
+    caplog,
+) -> None:
+    result = _run_canonical_remote_load(
+        monkeypatch,
+        manifest_format=PLACEMENT_BINDING_V1,
+        include_session_deadline=False,
+        include_coordinator_deadline=False,
+    )
+
+    assert result.success is False
+    assert result.calls["provider_lifecycle"] == []
+    assert result.calls["target_open"] == 0
+    assert result.calls["binding_open"] == 0
+    assert result.calls["coordinator_ready"] == []
+    assert "provider_request" not in result.calls
+    assert "absolute deadline" in caplog.text
+
+
+def test_runtime_v1_adapts_to_native_planner_provider_and_leases(
+    monkeypatch,
+) -> None:
+    result = _run_canonical_remote_load(
+        monkeypatch,
+        manifest_format=RUNTIME_MANIFEST_V1,
+    )
+    adapted = runtime_manifest_to_parts(result.source_runtime)
+
+    _assert_canonical_remote_load(
+        result,
+        expected_source_placement=adapted.placement,
+        expected_source_binding=adapted.binding,
+    )
+    assert result.calls["runtime_adapter"] == [result.source_runtime]
+
+
+def test_native_provider_rejects_unbounded_capability_during_preflight(
+    monkeypatch,
+    caplog,
+) -> None:
+    with caplog.at_level("ERROR"):
+        result = _run_canonical_remote_load(
+            monkeypatch,
+            manifest_format=PLACEMENT_BINDING_V1,
+            provider_supports_bounded_execution=False,
+        )
+
+    assert result.success is False
+    assert result.calls["provider_lifecycle"] == ["probe"]
+    assert result.calls["coordinator_ready"] == [False]
+    assert result.calls["coordinator_finish"] == [(False, True)]
+    assert (
+        "native provider requires supports_bounded_execution=true "
+        "for bounded execution contract version 1"
+    ) in caplog.text
+
+
+def test_legacy_bounded_execution_requires_contract_version(monkeypatch) -> None:
+    monkeypatch.setattr(
+        loader_module,
+        "_legacy_runtime_v1_supports_bounded_execution",
+        _REAL_LEGACY_RUNTIME_V1_SUPPORTS_BOUNDED_EXECUTION,
+    )
+    backend = SimpleNamespace(supports_bounded_execution=True)
+
+    assert loader_module._legacy_runtime_v1_supports_bounded_execution(backend) is False
+
+    backend.bounded_execution_contract_version = 1
+    assert loader_module._legacy_runtime_v1_supports_bounded_execution(backend) is True
+    del backend.supports_bounded_execution
+    assert loader_module._legacy_runtime_v1_supports_bounded_execution(backend) is False
+
+
+def test_native_preflight_requires_explicit_bounded_capability(monkeypatch) -> None:
+    provider = SimpleNamespace(bounded_execution_contract_version=1)
+    monkeypatch.setattr(
+        loader_module,
+        "preflight_weight_transfer",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            _capabilities=SimpleNamespace(),
+        ),
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match=(
+            "native provider requires supports_bounded_execution=true "
+            "for bounded execution contract version 1"
+        ),
+    ):
+        loader_module._preflight_bounded_native_weight_transfer(
+            provider,
+            object(),
+            attestor=object(),
+        )
+
+
+def test_unbounded_legacy_runtime_v1_fails_before_session_acquire(
+    monkeypatch,
+    caplog,
+) -> None:
+    backend = SimpleNamespace()
+    monkeypatch.setattr(
+        loader_module,
+        "get_world_group",
+        lambda: SimpleNamespace(world_size=1),
+    )
+    monkeypatch.setattr(
+        loader_module,
+        "_load_legacy_mooncake_weight_backend",
+        lambda: backend,
+    )
+    monkeypatch.setattr(
+        loader_module,
+        "_legacy_runtime_v1_supports_bounded_execution",
+        lambda candidate: candidate is not backend,
+    )
+    monkeypatch.setattr(
+        loader_module,
+        "RemoteInstanceWeightTransferWorldCoordinator",
+        lambda *_args, **_kwargs: pytest.fail(
+            "unbounded legacy executor must not acquire a source session"
+        ),
+    )
+    loader = RemoteInstanceModelLoader.__new__(RemoteInstanceModelLoader)
+
+    with caplog.at_level("ERROR"):
+        success = _load_heterogeneous(
+            loader,
+            object(),
+            object(),
+            "http://seed:30000",
+            "target-session",
+            object(),
+        )
+
+    assert success is False
+    assert "bounded target-world deadline" in caplog.text
+
+
+@pytest.mark.parametrize("local_failure", [False, True])
+def test_provider_preflight_failure_is_voted_before_session_collectives(
+    monkeypatch,
+    caplog,
+    local_failure,
+) -> None:
+    phases = []
+    remote_error = "configured provider contract mismatch"
+
+    class World:
+        rank_in_group = 0
+        world_size = 2
+
+        def all_gather_object(self, value, *, phase, execution_context):
+            assert isinstance(execution_context, WeightTransferExecutionContext)
+            phases.append(phase)
+            if phase == "heterogeneous_quarantine.metadata":
+                return [value, value]
+            if phase == "heterogeneous_quarantine.preflight":
+                return [value, value]
+            assert phase == "heterogeneous_provider.preflight"
+            remote = loader_module._RankLocalProviderPreflightOutcome(
+                world_rank=1,
+                error=None if local_failure else remote_error,
+                capability_fingerprint=(
+                    ("native", True, True, False) if local_failure else None
+                ),
+            )
+            return [value, remote]
+
+    def provider_factory(*_args, **_kwargs):
+        if local_failure:
+            raise RuntimeError("rank-local factory failure")
+        return _capability_probe_provider()
+
+    monkeypatch.setattr(loader_module, "get_world_group", lambda: World())
+    monkeypatch.setattr(
+        loader_module,
+        "probe_remote_instance_weight_transfer_capabilities",
+        lambda **_kwargs: (
+            remote_instance_weight_loader_utils.RemoteInstanceWeightTransferCapabilities(
+                native_executor=True,
+                canonical_adapter=True,
+                legacy_planner=False,
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        loader_module,
+        "_load_legacy_mooncake_weight_backend",
+        lambda: pytest.fail("explicit provider failure must not use legacy fallback"),
+    )
+    monkeypatch.setattr(
+        loader_module,
+        "RemoteInstanceWeightTransferWorldCoordinator",
+        lambda *_args, **_kwargs: pytest.fail(
+            "provider preflight failure must not enter session collectives"
+        ),
+    )
+    loader = RemoteInstanceModelLoader.__new__(RemoteInstanceModelLoader)
+
+    with caplog.at_level("ERROR"):
+        success = _load_heterogeneous(
+            loader,
+            object(),
+            object(),
+            "http://seed:30000",
+            "target-session",
+            object(),
+            provider_factory=provider_factory,
+        )
+
+    expected_rank = 0 if local_failure else 1
+    expected_error = (
+        "configured provider factory failed: RuntimeError: rank-local factory failure"
+        if local_failure
+        else remote_error
+    )
+    assert success is False
+    assert phases == [
+        "heterogeneous_quarantine.metadata",
+        "heterogeneous_quarantine.preflight",
+        "heterogeneous_provider.preflight",
+    ]
+    assert (
+        f"Target-world provider preflight failed at rank {expected_rank}: "
+        f"{expected_error}"
+    ) in caplog.messages
+
+
+def test_provider_preflight_rejects_cross_rank_capability_mismatch(
+    monkeypatch,
+    caplog,
+) -> None:
+    phases = []
+
+    class World:
+        rank_in_group = 0
+        world_size = 2
+
+        def all_gather_object(self, value, *, phase, execution_context):
+            assert isinstance(execution_context, WeightTransferExecutionContext)
+            phases.append(phase)
+            if phase == "heterogeneous_quarantine.metadata":
+                return [value, value]
+            if phase == "heterogeneous_quarantine.preflight":
+                return [value, value]
+            return [
+                value,
+                loader_module._RankLocalProviderPreflightOutcome(
+                    world_rank=1,
+                    capability_fingerprint=("legacy", False, True, True),
+                ),
+            ]
+
+    monkeypatch.setattr(loader_module, "get_world_group", lambda: World())
+    monkeypatch.setattr(
+        loader_module,
+        "probe_remote_instance_weight_transfer_capabilities",
+        lambda **_kwargs: (
+            remote_instance_weight_loader_utils.RemoteInstanceWeightTransferCapabilities(
+                native_executor=True,
+                canonical_adapter=True,
+                legacy_planner=False,
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        loader_module,
+        "RemoteInstanceWeightTransferWorldCoordinator",
+        lambda *_args, **_kwargs: pytest.fail(
+            "capability mismatch must not enter session collectives"
+        ),
+    )
+    loader = RemoteInstanceModelLoader.__new__(RemoteInstanceModelLoader)
+
+    with caplog.at_level("ERROR"):
+        success = _load_heterogeneous(
+            loader,
+            object(),
+            object(),
+            "http://seed:30000",
+            "target-session",
+            object(),
+            provider_factory=lambda *_args, **_kwargs: _capability_probe_provider(),
+        )
+
+    assert success is False
+    assert phases == [
+        "heterogeneous_quarantine.metadata",
+        "heterogeneous_quarantine.preflight",
+        "heterogeneous_provider.preflight",
+    ]
+    assert (
+        "Target-world provider preflight capability mismatch: "
+        "rank 1 differs from rank 0"
+    ) in caplog.messages
+
+
+@pytest.mark.parametrize("failure", ["factory", "capability", "invalid"])
+def test_explicit_provider_failure_does_not_fall_back_to_legacy(
+    monkeypatch,
+    failure,
+) -> None:
+    calls = []
+
+    def provider_factory(*_args, **_kwargs):
+        if failure == "factory":
+            raise RuntimeError("provider factory failed")
+        return SimpleNamespace(name="incomplete-provider")
+
+    def capability_probe(**kwargs):
+        if failure == "capability":
+            raise RuntimeError("provider capability probe failed")
+        return remote_instance_weight_loader_utils.probe_remote_instance_weight_transfer_capabilities(
+            **kwargs
+        )
+
+    configured_factory = object() if failure == "invalid" else provider_factory
+    monkeypatch.setattr(
+        loader_module,
+        "get_world_group",
+        lambda: SimpleNamespace(world_size=1),
+    )
+    monkeypatch.setattr(
+        loader_module,
+        "probe_remote_instance_weight_transfer_capabilities",
+        capability_probe,
+    )
+    monkeypatch.setattr(
+        loader_module,
+        "_load_legacy_mooncake_weight_backend",
+        lambda: calls.append("legacy"),
+    )
+    monkeypatch.setattr(
+        loader_module,
+        "RemoteInstanceWeightTransferWorldCoordinator",
+        lambda *_args, **_kwargs: calls.append("coordinator"),
+    )
+    loader = RemoteInstanceModelLoader.__new__(RemoteInstanceModelLoader)
+
+    success = _load_heterogeneous(
+        loader,
+        object(),
+        object(),
+        "http://seed:30000",
+        "target-session",
+        object(),
+        provider_factory=configured_factory,
+    )
+
+    assert success is False
+    assert calls == []
+
+
+def test_runtime_v1_legacy_hf_uses_negotiated_session_policy(monkeypatch) -> None:
+    result = _run_canonical_remote_load(
+        monkeypatch,
+        manifest_format=RUNTIME_MANIFEST_V1,
+        manifest_revision=_TARGET_HF_REVISION,
+        revision_semantics=remote_instance_weight_loader_utils.LEGACY_HF_UNATTESTED,
+        allow_legacy_hf_fallback=True,
+    )
+    adapted = runtime_manifest_to_parts(result.source_runtime)
+
+    _assert_canonical_remote_load(
+        result,
+        expected_source_placement=adapted.placement,
+        expected_source_binding=adapted.binding,
+        expected_revision=_TARGET_HF_REVISION,
+    )
+
+
+def test_head_source_placement_manifest_uses_unambiguous_hf_identity(
+    monkeypatch,
+) -> None:
+    result = _run_canonical_remote_load(
+        monkeypatch,
+        manifest_format=PLACEMENT_BINDING_V1,
+        manifest_revision=_TARGET_HF_REVISION,
+        revision_semantics=remote_instance_weight_loader_utils.LEGACY_HF_UNATTESTED,
+        allow_legacy_hf_fallback=True,
+        target_artifact_revision=_TARGET_HF_REVISION,
+        target_hf_revision=_TARGET_HF_REVISION,
+    )
+
+    _assert_canonical_remote_load(
+        result,
+        expected_revision=_TARGET_HF_REVISION,
+        expected_legacy_hf_fallback=True,
+    )
+
+
+def _tp2_manifest_parts(prefix: str, *, base_address: int):
+    rank0 = WeightParallelRank(tp=0)
+    rank1 = WeightParallelRank(tp=1)
+    return (
+        _canonical_manifest_parts(
+            f"{prefix}-0",
+            address=base_address,
+            parallel_rank=rank0,
+            global_offset=0,
+            local_size=4,
+        ),
+        _canonical_manifest_parts(
+            f"{prefix}-1",
+            address=base_address + 0x1000,
+            parallel_rank=rank1,
+            global_offset=4,
+            local_size=4,
+        ),
+    )
+
+
+def _target_session(placement, binding, bind_calls):
+    class TargetSession:
+        def __init__(self):
+            self.placement = placement
+
+        @contextlib.contextmanager
+        def bind(self):
+            bind_calls.append(placement.placement_id)
+            yield binding
+
+        def attest_binding(self, actual):
+            assert actual == binding
+
+    @contextlib.contextmanager
+    def builder(**_kwargs):
+        yield TargetSession()
+
+    return builder
+
+
+def _prepare_distributed_native(
+    monkeypatch,
+    *,
+    world_group,
+    coordinator,
+    target_parts,
+):
+    bind_calls = []
+    monkeypatch.setattr(
+        loader_module,
+        "preflight_weight_transfer",
+        lambda provider, request, *, attestor: SimpleNamespace(
+            provider=provider,
+            request=request,
+            attestor=attestor,
+            _capabilities=SimpleNamespace(
+                supports_bounded_execution=True,
+            ),
+        ),
+    )
+    loader = RemoteInstanceModelLoader.__new__(RemoteInstanceModelLoader)
+    phase_seconds = {
+        "source_manifest": 0.0,
+        "target_manifest": 0.0,
+        "plan": 0.0,
+        "binding": 0.0,
+    }
+    with contextlib.ExitStack() as resources:
+        prepared = loader._prepare_distributed_native_heterogeneous_weight_load(
+            model=object(),
+            coordinator=coordinator,
+            world_group=world_group,
+            transfer_resources=resources,
+            target_manifest_builder=_target_session(
+                *target_parts,
+                bind_calls,
+            ),
+            target_model_id=_TARGET_MODEL_ID,
+            manifest_revision=_TARGET_ARTIFACT_REVISION,
+            local_session_id=f"target-{world_group.rank_in_group}",
+            transfer_executor=SimpleNamespace(
+                bounded_execution_contract_version=1,
+            ),
+            phase_seconds=phase_seconds,
+        )
+    return prepared, bind_calls
+
+
+def test_placement_binding_root_plans_once_and_scatters_source_subsets(
+    monkeypatch,
+) -> None:
+    source_parts = _tp2_manifest_parts("source", base_address=0x10000)
+    target_parts = _tp2_manifest_parts("target", base_address=0x20000)
+    planner_calls = []
+    projection_calls = []
+    real_planner = loader_module.plan_weight_transfer
+    real_projection = loader_module.project_weight_transfer_plan_to_targets
+
+    def record_planner(*args, **kwargs):
+        planner_calls.append((args, kwargs))
+        return real_planner(*args, **kwargs)
+
+    def record_projection(*args, **kwargs):
+        projection_calls.append((args, kwargs))
+        return real_projection(*args, **kwargs)
+
+    monkeypatch.setattr(loader_module, "plan_weight_transfer", record_planner)
+    monkeypatch.setattr(
+        loader_module,
+        "project_weight_transfer_plan_to_targets",
+        record_projection,
+    )
+
+    class Coordinator:
+        def __init__(self):
+            self.owner_source_session = SimpleNamespace(
+                source_placements=tuple(item[0] for item in source_parts),
+                source_bindings=tuple(item[1] for item in source_parts),
+            )
+            self.cleared = 0
+
+        def clear_owner_source_session(self):
+            self.owner_source_session = None
+            self.cleared += 1
+
+        def raise_if_failed(self):
+            pass
+
+    coordinator = Coordinator()
+
+    class RootWorld:
+        rank_in_group = 0
+        world_size = 2
+
+        def gather_object(self, local, dst=0):
+            assert dst == 0
+            return [
+                local,
+                loader_module._TargetPlacementEnvelope(
+                    world_rank=1,
+                    parallel_rank=WeightParallelRank(tp=1),
+                    placement=target_parts[1][0],
+                ),
+            ]
+
+        def scatter_object(self, values, src=0):
+            assert src == 0
+            self.values = values
+            return values[0]
+
+    world = RootWorld()
+    prepared, bind_calls = _prepare_distributed_native(
+        monkeypatch,
+        world_group=world,
+        coordinator=coordinator,
+        target_parts=target_parts[0],
+    )
+
+    assert len(planner_calls) == 1
+    assert len(projection_calls) == 1
+    assert coordinator.cleared == 1
+    assert bind_calls == [target_parts[0][0].placement_id]
+    assert prepared.source_placements == (source_parts[0][0],)
+    assert prepared.source_bindings == (source_parts[0][1],)
+    assert tuple(
+        item.placement_id for item in world.values[1].logical_plan.source_placements
+    ) == (source_parts[1][0].placement_id,)
+    assert world.values[1].source_bindings == (source_parts[1][1],)
+
+
+def test_placement_binding_central_plan_uses_session_bounded_collectives(
+    monkeypatch,
+) -> None:
+    source_parts = _tp2_manifest_parts("source", base_address=0x10000)
+    target_parts = _tp2_manifest_parts("target", base_address=0x20000)
+    session = remote_instance_weight_loader_utils.RemoteInstanceWeightTransferSession(
+        transfer_id="transfer-1",
+        manifests=[],
+        lease_timeout_sec=300,
+        source_placements=[item[0] for item in source_parts],
+        source_bindings=[item[1] for item in source_parts],
+        manifest_format=PLACEMENT_BINDING_V1,
+        manifest_revision_semantics=ARTIFACT_WEIGHT_VERSION_V1,
+    )
+
+    class OriginalWorld:
+        rank_in_group = 0
+        world_size = 2
+
+        @staticmethod
+        def broadcast_object(*_args, **_kwargs):
+            raise AssertionError("session must replace synchronous broadcast")
+
+        @staticmethod
+        def all_gather_object(*_args, **_kwargs):
+            raise AssertionError("session must replace synchronous all-gather")
+
+        @staticmethod
+        def gather_object(*_args, **_kwargs):
+            raise AssertionError("session must replace synchronous gather")
+
+        @staticmethod
+        def scatter_object(*_args, **_kwargs):
+            raise AssertionError("session must replace synchronous scatter")
+
+    class BoundedCollectives:
+        rank = 0
+        world_size = 2
+
+        def __init__(self):
+            self.calls = []
+
+        def _record(self, phase, execution_context):
+            assert isinstance(execution_context, WeightTransferExecutionContext)
+            self.calls.append((phase, execution_context))
+
+        def synchronize_object_collective_deadline(
+            self,
+            *,
+            phase,
+            execution_context,
+        ):
+            assert phase == "remote_instance.acquire.deadline_control"
+            assert isinstance(execution_context, WeightTransferExecutionContext)
+            self.deadline_context = execution_context
+            return execution_context.deadline_unix_sec
+
+        def broadcast_object(
+            self,
+            value,
+            *,
+            src,
+            phase,
+            execution_context,
+        ):
+            assert src == 0
+            self._record(phase, execution_context)
+            return value
+
+        def gather_object(
+            self,
+            value,
+            *,
+            dst,
+            phase,
+            execution_context,
+        ):
+            assert dst == 0
+            self._record(phase, execution_context)
+            return [
+                value,
+                loader_module._TargetPlacementEnvelope(
+                    world_rank=1,
+                    parallel_rank=WeightParallelRank(tp=1),
+                    placement=target_parts[1][0],
+                ),
+            ]
+
+        def scatter_object(
+            self,
+            values,
+            *,
+            src,
+            phase,
+            execution_context,
+        ):
+            assert src == 0
+            self._record(phase, execution_context)
+            self.values = values
+            return values[0]
+
+        def all_gather_object(
+            self,
+            value,
+            *,
+            phase,
+            execution_context,
+        ):
+            self._record(phase, execution_context)
+            return [value] * self.world_size
+
+    class NoopHeartbeat:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def start(self):
+            pass
+
+        def raise_if_failed(self):
+            pass
+
+        def stop(self):
+            pass
+
+    monkeypatch.setattr(
+        remote_instance_weight_loader_utils,
+        "begin_remote_instance_weight_transfer",
+        lambda seed_url, **_kwargs: session,
+    )
+    monkeypatch.setattr(
+        remote_instance_weight_loader_utils,
+        "RemoteInstanceWeightTransferHeartbeat",
+        NoopHeartbeat,
+    )
+    monkeypatch.setattr(
+        remote_instance_weight_loader_utils,
+        "release_remote_instance_weight_transfer",
+        lambda seed_url, transfer_id: True,
+    )
+    collectives = BoundedCollectives()
+    world = OriginalWorld()
+    coordinator = remote_instance_weight_loader_utils.RemoteInstanceWeightTransferWorldCoordinator(
+        "http://source",
+        world,
+        capabilities=(
+            remote_instance_weight_loader_utils.RemoteInstanceWeightTransferCapabilities(
+                native_executor=True,
+                canonical_adapter=True,
+                legacy_planner=False,
+            )
+        ),
+        manifest_revision_semantics=ARTIFACT_WEIGHT_VERSION_V1,
+        collective_coordinator=collectives,
+    )
+
+    coordinator.acquire()
+    prepared, bind_calls = _prepare_distributed_native(
+        monkeypatch,
+        world_group=world,
+        coordinator=coordinator,
+        target_parts=target_parts[0],
+    )
+
+    assert bind_calls == [target_parts[0][0].placement_id]
+    assert prepared.source_placements == (source_parts[0][0],)
+    assert prepared.source_bindings == (source_parts[0][1],)
+    assert tuple(
+        item.placement_id
+        for item in collectives.values[1].logical_plan.source_placements
+    ) == (source_parts[1][0].placement_id,)
+    assert [phase for phase, _ in collectives.calls[:3]] == [
+        "remote_instance.acquire.broadcast",
+        "remote_instance.central_plan.gather",
+        "remote_instance.central_plan.scatter",
+    ]
+    assert all(
+        context is coordinator.execution_context for _, context in collectives.calls[:3]
+    )
+
+
+def test_placement_binding_non_root_prepares_without_source_session(
+    monkeypatch,
+) -> None:
+    source_parts = _tp2_manifest_parts("source", base_address=0x10000)
+    target_parts = _tp2_manifest_parts("target", base_address=0x20000)
+    global_plan = build_full_world_plan(
+        tuple(item[0] for item in source_parts),
+        tuple(item[0] for item in target_parts),
+        expected_target_topology=(
+            WeightParallelRank(tp=0),
+            WeightParallelRank(tp=1),
+        ),
+    )
+    local_plan = project_weight_transfer_plan_to_target(
+        global_plan,
+        target_parts[1][0].placement_id,
+    )
+    local_bindings = tuple(
+        loader_module.project_source_bindings(
+            local_plan.source_placements,
+            tuple(item[1] for item in source_parts),
+        )
+    )
+    local_envelope = loader_module._RankLocalTransferEnvelope(
+        world_rank=1,
+        parallel_rank=WeightParallelRank(tp=1),
+        target_placement_id=target_parts[1][0].placement_id,
+        logical_plan=local_plan,
+        source_bindings=local_bindings,
+    )
+
+    class Coordinator:
+        cleared = 0
+
+        @property
+        def owner_source_session(self):
+            raise AssertionError("non-root must not read the full source session")
+
+        def clear_owner_source_session(self):
+            self.cleared += 1
+
+        def raise_if_failed(self):
+            pass
+
+    class FollowerWorld:
+        rank_in_group = 1
+        world_size = 2
+
+        def gather_object(self, local, dst=0):
+            assert local.placement == target_parts[1][0]
+            return None
+
+        def scatter_object(self, values, src=0):
+            assert values is None
+            return local_envelope
+
+    coordinator = Coordinator()
+    prepared, bind_calls = _prepare_distributed_native(
+        monkeypatch,
+        world_group=FollowerWorld(),
+        coordinator=coordinator,
+        target_parts=target_parts[1],
+    )
+
+    assert coordinator.cleared == 1
+    assert bind_calls == [target_parts[1][0].placement_id]
+    assert prepared.source_placements == (source_parts[1][0],)
+    assert prepared.source_bindings == (source_parts[1][1],)
+
+
+@pytest.mark.parametrize(
+    "failure",
+    ("wrong-rank", "placement-mismatch", "source-binding-closure"),
+)
+def test_rank_local_envelope_fails_before_target_bind(monkeypatch, failure) -> None:
+    source_parts = _tp2_manifest_parts("source", base_address=0x10000)
+    target_parts = _tp2_manifest_parts("target", base_address=0x20000)
+    global_plan = build_full_world_plan(
+        tuple(item[0] for item in source_parts),
+        tuple(item[0] for item in target_parts),
+        expected_target_topology=(
+            WeightParallelRank(tp=0),
+            WeightParallelRank(tp=1),
+        ),
+    )
+    selected_target = target_parts[0 if failure == "placement-mismatch" else 1][0]
+    local_plan = project_weight_transfer_plan_to_target(
+        global_plan,
+        selected_target.placement_id,
+    )
+    local_bindings = tuple(
+        loader_module.project_source_bindings(
+            local_plan.source_placements,
+            tuple(item[1] for item in source_parts),
+        )
+    )
+    if failure == "source-binding-closure":
+        local_bindings = tuple(item[1] for item in source_parts)
+    envelope = loader_module._RankLocalTransferEnvelope(
+        world_rank=0 if failure == "wrong-rank" else 1,
+        parallel_rank=WeightParallelRank(tp=1),
+        target_placement_id=target_parts[1][0].placement_id,
+        logical_plan=local_plan,
+        source_bindings=local_bindings,
+    )
+
+    class Coordinator:
+        owner_source_session = None
+
+        def clear_owner_source_session(self):
+            pass
+
+    class FollowerWorld:
+        rank_in_group = 1
+        world_size = 2
+
+        def gather_object(self, local, dst=0):
+            return None
+
+        def scatter_object(self, values, src=0):
+            return envelope
+
+    bind_calls = []
+    loader = RemoteInstanceModelLoader.__new__(RemoteInstanceModelLoader)
+    with contextlib.ExitStack() as resources:
+        with pytest.raises(ValueError):
+            loader._prepare_distributed_native_heterogeneous_weight_load(
+                model=object(),
+                coordinator=Coordinator(),
+                world_group=FollowerWorld(),
+                transfer_resources=resources,
+                target_manifest_builder=_target_session(
+                    *target_parts[1],
+                    bind_calls,
+                ),
+                target_model_id=_TARGET_MODEL_ID,
+                manifest_revision=_TARGET_ARTIFACT_REVISION,
+                local_session_id="target-1",
+                transfer_executor=object(),
+                phase_seconds={
+                    "source_manifest": 0.0,
+                    "target_manifest": 0.0,
+                    "plan": 0.0,
+                    "binding": 0.0,
+                },
+            )
+    assert bind_calls == []
+
+
+def test_duplicate_target_placement_fails_before_target_bind(monkeypatch) -> None:
+    source_parts = _tp2_manifest_parts("source", base_address=0x10000)
+    target_parts = _tp2_manifest_parts("target", base_address=0x20000)
+
+    class Coordinator:
+        def __init__(self):
+            self.owner_source_session = SimpleNamespace(
+                source_placements=tuple(item[0] for item in source_parts),
+                source_bindings=tuple(item[1] for item in source_parts),
+            )
+
+        def clear_owner_source_session(self):
+            self.owner_source_session = None
+
+    class RootWorld:
+        rank_in_group = 0
+        world_size = 2
+
+        def gather_object(self, local, dst=0):
+            return [
+                local,
+                loader_module._TargetPlacementEnvelope(
+                    world_rank=1,
+                    parallel_rank=local.parallel_rank,
+                    placement=local.placement,
+                ),
+            ]
+
+        def scatter_object(self, values, src=0):
+            assert all(value.error for value in values)
+            return values[0]
+
+    bind_calls = []
+    loader = RemoteInstanceModelLoader.__new__(RemoteInstanceModelLoader)
+    with contextlib.ExitStack() as resources:
+        with pytest.raises(RuntimeError, match="duplicate target placement"):
+            loader._prepare_distributed_native_heterogeneous_weight_load(
+                model=object(),
+                coordinator=Coordinator(),
+                world_group=RootWorld(),
+                transfer_resources=resources,
+                target_manifest_builder=_target_session(
+                    *target_parts[0],
+                    bind_calls,
+                ),
+                target_model_id=_TARGET_MODEL_ID,
+                manifest_revision=_TARGET_ARTIFACT_REVISION,
+                local_session_id="target-0",
+                transfer_executor=object(),
+                phase_seconds={
+                    "source_manifest": 0.0,
+                    "target_manifest": 0.0,
+                    "plan": 0.0,
+                    "binding": 0.0,
+                },
+            )
+    assert bind_calls == []
+
+
+@pytest.mark.parametrize("failure", ("target-builder", "root-planner"))
+def test_distributed_planning_failure_is_scattered_before_bind(
+    monkeypatch,
+    failure,
+) -> None:
+    source_parts = _tp2_manifest_parts("source", base_address=0x10000)
+    target_parts = _tp2_manifest_parts("target", base_address=0x20000)
+
+    class Coordinator:
+        def __init__(self):
+            self.owner_source_session = SimpleNamespace(
+                source_placements=tuple(item[0] for item in source_parts),
+                source_bindings=tuple(item[1] for item in source_parts),
+            )
+            self.cleared = 0
+
+        def clear_owner_source_session(self):
+            self.owner_source_session = None
+            self.cleared += 1
+
+    class RootWorld:
+        rank_in_group = 0
+        world_size = 2
+
+        def __init__(self):
+            self.sequence = []
+            self.errors = None
+
+        def gather_object(self, local, dst=0):
+            self.sequence.append("gather")
+            return [
+                local,
+                loader_module._TargetPlacementEnvelope(
+                    world_rank=1,
+                    parallel_rank=WeightParallelRank(tp=1),
+                    placement=target_parts[1][0],
+                ),
+            ]
+
+        def scatter_object(self, values, src=0):
+            self.sequence.append("scatter")
+            self.errors = tuple(value.error for value in values)
+            return values[0]
+
+    if failure == "root-planner":
+        monkeypatch.setattr(
+            loader_module,
+            "plan_weight_transfer",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                RuntimeError("planner failed " + "x" * 4096)
+            ),
+        )
+
+    bind_calls = []
+    if failure == "target-builder":
+
+        @contextlib.contextmanager
+        def target_builder(**_kwargs):
+            raise RuntimeError("target placement failed")
+            yield
+
+    else:
+        target_builder = _target_session(*target_parts[0], bind_calls)
+
+    world = RootWorld()
+    loader = RemoteInstanceModelLoader.__new__(RemoteInstanceModelLoader)
+    with contextlib.ExitStack() as resources:
+        with pytest.raises(RuntimeError):
+            loader._prepare_distributed_native_heterogeneous_weight_load(
+                model=object(),
+                coordinator=Coordinator(),
+                world_group=world,
+                transfer_resources=resources,
+                target_manifest_builder=target_builder,
+                target_model_id=_TARGET_MODEL_ID,
+                manifest_revision=_TARGET_ARTIFACT_REVISION,
+                local_session_id="target-0",
+                transfer_executor=object(),
+                phase_seconds={
+                    "source_manifest": 0.0,
+                    "target_manifest": 0.0,
+                    "plan": 0.0,
+                    "binding": 0.0,
+                },
+            )
+
+    assert world.sequence == ["gather", "scatter"]
+    assert world.errors[0] == world.errors[1]
+    assert len(world.errors[0]) <= 1024
+    assert bind_calls == []
 
 
 def test_post_load_weights_refreshes_gemma_runtime_buffer() -> None:
@@ -789,11 +2290,54 @@ def test_transfer_engine_without_manifest_builder_uses_legacy_loader(
     ]
 
 
+def test_explicit_provider_without_manifest_builder_fails_closed(
+    monkeypatch,
+) -> None:
+    provider_calls = []
+    model = torch.nn.Module()
+    loader = RemoteInstanceModelLoader.__new__(RemoteInstanceModelLoader)
+    loader.load_config = SimpleNamespace(
+        load_format=loader_module.LoadFormat.REMOTE_INSTANCE,
+        remote_instance_weight_loader_backend=(
+            loader_module.RemoteInstanceWeightLoaderBackend.TRANSFER_ENGINE
+        ),
+        remote_instance_weight_loader_transfer_engine="engine",
+        remote_instance_weight_loader_seed_instance_ip="127.0.0.1",
+        remote_instance_weight_loader_seed_instance_service_port=30000,
+        remote_instance_weight_runtime_manifest_builder=None,
+        remote_instance_weight_transfer_provider_factory=(
+            lambda *_args, **_kwargs: provider_calls.append("provider")
+        ),
+        tp_rank=3,
+    )
+    monkeypatch.setattr(loader_module, "_get_quantization_config", lambda *args: None)
+    monkeypatch.setattr(loader_module, "_initialize_model", lambda *args: model)
+    monkeypatch.setattr(loader_module, "register_memory_region", lambda *args: ())
+    monkeypatch.setattr(
+        loader,
+        "load_model_from_remote_instance_by_transfer_engine",
+        lambda *_args, **_kwargs: pytest.fail(
+            "explicit provider configuration must not use the legacy loader"
+        ),
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="configured weight transfer provider requires a runtime manifest builder",
+    ):
+        loader.load_model(
+            model_config=SimpleNamespace(dtype=torch.float32),
+            device_config=SimpleNamespace(device="cpu"),
+        )
+
+    assert provider_calls == []
+
+
 def test_heterogeneous_loader_fails_closed_without_source_manifests(
     monkeypatch,
 ) -> None:
     class EmptyCoordinator:
-        def __init__(self, seed_url, world_group):
+        def __init__(self, seed_url, world_group, **_kwargs):
             pass
 
         def acquire(self):
@@ -860,7 +2404,9 @@ class _MirrorRecoveryWorld:
         self.gathers = []
         self.broadcasts = []
 
-    def all_gather_object(self, value):
+    def all_gather_object(self, value, *, phase, execution_context):
+        assert phase.startswith("heterogeneous_quarantine.")
+        assert isinstance(execution_context, WeightTransferExecutionContext)
         self.gathers.append(value)
         return [value]
 
@@ -877,7 +2423,9 @@ class _ScriptedRecoveryWorld:
         self.responses = iter(responses)
         self.gathers = []
 
-    def all_gather_object(self, value):
+    def all_gather_object(self, value, *, phase, execution_context):
+        assert phase.startswith("heterogeneous_quarantine.")
+        assert isinstance(execution_context, WeightTransferExecutionContext)
         self.gathers.append(value)
         response = next(self.responses)
         return response(value) if callable(response) else response
@@ -937,6 +2485,48 @@ def test_drain_heterogeneous_quarantine_keeps_unknown(monkeypatch) -> None:
     assert coordinator.calls == []
     assert resources.closed is False
     assert events == []
+
+
+def test_drain_heterogeneous_quarantine_fails_closed_on_collective_timeout(
+    monkeypatch,
+) -> None:
+    events = []
+    item, _, resources, coordinator = _recovery_quarantine_item(
+        source_transfer_id="transfer-1",
+        completion_ticket="ticket-1",
+        statuses=("COMPLETION_UNKNOWN",),
+        events=events,
+    )
+
+    class TimedOutWorld:
+        rank_in_group = 0
+        world_size = 2
+
+        @staticmethod
+        def all_gather_object(value, *, phase, execution_context):
+            assert value == ((0, "transfer-1", "ticket-1"),)
+            assert phase == "heterogeneous_quarantine.metadata"
+            assert isinstance(execution_context, WeightTransferExecutionContext)
+            raise TimeoutError("collective deadline exceeded")
+
+    quarantine = [item]
+    monkeypatch.setattr(
+        loader_module,
+        "_HETEROGENEOUS_UNKNOWN_TRANSFER_QUARANTINE",
+        quarantine,
+    )
+    monkeypatch.setattr(loader_module, "get_world_group", TimedOutWorld)
+
+    assert (
+        loader_module.drain_heterogeneous_weight_transfer_quarantine(
+            max_attempts=1,
+            timeout_ms=0,
+        )
+        is False
+    )
+    assert quarantine == [item]
+    assert resources.closed is False
+    assert coordinator.calls == []
 
 
 def test_drain_heterogeneous_quarantine_waits_for_every_rank_then_releases(
@@ -1198,7 +2788,7 @@ def test_world_coordinator_terminal_recovery_release_failure_is_fail_closed(
     monkeypatch.setattr(
         remote_instance_weight_loader_utils,
         "begin_remote_instance_weight_transfer",
-        lambda seed_url: session,
+        lambda seed_url, **_kwargs: session,
     )
     monkeypatch.setattr(
         remote_instance_weight_loader_utils,
@@ -1272,7 +2862,9 @@ def test_heterogeneous_loader_blocks_world_when_any_rank_is_quarantined(
     class World:
         world_size = 2
 
-        def all_gather_object(self, value):
+        def all_gather_object(self, value, *, phase, execution_context):
+            assert phase.startswith("heterogeneous_quarantine.")
+            assert isinstance(execution_context, WeightTransferExecutionContext)
             gathered.append(value)
             if type(value) is tuple:
                 return [(), ((1, "transfer-1", "remote-ticket-1"),)]
@@ -1342,15 +2934,12 @@ def test_heterogeneous_loader_attempts_recovery_before_quarantine_block(
         )
         is False
     )
-    assert events == [
-        (
-            "drain",
-            {
-                "max_attempts": 1,
-                "timeout_ms": (loader_module._HETEROGENEOUS_UNKNOWN_DRAIN_TIMEOUT_MS),
-            },
-        )
-    ]
+    assert len(events) == 1
+    name, kwargs = events[0]
+    assert name == "drain"
+    assert kwargs["max_attempts"] == 1
+    assert kwargs["timeout_ms"] == loader_module._HETEROGENEOUS_UNKNOWN_DRAIN_TIMEOUT_MS
+    assert isinstance(kwargs["execution_context"], WeightTransferExecutionContext)
 
 
 def test_legacy_loader_drains_ticket_before_releasing_target_model(
@@ -1514,18 +3103,20 @@ def test_heterogeneous_loader_releases_source_snapshot_after_transfer_failure(
     outcomes = []
     source_inventory = {
         "model_id": _TARGET_MODEL_ID,
-        "revision": _TARGET_REVISION,
+        "revision": _TARGET_HF_REVISION,
         "lease_id": "source-runtime-lease",
         "fragments": [],
     }
 
     class FakeCoordinator:
-        def __init__(self, seed_url, world_group):
+        def __init__(self, seed_url, world_group, **_kwargs):
             pass
 
         def acquire(self):
             return SimpleNamespace(
-                transfer_id="transfer-1", manifests=[source_inventory]
+                transfer_id="transfer-1",
+                manifests=[source_inventory],
+                deadline_unix_sec=time.time() + 120,
             )
 
         def raise_if_failed(self):
@@ -1554,7 +3145,9 @@ def test_heterogeneous_loader_releases_source_snapshot_after_transfer_failure(
             raise RuntimeError("bad manifest")
 
     fake_weight_transfer.RuntimeManifest = FailingRuntimeManifest
-    fake_weight_transfer.MemoryRegistrationLease = object
+    fake_weight_transfer.MemoryRegistrationLease = SimpleNamespace(
+        from_fragment=lambda fragment, **_kwargs: fragment
+    )
     fake_weight_transfer.MooncakeTransferEngineReader = object
     fake_weight_transfer.TransferCompletionUnknownError = _CompletionUnknownError
     fake_weight_transfer.TransferEngineError = _TransferEngineError
@@ -1599,7 +3192,7 @@ def test_heterogeneous_loader_drains_unknown_before_releasing_target_and_source(
         )
     source_inventory = {
         "model_id": _TARGET_MODEL_ID,
-        "revision": _TARGET_REVISION,
+        "revision": _TARGET_HF_REVISION,
         "lease_id": "source-runtime-lease",
         "fragments": [SimpleNamespace(fragment_id="source-fragment")],
     }
@@ -1611,12 +3204,14 @@ def test_heterogeneous_loader_drains_unknown_before_releasing_target_and_source(
     }
 
     class FakeCoordinator:
-        def __init__(self, seed_url, world_group):
+        def __init__(self, seed_url, world_group, **_kwargs):
             pass
 
         def acquire(self):
             return SimpleNamespace(
-                transfer_id="transfer-1", manifests=[source_inventory]
+                transfer_id="transfer-1",
+                manifests=[source_inventory],
+                deadline_unix_sec=time.time() + 120,
             )
 
         def raise_if_failed(self):
@@ -1780,7 +3375,7 @@ def test_heterogeneous_loader_requires_completion_proof_before_release(
     outcomes = []
     source_inventory = {
         "model_id": _TARGET_MODEL_ID,
-        "revision": _TARGET_REVISION,
+        "revision": _TARGET_HF_REVISION,
         "lease_id": "source-runtime-lease",
         "fragments": [SimpleNamespace(fragment_id="source-fragment")],
     }
@@ -1792,12 +3387,14 @@ def test_heterogeneous_loader_requires_completion_proof_before_release(
     }
 
     class FakeCoordinator:
-        def __init__(self, seed_url, world_group):
+        def __init__(self, seed_url, world_group, **_kwargs):
             pass
 
         def acquire(self):
             return SimpleNamespace(
-                transfer_id="transfer-1", manifests=[source_inventory]
+                transfer_id="transfer-1",
+                manifests=[source_inventory],
+                deadline_unix_sec=time.time() + 120,
             )
 
         def ready_for_transfer(self, local_ready):
@@ -1868,7 +3465,7 @@ def test_heterogeneous_loader_fails_closed_when_heartbeat_fails_during_transfer(
     state = {"outcomes": []}
     source_inventory = {
         "model_id": _TARGET_MODEL_ID,
-        "revision": _TARGET_REVISION,
+        "revision": _TARGET_HF_REVISION,
         "lease_id": "source-runtime-lease",
         "fragments": [],
     }
@@ -1885,7 +3482,7 @@ def test_heterogeneous_loader_fails_closed_when_heartbeat_fails_during_transfer(
             return SimpleNamespace(**inventory)
 
     class FakeCoordinator:
-        def __init__(self, seed_url, world_group):
+        def __init__(self, seed_url, world_group, **_kwargs):
             self.failed = False
             state["coordinator"] = self
 
@@ -1894,6 +3491,7 @@ def test_heterogeneous_loader_fails_closed_when_heartbeat_fails_during_transfer(
                 transfer_id="transfer-1",
                 manifests=[source_inventory],
                 lease_timeout_sec=60,
+                deadline_unix_sec=time.time() + 120,
             )
 
         def raise_if_failed(self):

@@ -1,11 +1,18 @@
 from __future__ import annotations
 
 import importlib
+import threading
+import time
 from dataclasses import dataclass
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
 from sglang.srt.model_executor.weight_runtime_manifest import (
     WeightRuntimeBindingManifest,
+)
+from sglang.srt.weight_transfer._threaded_call import (
+    _BoundedExecutor,
+    _ThreadedCall,
+    _ThreadedCallAdmissionError,
 )
 from sglang.srt.weight_transfer.contracts import RuntimeWeightLocation
 from sglang.srt.weight_transfer.provider import (
@@ -14,6 +21,7 @@ from sglang.srt.weight_transfer.provider import (
     WeightProviderCapabilities,
     WeightTransferCompletionUnknownError,
     WeightTransferError,
+    WeightTransferExecutionContext,
 )
 
 
@@ -50,10 +58,18 @@ class MooncakeWeightTransferCompletionUnknownError(
 class _PreparedMooncakeLoad:
     request: WeightLoadRequest
     executable_plan: Any
+    reader: Any
     source_manifests: tuple[Any, ...]
     target_manifest: Any
     source_registrations: tuple[Any, ...] | None
     target_registrations: tuple[Any, ...] | None
+
+
+@dataclass(frozen=True)
+class _PendingMooncakeCall:
+    call: _ThreadedCall
+    prepared: _PreparedMooncakeLoad
+    backend: Any
 
 
 class MooncakeWeightTransferProvider:
@@ -73,13 +89,16 @@ class MooncakeWeightTransferProvider:
         max_batch_operations: int = 8192,
         max_region_segments: int = 1_000_000,
         max_total_operations: int = 10_000_000,
+        max_concurrent_calls: int = 4,
     ) -> None:
-        if (
-            max_batch_operations <= 0
-            or max_region_segments <= 0
-            or max_total_operations <= 0
-        ):
-            raise ValueError("Mooncake lowering limits must be positive")
+        limits = (
+            max_batch_operations,
+            max_region_segments,
+            max_total_operations,
+            max_concurrent_calls,
+        )
+        if any(type(limit) is not int or limit <= 0 for limit in limits):
+            raise ValueError("Mooncake execution limits must be positive")
         self.transfer_engine = transfer_engine
         self.source_pre_registered = source_pre_registered
         self.source_registrations = (
@@ -92,7 +111,16 @@ class MooncakeWeightTransferProvider:
         self.max_batch_operations = max_batch_operations
         self.max_region_segments = max_region_segments
         self.max_total_operations = max_total_operations
-        self._reader = None
+        self._call_executor = _BoundedExecutor(
+            max_workers=max_concurrent_calls,
+            thread_name_prefix="sglang-mooncake-weight-transfer",
+        )
+        self._pending_lock = threading.Lock()
+        self._pending_calls: dict[str, _PendingMooncakeCall] = {}
+        self._pending_readers: dict[str, Any] = {}
+
+    def validate_environment(self) -> None:
+        self._load_backend()
 
     @staticmethod
     def _load_backend() -> Any:
@@ -171,6 +199,7 @@ class MooncakeWeightTransferProvider:
             supports_safe_cancel=False,
             supports_completion_ticket=True,
             supports_transactional_publish=False,
+            supports_bounded_execution=True,
             max_regions=1_000_000,
             max_segments_per_region=self.max_region_segments,
             max_total_operations=self.max_total_operations,
@@ -402,7 +431,13 @@ class MooncakeWeightTransferProvider:
             )
         )
 
-    def prepare(self, request: WeightLoadRequest) -> _PreparedMooncakeLoad:
+    def prepare(
+        self,
+        request: WeightLoadRequest,
+        *,
+        execution_context: WeightTransferExecutionContext | None = None,
+    ) -> _PreparedMooncakeLoad:
+        del execution_context
         if request.profile != "runtime_to_runtime" or any(
             not isinstance(region.source, RuntimeWeightLocation)
             for region in request.plan.regions
@@ -548,7 +583,7 @@ class MooncakeWeightTransferProvider:
                 completion_known=True,
                 cleanup_required=False,
             )
-        self._reader = backend.MooncakeTransferEngineReader(
+        reader = backend.MooncakeTransferEngineReader(
             self.transfer_engine,
             max_batch_operations=self.max_batch_operations,
             max_region_segments=self.max_region_segments,
@@ -556,6 +591,7 @@ class MooncakeWeightTransferProvider:
         return _PreparedMooncakeLoad(
             request=request,
             executable_plan=executable_plan,
+            reader=reader,
             source_manifests=source_manifests,
             target_manifest=target_manifests[0],
             source_registrations=source_registrations,
@@ -565,11 +601,78 @@ class MooncakeWeightTransferProvider:
     def submit(self, prepared: _PreparedMooncakeLoad) -> _PreparedMooncakeLoad:
         return prepared
 
-    def wait(self, submission: _PreparedMooncakeLoad) -> WeightLoadReceipt:
+    def _get_or_start_pending_call(
+        self,
+        pending_transfer_id: str,
+        submission: _PreparedMooncakeLoad,
+        backend: Any,
+        factory: Callable[[], Any],
+    ) -> _PendingMooncakeCall:
+        with self._pending_lock:
+            pending = self._pending_calls.get(pending_transfer_id)
+            if pending is None:
+                pending = _PendingMooncakeCall(
+                    call=_ThreadedCall(self._call_executor),
+                    prepared=submission,
+                    backend=backend,
+                )
+                self._pending_calls[pending_transfer_id] = pending
+                pending.call.start(
+                    factory,
+                    thread_name=(
+                        "sglang-mooncake-weight-transfer-"
+                        f"{submission.request.operation_id[:8]}"
+                    ),
+                )
+            elif pending.prepared is not submission:
+                raise MooncakeWeightTransferCompletionUnknownError(
+                    "completion ticket belongs to a different submission",
+                    operation_id=submission.request.operation_id,
+                    pending_transfer_id=pending_transfer_id,
+                )
+            return pending
+
+    def _forget_pending_call(
+        self,
+        pending_transfer_id: str,
+        pending: _PendingMooncakeCall,
+    ) -> None:
+        with self._pending_lock:
+            if self._pending_calls.get(pending_transfer_id) is pending:
+                self._pending_calls.pop(pending_transfer_id, None)
+
+    def seal_pending_transfers(self) -> tuple[str, ...]:
+        self._call_executor.seal()
+        with self._pending_lock:
+            return tuple(
+                sorted(self._pending_calls.keys() | self._pending_readers.keys())
+            )
+
+    def wait(
+        self,
+        submission: _PreparedMooncakeLoad,
+        *,
+        execution_context: WeightTransferExecutionContext | None = None,
+    ) -> WeightLoadReceipt:
         backend = self._load_backend()
-        assert self._reader is not None
-        try:
-            receipts = self._reader.execute(
+
+        def require_live_deadline() -> None:
+            if execution_context is None or not execution_context.expired():
+                return
+            raise WeightTransferError(
+                "Mooncake transfer deadline expired before RDMA submission",
+                code="DEADLINE_EXCEEDED",
+                provider=self.name,
+                phase="wait",
+                operation_id=submission.request.operation_id,
+                retryable=False,
+                completion_known=True,
+                cleanup_required=False,
+            )
+
+        def execute() -> tuple[Any, ...]:
+            require_live_deadline()
+            return submission.reader.execute(
                 submission.executable_plan,
                 submission.source_manifests,
                 submission.target_manifest,
@@ -578,7 +681,66 @@ class MooncakeWeightTransferProvider:
                 target_pre_registered=self.target_pre_registered,
                 target_registrations=submission.target_registrations,
             )
+
+        try:
+            if execution_context is None:
+                receipts = execute()
+            else:
+                require_live_deadline()
+                pending_transfer_id = (
+                    f"sglang-weight-transfer:{submission.request.operation_id}"
+                )
+                pending = self._get_or_start_pending_call(
+                    pending_transfer_id,
+                    submission,
+                    backend,
+                    execute,
+                )
+                try:
+                    receipts = pending.call.result_before(
+                        execution_context,
+                        interrupted=lambda: (
+                            MooncakeWeightTransferCompletionUnknownError(
+                                "Mooncake transfer did not finish before the deadline",
+                                operation_id=submission.request.operation_id,
+                                pending_transfer_id=pending_transfer_id,
+                            )
+                        ),
+                    )
+                except MooncakeWeightTransferCompletionUnknownError:
+                    raise
+                except _ThreadedCallAdmissionError as error:
+                    self._forget_pending_call(pending_transfer_id, pending)
+                    raise WeightTransferError(
+                        str(error),
+                        code="EXECUTION_ADMISSION_REJECTED",
+                        provider=self.name,
+                        phase="wait",
+                        operation_id=submission.request.operation_id,
+                        retryable=not error.sealed,
+                        completion_known=True,
+                        cleanup_required=False,
+                    ) from error
+                except pending.backend.TransferCompletionUnknownError as error:
+                    self._forget_pending_call(pending_transfer_id, pending)
+                    with self._pending_lock:
+                        self._pending_readers[error.pending_transfer_id] = (
+                            pending.prepared.reader
+                        )
+                    raise MooncakeWeightTransferCompletionUnknownError(
+                        str(error),
+                        operation_id=submission.request.operation_id,
+                        pending_transfer_id=error.pending_transfer_id,
+                    ) from error
+                except BaseException:
+                    self._forget_pending_call(pending_transfer_id, pending)
+                    raise
+                else:
+                    if not pending.call.was_abandoned:
+                        self._forget_pending_call(pending_transfer_id, pending)
         except backend.TransferCompletionUnknownError as error:
+            with self._pending_lock:
+                self._pending_readers[error.pending_transfer_id] = submission.reader
             raise MooncakeWeightTransferCompletionUnknownError(
                 str(error),
                 operation_id=submission.request.operation_id,
@@ -619,15 +781,22 @@ class MooncakeWeightTransferProvider:
     def cancel(self, submission: _PreparedMooncakeLoad) -> None:
         del submission
 
-    def synchronize(self, receipt: WeightLoadReceipt) -> None:
-        del receipt
+    def synchronize(
+        self,
+        receipt: WeightLoadReceipt,
+        *,
+        execution_context: WeightTransferExecutionContext | None = None,
+    ) -> None:
+        del receipt, execution_context
 
     def release(
         self,
         prepared: _PreparedMooncakeLoad,
         receipt: WeightLoadReceipt | None,
+        *,
+        execution_context: WeightTransferExecutionContext | None = None,
     ) -> None:
-        del prepared, receipt
+        del prepared, receipt, execution_context
 
     def drain_pending_transfer(
         self,
@@ -635,12 +804,44 @@ class MooncakeWeightTransferProvider:
         *,
         timeout_ms: int,
     ) -> str:
-        if self._reader is None:
-            raise RuntimeError("Mooncake reader has not been prepared")
-        return self._reader.drain_pending_transfer(
+        if type(timeout_ms) is not int or timeout_ms < 0:
+            raise ValueError("timeout_ms must be a non-negative integer")
+        deadline = time.monotonic() + timeout_ms / 1000
+
+        def remaining_seconds() -> float:
+            return max(0.0, deadline - time.monotonic())
+
+        def remaining_milliseconds() -> int:
+            return int(remaining_seconds() * 1000)
+
+        with self._pending_lock:
+            pending = self._pending_calls.get(pending_transfer_id)
+            reader = self._pending_readers.get(pending_transfer_id)
+        if pending is not None:
+            if not pending.call.done.wait(timeout=remaining_seconds()):
+                return "COMPLETION_UNKNOWN"
+            error = pending.call.error
+            if isinstance(error, pending.backend.TransferCompletionUnknownError):
+                status = pending.prepared.reader.drain_pending_transfer(
+                    error.pending_transfer_id,
+                    timeout_ms=remaining_milliseconds(),
+                )
+            else:
+                status = "COMPLETED" if error is None else "FAILED_DRAINED"
+            if status != "COMPLETION_UNKNOWN":
+                self._forget_pending_call(pending_transfer_id, pending)
+            return status
+        if reader is None:
+            raise ValueError(f"pending transfer does not exist: {pending_transfer_id}")
+        status = reader.drain_pending_transfer(
             pending_transfer_id,
-            timeout_ms=timeout_ms,
+            timeout_ms=remaining_milliseconds(),
         )
+        if status != "COMPLETION_UNKNOWN":
+            with self._pending_lock:
+                if self._pending_readers.get(pending_transfer_id) is reader:
+                    self._pending_readers.pop(pending_transfer_id, None)
+        return status
 
     def drain_completion(
         self,

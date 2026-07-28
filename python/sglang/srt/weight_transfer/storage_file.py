@@ -8,7 +8,6 @@ from pathlib import Path
 from typing import Callable, Iterator, TypeVar
 
 import msgspec
-
 from sglang.srt.weight_transfer.storage import (
     InMemoryWeightStorageCatalog,
     StoredWeightSnapshot,
@@ -88,6 +87,18 @@ class FileWeightStorageCatalog:
     ) -> WeightMaterializationAttempt:
         return self._mutate(
             lambda catalog: catalog.set_materialization_completion_ticket(
+                materialization_id,
+                completion_ticket,
+            )
+        )
+
+    def clear_materialization_completion_ticket(
+        self,
+        materialization_id: str,
+        completion_ticket: str,
+    ) -> WeightMaterializationAttempt:
+        return self._mutate(
+            lambda catalog: catalog.clear_materialization_completion_ticket(
                 materialization_id,
                 completion_ticket,
             )

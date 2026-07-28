@@ -10,7 +10,6 @@ from typing import TYPE_CHECKING, Any, Optional
 import msgspec
 import torch
 import torch.distributed as dist
-
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig, LoadFormat
 from sglang.srt.constants import GPU_MEMORY_TYPE_WEIGHTS
@@ -19,7 +18,7 @@ from sglang.srt.debug_utils.tensor_dump_forward_hook import (
 )
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_state
-from sglang.srt.model_loader.loader import get_model_loader
+from sglang.srt.model_loader.loader import WeightSnapshotActivation, get_model_loader
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     RemoteInstanceWeightLoaderBackend,
     trigger_init_weights_send_group_for_remote_instance_request,
@@ -44,6 +43,7 @@ class LoadedModel(msgspec.Struct, frozen=True, kw_only=True):
     loader: Any
     model: Any
     remote_instance_weight_info: Optional[Any]
+    pending_weight_snapshot_activation: Optional[WeightSnapshotActivation]
 
 
 def refresh_runtime_weight_state(model: Any) -> None:
@@ -235,6 +235,9 @@ def maybe_enable_ipc_weight_cache(
     if server_args.weight_cache_mode == "off":
         return
 
+    if load_config.load_format == LoadFormat.WEIGHT_SNAPSHOT:
+        raise ValueError("weight_snapshot cannot be combined with the IPC weight cache")
+
     if load_config.load_format != LoadFormat.IPC_CACHE:
         load_config.fallback_load_format = load_config.load_format
         load_config.load_format = LoadFormat.IPC_CACHE
@@ -261,51 +264,54 @@ def load_model_with_memory_saver(
     memory_saver_adapter: Any,
     is_draft_worker: bool,
 ) -> LoadedModel:
-    # Remove monkey_patch when linear.py quant remove dependencies with vllm
     monkey_patch_vllm_parallel_state()
-
-    enable_cpu_backup = server_args.enable_weights_cpu_backup or (
-        is_draft_worker and server_args.enable_draft_weights_cpu_backup
-    )
-
-    # In zero-copy IPC mode, the weights are shared with the daemon via
-    # CUDA IPC and must not be offloaded/reloaded by the memory saver.
-    is_ipc_zero_copy = server_args.weight_cache_mode != "off"
-    if is_ipc_zero_copy and enable_cpu_backup:
-        logger.warning(
-            "[ModelRunner] Disabling weights CPU backup in zero-copy IPC mode — "
-            "IPC-mapped weights cannot be offloaded to CPU."
+    pending_activation = None
+    try:
+        enable_cpu_backup = server_args.enable_weights_cpu_backup or (
+            is_draft_worker and server_args.enable_draft_weights_cpu_backup
         )
-        enable_cpu_backup = False
 
-    remote_instance_weight_info = None
-    with memory_saver_adapter.region(
-        GPU_MEMORY_TYPE_WEIGHTS,
-        enable_cpu_backup=enable_cpu_backup,
-    ):
-        loader = get_model_loader(
-            load_config=load_config,
-            model_config=model_config,
-        )
-        model = loader.load_model(
-            model_config=model_config,
-            device_config=DeviceConfig(device, gpu_id),
-        )
-        if hasattr(loader, "remote_instance_transfer_engine_weight_info"):
-            remote_instance_weight_info = (
-                loader.remote_instance_transfer_engine_weight_info
+        is_ipc_zero_copy = server_args.weight_cache_mode != "off"
+        if is_ipc_zero_copy and enable_cpu_backup:
+            logger.warning(
+                "[ModelRunner] Disabling weights CPU backup in zero-copy IPC mode — "
+                "IPC-mapped weights cannot be offloaded to CPU."
             )
-    # Cache needs to be cleared after loading model weights (in the loader.load_model function).
-    # To avoid conflict with memory_saver_adapter.region, empty_cache operation is now moved here.
-    if _is_npu:
-        torch.npu.empty_cache()
-    monkey_patch_vllm_parallel_state(reverse=True)
+            enable_cpu_backup = False
 
-    return LoadedModel(
-        loader=loader,
-        model=model,
-        remote_instance_weight_info=remote_instance_weight_info,
-    )
+        remote_instance_weight_info = None
+        with memory_saver_adapter.region(
+            GPU_MEMORY_TYPE_WEIGHTS,
+            enable_cpu_backup=enable_cpu_backup,
+        ):
+            loader = get_model_loader(
+                load_config=load_config,
+                model_config=model_config,
+            )
+            model = loader.load_model(
+                model_config=model_config,
+                device_config=DeviceConfig(device, gpu_id),
+            )
+            pending_activation = loader.take_pending_weight_snapshot_activation()
+            if hasattr(loader, "remote_instance_transfer_engine_weight_info"):
+                remote_instance_weight_info = (
+                    loader.remote_instance_transfer_engine_weight_info
+                )
+        if _is_npu:
+            torch.npu.empty_cache()
+
+        return LoadedModel(
+            loader=loader,
+            model=model,
+            remote_instance_weight_info=remote_instance_weight_info,
+            pending_weight_snapshot_activation=pending_activation,
+        )
+    except BaseException:
+        if pending_activation is not None:
+            pending_activation.close()
+        raise
+    finally:
+        monkey_patch_vllm_parallel_state(reverse=True)
 
 
 def dist_barrier_after_load(

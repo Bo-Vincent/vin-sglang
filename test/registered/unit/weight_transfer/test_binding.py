@@ -3,9 +3,9 @@ from __future__ import annotations
 from math import prod
 
 import pytest
-
 from sglang.srt.model_executor.weight_runtime_manifest import (
     RuntimeWeightBinding,
+    WeightManifestError,
     WeightParallelRank,
     WeightPlacementManifest,
     WeightPlacementTensor,
@@ -268,7 +268,11 @@ def test_binding_rejects_overlapping_target_writes() -> None:
     source_a = placement("source-a", tensor_id="a")
     source_b = placement("source-b", tensor_id="b")
     target_a = placement("target-a", tensor_id="a")
-    target_b = placement("target-b", tensor_id="b")
+    target_b = placement(
+        "target-b",
+        tensor_id="b",
+        rank=WeightParallelRank(pp=1),
+    )
     logical = plan_weight_transfer(
         (source_a, source_b),
         (target_a, target_b),
@@ -295,6 +299,493 @@ def test_binding_rejects_overlapping_target_writes() -> None:
                     endpoint="target:1",
                 ),
             ),
+        )
+
+
+def test_binding_rejects_full_region_overlapping_row_regions() -> None:
+    aliases = ("shared.weight", "shared.weight.alias")
+    source_full = placement(
+        "source-full",
+        tensor_id="full",
+        shape=(2, 4),
+        offset=(0, 0),
+        global_shape=(2, 4),
+        aliases=aliases,
+    )
+    source_rows = (
+        placement(
+            "source-row-0",
+            tensor_id="rows",
+            shape=(1, 4),
+            offset=(0, 0),
+            global_shape=(2, 4),
+            rank=WeightParallelRank(tp=0),
+            aliases=aliases,
+        ),
+        placement(
+            "source-row-1",
+            tensor_id="rows",
+            shape=(1, 4),
+            offset=(1, 0),
+            global_shape=(2, 4),
+            rank=WeightParallelRank(tp=1),
+            aliases=aliases,
+        ),
+    )
+    target_full = placement(
+        "target-full",
+        tensor_id="full",
+        shape=(2, 4),
+        offset=(0, 0),
+        global_shape=(2, 4),
+        aliases=aliases,
+    )
+    target_rows = placement(
+        "target-rows",
+        tensor_id="rows",
+        shape=(2, 4),
+        offset=(0, 0),
+        global_shape=(2, 4),
+        rank=WeightParallelRank(pp=1),
+        aliases=aliases,
+    )
+    logical = plan_weight_transfer(
+        (source_full, *source_rows),
+        (target_full, target_rows),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="overlapping target writes: logical regions partially overlap",
+    ):
+        bind_weight_transfer_plan(
+            logical,
+            source_bindings=(
+                runtime_binding(source_full, address=0x10000),
+                runtime_binding(source_rows[0], address=0x11000),
+                runtime_binding(source_rows[1], address=0x12000),
+            ),
+            target_bindings=(
+                runtime_binding(
+                    target_full,
+                    address=0x20000,
+                    worker_id="target",
+                    endpoint="target:1",
+                ),
+                runtime_binding(
+                    target_rows,
+                    address=0x20000,
+                    worker_id="target",
+                    endpoint="target:1",
+                ),
+            ),
+        )
+
+
+def test_binding_allows_disjoint_regions_for_one_target_fragment() -> None:
+    sources = (
+        placement(
+            "source-0",
+            shape=(4,),
+            offset=(0,),
+            global_shape=(8,),
+            rank=WeightParallelRank(tp=0),
+        ),
+        placement(
+            "source-1",
+            shape=(4,),
+            offset=(4,),
+            global_shape=(8,),
+            rank=WeightParallelRank(tp=1),
+        ),
+    )
+    target = placement("target")
+    logical = plan_weight_transfer(sources, (target,))
+
+    bound = bind_weight_transfer_plan(
+        logical,
+        source_bindings=(
+            runtime_binding(sources[0], address=0x10000),
+            runtime_binding(sources[1], address=0x11000),
+        ),
+        target_bindings=(runtime_binding(target, address=0x20000),),
+    )
+
+    assert len(bound.regions) == 2
+
+
+def test_alias_dedup_keeps_distinct_target_address_spaces() -> None:
+    aliases = ("shared.weight", "shared.weight.alias")
+    source = placement("source", aliases=aliases)
+    targets = (
+        placement(
+            "target-0",
+            rank=WeightParallelRank(dp=0),
+            aliases=aliases,
+        ),
+        placement(
+            "target-1",
+            rank=WeightParallelRank(dp=1),
+            aliases=aliases,
+        ),
+    )
+    logical = plan_weight_transfer((source,), targets)
+
+    bound = bind_weight_transfer_plan(
+        logical,
+        source_bindings=(runtime_binding(source, address=0x10000),),
+        target_bindings=(
+            runtime_binding(
+                targets[0],
+                address=0x20000,
+                worker_id="target",
+                endpoint="target:1",
+            ),
+            runtime_binding(
+                targets[1],
+                address=0x20000,
+                worker_id="target",
+                endpoint="target:1",
+                device="cuda:1",
+            ),
+        ),
+    )
+
+    assert len(bound.regions) == 2
+
+
+@pytest.mark.parametrize(
+    "second_target_overrides",
+    (
+        {"generation": 2},
+        {"lease_id": "other-lease"},
+    ),
+    ids=("generation", "lease"),
+)
+def test_alias_dedup_rejects_inconsistent_target_snapshot_identity(
+    second_target_overrides,
+) -> None:
+    aliases = ("shared.weight", "shared.weight.alias")
+    source = placement("source", aliases=aliases)
+    targets = (
+        placement(
+            "target-0",
+            rank=WeightParallelRank(dp=0),
+            aliases=aliases,
+        ),
+        placement(
+            "target-1",
+            rank=WeightParallelRank(dp=1),
+            aliases=aliases,
+        ),
+    )
+    logical = plan_weight_transfer((source,), targets)
+
+    with pytest.raises(ValueError, match="target alias snapshot identity differs"):
+        bind_weight_transfer_plan(
+            logical,
+            source_bindings=(runtime_binding(source, address=0x10000),),
+            target_bindings=(
+                runtime_binding(
+                    targets[0],
+                    address=0x20000,
+                    worker_id="target",
+                    endpoint="target:1",
+                ),
+                runtime_binding(
+                    targets[1],
+                    address=0x20000,
+                    worker_id="target",
+                    endpoint="target:1",
+                    **second_target_overrides,
+                ),
+            ),
+        )
+
+
+@pytest.mark.parametrize(
+    "second_target_overrides",
+    (
+        {"generation": 2},
+        {"lease_id": "other-lease"},
+    ),
+    ids=("generation", "lease"),
+)
+def test_target_snapshot_identity_is_consistent_within_address_space(
+    second_target_overrides,
+) -> None:
+    source = placement("source")
+    targets = (
+        placement("target-0", rank=WeightParallelRank(dp=0)),
+        placement("target-1", rank=WeightParallelRank(dp=1)),
+    )
+    logical = plan_weight_transfer((source,), targets)
+
+    with pytest.raises(
+        ValueError,
+        match="target binding snapshot identity differs within address space",
+    ):
+        bind_weight_transfer_plan(
+            logical,
+            source_bindings=(runtime_binding(source, address=0x10000),),
+            target_bindings=(
+                runtime_binding(
+                    targets[0],
+                    address=0x20000,
+                    worker_id="target",
+                    endpoint="target:1",
+                ),
+                runtime_binding(
+                    targets[1],
+                    address=0x30000,
+                    worker_id="target",
+                    endpoint="target:1",
+                    **second_target_overrides,
+                ),
+            ),
+        )
+
+
+def test_exact_alias_with_identical_source_payload_is_deduplicated() -> None:
+    aliases = ("shared.weight", "shared.weight.alias")
+    source = placement("source", aliases=aliases)
+    targets = (
+        placement(
+            "target-0",
+            rank=WeightParallelRank(dp=0),
+            aliases=aliases,
+        ),
+        placement(
+            "target-1",
+            rank=WeightParallelRank(dp=1),
+            aliases=aliases,
+        ),
+    )
+    logical = plan_weight_transfer((source,), targets)
+
+    bound = bind_weight_transfer_plan(
+        logical,
+        source_bindings=(runtime_binding(source, address=0x10000),),
+        target_bindings=(
+            runtime_binding(
+                targets[0],
+                address=0x20000,
+                worker_id="target",
+                endpoint="target:1",
+            ),
+            runtime_binding(
+                targets[1],
+                address=0x20000,
+                worker_id="target",
+                endpoint="target:1",
+            ),
+        ),
+    )
+
+    assert len(bound.regions) == 1
+
+
+def test_exact_alias_dedup_uses_payload_not_source_alias_metadata() -> None:
+    target_aliases = ("shared.weight", "shared.weight.alias")
+    sources = (
+        placement("source-a", tensor_id="a", aliases=("source.a",)),
+        placement("source-b", tensor_id="b", aliases=("source.b",)),
+    )
+    targets = (
+        placement("target-a", tensor_id="a", aliases=target_aliases),
+        placement(
+            "target-b",
+            tensor_id="b",
+            rank=WeightParallelRank(pp=1),
+            aliases=target_aliases,
+        ),
+    )
+    logical = plan_weight_transfer(sources, targets)
+
+    bound = bind_weight_transfer_plan(
+        logical,
+        source_bindings=(
+            runtime_binding(sources[0], address=0x10000),
+            runtime_binding(sources[1], address=0x10000),
+        ),
+        target_bindings=(
+            runtime_binding(
+                targets[0],
+                address=0x20000,
+                worker_id="target",
+                endpoint="target:1",
+            ),
+            runtime_binding(
+                targets[1],
+                address=0x20000,
+                worker_id="target",
+                endpoint="target:1",
+            ),
+        ),
+    )
+
+    assert len(bound.regions) == 1
+
+
+def test_exact_alias_rejects_different_source_payloads() -> None:
+    aliases = ("shared.weight", "shared.weight.alias")
+    sources = (
+        placement(
+            "source-0",
+            rank=WeightParallelRank(dp=0),
+            aliases=aliases,
+        ),
+        placement(
+            "source-1",
+            rank=WeightParallelRank(dp=1),
+            aliases=aliases,
+        ),
+    )
+    targets = (
+        placement(
+            "target-0",
+            rank=WeightParallelRank(dp=0),
+            aliases=aliases,
+        ),
+        placement(
+            "target-1",
+            rank=WeightParallelRank(dp=1),
+            aliases=aliases,
+        ),
+    )
+    logical = plan_weight_transfer(sources, targets)
+
+    with pytest.raises(
+        ValueError,
+        match="overlapping target writes: source payload differs",
+    ):
+        bind_weight_transfer_plan(
+            logical,
+            source_bindings=(
+                runtime_binding(sources[0], address=0x10000),
+                runtime_binding(sources[1], address=0x11000),
+            ),
+            target_bindings=(
+                runtime_binding(
+                    targets[0],
+                    address=0x20000,
+                    worker_id="target",
+                    endpoint="target:1",
+                ),
+                runtime_binding(
+                    targets[1],
+                    address=0x20000,
+                    worker_id="target",
+                    endpoint="target:1",
+                ),
+            ),
+        )
+
+
+def test_alias_validation_does_not_compare_every_region_pair(monkeypatch) -> None:
+    from sglang.srt.weight_transfer import _geometry as geometry_module
+
+    parts = 64
+    sources = tuple(
+        placement(
+            f"source-{rank}",
+            shape=(1,),
+            offset=(rank,),
+            global_shape=(parts,),
+            rank=WeightParallelRank(tp=rank),
+        )
+        for rank in range(parts)
+    )
+    target = placement("target", shape=(parts,), global_shape=(parts,))
+    logical = plan_weight_transfer(sources, (target,))
+    comparisons = 0
+    sweeps = 0
+    original = geometry_module.boxes_intersect
+    original_sweep = geometry_module.find_box_overlap
+
+    def counting_intersection(left, right):
+        nonlocal comparisons
+        comparisons += 1
+        return original(left, right)
+
+    def counting_sweep(boxes, *, budget=None):
+        nonlocal sweeps
+        sweeps += 1
+        return original_sweep(boxes, budget=budget)
+
+    monkeypatch.setattr(
+        geometry_module,
+        "boxes_intersect",
+        counting_intersection,
+    )
+    monkeypatch.setattr(
+        geometry_module,
+        "find_box_overlap",
+        counting_sweep,
+    )
+
+    bound = bind_weight_transfer_plan(
+        logical,
+        source_bindings=tuple(
+            runtime_binding(source, address=0x10000 + rank * 0x1000)
+            for rank, source in enumerate(sources)
+        ),
+        target_bindings=(runtime_binding(target, address=0x100000),),
+    )
+
+    assert len(bound.regions) == parts
+    assert comparisons <= parts * 4
+    assert sweeps == 1
+
+
+def test_alias_validation_rejects_non_transitive_payload_matches() -> None:
+    from itertools import permutations
+
+    from sglang.srt.weight_transfer._geometry import (
+        TargetAliasCandidate,
+        TargetAliasClassification,
+        analyze_target_aliases,
+    )
+
+    common = {
+        "allocation_identity": ("target",),
+        "snapshot_identity": (1, "lease"),
+        "target_view_identity": (("weight", "weight.alias"), (0,), (8,)),
+        "logical_box": ((0,), (8,)),
+        "alias_declared": True,
+    }
+    candidates = (
+        TargetAliasCandidate(
+            **common,
+            source_identity=("source-0",),
+            source_payload_identity=("payload-0",),
+        ),
+        TargetAliasCandidate(
+            **common,
+            source_identity=("source-0",),
+            source_payload_identity=("payload-1",),
+        ),
+        TargetAliasCandidate(
+            **common,
+            source_identity=("source-1",),
+            source_payload_identity=("payload-1",),
+        ),
+    )
+
+    for ordered in permutations(candidates):
+        analysis = analyze_target_aliases(ordered)
+
+        assert analysis.conflict is not None
+        assert (
+            analysis.conflict.classification
+            is TargetAliasClassification.SOURCE_PAYLOAD_MISMATCH
+        )
+        left = ordered[analysis.conflict.left_index]
+        right = ordered[analysis.conflict.right_index]
+        assert left.source_identity != right.source_identity
+        assert (
+            left.source_payload_identity is None
+            or left.source_payload_identity != right.source_payload_identity
         )
 
 
@@ -413,21 +904,16 @@ def test_legacy_adapter_keeps_placement_id_across_generations() -> None:
     )
 
 
-def test_binding_rejects_runtime_address_range_overflow() -> None:
+def test_runtime_binding_rejects_address_range_overflow() -> None:
     source = placement("source")
-    target = placement("target")
-    logical = plan_weight_transfer((source,), (target,))
 
-    with pytest.raises(ValueError, match="runtime address range exceeds uint64"):
-        bind_weight_transfer_plan(
-            logical,
-            source_bindings=(
-                runtime_binding(
-                    source,
-                    address=(1 << 64) - source.tensors[0].nbytes + 1,
-                ),
-            ),
-            target_bindings=(runtime_binding(target, address=0x20000),),
+    with pytest.raises(
+        WeightManifestError,
+        match="runtime address range exceeds uint64",
+    ):
+        runtime_binding(
+            source,
+            address=(1 << 64) - source.tensors[0].nbytes + 1,
         )
 
 

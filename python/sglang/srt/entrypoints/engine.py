@@ -48,7 +48,6 @@ from typing import (
 import torch
 import uvloop
 import zmq
-
 from sglang.srt.elastic_ep.expert_backup_manager import run_expert_backup_manager
 from sglang.srt.entrypoints.engine_info_bootstrap_server import (
     EngineInfoBootstrapServer,
@@ -229,6 +228,13 @@ class Engine(EngineScoreMixin, EngineBase):
                 # Do not print logs by default
                 kwargs["log_level"] = "error"
             server_args = self.server_args_class(**kwargs)
+        configured_load_format = getattr(server_args, "load_format", None)
+        load_format = getattr(configured_load_format, "value", configured_load_format)
+        if load_format == "weight_snapshot":
+            raise ValueError(
+                "--load-format weight_snapshot requires the HTTP server startup "
+                "lifecycle and is not supported by Engine"
+            )
         self.server_args = server_args
         logger.info(f"{server_args=}")
 
@@ -1247,13 +1253,17 @@ class Engine(EngineScoreMixin, EngineBase):
         storage_options: Dict[str, Any],
         materialization_id: Optional[str] = None,
         source_external_dp_rank: Optional[int] = None,
+        lease_timeout_sec: Optional[int] = None,
     ) -> Dict[str, Any]:
         """Materialize one runtime weight replica into persistent storage."""
-        obj = MaterializeWeightsReqInput(
+        request_options = dict(
             storage_options=storage_options,
             materialization_id=materialization_id,
             source_external_dp_rank=source_external_dp_rank,
         )
+        if lease_timeout_sec is not None:
+            request_options["lease_timeout_sec"] = lease_timeout_sec
+        obj = MaterializeWeightsReqInput(**request_options)
         return self.loop.run_until_complete(
             self.tokenizer_manager.materialize_weights(obj, None)
         )

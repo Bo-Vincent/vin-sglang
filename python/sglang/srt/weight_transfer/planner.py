@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from bisect import bisect_left, bisect_right
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from heapq import nsmallest
 from math import prod
 from typing import Sequence
 
@@ -10,6 +11,17 @@ from sglang.srt.model_executor.weight_runtime_manifest import (
     WeightPlacementManifest,
     WeightPlacementTensor,
     compute_weight_placement_id,
+)
+from sglang.srt.weight_transfer._geometry import (
+    DEFAULT_MAX_GEOMETRY_BOXES,
+    DEFAULT_MAX_GEOMETRY_EVENTS,
+    DEFAULT_MAX_GEOMETRY_SORT_WORK,
+    GeometryWorkBudget,
+    _sort_work,
+    intersect_boxes,
+)
+from sglang.srt.weight_transfer._geometry import (
+    boxes_exactly_cover as _boxes_exactly_cover,
 )
 from sglang.srt.weight_transfer.contracts import (
     LogicalPlacementFragment,
@@ -20,7 +32,7 @@ from sglang.srt.weight_transfer.contracts import (
     build_region,
 )
 
-TensorOwner = tuple[int, int | None]
+TensorOwner = tuple[int, int | None, int | None]
 BoxGeometry = tuple[tuple[int, ...], tuple[int, ...]]
 
 
@@ -31,6 +43,14 @@ class WeightPlannerLimits:
     max_regions: int = 1_000_000
     max_segments_per_region: int = 1_000_000
     max_total_segments: int = 10_000_000
+    max_geometry_comparisons: int = 10_000_000
+    max_geometry_boxes: int = DEFAULT_MAX_GEOMETRY_BOXES
+    max_geometry_events: int = DEFAULT_MAX_GEOMETRY_EVENTS
+    max_sort_work: int = DEFAULT_MAX_GEOMETRY_SORT_WORK
+    max_source_placements: int = 1_000_000
+    max_target_placements: int = 1_000_000
+    max_source_fragments: int = 10_000_000
+    max_target_fragments: int = 10_000_000
 
     def __post_init__(self) -> None:
         for name in (
@@ -39,6 +59,14 @@ class WeightPlannerLimits:
             "max_regions",
             "max_segments_per_region",
             "max_total_segments",
+            "max_geometry_comparisons",
+            "max_geometry_boxes",
+            "max_geometry_events",
+            "max_sort_work",
+            "max_source_placements",
+            "max_target_placements",
+            "max_source_fragments",
+            "max_target_fragments",
         ):
             value = getattr(self, name)
             if type(value) is not int or value <= 0:
@@ -46,6 +74,40 @@ class WeightPlannerLimits:
 
 
 DEFAULT_WEIGHT_PLANNER_LIMITS = WeightPlannerLimits()
+
+
+@dataclass
+class _CandidateWorkBudget:
+    limit: int
+    geometry_budget: GeometryWorkBudget
+    visits: int = 0
+
+    def consume(self, count: int = 1) -> None:
+        if type(count) is not int or count < 0:
+            raise ValueError("candidate work count must be a non-negative integer")
+        if count > self.limit - self.visits:
+            raise ValueError("transfer plan exceeds candidate visit limit")
+        self.visits += count
+
+    def reserve_index_build(
+        self,
+        *,
+        candidate_work: int,
+        index_entries: int,
+        sort_work: int,
+    ) -> None:
+        if type(candidate_work) is not int or candidate_work < 0:
+            raise ValueError("candidate work count must be a non-negative integer")
+        if candidate_work > self.limit - self.visits:
+            raise ValueError("transfer plan exceeds candidate visit limit")
+        self.geometry_budget.reserve(
+            boxes=index_entries,
+            sort_work=sort_work,
+        )
+        self.visits += candidate_work
+
+    def reserve_sort(self, count: int) -> None:
+        self.geometry_budget.reserve(sort_work=_sort_work(count))
 
 
 @dataclass(frozen=True)
@@ -58,6 +120,7 @@ class _TensorDescriptor:
     shard_dims: tuple[int, ...]
     layer_id: int | None
     expert_id: int | None
+    expert_axis: int | None
     layout_fingerprint: str
 
 
@@ -109,7 +172,10 @@ class _IntervalNode:
     right: _IntervalNode | None
 
     @classmethod
-    def build(cls, entries: Sequence[_IntervalEntry]) -> _IntervalNode | None:
+    def build(
+        cls,
+        entries: Sequence[_IntervalEntry],
+    ) -> _IntervalNode | None:
         if not entries:
             return None
         midpoints = sorted(
@@ -161,42 +227,72 @@ class _IntervalNode:
         begin: int,
         end: int,
         result: list[_IntervalEntry],
+        budget: _CandidateWorkBudget,
     ) -> None:
+        budget.consume()
         if end <= self.center:
-            result.extend(self.by_begin[: bisect_left(self.begins, end)])
+            stop = bisect_left(self.begins, end)
+            budget.consume(stop)
+            result.extend(self.by_begin[:stop])
             if self.left is not None:
-                self.left.query(begin, end, result)
+                self.left.query(begin, end, result, budget)
             return
         if begin > self.center:
-            result.extend(self.by_end[bisect_right(self.ends, begin) :])
+            start = bisect_right(self.ends, begin)
+            budget.consume(len(self.by_end) - start)
+            result.extend(self.by_end[start:])
             if self.right is not None:
-                self.right.query(begin, end, result)
+                self.right.query(begin, end, result, budget)
             return
 
+        budget.consume(len(self.by_begin))
         result.extend(self.by_begin)
         if begin < self.center and self.left is not None:
-            self.left.query(begin, end, result)
+            self.left.query(begin, end, result, budget)
         if end > self.center and self.right is not None:
-            self.right.query(begin, end, result)
+            self.right.query(begin, end, result, budget)
 
-    def count(self, begin: int, end: int) -> int:
+    def count(
+        self,
+        begin: int,
+        end: int,
+        budget: _CandidateWorkBudget,
+    ) -> int:
+        budget.consume()
         if end <= self.center:
             result = bisect_left(self.begins, end)
             if self.left is not None:
-                result += self.left.count(begin, end)
+                result += self.left.count(begin, end, budget)
             return result
         if begin > self.center:
             result = len(self.by_end) - bisect_right(self.ends, begin)
             if self.right is not None:
-                result += self.right.count(begin, end)
+                result += self.right.count(begin, end, budget)
             return result
 
         result = len(self.by_begin)
         if begin < self.center and self.left is not None:
-            result += self.left.count(begin, end)
+            result += self.left.count(begin, end, budget)
         if end > self.center and self.right is not None:
-            result += self.right.count(begin, end)
+            result += self.right.count(begin, end, budget)
         return result
+
+
+def _entry_intersects_target(
+    entry: _IntervalEntry,
+    target: _CollectedFragment,
+) -> bool:
+    return all(
+        source_begin < target_begin + target_extent
+        and target_begin < source_begin + source_extent
+        for source_begin, source_extent, target_begin, target_extent in zip(
+            entry.geometry[0],
+            entry.geometry[1],
+            target.global_offset,
+            target.local_shape,
+            strict=True,
+        )
+    )
 
 
 class _SourceCandidateIndex:
@@ -204,11 +300,22 @@ class _SourceCandidateIndex:
         self,
         groups: dict[BoxGeometry, list[_CollectedFragment]],
         descriptor: _TensorDescriptor,
+        budget: _CandidateWorkBudget,
     ) -> None:
         if not groups:
             raise ValueError("source candidate index must not be empty")
         first_geometry = next(iter(groups))
         ndim = len(first_geometry[0])
+        group_count = len(groups)
+        depth = group_count.bit_length()
+        index_entries = group_count * ndim
+        budget.reserve_index_build(
+            candidate_work=sum(len(fragments) for fragments in groups.values())
+            + index_entries * depth,
+            index_entries=index_entries,
+            sort_work=sum(_sort_work(len(fragments)) for fragments in groups.values())
+            + index_entries * (depth * (depth + 1) // 2 + 2 * depth),
+        )
         self._groups: dict[
             BoxGeometry,
             dict[tuple[int, TensorOwner], _CollectedFragment],
@@ -229,6 +336,7 @@ class _SourceCandidateIndex:
             )
             for dim in range(ndim)
         )
+        self._budget = budget
 
     @staticmethod
     def _representatives(
@@ -252,7 +360,7 @@ class _SourceCandidateIndex:
         *,
         source_dp: int,
         owner: TensorOwner,
-    ) -> tuple[tuple[_CollectedFragment, ...], int]:
+    ) -> tuple[_CollectedFragment, ...]:
         counts = []
         for dim, root in enumerate(self._roots):
             if root is None:
@@ -263,13 +371,14 @@ class _SourceCandidateIndex:
                     root.count(
                         begin,
                         begin + target.local_shape[dim],
+                        self._budget,
                     ),
                     dim,
                     root,
                 )
             )
         if not counts:
-            return (), 0
+            return ()
         _, sweep_dim, root = min(counts, key=lambda item: (item[0], item[1]))
         entries: list[_IntervalEntry] = []
         begin = target.global_offset[sweep_dim]
@@ -277,32 +386,22 @@ class _SourceCandidateIndex:
             begin,
             begin + target.local_shape[sweep_dim],
             entries,
+            self._budget,
         )
-        geometries = sorted(
-            {
-                entry.geometry
-                for entry in entries
-                if all(
-                    source_begin < target_begin + target_extent
-                    and target_begin < source_begin + source_extent
-                    for source_begin, source_extent, target_begin, target_extent in zip(
-                        entry.geometry[0],
-                        entry.geometry[1],
-                        target.global_offset,
-                        target.local_shape,
-                        strict=True,
-                    )
-                )
-            }
-        )
+        matching_geometries = set()
+        matching_count = 0
+        for entry in entries:
+            if _entry_intersects_target(entry, target):
+                matching_count += 1
+                matching_geometries.add(entry.geometry)
+        self._budget.consume(matching_count)
+        self._budget.reserve_sort(matching_count)
+        geometries = sorted(matching_geometries)
         key = (source_dp, owner)
-        return (
-            tuple(
-                representative
-                for geometry in geometries
-                if (representative := self._groups[geometry].get(key)) is not None
-            ),
-            len(entries),
+        return tuple(
+            representative
+            for geometry in geometries
+            if (representative := self._groups[geometry].get(key)) is not None
         )
 
 
@@ -331,6 +430,7 @@ def _descriptor(tensor: WeightPlacementTensor) -> _TensorDescriptor:
         shard_dims=_effective_shard_dims(tensor),
         layer_id=tensor.layer_id,
         expert_id=tensor.expert_id,
+        expert_axis=tensor.expert_axis,
         layout_fingerprint=tensor.layout_fingerprint,
     )
 
@@ -342,6 +442,7 @@ def _descriptor_identity(descriptor: _TensorDescriptor) -> tuple:
         descriptor.itemsize,
         descriptor.layer_id,
         descriptor.expert_id,
+        descriptor.expert_axis,
         descriptor.layout_fingerprint,
     )
 
@@ -405,7 +506,7 @@ def _validate_fragment_geometry(
 def _validate_parallel_rank(rank: WeightParallelRank, label: str) -> None:
     if not isinstance(rank, WeightParallelRank) or any(
         type(value) is not int or value < 0
-        for value in (rank.dp, rank.tp, rank.pp, rank.ep)
+        for value in (rank.dp, rank.tp, rank.pp, rank.ep, rank.moe_dp)
     ):
         raise ValueError(f"{label} parallel rank is invalid")
 
@@ -413,6 +514,8 @@ def _validate_parallel_rank(rank: WeightParallelRank, label: str) -> None:
 def _collect_placements(
     placements: Sequence[WeightPlacementManifest],
     label: str,
+    *,
+    require_unique_parallel_ranks: bool = False,
 ) -> tuple[dict[str, _TensorDescriptor], tuple[_CollectedFragment, ...]]:
     if not placements:
         raise ValueError(f"{label} placements must not be empty")
@@ -431,6 +534,7 @@ def _collect_placements(
     side_shards: dict[str, tuple[int, ...]] = {}
     fragments = []
     fragment_ids = set()
+    placement_by_rank = {}
     for placement in ordered:
         placement_ranks = set()
         for tensor in placement.tensors:
@@ -475,102 +579,55 @@ def _collect_placements(
             raise ValueError(f"{label} placement has no fragments")
         if len(placement_ranks) != 1:
             raise ValueError(f"{label} placement mixes parallel ranks")
+        rank = next(iter(placement_ranks))
+        previous_placement = placement_by_rank.setdefault(rank, placement.placement_id)
+        if (
+            require_unique_parallel_ranks
+            and previous_placement != placement.placement_id
+        ):
+            raise ValueError(f"{label} parallel rank maps to multiple placements")
     if not fragments:
         raise ValueError(f"{label} placements have no fragments")
     return descriptors, tuple(fragments)
 
 
-def _box_contains(
-    outer_offset: tuple[int, ...],
-    outer_shape: tuple[int, ...],
-    inner_offset: tuple[int, ...],
-    inner_shape: tuple[int, ...],
-) -> bool:
-    return all(
-        outer_begin <= inner_begin
-        and inner_begin + inner_extent <= outer_begin + outer_extent
-        for outer_begin, outer_extent, inner_begin, inner_extent in zip(
-            outer_offset,
-            outer_shape,
-            inner_offset,
-            inner_shape,
-            strict=True,
-        )
-    )
-
-
-def _boxes_overlap(
-    boxes: Sequence[tuple[tuple[int, ...], tuple[int, ...]]],
-) -> bool:
-    if len(boxes) < 2:
-        return False
-    ndim = len(boxes[0][0])
-    sweep_dim = max(
-        range(ndim),
-        key=lambda dim: len(
-            {(offset[dim], offset[dim] + shape[dim]) for offset, shape in boxes}
-        ),
-    )
-    ordered = sorted(boxes, key=lambda item: item[0][sweep_dim])
-    active: list[tuple[tuple[int, ...], tuple[int, ...]]] = []
-    for offset, shape in ordered:
-        begin = offset[sweep_dim]
-        active = [
-            candidate
-            for candidate in active
-            if candidate[0][sweep_dim] + candidate[1][sweep_dim] > begin
-        ]
-        if any(
-            all(
-                left_begin < right_begin + right_extent
-                and right_begin < left_begin + left_extent
-                for left_begin, left_extent, right_begin, right_extent in zip(
-                    candidate_offset,
-                    candidate_shape,
-                    offset,
-                    shape,
-                    strict=True,
-                )
-            )
-            for candidate_offset, candidate_shape in active
-        ):
-            return True
-        active.append((offset, shape))
-    return False
-
-
-def _boxes_exactly_cover(
-    container_offset: tuple[int, ...],
-    container_shape: tuple[int, ...],
-    boxes: Sequence[tuple[tuple[int, ...], tuple[int, ...]]],
-) -> bool:
-    unique_boxes = tuple(dict.fromkeys(boxes))
-    if not unique_boxes:
-        return False
-    if any(
-        not _box_contains(container_offset, container_shape, offset, shape)
-        for offset, shape in unique_boxes
-    ):
-        return False
-    if sum(prod(shape) for _, shape in unique_boxes) != prod(container_shape):
-        return False
-    return not _boxes_overlap(unique_boxes)
+def _preflight_placement_counts(
+    placements: Sequence[WeightPlacementManifest],
+    label: str,
+    *,
+    max_placements: int,
+    max_fragments: int,
+) -> None:
+    if len(placements) > max_placements:
+        raise ValueError(f"transfer plan exceeds {label} placement limit")
+    fragment_count = 0
+    for placement in placements:
+        tensor_count = len(placement.tensors)
+        if tensor_count > max_fragments - fragment_count:
+            raise ValueError(f"transfer plan exceeds {label} fragment limit")
+        fragment_count += tensor_count
 
 
 def _tensor_owner(
     descriptor: _TensorDescriptor,
     fragment: _CollectedFragment,
 ) -> TensorOwner:
+    expert_tensor = (
+        descriptor.expert_axis is not None or descriptor.expert_id is not None
+    )
     return (
         fragment.rank.pp,
-        fragment.rank.ep if descriptor.expert_id is not None else None,
+        fragment.rank.ep if expert_tensor else None,
+        fragment.rank.moe_dp if expert_tensor else None,
     )
 
 
 def _fragments_cover_tensor(
     descriptor: _TensorDescriptor,
     fragments: Sequence[_CollectedFragment],
+    geometry_budget: GeometryWorkBudget,
 ) -> bool:
+    geometry_budget.reserve(boxes=len(fragments))
     boxes = tuple(
         dict.fromkeys(
             (fragment.global_offset, fragment.local_shape)
@@ -582,12 +639,15 @@ def _fragments_cover_tensor(
         (0,) * len(descriptor.global_shape),
         descriptor.global_shape,
         boxes,
+        budget=geometry_budget,
+        _boxes_reserved=True,
     )
 
 
 def _complete_source_replicas(
     descriptors: dict[str, _TensorDescriptor],
     fragments: Sequence[_CollectedFragment],
+    geometry_budget: GeometryWorkBudget,
 ) -> dict[int, dict[str, TensorOwner]]:
     by_dp_and_tensor: dict[int, dict[str, list[_CollectedFragment]]] = {}
     for fragment in fragments:
@@ -613,7 +673,11 @@ def _complete_source_replicas(
             complete_owners = [
                 owner
                 for owner, owner_fragments in by_owner.items()
-                if _fragments_cover_tensor(descriptor, owner_fragments)
+                if _fragments_cover_tensor(
+                    descriptor,
+                    owner_fragments,
+                    geometry_budget,
+                )
             ]
             if not by_owner or len(complete_owners) != len(by_owner):
                 complete = False
@@ -632,6 +696,7 @@ def _complete_source_replicas(
 def _validate_supplied_target_coverage(
     descriptors: dict[str, _TensorDescriptor],
     fragments: Sequence[_CollectedFragment],
+    geometry_budget: GeometryWorkBudget,
 ) -> None:
     by_dp_and_tensor: dict[int, dict[str, list[_CollectedFragment]]] = {}
     for fragment in fragments:
@@ -651,7 +716,11 @@ def _validate_supplied_target_coverage(
                     [],
                 ).append(fragment)
             if not by_owner or any(
-                not _fragments_cover_tensor(descriptor, owner_fragments)
+                not _fragments_cover_tensor(
+                    descriptor,
+                    owner_fragments,
+                    geometry_budget,
+                )
                 for owner_fragments in by_owner.values()
             ):
                 raise ValueError(
@@ -661,7 +730,10 @@ def _validate_supplied_target_coverage(
 
 
 def _parallel_rank_text(rank: WeightParallelRank) -> str:
-    return f"(dp={rank.dp}, tp={rank.tp}, pp={rank.pp}, ep={rank.ep})"
+    return (
+        f"(dp={rank.dp}, tp={rank.tp}, pp={rank.pp}, ep={rank.ep}, "
+        f"moe_dp={rank.moe_dp})"
+    )
 
 
 def _validate_expected_target_topology(
@@ -678,23 +750,26 @@ def _validate_expected_target_topology(
 
     expected = set(expected_ranks)
     supplied = {fragment.rank for fragment in target_fragments}
-    missing = sorted(
-        expected - supplied,
-        key=lambda rank: (rank.dp, rank.pp, rank.ep, rank.tp),
-    )
-    unexpected = sorted(
-        supplied - expected,
-        key=lambda rank: (rank.dp, rank.pp, rank.ep, rank.tp),
-    )
+    rank_key = lambda rank: (rank.dp, rank.pp, rank.ep, rank.tp, rank.moe_dp)
+    missing_set = expected - supplied
+    unexpected_set = supplied - expected
+    missing = nsmallest(8, missing_set, key=rank_key)
+    unexpected = nsmallest(8, unexpected_set, key=rank_key)
     if missing or unexpected:
         details = []
         if missing:
+            suffix = ", ..." if len(missing_set) > len(missing) else ""
             details.append(
-                "missing ranks: " + ", ".join(map(_parallel_rank_text, missing))
+                "missing ranks: "
+                + ", ".join(map(_parallel_rank_text, missing))
+                + suffix
             )
         if unexpected:
+            suffix = ", ..." if len(unexpected_set) > len(unexpected) else ""
             details.append(
-                "unexpected ranks: " + ", ".join(map(_parallel_rank_text, unexpected))
+                "unexpected ranks: "
+                + ", ".join(map(_parallel_rank_text, unexpected))
+                + suffix
             )
         raise ValueError("target placement topology mismatch; " + "; ".join(details))
 
@@ -719,18 +794,24 @@ def _validate_tensor_sets(
     *,
     local_target: bool,
 ) -> None:
+    def summarize(ids: set[str]) -> str:
+        limit = 8
+        sample = nsmallest(limit, ids)
+        suffix = ", ..." if len(ids) > limit else ""
+        return ", ".join(sample) + suffix
+
     source_ids = set(source)
     target_ids = set(target)
-    missing_source = sorted(target_ids - source_ids)
+    missing_source = target_ids - source_ids
     if missing_source:
         raise ValueError(
-            "target contains unknown tensors: " + ", ".join(missing_source)
+            "target contains unknown tensors: " + summarize(missing_source)
         )
     if not local_target:
-        missing_target = sorted(source_ids - target_ids)
+        missing_target = source_ids - target_ids
         if missing_target:
-            raise ValueError("target is missing tensors: " + ", ".join(missing_target))
-    for tensor_id in sorted(target_ids):
+            raise ValueError("target is missing tensors: " + summarize(missing_target))
+    for tensor_id in target_ids:
         if _descriptor_identity(source[tensor_id]) != _descriptor_identity(
             target[tensor_id]
         ):
@@ -741,33 +822,10 @@ def _overlap_box(
     source: _CollectedFragment,
     target: _CollectedFragment,
 ) -> tuple[tuple[int, ...], tuple[int, ...]] | None:
-    overlap_offset = tuple(
-        max(source_begin, target_begin)
-        for source_begin, target_begin in zip(
-            source.global_offset,
-            target.global_offset,
-            strict=True,
-        )
+    return intersect_boxes(
+        (source.global_offset, source.local_shape),
+        (target.global_offset, target.local_shape),
     )
-    overlap_end = tuple(
-        min(
-            source_begin + source_extent,
-            target_begin + target_extent,
-        )
-        for source_begin, source_extent, target_begin, target_extent in zip(
-            source.global_offset,
-            source.local_shape,
-            target.global_offset,
-            target.local_shape,
-            strict=True,
-        )
-    )
-    overlap_shape = tuple(
-        end - begin for begin, end in zip(overlap_offset, overlap_end, strict=True)
-    )
-    if any(extent <= 0 for extent in overlap_shape):
-        return None
-    return overlap_offset, overlap_shape
 
 
 def _source_sort_key(fragment: _CollectedFragment) -> tuple:
@@ -777,6 +835,7 @@ def _source_sort_key(fragment: _CollectedFragment) -> tuple:
         rank.pp,
         rank.ep,
         rank.tp,
+        rank.moe_dp,
         fragment.placement_id,
         fragment.placement_fragment_id,
     )
@@ -839,6 +898,7 @@ def _build_executor_groups(
             item.rank.pp,
             item.rank.ep,
             item.rank.tp,
+            item.rank.moe_dp,
             item.placement_id,
         )
     )
@@ -864,6 +924,58 @@ def _build_pipeline_routes(
     )
 
 
+def _project_source_fragment_closure(
+    source_placements: Sequence[WeightPlacementManifest],
+    regions: Sequence[LogicalWeightTransferRegion],
+) -> tuple[
+    tuple[WeightPlacementManifest, ...],
+    tuple[LogicalWeightTransferRegion, ...],
+]:
+    referenced_by_placement: dict[str, set[str]] = {}
+    for region in regions:
+        referenced_by_placement.setdefault(region.source.placement_id, set()).add(
+            region.source.placement_fragment_id
+        )
+
+    projected = []
+    projected_id_by_source_id = {}
+    for source in sorted(source_placements, key=lambda item: item.placement_id):
+        selected_ids = referenced_by_placement.get(source.placement_id)
+        if not selected_ids:
+            continue
+        tensors = tuple(
+            tensor
+            for tensor in source.tensors
+            if tensor.placement_fragment_id in selected_ids
+        )
+        if {tensor.placement_fragment_id for tensor in tensors} != selected_ids:
+            raise ValueError("logical region source differs from source placement")
+        if tensors == source.tensors:
+            projected_source = source
+        else:
+            projected_source = WeightPlacementManifest(
+                model_id=source.model_id,
+                revision=source.revision,
+                placement_id=compute_weight_placement_id(tensors),
+                tensors=tensors,
+                format_version=source.format_version,
+            )
+        projected.append(projected_source)
+        projected_id_by_source_id[source.placement_id] = projected_source.placement_id
+
+    projected_regions = tuple(
+        replace(
+            region,
+            source=replace(
+                region.source,
+                placement_id=projected_id_by_source_id[region.source.placement_id],
+            ),
+        )
+        for region in regions
+    )
+    return tuple(projected), projected_regions
+
+
 def _plan(
     source_placements: Sequence[WeightPlacementManifest],
     target_placements: Sequence[WeightPlacementManifest],
@@ -872,6 +984,18 @@ def _plan(
     expected_target_topology: Sequence[WeightParallelRank] | None,
     limits: WeightPlannerLimits,
 ) -> LogicalWeightTransferPlan:
+    _preflight_placement_counts(
+        source_placements,
+        "source",
+        max_placements=limits.max_source_placements,
+        max_fragments=limits.max_source_fragments,
+    )
+    _preflight_placement_counts(
+        target_placements,
+        "target",
+        max_placements=limits.max_target_placements,
+        max_fragments=limits.max_target_fragments,
+    )
     source_descriptors, source_fragments = _collect_placements(
         source_placements,
         "source",
@@ -879,6 +1003,7 @@ def _plan(
     target_descriptors, target_fragments = _collect_placements(
         target_placements,
         "target",
+        require_unique_parallel_ranks=True,
     )
     if any(
         len(descriptor.global_shape) > limits.max_tensor_ndim
@@ -895,6 +1020,12 @@ def _plan(
         or source_identity.revision != target_identity.revision
     ):
         raise ValueError("source and target model identity differ")
+    geometry_budget = GeometryWorkBudget(
+        limits.max_geometry_comparisons,
+        max_boxes=limits.max_geometry_boxes,
+        max_events=limits.max_geometry_events,
+        max_sort_work=limits.max_sort_work,
+    )
     _validate_tensor_sets(
         source_descriptors,
         target_descriptors,
@@ -906,6 +1037,7 @@ def _plan(
         _validate_supplied_target_coverage(
             target_descriptors,
             target_fragments,
+            geometry_budget,
         )
         if expected_target_topology is not None:
             _validate_expected_target_topology(
@@ -916,6 +1048,7 @@ def _plan(
     source_replicas = _complete_source_replicas(
         source_descriptors,
         source_fragments,
+        geometry_budget,
     )
     source_dp_ranks = sorted(source_replicas)
     source_dp_by_target_dp = {
@@ -927,7 +1060,12 @@ def _plan(
         str,
         dict[tuple[tuple[int, ...], tuple[int, ...]], list[_CollectedFragment]],
     ] = {}
+    candidate_budget = _CandidateWorkBudget(
+        limits.max_candidate_visits,
+        geometry_budget,
+    )
     for fragment in source_fragments:
+        candidate_budget.consume()
         candidate_groups.setdefault(fragment.tensor_id, {}).setdefault(
             (fragment.global_offset, fragment.local_shape),
             [],
@@ -936,101 +1074,106 @@ def _plan(
         tensor_id: _SourceCandidateIndex(
             groups,
             source_descriptors[tensor_id],
+            candidate_budget,
         )
         for tensor_id, groups in candidate_groups.items()
     }
 
-    regions = []
-    candidate_visits = 0
-    total_segments = 0
-    for target in sorted(
-        target_fragments,
-        key=lambda item: (
-            item.placement_id,
-            item.placement_fragment_id,
-        ),
-    ):
-        source_dp = source_dp_by_target_dp[target.rank.dp]
-        owner = source_replicas[source_dp][target.tensor_id]
-        overlaps = []
-        candidates, visits = candidate_indexes[target.tensor_id].query(
-            target,
-            source_dp=source_dp,
-            owner=owner,
-        )
-        candidate_visits += visits
-        if candidate_visits > limits.max_candidate_visits:
-            raise ValueError("transfer plan exceeds candidate visit limit")
-        for source in candidates:
-            overlap = _overlap_box(source, target)
-            if overlap is not None:
-                overlaps.append((*overlap, source))
-        overlaps.sort(
+    with geometry_budget.request_scope():
+        regions = []
+        total_segments = 0
+        for target in sorted(
+            target_fragments,
             key=lambda item: (
-                item[0],
-                item[1],
-                _source_sort_key(item[2]),
-            )
-        )
-        if not _boxes_exactly_cover(
-            target.global_offset,
-            target.local_shape,
-            tuple((offset, shape) for offset, shape, _ in overlaps),
+                item.placement_id,
+                item.placement_fragment_id,
+            ),
         ):
-            raise ValueError(
-                f"target fragment is not fully covered: {target.placement_fragment_id}"
+            source_dp = source_dp_by_target_dp[target.rank.dp]
+            owner = source_replicas[source_dp][target.tensor_id]
+            overlaps = []
+            candidates = candidate_indexes[target.tensor_id].query(
+                target,
+                source_dp=source_dp,
+                owner=owner,
             )
-        for overlap_offset, overlap_shape, source in overlaps:
-            region = build_region(
-                tensor_id=target.tensor_id,
-                source=source.logical,
-                target=target.logical,
-                overlap_offset=overlap_offset,
-                overlap_shape=overlap_shape,
+            for source in candidates:
+                overlap = _overlap_box(source, target)
+                if overlap is not None:
+                    overlaps.append((*overlap, source))
+            candidate_budget.reserve_sort(len(overlaps))
+            overlaps.sort(
+                key=lambda item: (
+                    item[0],
+                    item[1],
+                    _source_sort_key(item[2]),
+                )
             )
-            if region.segment_count > limits.max_segments_per_region:
-                raise ValueError("transfer plan exceeds per-region segment limit")
-            regions.append(region)
-            if len(regions) > limits.max_regions:
-                raise ValueError("transfer plan exceeds region limit")
-            total_segments += region.segment_count
-            if total_segments > limits.max_total_segments:
-                raise ValueError("transfer plan exceeds total segment limit")
+            geometry_budget.reserve(boxes=len(overlaps))
+            overlap_boxes = tuple((offset, shape) for offset, shape, _ in overlaps)
+            if not _boxes_exactly_cover(
+                target.global_offset,
+                target.local_shape,
+                overlap_boxes,
+                budget=geometry_budget,
+                _boxes_reserved=True,
+            ):
+                raise ValueError(
+                    f"target fragment is not fully covered: "
+                    f"{target.placement_fragment_id}"
+                )
+            for overlap_offset, overlap_shape, source in overlaps:
+                region = build_region(
+                    tensor_id=target.tensor_id,
+                    source=source.logical,
+                    target=target.logical,
+                    overlap_offset=overlap_offset,
+                    overlap_shape=overlap_shape,
+                )
+                if region.segment_count > limits.max_segments_per_region:
+                    raise ValueError("transfer plan exceeds per-region segment limit")
+                regions.append(region)
+                if len(regions) > limits.max_regions:
+                    raise ValueError("transfer plan exceeds region limit")
+                total_segments += region.segment_count
+                if total_segments > limits.max_total_segments:
+                    raise ValueError("transfer plan exceeds total segment limit")
 
-    regions.sort(
-        key=lambda item: (
-            item.target.placement_id,
-            item.target.placement_fragment_id,
-            item.target_base_offset,
-            item.source.placement_id,
-            item.source.placement_fragment_id,
-            item.source_base_offset,
+        regions.sort(
+            key=lambda item: (
+                item.target.placement_id,
+                item.target.placement_fragment_id,
+                item.target_base_offset,
+                item.source.placement_id,
+                item.source.placement_fragment_id,
+                item.source_base_offset,
+            )
         )
-    )
-    normalized_sources = tuple(
-        sorted(source_placements, key=lambda item: item.placement_id)
-    )
-    normalized_targets = tuple(
-        sorted(target_placements, key=lambda item: item.placement_id)
-    )
-    return LogicalWeightTransferPlan(
-        model_id=source_identity.model_id,
-        revision=source_identity.revision,
-        source_placements=normalized_sources,
-        target_placements=normalized_targets,
-        regions=tuple(regions),
-        source_executors=_build_executor_groups(
-            normalized_sources,
+        normalized_sources, normalized_regions = _project_source_fragment_closure(
+            source_placements,
             regions,
-            "source",
-        ),
-        target_executors=_build_executor_groups(
-            normalized_targets,
-            regions,
-            "target",
-        ),
-        pipeline_routes=_build_pipeline_routes(regions),
-    )
+        )
+        normalized_targets = tuple(
+            sorted(target_placements, key=lambda item: item.placement_id)
+        )
+        return LogicalWeightTransferPlan(
+            model_id=source_identity.model_id,
+            revision=source_identity.revision,
+            source_placements=normalized_sources,
+            target_placements=normalized_targets,
+            regions=normalized_regions,
+            source_executors=_build_executor_groups(
+                normalized_sources,
+                normalized_regions,
+                "source",
+            ),
+            target_executors=_build_executor_groups(
+                normalized_targets,
+                normalized_regions,
+                "target",
+            ),
+            pipeline_routes=_build_pipeline_routes(normalized_regions),
+        )
 
 
 def plan_weight_transfer(
@@ -1074,7 +1217,165 @@ def plan_weight_transfer_to_local_target(
     )
     if len(result.target_executors) != 1:
         raise ValueError("local target must describe exactly one executor")
-    return result
+    return project_weight_transfer_plan_to_target(
+        result,
+        target_placement.placement_id,
+    )
+
+
+def project_weight_transfer_plan_to_targets(
+    plan: LogicalWeightTransferPlan,
+    target_placement_ids: Sequence[str] | None = None,
+) -> dict[str, LogicalWeightTransferPlan]:
+    """Project a full-world plan onto target-local fragment closures."""
+
+    if not isinstance(plan, LogicalWeightTransferPlan):
+        raise ValueError("logical transfer plan is invalid")
+    target_by_id = {
+        placement.placement_id: placement for placement in plan.target_placements
+    }
+    if target_placement_ids is None:
+        selected_target_ids = tuple(target_by_id)
+    else:
+        selected_target_ids = tuple(target_placement_ids)
+        if (
+            not selected_target_ids
+            or any(
+                type(placement_id) is not str or not placement_id
+                for placement_id in selected_target_ids
+            )
+            or len(selected_target_ids) != len(set(selected_target_ids))
+        ):
+            raise ValueError("target placement IDs must be unique non-empty strings")
+        if any(
+            placement_id not in target_by_id for placement_id in selected_target_ids
+        ):
+            raise ValueError("target placement ID must identify exactly one placement")
+
+    source_by_id = {
+        placement.placement_id: placement for placement in plan.source_placements
+    }
+    source_tensor_by_fragment = {}
+    for placement in plan.source_placements:
+        for tensor_index, tensor in enumerate(placement.tensors):
+            source_tensor_by_fragment[tensor.placement_fragment_id] = (
+                placement.placement_id,
+                tensor_index,
+                tensor,
+            )
+
+    regions_by_target = {placement_id: [] for placement_id in selected_target_ids}
+    source_tensors_by_target = {
+        placement_id: {} for placement_id in selected_target_ids
+    }
+    for region in plan.regions:
+        target_regions = regions_by_target.get(region.target.placement_id)
+        if target_regions is None:
+            continue
+        target_regions.append(region)
+        source_record = source_tensor_by_fragment.get(
+            region.source.placement_fragment_id
+        )
+        if source_record is None or source_record[0] != region.source.placement_id:
+            raise ValueError("logical region source differs from source placement")
+        selected_by_source = source_tensors_by_target[
+            region.target.placement_id
+        ].setdefault(region.source.placement_id, {})
+        selected_by_source.setdefault(
+            region.source.placement_fragment_id,
+            source_record[1:],
+        )
+
+    projected_by_target = {}
+    source_order = {
+        placement.placement_id: index
+        for index, placement in enumerate(plan.source_placements)
+    }
+    for target_placement_id in selected_target_ids:
+        original_regions = regions_by_target[target_placement_id]
+        if not original_regions:
+            raise ValueError("projected target placement has no regions")
+
+        sources = []
+        projected_id_by_source_id = {}
+        selected_sources = source_tensors_by_target[target_placement_id]
+        for source_placement_id in sorted(
+            selected_sources,
+            key=source_order.__getitem__,
+        ):
+            source = source_by_id[source_placement_id]
+            tensors = tuple(
+                tensor
+                for _, tensor in sorted(
+                    selected_sources[source_placement_id].values(),
+                    key=lambda item: item[0],
+                )
+            )
+            if tensors == source.tensors:
+                projected_source = source
+            else:
+                projected_source = WeightPlacementManifest(
+                    model_id=source.model_id,
+                    revision=source.revision,
+                    placement_id=compute_weight_placement_id(tensors),
+                    tensors=tensors,
+                    format_version=source.format_version,
+                )
+            sources.append(projected_source)
+            projected_id_by_source_id[source_placement_id] = (
+                projected_source.placement_id
+            )
+
+        regions = tuple(
+            replace(
+                region,
+                source=replace(
+                    region.source,
+                    placement_id=projected_id_by_source_id[region.source.placement_id],
+                ),
+            )
+            for region in original_regions
+        )
+        source_placements = tuple(sources)
+        target_placements = (target_by_id[target_placement_id],)
+        projected = LogicalWeightTransferPlan(
+            model_id=plan.model_id,
+            revision=plan.revision,
+            source_placements=source_placements,
+            target_placements=target_placements,
+            regions=regions,
+            source_executors=_build_executor_groups(
+                source_placements,
+                regions,
+                "source",
+            ),
+            target_executors=_build_executor_groups(
+                target_placements,
+                regions,
+                "target",
+            ),
+            pipeline_routes=_build_pipeline_routes(regions),
+        )
+        if len(projected.target_executors) != 1:
+            raise ValueError("projected plan must describe exactly one target executor")
+        projected_by_target[target_placement_id] = projected
+    return projected_by_target
+
+
+def project_weight_transfer_plan_to_target(
+    plan: LogicalWeightTransferPlan,
+    target_placement_id: str,
+) -> LogicalWeightTransferPlan:
+    """Project a full-world plan onto one target placement."""
+
+    if not isinstance(plan, LogicalWeightTransferPlan):
+        raise ValueError("logical transfer plan is invalid")
+    if type(target_placement_id) is not str or not target_placement_id:
+        raise ValueError("target placement ID must be a non-empty string")
+    return project_weight_transfer_plan_to_targets(
+        plan,
+        (target_placement_id,),
+    )[target_placement_id]
 
 
 def select_weight_storage_placements(
@@ -1086,7 +1387,11 @@ def select_weight_storage_placements(
         source_placements,
         "source",
     )
-    replicas = _complete_source_replicas(descriptors, fragments)
+    replicas = _complete_source_replicas(
+        descriptors,
+        fragments,
+        GeometryWorkBudget(),
+    )
     selected_dp = min(replicas)
     owner_by_tensor = replicas[selected_dp]
     by_geometry: dict[

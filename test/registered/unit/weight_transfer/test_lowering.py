@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import pytest
-
 from sglang.srt.model_executor.weight_runtime_manifest import (
     RuntimeWeightBinding,
     WeightParallelRank,

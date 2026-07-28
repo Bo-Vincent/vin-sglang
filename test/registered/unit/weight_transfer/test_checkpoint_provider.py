@@ -5,7 +5,6 @@ import hashlib
 from math import prod
 
 import pytest
-
 from sglang.srt.model_executor.weight_runtime_manifest import (
     RuntimeWeightBinding,
     WeightParallelRank,
@@ -322,8 +321,7 @@ def test_bad_checksum_is_rejected_before_any_target_write() -> None:
             ),
             provider=CheckpointStorageToRuntimeProvider(
                 range_reader=lambda location, offset, nbytes: payload[
-                    offset
-                    - location.object_offset : offset
+                    offset - location.object_offset : offset
                     - location.object_offset
                     + nbytes
                 ],

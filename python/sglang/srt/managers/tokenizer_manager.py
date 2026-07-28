@@ -20,6 +20,7 @@ import copy
 import dataclasses
 import json
 import logging
+import math
 import os
 import pickle
 import signal
@@ -27,14 +28,16 @@ import socket
 import sys
 import threading
 import time
+import uuid
 from array import array
 from collections import deque
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
+from contextvars import ContextVar
 from datetime import datetime
 from enum import Enum
 from functools import lru_cache
 from http import HTTPStatus
-from typing import Any, Awaitable, Dict, Iterable, List, Optional, Tuple, Union
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import fastapi
 import pybase64
@@ -43,7 +46,6 @@ import uvloop
 import zmq
 import zmq.asyncio
 from fastapi import BackgroundTasks
-
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.disaggregation.encode_receiver import create_mm_receiver
@@ -91,7 +93,12 @@ from sglang.srt.managers.mm_utils import TensorTransportMode, wrap_shm_features
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.schedule_batch import MultimodalDataItem
 from sglang.srt.managers.scheduler_input_blocker import input_blocker_guard_region
-from sglang.srt.managers.tokenizer_control_mixin import TokenizerControlMixin
+from sglang.srt.managers.tokenizer_control_mixin import (
+    _ADMIN_PAUSE_OWNER,
+    TokenizerControlMixin,
+    _record_weight_update_safety,
+    _validate_next_weight_revision,
+)
 from sglang.srt.managers.tokenizer_manager_score_mixin import TokenizerManagerScoreMixin
 from sglang.srt.managers.utils import is_health_check_generate_req
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
@@ -143,6 +150,8 @@ from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
 _REQUEST_STATE_WAIT_TIMEOUT = envs.SGLANG_REQUEST_STATE_WAIT_TIMEOUT.get()
+_STARTUP_WARMUP_HEADER = "x-sglang-startup-warmup"
+_STARTUP_WARMUP_BYPASS = ContextVar("sglang_startup_warmup_bypass", default=None)
 
 logger = logging.getLogger(__name__)
 
@@ -260,6 +269,25 @@ class InputFormat(Enum):
     SINGLE_STRING = 1  # Regular single text like "Hello world"
     BATCH_STRINGS = 2  # Regular batch like ["Hello", "World"]
     CROSS_ENCODER_PAIRS = 3  # Cross-encoder pairs like [["query", "document"]]
+
+
+@dataclasses.dataclass(slots=True)
+class _DiskWeightUpdateAttempt:
+    future: asyncio.Future[Tuple[UpdateWeightFromDiskReqOutput, ...]]
+    expected_workers: int
+    responses: Dict[int, UpdateWeightFromDiskReqOutput] = dataclasses.field(
+        default_factory=dict
+    )
+
+
+def _validate_disk_weight_update_timeout(timeout_sec) -> None:
+    if (
+        isinstance(timeout_sec, bool)
+        or not isinstance(timeout_sec, (int, float))
+        or not math.isfinite(timeout_sec)
+        or timeout_sec <= 0
+    ):
+        raise ValueError("timeout_sec must be a positive finite number")
 
 
 class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
@@ -452,6 +480,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         # Health check
         self.server_status = ServerStatus.Starting
+        self._startup_admission_enabled = False
+        self._startup_warmup_token = (
+            getattr(self.server_args, "_startup_warmup_token", None) or uuid.uuid4().hex
+        )
         self.gracefully_exit = False
         self.last_receive_tstamp = real_time()
 
@@ -491,19 +523,20 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def init_weight_update(self):
         # Initial weights status
         self.initial_weights_loaded = True
+        self.runtime_weight_revision = self.server_args.weight_version
         if self.server_args.checkpoint_engine_wait_weights_before_ready:
             self.initial_weights_loaded = False
 
         # Weight updates
         # The event to notify the weight sync is finished.
         self.model_update_lock = RWLock()
-        self.model_update_result: Optional[Awaitable[UpdateWeightFromDiskReqOutput]] = (
-            None
-        )
-        self.model_update_expected_workers = self.elastic_worker_count
-        self.model_update_tmp: List[UpdateWeightFromDiskReqOutput] = []
+        self.model_update_attempts: Dict[str, _DiskWeightUpdateAttempt] = {}
+        self.weight_update_fail_closed = False
         self.is_pause = False
         self.is_pause_cond = asyncio.Condition()
+        self._generation_pause_owners: set[str] = set()
+        self._generation_pause_transition_lock = asyncio.Lock()
+        self._remote_weight_transfer_pause_lock = asyncio.Lock()
 
     def init_lora(self):
         # LoRA
@@ -627,11 +660,49 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.sampling_params_class = SamplingParams
         self.signal_handler_class = SignalHandler
 
+    @contextmanager
+    def _startup_warmup_admission_bypass(self):
+        token = _STARTUP_WARMUP_BYPASS.set(self)
+        try:
+            yield
+        finally:
+            _STARTUP_WARMUP_BYPASS.reset(token)
+
+    def _startup_warmup_request_headers(self) -> Dict[str, str]:
+        return {_STARTUP_WARMUP_HEADER: self._startup_warmup_token}
+
+    def _enable_startup_admission_gate(self) -> None:
+        self._startup_admission_enabled = True
+
+    def _is_internal_startup_warmup(self, request: Optional[fastapi.Request]) -> bool:
+        if _STARTUP_WARMUP_BYPASS.get() is self:
+            return True
+        headers = getattr(request, "headers", None)
+        return (
+            headers is not None
+            and headers.get(_STARTUP_WARMUP_HEADER) == self._startup_warmup_token
+        )
+
+    def _admit_inference_request(self, request: Optional[fastapi.Request]) -> None:
+        if not getattr(self, "_startup_admission_enabled", False):
+            return
+        if self.server_status is ServerStatus.Up:
+            return
+        if (
+            self.server_status is ServerStatus.Starting
+            and self._is_internal_startup_warmup(request)
+        ):
+            return
+        raise RuntimeError(
+            f"server is {self.server_status.value.lower()}; inference is not admitted"
+        )
+
     async def generate_request(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
         request: Optional[fastapi.Request] = None,
     ):
+        self._admit_inference_request(request)
         self.auto_create_handle_loop()
 
         # Normalize the request
@@ -661,6 +732,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 await self.is_pause_cond.wait_for(lambda: not self.is_pause)
 
             async with self.model_update_lock.reader_lock:
+                if getattr(self, "weight_update_fail_closed", False):
+                    raise RuntimeError(
+                        "inference is disabled after a partial weight update; "
+                        "complete a full disk weight restore before serving"
+                    )
                 await self._validate_and_resolve_lora(obj)
 
                 # Tokenize the request and send it to the scheduler
@@ -1546,9 +1622,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 # Record response sent time right before we log finished results and metrics.
                 if not state.time_stats.response_sent_to_client_time:
                     state.time_stats.set_response_sent_to_client_time()
-                    out["meta_info"][
-                        "response_sent_to_client_ts"
-                    ] = state.time_stats.get_response_sent_to_client_realtime()
+                    out["meta_info"]["response_sent_to_client_ts"] = (
+                        state.time_stats.get_response_sent_to_client_realtime()
+                    )
                 self.request_logger.log_finished_request(
                     obj,
                     out,
@@ -1576,9 +1652,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 # Record response sent time right before we send response.
                 if not state.time_stats.response_sent_to_client_time:
                     state.time_stats.set_response_sent_to_client_time()
-                    out["meta_info"][
-                        "response_sent_to_client_ts"
-                    ] = state.time_stats.get_response_sent_to_client_realtime()
+                    out["meta_info"]["response_sent_to_client_ts"] = (
+                        state.time_stats.get_response_sent_to_client_realtime()
+                    )
                 yield out
             else:
                 if (
@@ -1734,56 +1810,57 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
 
     async def pause_generation(self, obj: PauseGenerationReqInput):
-        async with self.is_pause_cond:
-            self.is_pause = True
-            if obj.mode != "abort":
-                await self._async_dispatch_to_scheduler(obj)
-            else:
-                # we are using the model_update_lock to check if there is still on-going requests.
-                while True:
-                    # TODO: maybe make it async instead of fire-and-forget
-                    self.abort_request(abort_all=True)
-                    is_locked = await self.model_update_lock.is_locked()
-                    if not is_locked:
-                        break
-                    await asyncio.sleep(1.0)
+        await self._acquire_generation_pause(_ADMIN_PAUSE_OWNER, obj)
+
+    async def _pause_generation_impl(self, obj: PauseGenerationReqInput):
+        if obj.mode != "abort":
+            await self._async_dispatch_to_scheduler(obj)
+        else:
+            # we are using the model_update_lock to check if there is still on-going requests.
+            while True:
+                # TODO: maybe make it async instead of fire-and-forget
+                self.abort_request(abort_all=True)
+                is_locked = await self.model_update_lock.is_locked()
+                if not is_locked:
+                    break
+                await asyncio.sleep(1.0)
 
     async def continue_generation(self, obj: ContinueGenerationReqInput):
-        async with self.is_pause_cond:
-            self.is_pause = False
-            await self._async_dispatch_to_scheduler(obj)
-            self.is_pause_cond.notify_all()
+        await self._release_generation_pause(_ADMIN_PAUSE_OWNER, obj)
+
+    async def _continue_generation_impl(self, obj: ContinueGenerationReqInput):
+        await self._async_dispatch_to_scheduler(obj)
 
     async def update_weights_from_disk(
         self,
         obj: UpdateWeightFromDiskReqInput,
         request: Optional[fastapi.Request] = None,
     ) -> Tuple[bool, str]:
+        self._require_single_tokenizer_weight_update_owner()
+        _validate_disk_weight_update_timeout(obj.timeout_sec)
         self.auto_create_handle_loop()
 
         # default the load format to the server_args
         if obj.load_format is None:
             obj.load_format = self.server_args.load_format
         logger.info("Start update_weights. Load format=%s", obj.load_format)
-
         if obj.abort_all_requests:
             self.abort_request(abort_all=True)
 
-        # Immediately update the weights if the engine is in paused state
-        async with self.is_pause_cond:
-            is_paused = self.is_pause
-
-        lock_context = (
-            self.model_update_lock.writer_lock if not is_paused else nullcontext()
-        )
-        async with lock_context:
-            success, message, num_paused_requests = (
-                await self._wait_for_model_update_from_disk(obj)
-            )
-
-        if success and obj.weight_version is not None:
-            self._update_weight_version_if_provided(obj.weight_version)
-            message += f" Weight version updated to {obj.weight_version}."
+        async with self.model_update_lock.writer_lock:
+            _validate_next_weight_revision(self, obj.weight_version)
+            try:
+                (
+                    success,
+                    message,
+                    num_paused_requests,
+                ) = await self._wait_for_model_update_from_disk(obj)
+            except BaseException:
+                self.weight_update_fail_closed = True
+                raise
+            if success and obj.weight_version is not None:
+                self._update_weight_version_if_provided(obj.weight_version)
+                message += f" Weight version updated to {obj.weight_version}."
 
         return success, message, num_paused_requests
 
@@ -1797,26 +1874,43 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     async def _wait_for_model_update_from_disk(
         self, obj: UpdateWeightFromDiskReqInput
     ) -> Tuple[bool, str]:
+        timeout_sec = obj.timeout_sec
+        _validate_disk_weight_update_timeout(timeout_sec)
         expected_workers = self.elastic_worker_count
-        self.model_update_expected_workers = expected_workers
-        self.model_update_tmp = []
-        self.model_update_result = asyncio.Future()
-        self._dispatch_to_scheduler(obj)
-        if expected_workers == 1:
-            result = await self.model_update_result
-            if result.success:
-                self._update_model_path_info(obj.model_path, obj.load_format)
-            return result.success, result.message, result.num_paused_requests
-        else:
-            result = await self.model_update_result
+        request_id = uuid.uuid4().hex
+        obj.request_id = request_id
+        attempt = _DiskWeightUpdateAttempt(
+            future=asyncio.get_running_loop().create_future(),
+            expected_workers=expected_workers,
+        )
+        self.model_update_attempts[request_id] = attempt
+        try:
+            self._dispatch_to_scheduler(obj)
+            try:
+                results = await asyncio.wait_for(
+                    attempt.future,
+                    timeout=float(timeout_sec),
+                )
+            except asyncio.TimeoutError as error:
+                raise RuntimeError(
+                    "disk weight update response deadline expired: "
+                    f"received {len(attempt.responses)}/{expected_workers}; "
+                    "the weight state is unknown"
+                ) from error
+        finally:
+            if self.model_update_attempts.get(request_id) is attempt:
+                self.model_update_attempts.pop(request_id)
 
-            all_success = all([r.success for r in result])
-            if all_success is True:
-                self._update_model_path_info(obj.model_path, obj.load_format)
-            all_message = [r.message for r in result]
-            all_message = " | ".join(all_message)
-            all_paused_requests = [r.num_paused_requests for r in result]
-            return all_success, all_message, all_paused_requests
+        _record_weight_update_safety(self, results, full_restore=True)
+        all_success = all(result.success for result in results)
+        if all_success:
+            self._update_model_path_info(obj.model_path, obj.load_format)
+
+        messages = " | ".join(result.message for result in results)
+        paused = [result.num_paused_requests for result in results]
+        if expected_workers == 1:
+            return all_success, messages, paused[0]
+        return all_success, messages, paused
 
     def configure_logging(self, obj: ConfigureLoggingReq):
         self.request_logger.configure(
@@ -2673,7 +2767,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 filename = os.path.join(
                     self.crash_dump_folder,
                     hostname,
-                    f'crash_dump_{datetime.now().strftime("%Y-%m-%d_%H-%M-%S")}.pkl',
+                    f"crash_dump_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.pkl",
                 )
                 os.makedirs(os.path.dirname(filename), exist_ok=True)
 
@@ -2880,9 +2974,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 scale_phase=self.elastic_scale_phase,
             )
         self.auto_create_handle_loop()
-        responses: List[ScaleElasticEPReqOutput] = (
-            await self.scale_elastic_ep_communicator(obj)
-        )
+        responses: List[
+            ScaleElasticEPReqOutput
+        ] = await self.scale_elastic_ep_communicator(obj)
         for res in responses:
             if not res.success:
                 self.elastic_scale_phase = res.scale_phase
@@ -2906,12 +3000,38 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             future.set_result(recv_obj.session_id if recv_obj.success else None)
 
     def _handle_update_weights_from_disk_req_output(self, recv_obj):
-        if self.model_update_expected_workers == 1:
-            self.model_update_result.set_result(recv_obj)
-        else:
-            self.model_update_tmp.append(recv_obj)
-            if len(self.model_update_tmp) == self.model_update_expected_workers:
-                self.model_update_result.set_result(self.model_update_tmp)
+        request_id = recv_obj.request_id
+        attempt = self.model_update_attempts.get(request_id)
+        if attempt is None or attempt.future.done():
+            logger.debug("Dropping stale disk weight update response: %s", request_id)
+            return
+
+        rank = recv_obj.external_dp_rank
+        if (
+            isinstance(rank, bool)
+            or not isinstance(rank, int)
+            or rank < 0
+            or rank >= attempt.expected_workers
+        ):
+            logger.warning(
+                "Dropping disk weight update response with invalid rank %r",
+                rank,
+            )
+            return
+        if rank in attempt.responses:
+            logger.debug(
+                "Dropping duplicate disk weight update response from rank %d", rank
+            )
+            return
+
+        attempt.responses[rank] = recv_obj
+        if len(attempt.responses) == attempt.expected_workers:
+            attempt.future.set_result(
+                tuple(
+                    attempt.responses[worker_rank]
+                    for worker_rank in range(attempt.expected_workers)
+                )
+            )
 
     async def _validate_and_resolve_lora(
         self, obj: Union[GenerateReqInput, EmbeddingReqInput]

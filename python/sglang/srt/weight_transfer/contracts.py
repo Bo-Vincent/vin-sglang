@@ -2,17 +2,37 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass
+from functools import cached_property
 from itertools import product
 from math import prod
 from typing import Any, Iterable, Sequence
 
 from sglang.srt.model_executor.weight_runtime_manifest import (
-    WeightRuntimeBindingManifest,
     WeightParallelRank,
     WeightPlacementManifest,
+    WeightRuntimeBindingManifest,
+    validate_weight_placement_tensor_geometry,
+    weight_parallel_rank_identity,
+)
+from sglang.srt.weight_transfer._geometry import (
+    GeometryWorkBudget,
+    TargetAliasCandidate,
+    analyze_target_aliases,
+)
+from sglang.srt.weight_transfer._geometry import box_contains as _box_contains
+from sglang.srt.weight_transfer._geometry import (
+    boxes_exactly_cover as _boxes_exactly_cover,
 )
 
 _UINT64_MAX = (1 << 64) - 1
+_LogicalTensorDescriptor = tuple[
+    tuple[int, ...],
+    str,
+    int,
+    int | None,
+    int | None,
+    str,
+]
 
 
 def _require_nonempty_string(value: object, name: str) -> None:
@@ -46,88 +66,12 @@ def _require_uint64_range(
         raise ValueError(f"{name} exceeds uint64")
 
 
-def _box_contains(
-    outer_offset: tuple[int, ...],
-    outer_shape: tuple[int, ...],
-    inner_offset: tuple[int, ...],
-    inner_shape: tuple[int, ...],
-) -> bool:
-    return all(
-        outer_begin <= inner_begin
-        and inner_begin + inner_extent <= outer_begin + outer_extent
-        for outer_begin, outer_extent, inner_begin, inner_extent in zip(
-            outer_offset,
-            outer_shape,
-            inner_offset,
-            inner_shape,
-            strict=True,
-        )
-    )
-
-
-def _boxes_overlap(
-    boxes: Sequence[tuple[tuple[int, ...], tuple[int, ...]]],
-) -> bool:
-    if len(boxes) < 2:
-        return False
-    ndim = len(boxes[0][0])
-    sweep_dim = max(
-        range(ndim),
-        key=lambda dim: len(
-            {(offset[dim], offset[dim] + shape[dim]) for offset, shape in boxes}
-        ),
-    )
-    ordered = sorted(boxes, key=lambda item: item[0][sweep_dim])
-    active: list[tuple[tuple[int, ...], tuple[int, ...]]] = []
-    for offset, shape in ordered:
-        begin = offset[sweep_dim]
-        active = [
-            candidate
-            for candidate in active
-            if candidate[0][sweep_dim] + candidate[1][sweep_dim] > begin
-        ]
-        if any(
-            all(
-                left_begin < right_begin + right_extent
-                and right_begin < left_begin + left_extent
-                for left_begin, left_extent, right_begin, right_extent in zip(
-                    candidate_offset,
-                    candidate_shape,
-                    offset,
-                    shape,
-                    strict=True,
-                )
-            )
-            for candidate_offset, candidate_shape in active
-        ):
-            return True
-        active.append((offset, shape))
-    return False
-
-
-def _boxes_exactly_cover(
-    container_offset: tuple[int, ...],
-    container_shape: tuple[int, ...],
-    boxes: Sequence[tuple[tuple[int, ...], tuple[int, ...]]],
-) -> bool:
-    if not boxes:
-        return False
-    if any(
-        not _box_contains(container_offset, container_shape, offset, shape)
-        for offset, shape in boxes
-    ):
-        return False
-    if sum(prod(shape) for _, shape in boxes) != prod(container_shape):
-        return False
-    return not _boxes_overlap(boxes)
-
-
 def _require_parallel_rank(rank: object, name: str) -> WeightParallelRank:
     if not isinstance(rank, WeightParallelRank):
         raise ValueError(f"{name} must be a WeightParallelRank")
     if any(
         type(value) is not int or value < 0
-        for value in (rank.dp, rank.tp, rank.pp, rank.ep)
+        for value in (rank.dp, rank.tp, rank.pp, rank.ep, rank.moe_dp)
     ):
         raise ValueError(f"{name} values must be non-negative integers")
     return rank
@@ -575,15 +519,11 @@ def _placement_identity(placement: WeightPlacementManifest) -> tuple:
                 tuple(tensor.shard_dims),
                 tensor.layer_id,
                 tensor.expert_id,
+                tensor.expert_axis,
                 tensor.layout_fingerprint,
                 tensor.nbytes,
                 tensor.byte_offset,
-                (
-                    tensor.rank.dp,
-                    tensor.rank.tp,
-                    tensor.rank.pp,
-                    tensor.rank.ep,
-                ),
+                *weight_parallel_rank_identity(tensor.rank),
             )
             for tensor in tensors
         ),
@@ -620,6 +560,30 @@ def _placement_fragments(
             raise ValueError(f"{side} placement has no fragments")
         if len(placement_ranks) != 1:
             raise ValueError(f"{side} placement mixes parallel ranks")
+    return result
+
+
+def _logical_tensor_descriptors(
+    placements: Sequence[WeightPlacementManifest],
+    side: str,
+) -> dict[str, _LogicalTensorDescriptor]:
+    result = {}
+    for placement in placements:
+        for tensor in placement.tensors:
+            descriptor = (
+                tuple(tensor.global_shape),
+                tensor.dtype,
+                tensor.itemsize,
+                tensor.layer_id,
+                tensor.expert_id,
+                tensor.expert_axis,
+                tensor.layout_fingerprint,
+            )
+            previous = result.setdefault(tensor.tensor_id, descriptor)
+            if previous != descriptor:
+                raise ValueError(
+                    f"inconsistent {side} tensor descriptor: {tensor.tensor_id}"
+                )
     return result
 
 
@@ -694,6 +658,9 @@ class LogicalWeightTransferPlan:
                 for placement in placements
             ):
                 raise ValueError(f"{side} placement identity mismatch")
+            for placement in placements:
+                for tensor in placement.tensors:
+                    validate_weight_placement_tensor_geometry(tensor)
         if not self.regions:
             raise ValueError("logical plan regions must not be empty")
         source_fragments = _placement_fragments(
@@ -704,6 +671,17 @@ class LogicalWeightTransferPlan:
             self.target_placements,
             "target",
         )
+        source_descriptors = _logical_tensor_descriptors(
+            self.source_placements,
+            "source",
+        )
+        target_descriptors = _logical_tensor_descriptors(
+            self.target_placements,
+            "target",
+        )
+        for tensor_id, target_descriptor in target_descriptors.items():
+            if source_descriptors.get(tensor_id) != target_descriptor:
+                raise ValueError(f"tensor descriptor mismatch: {tensor_id}")
         boxes_by_target: dict[
             str,
             list[tuple[tuple[int, ...], tuple[int, ...]]],
@@ -719,11 +697,13 @@ class LogicalWeightTransferPlan:
                 region.target.placement_fragment_id,
                 [],
             ).append((region.overlap_offset, region.overlap_shape))
+        geometry_budget = GeometryWorkBudget()
         for fragment_id, fragment in target_fragments.items():
             if not _boxes_exactly_cover(
                 fragment.global_offset,
                 fragment.local_shape,
                 boxes_by_target.get(fragment_id, ()),
+                budget=geometry_budget,
             ):
                 raise ValueError(
                     f"regions must exactly cover target fragment: {fragment_id}"
@@ -761,7 +741,7 @@ class LogicalWeightTransferPlan:
     def total_segments(self) -> int:
         return sum(region.segment_count for region in self.regions)
 
-    @property
+    @cached_property
     def digest(self) -> str:
         identity = (
             "sglang-logical-weight-transfer-v1",
@@ -777,12 +757,7 @@ class LogicalWeightTransferPlan:
             tuple(
                 (
                     group.placement_id,
-                    (
-                        group.rank.dp,
-                        group.rank.tp,
-                        group.rank.pp,
-                        group.rank.ep,
-                    ),
+                    *weight_parallel_rank_identity(group.rank),
                     group.placement_fragment_ids,
                     group.region_indices,
                 )
@@ -791,12 +766,7 @@ class LogicalWeightTransferPlan:
             tuple(
                 (
                     group.placement_id,
-                    (
-                        group.rank.dp,
-                        group.rank.tp,
-                        group.rank.pp,
-                        group.rank.ep,
-                    ),
+                    *weight_parallel_rank_identity(group.rank),
                     group.placement_fragment_ids,
                     group.region_indices,
                 )
@@ -904,7 +874,7 @@ class RuntimeWeightLocation:
             ("address", 1),
             ("nbytes", 1),
             ("storage_offset", 0),
-            ("generation", 1),
+            ("generation", 0),
         ):
             value = getattr(self, name)
             if type(value) is not int or value < minimum:
@@ -1172,18 +1142,24 @@ def _declared_source_identity(
             "runtime",
             fragment.worker_id,
             fragment.endpoint,
+            fragment.device,
             binding.generation,
-            fragment.address + region.source_base_offset,
+            binding.lease_id,
+            fragment.address,
+            fragment.nbytes,
         )
     else:
         location = (
             "storage",
             binding.provider,
+            binding.storage_id,
             fragment.object_key,
-            fragment.object_offset + region.source_base_offset,
+            fragment.object_offset,
+            fragment.nbytes,
         )
     return (
         location,
+        region.source_base_offset,
         region.inner_bytes,
         region.outer_loop_counts,
         region.source_strides,
@@ -1236,18 +1212,46 @@ def _declared_storage_payload_identity(
     )
 
 
-def _declared_target_identity(
-    region: LogicalWeightTransferRegion,
+def _declared_target_snapshot_identity(
     binding: WeightRuntimeBindingManifest,
-    fragment: Any,
-) -> tuple:
-    return (
-        fragment.worker_id,
-        fragment.endpoint,
-        fragment.address + region.target_base_offset,
-        region.inner_bytes,
-        region.outer_loop_counts,
-        region.target_strides,
+) -> tuple[int, str]:
+    return binding.generation, binding.lease_id
+
+
+def _declared_target_alias_candidate(
+    region: LogicalWeightTransferRegion,
+    source_binding: SourceBindingManifest,
+    source_fragment: Any,
+    target_binding: WeightRuntimeBindingManifest,
+    target_fragment: Any,
+) -> TargetAliasCandidate:
+    target = region.target
+    return TargetAliasCandidate(
+        allocation_identity=(
+            target_fragment.worker_id,
+            target_fragment.endpoint,
+            target_fragment.device,
+            target_fragment.address,
+            target_fragment.nbytes,
+        ),
+        snapshot_identity=_declared_target_snapshot_identity(target_binding),
+        target_view_identity=(
+            target.aliases,
+            target.global_offset,
+            target.local_shape,
+        ),
+        logical_box=(region.overlap_offset, region.overlap_shape),
+        source_identity=_declared_source_identity(
+            region,
+            source_binding,
+            source_fragment,
+        ),
+        source_payload_identity=_declared_storage_payload_identity(
+            region,
+            source_binding,
+            source_fragment,
+        ),
+        alias_declared=len(target.aliases) > 1,
     )
 
 
@@ -1262,8 +1266,8 @@ def _expected_bound_region_identities(
         tuple[SourceBindingManifest, Any],
     ],
 ) -> tuple[tuple, ...]:
-    result = []
-    by_target = {}
+    regions = []
+    candidates = []
     for region in logical_plan.regions:
         source_pair = source_fragments.get(
             (
@@ -1284,48 +1288,107 @@ def _expected_bound_region_identities(
             WeightRuntimeBindingManifest,
         ):
             raise ValueError("bound target is not declared by target bindings")
-        source_identity = _declared_source_identity(
-            region,
-            *source_pair,
-        )
-        storage_payload_identity = _declared_storage_payload_identity(
-            region,
-            *source_pair,
-        )
-        target_identity = _declared_target_identity(
-            region,
-            target_pair[0],
-            target_pair[1],
-        )
-        previous = by_target.get(target_identity)
-        if previous is None:
-            by_target[target_identity] = (
+        regions.append(region)
+        candidates.append(
+            _declared_target_alias_candidate(
                 region,
-                source_identity,
-                storage_payload_identity,
+                source_pair[0],
+                source_pair[1],
+                target_pair[0],
+                target_pair[1],
             )
-            result.append(_region_identity(region))
-            continue
+        )
+    analysis = analyze_target_aliases(candidates)
+    conflict = analysis.conflict
+    if conflict is not None:
+        previous_region = regions[conflict.left_index]
+        region = regions[conflict.right_index]
+        previous_candidate = candidates[conflict.left_index]
+        candidate = candidates[conflict.right_index]
+        raise ValueError(
+            f"{conflict.classification.value}: "
+            f"tensor={region.tensor_id!r}, "
+            f"target_fragments=("
+            f"{previous_region.target.placement_fragment_id!r}, "
+            f"{region.target.placement_fragment_id!r}), "
+            f"target_allocation={candidate.allocation_identity!r}, "
+            f"target_snapshots=("
+            f"{previous_candidate.snapshot_identity!r}, "
+            f"{candidate.snapshot_identity!r}), "
+            f"source_fragments=("
+            f"{previous_region.source.placement_fragment_id!r}, "
+            f"{region.source.placement_fragment_id!r}), "
+            f"logical_regions=("
+            f"{previous_candidate.logical_box!r}, "
+            f"{candidate.logical_box!r})"
+        )
+    return tuple(_region_identity(regions[index]) for index in analysis.keep_indices)
+
+
+def _validate_target_binding_snapshot_identities(
+    bindings: Sequence[WeightRuntimeBindingManifest],
+) -> None:
+    by_address_space: dict[tuple[str, str, str], tuple[int, str]] = {}
+    for binding in bindings:
+        snapshot_identity = _declared_target_snapshot_identity(binding)
+        for fragment in binding.fragments:
+            address_space = (
+                fragment.worker_id,
+                fragment.endpoint,
+                fragment.device,
+            )
+            previous = by_address_space.setdefault(
+                address_space,
+                snapshot_identity,
+            )
+            if previous != snapshot_identity:
+                raise ValueError(
+                    "target binding snapshot identity differs within address space"
+                )
+
+
+def _logical_binding_fragment_keys(
+    logical_plan: LogicalWeightTransferPlan,
+    side: str,
+) -> set[tuple[str, str]]:
+    return {
         (
-            previous_region,
-            previous_source_identity,
-            previous_storage_payload_identity,
-        ) = previous
-        identical_source_payload = previous_source_identity == source_identity or (
-            previous_storage_payload_identity is not None
-            and previous_storage_payload_identity == storage_payload_identity
+            getattr(region, side).placement_id,
+            getattr(region, side).placement_fragment_id,
         )
-        exact_alias = (
-            len(previous_region.target.aliases) > 1
-            and previous_region.target.aliases == region.target.aliases
-            and previous_region.source.aliases == region.source.aliases
-            and identical_source_payload
-            and previous_region.overlap_offset == region.overlap_offset
-            and previous_region.overlap_shape == region.overlap_shape
-        )
-        if not exact_alias:
-            raise ValueError("declared bindings create overlapping target writes")
-    return tuple(result)
+        for region in logical_plan.regions
+    }
+
+
+def _validate_binding_fragment_closure(
+    logical_plan: LogicalWeightTransferPlan,
+    source_fragments: dict[tuple[str, str], tuple[SourceBindingManifest, Any]],
+    target_fragments: dict[tuple[str, str], tuple[SourceBindingManifest, Any]],
+) -> None:
+    expected_source = _logical_binding_fragment_keys(logical_plan, "source")
+    expected_target = _logical_binding_fragment_keys(logical_plan, "target")
+    if set(source_fragments) != expected_source:
+        raise ValueError("source binding fragments must exactly match logical regions")
+    if set(target_fragments) != expected_target:
+        raise ValueError("target binding fragments must exactly match logical regions")
+
+
+def _validate_runtime_source_generations(
+    bindings: Sequence[SourceBindingManifest],
+    regions: Sequence[BoundWeightTransferRegion],
+) -> None:
+    generations = {
+        binding.generation
+        for binding in bindings
+        if isinstance(binding, WeightRuntimeBindingManifest)
+    }
+    generations.update(
+        region.source.generation
+        for region in regions
+        if isinstance(region.source, RuntimeWeightLocation)
+    )
+    if len(generations) > 1:
+        raise ValueError("source generations differ")
 
 
 def _validate_bound_physical_locations(
@@ -1418,11 +1481,21 @@ class BoundWeightTransferPlan:
             self.target_bindings,
             "target",
         )
+        _validate_binding_fragment_closure(
+            self.logical_plan,
+            source_fragments,
+            target_fragments,
+        )
+        _validate_runtime_source_generations(
+            self.source_bindings,
+            self.regions,
+        )
         expected_identities = _expected_bound_region_identities(
             self.logical_plan,
             source_fragments,
             target_fragments,
         )
+        _validate_target_binding_snapshot_identities(self.target_bindings)
         actual_identities = tuple(
             _region_identity(region.logical_region) for region in self.regions
         )
@@ -1446,7 +1519,7 @@ class BoundWeightTransferPlan:
     def total_segments(self) -> int:
         return sum(region.segment_count for region in self.regions)
 
-    @property
+    @cached_property
     def digest(self) -> str:
         identity = (
             "sglang-bound-weight-transfer-v1",

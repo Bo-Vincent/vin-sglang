@@ -1166,6 +1166,17 @@ class TestRemoteInstanceLoadFormat(CustomTestCase):
 
 
 class TestWeightSnapshotLoadFormat(CustomTestCase):
+    def test_runtime_manifest_is_disabled_by_default(self):
+        self.assertFalse(ServerArgs(model_path="dummy").enable_weight_runtime_manifest)
+
+    def test_weight_snapshot_requires_runtime_manifest_before_launch(self):
+        with self.assertRaisesRegex(
+            ValueError,
+            "--load-format weight_snapshot requires "
+            "--enable-weight-runtime-manifest",
+        ):
+            ServerArgs(model_path="dummy", load_format="weight_snapshot")
+
     def test_public_cli_accepts_weight_snapshot(self):
         parser = server_args_module.argparse.ArgumentParser()
         ServerArgs.add_cli_args(parser)
@@ -1186,6 +1197,48 @@ class TestWeightSnapshotLoadFormat(CustomTestCase):
             if action.dest == "speculative_draft_load_format"
         )
         self.assertNotIn("weight_snapshot", draft_action.choices)
+
+    def test_weight_snapshot_rejects_weight_cache(self):
+        args = ServerArgs(
+            model_path="dummy",
+            load_format="weight_snapshot",
+            enable_weight_runtime_manifest=True,
+            weight_cache_mode="client",
+        )
+
+        with self.assertRaisesRegex(ValueError, "snapshot identity"):
+            args._handle_load_format()
+
+    def test_explicit_weight_snapshot_preserves_remote_model_url(self):
+        args = ServerArgs(
+            model_path="dummy",
+            load_format="weight_snapshot",
+            enable_weight_runtime_manifest=True,
+        )
+        args.model_path = "https://models.example/snapshot"
+
+        args._handle_load_format()
+
+        self.assertEqual(args.load_format, "weight_snapshot")
+
+    def test_weight_snapshot_accepts_multiple_tokenizer_workers(self):
+        args = ServerArgs(
+            model_path="dummy",
+            load_format="weight_snapshot",
+            enable_weight_runtime_manifest=True,
+            tokenizer_worker_num=2,
+        )
+
+        self.assertEqual(args.tokenizer_worker_num, 2)
+
+    def test_weight_snapshot_rejects_legacy_smg_grpc(self):
+        with self.assertRaisesRegex(ValueError, "SMG gRPC"):
+            ServerArgs(
+                model_path="dummy",
+                load_format="weight_snapshot",
+                enable_weight_runtime_manifest=True,
+                smg_grpc_mode=True,
+            )
 
 
 class TestWaterfillArgs(CustomTestCase):

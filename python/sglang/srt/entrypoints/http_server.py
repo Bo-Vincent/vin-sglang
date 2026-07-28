@@ -19,13 +19,17 @@ This file implements HTTP APIs for the inference engine via fastapi.
 
 import asyncio
 import dataclasses
+import fcntl
 import logging
+import mmap
 import os
 import ssl
+import struct
 import tempfile
 import threading
 import time
 import uuid
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from contextlib import asynccontextmanager
 from http import HTTPStatus
 from typing import (
@@ -60,7 +64,6 @@ from fastapi import (
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
-
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationMode
 from sglang.srt.entrypoints.anthropic.protocol import (
@@ -144,6 +147,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
     UpdateWeightVersionReqInput,
     VertexGenerateReqInput,
+    WeightMaterializationSessionState,
 )
 from sglang.srt.managers.multi_tokenizer_mixin import (
     MultiTokenizerRouter,
@@ -153,8 +157,11 @@ from sglang.srt.managers.multi_tokenizer_mixin import (
     read_from_shared_memory,
     write_data_for_multi_tokenizer,
 )
-from sglang.srt.managers.tokenizer_manager import ServerStatus, TokenizerManager
 from sglang.srt.managers.tokenizer_control_mixin import WeightMaterializationError
+from sglang.srt.managers.tokenizer_manager import ServerStatus, TokenizerManager
+from sglang.srt.managers.weight_materialization import (
+    is_retryable_materialization_state,
+)
 from sglang.srt.observability.func_timer import enable_func_timer
 from sglang.srt.observability.trace import (
     process_tracing_init,
@@ -181,6 +188,10 @@ from sglang.srt.utils.json_response import (
 )
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 from sglang.srt.utils.watchdog import SubprocessWatchdog
+from sglang.srt.weight_transfer.remote_protocol import (
+    HF_REVISION_V1,
+    RUNTIME_MANIFEST_V1,
+)
 from sglang.utils import get_exception_traceback
 from sglang.version import __version__
 
@@ -190,6 +201,79 @@ asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 # Global constants
 HEALTH_CHECK_TIMEOUT = int(os.getenv("SGLANG_HEALTH_CHECK_TIMEOUT", 20))
 WAIT_WEIGHTS_READY_TIMEOUT = int(os.getenv("SGLANG_WAIT_WEIGHTS_READY_TIMEOUT", 120))
+_MULTI_WORKER_STARTUP_TIMEOUT_SEC = 300
+_MULTI_WORKER_REGISTRATION_TIMEOUT_SEC = 30
+
+
+class _WeightSnapshotActivationCompletionUnknown(RuntimeError):
+    pass
+
+
+class _WeightSnapshotStartupActivation:
+    def __init__(
+        self,
+        tokenizer_manager: Any,
+        event_loop: asyncio.AbstractEventLoop,
+    ) -> None:
+        self._tokenizer_manager = tokenizer_manager
+        self._event_loop = event_loop
+        self._lock = threading.Lock()
+        self._close_started = False
+        self._completion_unknown = False
+
+    def _claim_close(self) -> bool:
+        with self._lock:
+            if self._close_started or self._completion_unknown:
+                return False
+            self._close_started = True
+            return True
+
+    def _mark_completion_unknown(self) -> None:
+        with self._lock:
+            self._completion_unknown = True
+
+    def mark_completed_by_peer(self) -> None:
+        with self._lock:
+            if not self._completion_unknown:
+                self._close_started = True
+
+    @staticmethod
+    def _check_result(action: str, result: tuple[bool, str]) -> None:
+        success, message = result
+        if not success:
+            raise RuntimeError(f"weight snapshot activation {action} failed: {message}")
+
+    def update_sync(self, action: str) -> None:
+        if action == "close" and not self._claim_close():
+            return
+        future = asyncio.run_coroutine_threadsafe(
+            self._tokenizer_manager.update_weight_snapshot_activation(action),
+            self._event_loop,
+        )
+        try:
+            result = future.result(timeout=300)
+        except FutureTimeoutError as error:
+            future.cancel()
+            self._mark_completion_unknown()
+            raise _WeightSnapshotActivationCompletionUnknown(
+                f"weight snapshot activation {action} did not reach a terminal state"
+            ) from error
+        self._check_result(action, result)
+
+    async def close_async(self) -> None:
+        if not self._claim_close():
+            return
+        try:
+            result = await asyncio.wait_for(
+                self._tokenizer_manager.update_weight_snapshot_activation("close"),
+                timeout=300,
+            )
+        except asyncio.TimeoutError as error:
+            self._mark_completion_unknown()
+            raise _WeightSnapshotActivationCompletionUnknown(
+                "weight snapshot activation close did not reach a terminal state"
+            ) from error
+        self._check_result("close", result)
 
 
 # Store global states
@@ -212,6 +296,234 @@ def get_global_state() -> _GlobalState:
     return _global_state
 
 
+def _admit_http_inference_request(request: Request) -> None:
+    try:
+        _global_state.tokenizer_manager._admit_inference_request(request)
+    except RuntimeError as error:
+        raise HTTPException(
+            status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+            detail=str(error),
+        ) from error
+
+
+def _ensure_startup_warmup_token(server_args: ServerArgs) -> str:
+    token = getattr(server_args, "_startup_warmup_token", None)
+    if token is None:
+        token = uuid.uuid4().hex
+        server_args._startup_warmup_token = token
+    return token
+
+
+class _MultiWorkerStartupBarrier:
+    _STATE = struct.Struct("=IIIII")
+    _WAITING = 0
+    _WARMED = 1
+    _ACTIVATING = 2
+    _ACTIVATED = 3
+    _OPEN = 4
+    _FAILED = 5
+
+    def __init__(self, path: str, fd: int) -> None:
+        self.path = path
+        self._fd = fd
+        self._memory = mmap.mmap(fd, self._STATE.size)
+        self._warmup_arrived = False
+        self._warmup_succeeded = False
+        self._activation_leader = False
+        self._armed = False
+        self._closed = False
+
+    @classmethod
+    def create(cls, expected_workers: int):
+        if type(expected_workers) is not int or expected_workers <= 0:
+            raise ValueError("startup barrier worker count must be positive")
+        path = os.path.join(
+            tempfile.gettempdir(),
+            f"sglang-startup-{os.getpid()}-{uuid.uuid4().hex}",
+        )
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+        os.ftruncate(fd, cls._STATE.size)
+        barrier = cls(path, fd)
+        barrier._write((expected_workers, 0, 0, 0, cls._WAITING))
+        return barrier
+
+    @classmethod
+    def attach(cls, path: str):
+        if type(path) is not str or not path:
+            raise ValueError("startup barrier path is invalid")
+        return cls(path, os.open(path, os.O_RDWR))
+
+    def _read(self) -> tuple[int, int, int, int, int]:
+        self._memory.seek(0)
+        return self._STATE.unpack(self._memory.read(self._STATE.size))
+
+    def _write(self, state: tuple[int, int, int, int, int]) -> None:
+        self._memory.seek(0)
+        self._memory.write(self._STATE.pack(*state))
+        self._memory.flush()
+
+    def _update(self, update):
+        fcntl.flock(self._fd, fcntl.LOCK_EX)
+        try:
+            state = update(self._read())
+            self._write(state)
+            return state
+        finally:
+            fcntl.flock(self._fd, fcntl.LOCK_UN)
+
+    def _wait(self, accepted_states: set[int], timeout_sec: float) -> int:
+        deadline = time.monotonic() + timeout_sec
+        while True:
+            fcntl.flock(self._fd, fcntl.LOCK_SH)
+            try:
+                state = self._read()[4]
+            finally:
+                fcntl.flock(self._fd, fcntl.LOCK_UN)
+            if state in accepted_states or state == self._FAILED:
+                return state
+            if time.monotonic() >= deadline:
+                self.fail()
+                return self._FAILED
+            time.sleep(0.01)
+
+    def arrive_warmup(self, success: bool, *, timeout_sec: float) -> bool:
+        if self._warmup_arrived:
+            raise RuntimeError("startup warmup result was already reported")
+        self._warmup_arrived = True
+        self._warmup_succeeded = bool(success)
+
+        def update(state):
+            expected, warmed, armed, failed, phase = state
+            if phase == self._FAILED:
+                return state
+            if phase == self._OPEN and success:
+                return state
+            warmed += 1
+            failed = failed or int(not success)
+            if failed:
+                phase = self._FAILED
+            elif warmed == expected:
+                phase = self._WARMED
+            return expected, warmed, armed, failed, phase
+
+        ready_phases = {
+            self._WARMED,
+            self._ACTIVATING,
+            self._ACTIVATED,
+            self._OPEN,
+        }
+        phase = self._update(update)[4]
+        if phase not in ready_phases and phase != self._FAILED:
+            phase = self._wait(ready_phases, timeout_sec)
+        return phase in ready_phases
+
+    def claim_activation(self) -> bool:
+        if not self._warmup_succeeded:
+            raise RuntimeError(
+                "startup worker cannot claim activation before successful warmup"
+            )
+        claimed = False
+
+        def update(state):
+            nonlocal claimed
+            expected, warmed, armed, failed, phase = state
+            if phase == self._WARMED:
+                claimed = True
+                phase = self._ACTIVATING
+            elif phase not in {
+                self._ACTIVATING,
+                self._ACTIVATED,
+                self._OPEN,
+                self._FAILED,
+            }:
+                failed = 1
+                phase = self._FAILED
+            return expected, warmed, armed, failed, phase
+
+        phase = self._update(update)[4]
+        if phase == self._FAILED:
+            raise RuntimeError("startup activation claim failed")
+        self._activation_leader = claimed
+        return claimed
+
+    def complete_activation(self) -> bool:
+        if not self._activation_leader:
+            raise RuntimeError("only the startup activation leader may complete")
+
+        def update(state):
+            expected, warmed, armed, failed, phase = state
+            if phase == self._ACTIVATING:
+                phase = self._ACTIVATED
+            elif phase != self._FAILED:
+                failed = 1
+                phase = self._FAILED
+            return expected, warmed, armed, failed, phase
+
+        return self._update(update)[4] == self._ACTIVATED
+
+    def wait_for_activation(self, *, timeout_sec: float) -> bool:
+        phase = self._wait({self._ACTIVATED, self._OPEN}, timeout_sec)
+        return phase in {self._ACTIVATED, self._OPEN}
+
+    def arm(self, *, timeout_sec: float) -> bool:
+        if not self._warmup_succeeded:
+            raise RuntimeError("startup worker cannot arm before successful warmup")
+        if self._armed:
+            raise RuntimeError("startup worker was already armed")
+        self._armed = True
+
+        def update(state):
+            expected, warmed, armed, failed, phase = state
+            if phase == self._FAILED:
+                return state
+            if phase == self._OPEN:
+                return state
+            if phase != self._ACTIVATED:
+                return expected, warmed, armed, 1, self._FAILED
+            armed += 1
+            if armed == expected:
+                phase = self._OPEN
+            return expected, warmed, armed, failed, phase
+
+        phase = self._update(update)[4]
+        if phase not in {self._OPEN, self._FAILED}:
+            phase = self._wait({self._OPEN}, timeout_sec)
+        return phase == self._OPEN
+
+    def admission_open(self) -> bool:
+        fcntl.flock(self._fd, fcntl.LOCK_SH)
+        try:
+            return self._read()[4] == self._OPEN
+        finally:
+            fcntl.flock(self._fd, fcntl.LOCK_UN)
+
+    def fail(self) -> None:
+        def update(state):
+            expected, warmed, armed, _failed, phase = state
+            if phase == self._OPEN:
+                return state
+            return expected, warmed, armed, 1, self._FAILED
+
+        self._update(update)
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._memory.close()
+        os.close(self._fd)
+
+    def unlink(self) -> None:
+        self.close()
+        try:
+            os.unlink(self.path)
+        except FileNotFoundError:
+            pass
+
+
+_multi_worker_startup_barrier: _MultiWorkerStartupBarrier | None = None
+
+
 async def init_multi_tokenizer() -> ServerArgs:
     """
     Initialization function for multi-process tokenizer mode.
@@ -227,9 +539,9 @@ async def init_multi_tokenizer() -> ServerArgs:
     port_args: PortArgs
 
     # API key authentication is not supported in multi-tokenizer mode
-    assert (
-        server_args.api_key is None
-    ), "API key is not supported in multi-tokenizer mode"
+    assert server_args.api_key is None, (
+        "API key is not supported in multi-tokenizer mode"
+    )
 
     # Create a new ipc name for the current process
     port_args.tokenizer_ipc_name = (
@@ -266,9 +578,13 @@ async def init_multi_tokenizer() -> ServerArgs:
 
 @asynccontextmanager
 async def lifespan(fast_api_app: FastAPI):
+    global _multi_worker_startup_barrier
+
     grpc_handle = None
     sidecar = None
     warmup_thread = None
+    warmup_thread_started = False
+    startup_barrier = None
     if getattr(fast_api_app, "is_single_tokenizer_mode", False):
         server_args = fast_api_app.server_args
         warmup_thread_kwargs = fast_api_app.warmup_thread_kwargs
@@ -276,8 +592,34 @@ async def lifespan(fast_api_app: FastAPI):
     else:
         # Initialize multi-tokenizer support for worker processes
         server_args = await init_multi_tokenizer()
-        warmup_thread_kwargs = dict(server_args=server_args)
+        startup_barrier = _MultiWorkerStartupBarrier.attach(
+            server_args._multi_worker_startup_barrier_path
+        )
+        _multi_worker_startup_barrier = startup_barrier
+        warmup_thread_kwargs = dict(
+            server_args=server_args,
+            startup_barrier=startup_barrier,
+        )
         thread_label = f"MultiTokenizer-{_global_state.tokenizer_manager.worker_id}"
+
+    _global_state.tokenizer_manager._enable_startup_admission_gate()
+
+    weight_snapshot_activation = None
+    configured_load_format = getattr(server_args, "load_format", None)
+    load_format = getattr(configured_load_format, "value", configured_load_format)
+    if load_format == "weight_snapshot":
+        weight_snapshot_activation = _WeightSnapshotStartupActivation(
+            _global_state.tokenizer_manager,
+            asyncio.get_running_loop(),
+        )
+        _global_state.tokenizer_manager.server_status = ServerStatus.Starting
+        warmup_thread_kwargs = {
+            **warmup_thread_kwargs,
+            "weight_snapshot_activation": weight_snapshot_activation.update_sync,
+            "weight_snapshot_activation_completed_by_peer": (
+                weight_snapshot_activation.mark_completed_by_peer
+            ),
+        }
 
     # Add prometheus middleware
     if server_args.enable_metrics:
@@ -375,20 +717,26 @@ async def lifespan(fast_api_app: FastAPI):
             f"OpenAIServingResponses init traceback:\n{get_exception_traceback()}"
         )
 
-    # Execute custom warmups
-    if server_args.warmups is not None:
-        await execute_warmups(
-            server_args.disaggregation_mode,
-            server_args.warmups.split(","),
-            _global_state.tokenizer_manager,
-        )
-        logger.info("Warmup ended")
-
     # Start the native gRPC server and warmup inside the try so a failure in
     # either still runs the finally cleanup below. Native gRPC is enabled via
     # --grpc-port / SGLANG_GRPC_PORT; only the single-tokenizer process is
     # gRPC-capable (__post_init__ rejects --tokenizer-worker-num > 1).
     try:
+        if startup_barrier is not None:
+            await _global_state.tokenizer_manager.wait_for_router_registration(
+                timeout_sec=_MULTI_WORKER_REGISTRATION_TIMEOUT_SEC,
+            )
+
+        # Execute custom warmups
+        if server_args.warmups is not None:
+            with _global_state.tokenizer_manager._startup_warmup_admission_bypass():
+                await execute_warmups(
+                    server_args.disaggregation_mode,
+                    server_args.warmups.split(","),
+                    _global_state.tokenizer_manager,
+                )
+            logger.info("Warmup ended")
+
         if (
             getattr(fast_api_app, "is_single_tokenizer_mode", False)
             and server_args.grpc_port is not None
@@ -411,10 +759,28 @@ async def lifespan(fast_api_app: FastAPI):
             kwargs=warmup_thread_kwargs,
         )
         warmup_thread.start()
+        warmup_thread_started = True
 
         # Start the HTTP server
         yield
+    except BaseException:
+        if startup_barrier is not None:
+            startup_barrier.fail()
+        _global_state.tokenizer_manager.server_status = ServerStatus.UnHealthy
+        raise
     finally:
+        if warmup_thread_started:
+            await asyncio.to_thread(warmup_thread.join)
+        if weight_snapshot_activation is not None:
+            try:
+                await weight_snapshot_activation.close_async()
+            except _WeightSnapshotActivationCompletionUnknown:
+                logger.error(
+                    "Weight snapshot startup cleanup completion is unknown; "
+                    "not retrying close"
+                )
+            except Exception:
+                logger.exception("Failed to close weight snapshot activation")
         if sidecar is not None:
             try:
                 sidecar.stop()
@@ -423,8 +789,14 @@ async def lifespan(fast_api_app: FastAPI):
         _shutdown_native_grpc_server(grpc_handle)
         if tool_server is not None and hasattr(tool_server, "aclose"):
             await tool_server.aclose()
-        if warmup_thread is not None:
-            warmup_thread.join()
+        if startup_barrier is not None:
+            try:
+                _global_state.tokenizer_manager.unregister_from_router()
+            except Exception:
+                logger.exception("Failed to unregister tokenizer worker")
+            if _multi_worker_startup_barrier is startup_barrier:
+                _multi_worker_startup_barrier = None
+            startup_barrier.close()
 
 
 # Fast API
@@ -439,6 +811,18 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def _gate_multi_worker_startup(request: Request, call_next):
+    barrier = _multi_worker_startup_barrier
+    if barrier is not None and not barrier.admission_open():
+        manager = _global_state.tokenizer_manager
+        is_warmup = getattr(manager, "_is_internal_startup_warmup", None)
+        if not callable(is_warmup) or not is_warmup(request):
+            return Response(status_code=HTTPStatus.SERVICE_UNAVAILABLE)
+    return await call_next(request)
+
 
 if envs.SGLANG_ENABLE_REQUEST_DECOMPRESSION.get():
     from sglang.srt.entrypoints.http_request_decompression import (
@@ -629,7 +1013,7 @@ async def health_generate(request: Request) -> Response:
         logger.info("Health check request received during shutdown. Returning 503.")
         return Response(status_code=503)
 
-    if _global_state.tokenizer_manager.server_status == ServerStatus.Starting:
+    if _global_state.tokenizer_manager.server_status is not ServerStatus.Up:
         return Response(status_code=503)
 
     if (
@@ -674,8 +1058,13 @@ async def health_generate(request: Request) -> Response:
         if _global_state.tokenizer_manager.last_receive_tstamp > tic:
             task.cancel()
             _global_state.tokenizer_manager.rid_to_state.pop(rid, None)
-            _global_state.tokenizer_manager.server_status = ServerStatus.Up
-            return Response(status_code=200)
+            return Response(
+                status_code=(
+                    200
+                    if _global_state.tokenizer_manager.server_status is ServerStatus.Up
+                    else 503
+                )
+            )
 
     task.cancel()
     tic_time = time.strftime("%H:%M:%S", time.localtime(tic))
@@ -746,9 +1135,9 @@ async def get_server_info():
 async def server_info():
     """Get the server information."""
     # Returns internal states per DP.
-    internal_states: List[Dict[Any, Any]] = (
-        await _global_state.tokenizer_manager.get_internal_state()
-    )
+    internal_states: List[
+        Dict[Any, Any]
+    ] = await _global_state.tokenizer_manager.get_internal_state()
 
     server_args = _global_state.tokenizer_manager.server_args
 
@@ -834,6 +1223,7 @@ if os.environ.get("DUMPER_SERVER_PORT") == "reuse":
 )
 async def generate_request(obj: GenerateReqInput, request: Request):
     """Handle a generate request."""
+    _admit_http_inference_request(request)
     if envs.SGLANG_ENABLE_REQUEST_HEADER_OVERRIDES.get():
         apply_header_overrides(obj, request.headers)
     if obj.stream:
@@ -1286,51 +1676,99 @@ async def materialize_weights(
         if isinstance(error, ValueError):
             status_code = HTTPStatus.BAD_REQUEST
         elif isinstance(error, WeightMaterializationError):
-            status_code = {
-                "conflict": HTTPStatus.CONFLICT,
-                "not_found": HTTPStatus.NOT_FOUND,
-                "completion_unknown": HTTPStatus.SERVICE_UNAVAILABLE,
-                "cleanup_pending": HTTPStatus.SERVICE_UNAVAILABLE,
-                "disabled": HTTPStatus.SERVICE_UNAVAILABLE,
-            }.get(error.session_state, HTTPStatus.INTERNAL_SERVER_ERROR)
+            try:
+                state = WeightMaterializationSessionState(error.session_state)
+            except ValueError:
+                status_code = HTTPStatus.INTERNAL_SERVER_ERROR
+            else:
+                if state is WeightMaterializationSessionState.CONFLICT:
+                    status_code = HTTPStatus.CONFLICT
+                elif state is WeightMaterializationSessionState.NOT_FOUND:
+                    status_code = HTTPStatus.NOT_FOUND
+                elif (
+                    state is WeightMaterializationSessionState.DISABLED
+                    or is_retryable_materialization_state(state)
+                ):
+                    status_code = HTTPStatus.SERVICE_UNAVAILABLE
+                else:
+                    status_code = HTTPStatus.INTERNAL_SERVER_ERROR
         else:
             status_code = HTTPStatus.INTERNAL_SERVER_ERROR
-        return ORJSONResponse(
-            {
-                "materialization_id": getattr(
-                    error, "materialization_id", obj.materialization_id
-                ),
-                "session_state": getattr(error, "session_state", "failed"),
-                "message": str(error),
-            },
-            status_code=status_code,
-        )
+        content = {
+            "materialization_id": getattr(
+                error, "materialization_id", obj.materialization_id
+            ),
+            "session_state": getattr(error, "session_state", "failed"),
+            "message": str(error),
+        }
+        completion_ticket = getattr(error, "completion_ticket", None)
+        if completion_ticket is not None:
+            content["completion_ticket"] = completion_ticket
+        return ORJSONResponse(content, status_code=status_code)
 
 
 @app.post("/remote_instance_weight_transfer")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def begin_remote_instance_weight_transfer(
     lease_timeout_sec: int = 300,
-    manifest_format: str = "runtime_v1",
+    manifest_format: str = RUNTIME_MANIFEST_V1,
     transfer_id: str | None = None,
+    manifest_revision_semantics: str = HF_REVISION_V1,
+    lease_fence: str | None = None,
 ):
     try:
+        kwargs = {
+            "manifest_format": manifest_format,
+            "manifest_revision_semantics": manifest_revision_semantics,
+            "transfer_id": transfer_id,
+        }
+        if lease_fence is not None:
+            kwargs["lease_fence"] = lease_fence
         return (
             await _global_state.tokenizer_manager.begin_remote_instance_weight_transfer(
                 lease_timeout_sec,
-                manifest_format=manifest_format,
-                transfer_id=transfer_id,
+                **kwargs,
             )
         )
     except (RuntimeError, ValueError) as error:
-        return ORJSONResponse(
-            {
-                "transfer_id": getattr(error, "transfer_id", None),
-                "session_state": getattr(error, "session_state", "failed"),
-                "message": str(error),
-            },
+        return _remote_weight_transfer_error_response(
+            transfer_id=getattr(error, "transfer_id", None),
+            session_state=getattr(error, "session_state", "failed"),
+            message=str(error),
+            lease_fence=getattr(error, "lease_fence", None),
+            generation=getattr(error, "generation", None),
             status_code=HTTPStatus.CONFLICT,
         )
+
+
+def _remote_weight_transfer_error_response(
+    *,
+    transfer_id: str | None,
+    session_state,
+    message: str,
+    status_code: HTTPStatus,
+    lease_fence: str | None = None,
+    generation: int | None = None,
+    completion_unknown: bool = False,
+    cleanup_pending: bool = False,
+    retryable: bool | None = None,
+    reconcile_required: bool = False,
+) -> ORJSONResponse:
+    content = {
+        "transfer_id": transfer_id,
+        "session_state": getattr(session_state, "value", session_state),
+        "message": message,
+    }
+    if lease_fence is not None:
+        content["lease_fence"] = lease_fence
+    if generation is not None:
+        content["generation"] = generation
+    if completion_unknown:
+        content["completion_unknown"] = True
+        content["cleanup_pending"] = cleanup_pending
+        content["retryable"] = False if retryable is None else retryable
+        content["reconcile_required"] = reconcile_required
+    return ORJSONResponse(content, status_code=status_code)
 
 
 @app.get("/remote_instance_weight_transfer")
@@ -1343,10 +1781,32 @@ async def list_remote_instance_weight_transfer_sessions():
 
 @app.get("/remote_instance_weight_transfer/{transfer_id}")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def get_remote_instance_weight_transfer_session(transfer_id: str):
-    session = await _global_state.tokenizer_manager.get_remote_instance_weight_transfer_session(
-        transfer_id
-    )
+async def get_remote_instance_weight_transfer_session(
+    transfer_id: str,
+    lease_fence: str | None = None,
+    generation: int | None = None,
+):
+    try:
+        kwargs = {}
+        if lease_fence is not None:
+            kwargs["lease_fence"] = lease_fence
+        if generation is not None:
+            kwargs["generation"] = generation
+        session = await _global_state.tokenizer_manager.get_remote_instance_weight_transfer_session(
+            transfer_id,
+            **kwargs,
+        )
+    except (RuntimeError, ValueError) as error:
+        return _remote_weight_transfer_error_response(
+            transfer_id=transfer_id,
+            session_state="conflict",
+            message=str(error),
+            status_code=(
+                HTTPStatus.BAD_REQUEST
+                if isinstance(error, ValueError)
+                else HTTPStatus.CONFLICT
+            ),
+        )
     if session is None:
         return ORJSONResponse(
             {
@@ -1364,32 +1824,144 @@ async def get_remote_instance_weight_transfer_session(transfer_id: str):
 
 @app.delete("/remote_instance_weight_transfer/{transfer_id}")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def release_remote_instance_weight_transfer(transfer_id: str):
-    (
-        success,
-        message,
-    ) = await _global_state.tokenizer_manager.release_remote_instance_weight_transfer(
-        transfer_id
-    )
+async def release_remote_instance_weight_transfer(
+    transfer_id: str,
+    lease_fence: str | None = None,
+    generation: int | None = None,
+):
+    fenced_request = lease_fence is not None or generation is not None
+    try:
+        kwargs = {}
+        if lease_fence is not None:
+            kwargs["lease_fence"] = lease_fence
+        if generation is not None:
+            kwargs["generation"] = generation
+        (
+            success,
+            message,
+        ) = await _global_state.tokenizer_manager.release_remote_instance_weight_transfer(
+            transfer_id,
+            **kwargs,
+        )
+    except (RuntimeError, ValueError) as error:
+        completion_unknown = bool(getattr(error, "completion_unknown", False))
+        if not fenced_request and not completion_unknown:
+            raise HTTPException(
+                status_code=HTTPStatus.CONFLICT,
+                detail=str(error),
+            ) from error
+        return _remote_weight_transfer_error_response(
+            transfer_id=getattr(error, "transfer_id", transfer_id),
+            session_state=getattr(error, "session_state", "failed"),
+            message=str(error),
+            lease_fence=getattr(error, "lease_fence", lease_fence),
+            generation=getattr(error, "generation", generation),
+            status_code=(
+                HTTPStatus.SERVICE_UNAVAILABLE
+                if completion_unknown
+                else (
+                    HTTPStatus.BAD_REQUEST
+                    if isinstance(error, ValueError)
+                    else HTTPStatus.CONFLICT
+                )
+            ),
+            completion_unknown=completion_unknown,
+            cleanup_pending=bool(getattr(error, "cleanup_pending", False)),
+            retryable=getattr(error, "retryable", None),
+            reconcile_required=bool(getattr(error, "reconcile_required", False)),
+        )
     if not success:
-        raise HTTPException(status_code=HTTPStatus.CONFLICT, detail=message)
+        if not fenced_request:
+            raise HTTPException(
+                status_code=HTTPStatus.CONFLICT,
+                detail=message,
+            )
+        return _remote_weight_transfer_error_response(
+            transfer_id=transfer_id,
+            session_state="conflict",
+            message=message,
+            status_code=HTTPStatus.CONFLICT,
+            lease_fence=lease_fence,
+            generation=generation,
+        )
     return {"success": True, "message": message}
 
 
 @app.post("/remote_instance_weight_transfer/{transfer_id}/renew")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def renew_remote_instance_weight_transfer(
-    transfer_id: str, lease_timeout_sec: int = 300
+    transfer_id: str,
+    lease_timeout_sec: int = 300,
+    lease_fence: str | None = None,
+    generation: int | None = None,
 ):
-    (
-        success,
-        message,
-    ) = await _global_state.tokenizer_manager.renew_remote_instance_weight_transfer(
-        transfer_id, lease_timeout_sec
-    )
+    fenced_request = lease_fence is not None or generation is not None
+    try:
+        kwargs = {}
+        if lease_fence is not None:
+            kwargs["lease_fence"] = lease_fence
+        if generation is not None:
+            kwargs["generation"] = generation
+        (
+            success,
+            message,
+        ) = await _global_state.tokenizer_manager.renew_remote_instance_weight_transfer(
+            transfer_id,
+            lease_timeout_sec,
+            **kwargs,
+        )
+    except (RuntimeError, ValueError) as error:
+        completion_unknown = bool(getattr(error, "completion_unknown", False))
+        if not fenced_request and not completion_unknown:
+            raise HTTPException(
+                status_code=HTTPStatus.CONFLICT,
+                detail=str(error),
+            ) from error
+        return _remote_weight_transfer_error_response(
+            transfer_id=getattr(error, "transfer_id", transfer_id),
+            session_state=getattr(error, "session_state", "failed"),
+            message=str(error),
+            lease_fence=getattr(error, "lease_fence", lease_fence),
+            generation=getattr(error, "generation", generation),
+            status_code=(
+                HTTPStatus.SERVICE_UNAVAILABLE
+                if completion_unknown
+                else (
+                    HTTPStatus.BAD_REQUEST
+                    if isinstance(error, ValueError)
+                    else HTTPStatus.CONFLICT
+                )
+            ),
+            completion_unknown=completion_unknown,
+            cleanup_pending=bool(getattr(error, "cleanup_pending", False)),
+            retryable=getattr(error, "retryable", None),
+            reconcile_required=bool(getattr(error, "reconcile_required", False)),
+        )
     if not success:
-        raise HTTPException(status_code=HTTPStatus.CONFLICT, detail=message)
-    return {"success": True, "message": message}
+        if not fenced_request:
+            raise HTTPException(
+                status_code=HTTPStatus.CONFLICT,
+                detail=message,
+            )
+        return _remote_weight_transfer_error_response(
+            transfer_id=transfer_id,
+            session_state="conflict",
+            message=message,
+            status_code=HTTPStatus.CONFLICT,
+            lease_fence=lease_fence,
+            generation=generation,
+        )
+    session = await _global_state.tokenizer_manager.get_remote_instance_weight_transfer_session(
+        transfer_id,
+        **kwargs,
+    )
+    return {
+        "success": True,
+        "message": message,
+        "deadline_unix_sec": (
+            None if session is None else session.get("deadline_unix_sec")
+        ),
+    }
 
 
 @app.post("/init_weights_update_group")
@@ -1491,13 +2063,21 @@ async def update_weight_version(
     obj: Annotated[UpdateWeightVersionReqInput, Body()], request: Request
 ):
     """Update the weight version. This operation requires no active requests."""
+    if _global_state.tokenizer_manager.server_args.enable_weight_runtime_manifest:
+        return ORJSONResponse(
+            {
+                "success": False,
+                "message": (
+                    "update_weight_version cannot relabel a runtime weight artifact; "
+                    "set weight_version on the weight update request"
+                ),
+            },
+            status_code=HTTPStatus.CONFLICT,
+        )
     if obj.abort_all_requests:
         _global_state.tokenizer_manager.abort_request(abort_all=True)
 
-    # Use a simple approach without the complex lock mechanism for now
-    # since weight_version update is a simple operation that doesn't affect model weights
     try:
-        # Update the weight version in server args (the single source of truth)
         _global_state.tokenizer_manager.server_args.override(
             "http.update_weight_version", weight_version=obj.new_version
         )
@@ -1774,6 +2354,7 @@ async def continue_generation(
 @app.post("/v1/completions", dependencies=[Depends(validate_json_request)])
 async def openai_v1_completions(request: CompletionRequest, raw_request: Request):
     """OpenAI-compatible text completion endpoint."""
+    _admit_http_inference_request(raw_request)
     return await raw_request.app.state.openai_serving_completion.handle_request(
         request, raw_request
     )
@@ -1784,6 +2365,7 @@ async def openai_v1_chat_completions(
     request: ChatCompletionRequest, raw_request: Request
 ):
     """OpenAI-compatible chat completion endpoint."""
+    _admit_http_inference_request(raw_request)
     return await raw_request.app.state.openai_serving_chat.handle_request(
         request, raw_request
     )
@@ -1796,6 +2378,7 @@ async def openai_v1_chat_completions(
 )
 async def openai_v1_embeddings(request: EmbeddingRequest, raw_request: Request):
     """OpenAI-compatible embeddings endpoint."""
+    _admit_http_inference_request(raw_request)
     return await raw_request.app.state.openai_serving_embedding.handle_request(
         request, raw_request
     )
@@ -1808,6 +2391,7 @@ async def openai_v1_embeddings(request: EmbeddingRequest, raw_request: Request):
 )
 async def openai_v1_classify(request: ClassifyRequest, raw_request: Request):
     """OpenAI-compatible classification endpoint."""
+    _admit_http_inference_request(raw_request)
     return await raw_request.app.state.openai_serving_classify.handle_request(
         request, raw_request
     )
@@ -1863,6 +2447,7 @@ async def openai_v1_audio_transcriptions(
     ),
 ):
     """OpenAI-compatible audio transcription endpoint."""
+    _admit_http_inference_request(raw_request)
     if response_format not in ["json", "text", "verbose_json"]:
         return ORJSONResponse(
             content={
@@ -1960,6 +2545,7 @@ async def retrieve_model(model: str):
 @app.post("/v1/score", dependencies=[Depends(validate_json_request)])
 async def v1_score_request(request: ScoringRequest, raw_request: Request):
     """Endpoint for the scoring API. Supports CausalLM (logprob-based) and SequenceClassification (class logit-based) models. See Engine.score() for documentation."""
+    _admit_http_inference_request(raw_request)
     return await raw_request.app.state.openai_serving_score.handle_request(
         request, raw_request
     )
@@ -1968,6 +2554,7 @@ async def v1_score_request(request: ScoringRequest, raw_request: Request):
 @app.post("/v1/responses", dependencies=[Depends(validate_json_request)])
 async def v1_responses_request(request: ResponsesRequest, raw_request: Request):
     """Endpoint for the responses API with reasoning support."""
+    _admit_http_inference_request(raw_request)
 
     result = await raw_request.app.state.openai_serving_responses.create_responses(
         request, raw_request
@@ -2005,6 +2592,7 @@ async def v1_cancel_responses(response_id: str, raw_request: Request):
 )
 async def v1_rerank_request(request: V1RerankReqInput, raw_request: Request):
     """Endpoint for reranking documents based on query relevance."""
+    _admit_http_inference_request(raw_request)
     return await raw_request.app.state.openai_serving_rerank.handle_request(
         request, raw_request
     )
@@ -2238,7 +2826,7 @@ async def _send_disaggregation_warmup_requests(
 
 
 def _execute_server_warmup(server_args: ServerArgs):
-    headers = {}
+    headers = _global_state.tokenizer_manager._startup_warmup_request_headers()
     url = server_args.url()
     if server_args.api_key:
         headers["Authorization"] = f"Bearer {server_args.api_key}"
@@ -2262,7 +2850,6 @@ def _execute_server_warmup(server_args: ServerArgs):
 
     if not success:
         logger.error(f"Initialization failed. warmup error: {last_traceback}")
-        kill_process_tree(os.getpid())
         return success
 
     model_info = res.json()
@@ -2351,7 +2938,6 @@ def _execute_server_warmup(server_args: ServerArgs):
                 verify=ssl_verify,
             )
             assert res.status_code == 200, f"{res.text}"
-            _global_state.tokenizer_manager.server_status = ServerStatus.Up
 
         else:
             logger.info(f"Start of pd disaggregation warmup ...")
@@ -2371,7 +2957,6 @@ def _execute_server_warmup(server_args: ServerArgs):
                     server_args.dp_size,
                 )
                 logger.info("End of disaggregation warmup")
-                _global_state.tokenizer_manager.server_status = ServerStatus.Up
             else:
                 logger.info(
                     "Disaggregation warmup failed (mode=%s), status codes: %s",
@@ -2379,11 +2964,11 @@ def _execute_server_warmup(server_args: ServerArgs):
                     failed_status_codes,
                 )
                 _global_state.tokenizer_manager.server_status = ServerStatus.UnHealthy
+                return False
 
     except Exception:
         last_traceback = get_exception_traceback()
         logger.error(f"Initialization failed. warmup error: {last_traceback}")
-        kill_process_tree(os.getpid())
         return False
 
     return success
@@ -2393,39 +2978,105 @@ def _wait_and_warmup(
     server_args: ServerArgs,
     launch_callback: Optional[Callable[[], None]] = None,
     execute_warmup_func: Callable = _execute_server_warmup,
+    weight_snapshot_activation: Optional[Callable[[str], None]] = None,
+    weight_snapshot_activation_completed_by_peer: Optional[Callable[[], None]] = None,
+    startup_barrier: _MultiWorkerStartupBarrier | None = None,
 ):
-    if server_args.checkpoint_engine_wait_weights_before_ready:
-        _wait_weights_ready()
+    if (
+        weight_snapshot_activation is not None
+        and _global_state.tokenizer_manager.server_status is not ServerStatus.Starting
+    ):
+        _global_state.tokenizer_manager.server_status = ServerStatus.Starting
 
-    # Joiner schedulers are served through the primary after adoption.
-    skip_elastic_joiner_warmup = server_args.is_ep_scale_joiner
-    if skip_elastic_joiner_warmup:
-        logger.debug(
-            "[Elastic EP] Skipping server warmup for elastic joiner (ep_join_mode=%s)",
-            server_args.ep_join_mode,
-        )
+    close_started = False
+    completion_unknown = False
 
-    if not server_args.skip_server_warmup and not skip_elastic_joiner_warmup:
-        if not execute_warmup_func(server_args):
+    def close_pending_activation() -> None:
+        nonlocal close_started, completion_unknown
+        if weight_snapshot_activation is None or close_started or completion_unknown:
             return
-    else:
-        _global_state.tokenizer_manager.server_status = ServerStatus.Up
+        close_started = True
+        try:
+            weight_snapshot_activation("close")
+        except _WeightSnapshotActivationCompletionUnknown:
+            completion_unknown = True
+            raise
 
-    # The server is ready for requests
-    logger.info("The server is fired up and ready to roll!")
+    try:
+        if server_args.checkpoint_engine_wait_weights_before_ready:
+            _wait_weights_ready()
 
-    if server_args.delete_ckpt_after_loading:
-        delete_directory(server_args.model_path)
+        # Joiner schedulers are served through the primary after adoption.
+        skip_elastic_joiner_warmup = server_args.is_ep_scale_joiner
+        if skip_elastic_joiner_warmup:
+            logger.debug(
+                "[Elastic EP] Skipping server warmup for elastic joiner (ep_join_mode=%s)",
+                server_args.ep_join_mode,
+            )
 
-    if server_args.debug_tensor_dump_input_file:
+        if not server_args.skip_server_warmup and not skip_elastic_joiner_warmup:
+            if not execute_warmup_func(server_args):
+                raise RuntimeError("server warmup failed")
+
+        if server_args.delete_ckpt_after_loading:
+            delete_directory(server_args.model_path)
+
+        if server_args.debug_tensor_dump_input_file:
+            kill_process_tree(os.getpid())
+
+        if launch_callback is not None:
+            launch_callback()
+        if startup_barrier is not None:
+            if not startup_barrier.arrive_warmup(
+                True,
+                timeout_sec=_MULTI_WORKER_STARTUP_TIMEOUT_SEC,
+            ):
+                raise RuntimeError("multi-worker startup warmup barrier failed")
+            activation_leader = startup_barrier.claim_activation()
+            if activation_leader:
+                if weight_snapshot_activation is not None:
+                    weight_snapshot_activation("activate")
+                    close_pending_activation()
+                if not startup_barrier.complete_activation():
+                    raise RuntimeError("multi-worker startup activation publish failed")
+            if not startup_barrier.wait_for_activation(
+                timeout_sec=_MULTI_WORKER_STARTUP_TIMEOUT_SEC,
+            ):
+                raise RuntimeError("multi-worker startup activation barrier failed")
+            if (
+                not activation_leader
+                and weight_snapshot_activation_completed_by_peer is not None
+            ):
+                weight_snapshot_activation_completed_by_peer()
+            _global_state.tokenizer_manager.server_status = ServerStatus.Up
+            if not startup_barrier.arm(
+                timeout_sec=_MULTI_WORKER_STARTUP_TIMEOUT_SEC,
+            ):
+                raise RuntimeError("multi-worker startup admission barrier failed")
+        else:
+            if weight_snapshot_activation is not None:
+                weight_snapshot_activation("activate")
+                close_pending_activation()
+            _global_state.tokenizer_manager.server_status = ServerStatus.Up
+        logger.info("The server is fired up and ready to roll!")
+    except _WeightSnapshotActivationCompletionUnknown:
+        completion_unknown = True
+        _global_state.tokenizer_manager.server_status = ServerStatus.UnHealthy
+        logger.exception("Weight snapshot startup activation completion is unknown")
         kill_process_tree(os.getpid())
-
-    if launch_callback is not None:
-        launch_callback()
+    except Exception:
+        _global_state.tokenizer_manager.server_status = ServerStatus.UnHealthy
+        if startup_barrier is not None:
+            startup_barrier.fail()
+        try:
+            close_pending_activation()
+        except Exception:
+            logger.exception("Failed to close weight snapshot activation")
+        logger.exception("Weight snapshot startup activation failed")
+        kill_process_tree(os.getpid())
 
 
 def _wait_weights_ready():
-    """Wait for weights to be ready within the specified timeout."""
     timeout = WAIT_WEIGHTS_READY_TIMEOUT
     start_time = time.time()
 
@@ -2437,11 +3088,11 @@ def _wait_weights_ready():
             return
         time.sleep(1)
 
-    # Timeout reached without weights being ready
-    logger.error(
+    raise RuntimeError(
         f"Weights are not ready after waiting {timeout} seconds. "
-        f"Consider increasing SGLANG_WAIT_WEIGHTS_READY_TIMEOUT environment variable. "
-        f"Current status: initial_weights_loaded={_global_state.tokenizer_manager.initial_weights_loaded}"
+        "Consider increasing SGLANG_WAIT_WEIGHTS_READY_TIMEOUT. "
+        "Current status: "
+        f"initial_weights_loaded={_global_state.tokenizer_manager.initial_weights_loaded}"
     )
 
 
@@ -2532,6 +3183,9 @@ def _setup_and_run_http_server(
 
     Called by launch_server after subprocesses have been launched.
     """
+    multi_tokenizer_args_shm = None
+    startup_barrier_owner = None
+
     # Set global states
     set_global_state(
         _GlobalState(
@@ -2583,6 +3237,11 @@ def _setup_and_run_http_server(
         # If it is multi-tokenizer mode, we need to write the arguments to shared memory
         # for other worker processes to read.
         app.is_single_tokenizer_mode = False
+        _ensure_startup_warmup_token(server_args)
+        startup_barrier_owner = _MultiWorkerStartupBarrier.create(
+            server_args.tokenizer_worker_num
+        )
+        server_args._multi_worker_startup_barrier_path = startup_barrier_owner.path
         multi_tokenizer_args_shm = write_data_for_multi_tokenizer(
             port_args, server_args, scheduler_infos[0]
         )
@@ -2720,6 +3379,8 @@ def _setup_and_run_http_server(
                 multi_tokenizer_args_shm.unlink()
             if _global_state is not None:
                 _global_state.tokenizer_manager.socket_mapping.clear_all_sockets()
+            if startup_barrier_owner is not None:
+                startup_barrier_owner.unlink()
 
 
 def _start_native_grpc_server_for_runtime(

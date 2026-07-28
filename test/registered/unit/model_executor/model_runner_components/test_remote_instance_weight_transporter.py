@@ -76,6 +76,45 @@ def _runtime_manifest(worker_id: str) -> dict:
     }
 
 
+def _legacy_runtime_backend() -> ModuleType:
+    backend = ModuleType("mooncake.weight_transfer")
+    backend.bounded_execution_contract_version = 1
+    backend.supports_bounded_execution = True
+
+    class MemoryRegistrationLease:
+        from_fragment = staticmethod(lambda fragment, **kwargs: (fragment, kwargs))
+
+    class RuntimeManifest:
+        from_runtime_inventory = staticmethod(lambda inventory: inventory)
+
+    backend.MemoryRegistrationLease = MemoryRegistrationLease
+    backend.MooncakeTransferEngineReader = lambda *args, **kwargs: (args, kwargs)
+    backend.RuntimeManifest = RuntimeManifest
+    backend.TransferCompletionUnknownError = RuntimeError
+    backend.TransferEngineError = RuntimeError
+    backend.plan_runtime_transfer_to_local_target = lambda sources, target: (
+        sources,
+        target,
+    )
+    return backend
+
+
+def test_model_runner_legacy_loader_does_not_receive_native_manifest_hooks() -> None:
+    from sglang.srt.model_executor.model_runner import ModelRunner
+
+    runner = ModelRunner.__new__(ModelRunner)
+    runner.server_args = SimpleNamespace(enable_weight_runtime_manifest=False)
+    runner.is_draft_worker = False
+    runner.remote_instance_weight_transporter = SimpleNamespace(
+        create_weight_transfer_provider=object()
+    )
+
+    assert runner._select_remote_instance_weight_transfer_hooks() == (
+        None,
+        None,
+    )
+
+
 def test_transporter_publishes_legacy_weight_info_without_holding_snapshot(
     monkeypatch,
 ) -> None:
@@ -269,6 +308,12 @@ def test_remote_transfer_session_uses_begin_and_release_endpoints(monkeypatch) -
     result = loader_utils.begin_remote_instance_weight_transfer(
         "http://127.0.0.1:30000",
         transfer_id="transfer-1",
+        lease_fence="target-fence",
+        capabilities=loader_utils.RemoteInstanceWeightTransferCapabilities(
+            native_executor=True,
+            canonical_adapter=True,
+            legacy_planner=False,
+        ),
     )
 
     assert result.transfer_id == "transfer-1"
@@ -284,6 +329,8 @@ def test_remote_transfer_session_uses_begin_and_release_endpoints(monkeypatch) -
                 "lease_timeout_sec": 300,
                 "manifest_format": "placement_binding_v1",
                 "transfer_id": "transfer-1",
+                "manifest_revision_semantics": "hf_revision_v1",
+                "lease_fence": "target-fence",
             },
             30,
         ),
@@ -293,6 +340,122 @@ def test_remote_transfer_session_uses_begin_and_release_endpoints(monkeypatch) -
             30,
         ),
     ]
+
+
+def test_remote_transfer_session_omitted_capabilities_uses_legacy_runtime_backend(
+    monkeypatch,
+) -> None:
+    manifest = _runtime_manifest("source-session/dp0-pp0-ep0-tp0")
+    calls = []
+
+    def fake_post(url, params, timeout):
+        calls.append((url, params, timeout))
+        return SimpleNamespace(
+            status_code=200,
+            json=lambda: {
+                "transfer_id": "transfer-1",
+                "weight_runtime_manifests": [manifest],
+            },
+        )
+
+    monkeypatch.setattr(loader_utils.requests, "post", fake_post)
+    monkeypatch.setattr(
+        loader_utils,
+        "_load_legacy_mooncake_weight_backend",
+        _legacy_runtime_backend,
+    )
+    monkeypatch.setattr(
+        loader_utils, "supports_mooncake_placement_binding_v1", lambda: False
+    )
+
+    result = loader_utils.begin_remote_instance_weight_transfer(
+        "http://127.0.0.1:30000",
+        transfer_id="transfer-1",
+        lease_fence="target-fence",
+    )
+
+    assert result is not None
+    assert result.manifest_format == "runtime_v1"
+    assert calls == [
+        (
+            "http://127.0.0.1:30000/remote_instance_weight_transfer",
+            {
+                "lease_timeout_sec": 300,
+                "manifest_format": "runtime_v1",
+                "transfer_id": "transfer-1",
+                "manifest_revision_semantics": "hf_revision_v1",
+                "lease_fence": "target-fence",
+            },
+            30,
+        )
+    ]
+
+
+def test_remote_transfer_session_omitted_capabilities_fails_closed_when_unavailable(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        loader_utils,
+        "_load_legacy_mooncake_weight_backend",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        loader_utils, "supports_mooncake_placement_binding_v1", lambda: False
+    )
+    monkeypatch.setattr(
+        loader_utils.requests,
+        "post",
+        lambda *args, **kwargs: pytest.fail("HTTP request must not be sent"),
+    )
+
+    assert (
+        loader_utils.begin_remote_instance_weight_transfer(
+            "http://127.0.0.1:30000",
+            transfer_id="transfer-1",
+        )
+        is None
+    )
+
+
+def test_remote_transfer_session_explicit_capabilities_skip_legacy_probes(
+    monkeypatch,
+) -> None:
+    manifest = _runtime_manifest("source-session/dp0-pp0-ep0-tp0")
+    monkeypatch.setattr(
+        loader_utils,
+        "_load_legacy_mooncake_weight_backend",
+        lambda: pytest.fail("explicit capabilities must not load the legacy backend"),
+    )
+    monkeypatch.setattr(
+        loader_utils,
+        "supports_mooncake_placement_binding_v1",
+        lambda: pytest.fail("explicit capabilities must not probe legacy providers"),
+    )
+    monkeypatch.setattr(
+        loader_utils.requests,
+        "post",
+        lambda *args, **kwargs: SimpleNamespace(
+            status_code=200,
+            json=lambda: {
+                "transfer_id": "transfer-1",
+                "weight_runtime_manifests": [manifest],
+            },
+        ),
+    )
+    capabilities = loader_utils.RemoteInstanceWeightTransferCapabilities(
+        native_executor=False,
+        canonical_adapter=True,
+        legacy_planner=True,
+    )
+
+    result = loader_utils.begin_remote_instance_weight_transfer(
+        "http://127.0.0.1:30000",
+        transfer_id="transfer-1",
+        capabilities=capabilities,
+    )
+
+    assert result is not None
+    assert result.manifest_format == "runtime_v1"
 
 
 def test_runtime_manifest_must_stay_inside_registered_memory() -> None:

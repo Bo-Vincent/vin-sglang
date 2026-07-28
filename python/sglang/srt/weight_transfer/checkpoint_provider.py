@@ -8,8 +8,8 @@ from pathlib import Path
 from typing import Protocol
 
 from sglang.srt.weight_transfer.contracts import (
-    StorageWeightLocation,
     RuntimeWeightLocation,
+    StorageWeightLocation,
 )
 from sglang.srt.weight_transfer.lowering import (
     WeightLoweringLimits,
@@ -22,6 +22,7 @@ from sglang.srt.weight_transfer.provider import (
     WeightProviderCapabilities,
     WeightProviderReceipt,
     WeightTransferError,
+    WeightTransferExecutionContext,
 )
 
 
@@ -141,7 +142,13 @@ class CheckpointStorageToRuntimeProvider:
             max_batch_bytes=self.lowering_limits.max_batch_bytes,
         )
 
-    def prepare(self, request) -> _PreparedCheckpointLoad:
+    def prepare(
+        self,
+        request,
+        *,
+        execution_context: WeightTransferExecutionContext | None = None,
+    ) -> _PreparedCheckpointLoad:
+        del execution_context
         if not isinstance(request, WeightLoadRequest):
             raise self._error(
                 "checkpoint provider only supports weight load requests",
@@ -281,7 +288,13 @@ class CheckpointStorageToRuntimeProvider:
         self._lifecycle.append(CheckpointProviderState.COMPLETED)
         return _CheckpointSubmission(prepared=prepared, receipt=receipt)
 
-    def wait(self, submission: _CheckpointSubmission) -> WeightProviderReceipt:
+    def wait(
+        self,
+        submission: _CheckpointSubmission,
+        *,
+        execution_context: WeightTransferExecutionContext | None = None,
+    ) -> WeightProviderReceipt:
+        del execution_context
         if (
             not isinstance(submission, _CheckpointSubmission)
             or submission.cancelled
@@ -296,7 +309,13 @@ class CheckpointStorageToRuntimeProvider:
         submission.cancelled = True
         self._lifecycle.append(CheckpointProviderState.CANCELLED)
 
-    def synchronize(self, receipt: WeightProviderReceipt) -> None:
+    def synchronize(
+        self,
+        receipt: WeightProviderReceipt,
+        *,
+        execution_context: WeightTransferExecutionContext | None = None,
+    ) -> None:
+        del execution_context
         if not isinstance(receipt, WeightLoadReceipt) or receipt.provider != self.name:
             raise ValueError("invalid checkpoint load receipt")
 
@@ -304,8 +323,10 @@ class CheckpointStorageToRuntimeProvider:
         self,
         prepared: _PreparedCheckpointLoad,
         receipt: WeightProviderReceipt | None,
+        *,
+        execution_context: WeightTransferExecutionContext | None = None,
     ) -> None:
-        del receipt
+        del receipt, execution_context
         if not isinstance(prepared, _PreparedCheckpointLoad):
             raise ValueError("invalid prepared checkpoint load")
         if prepared.released:
