@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import ast
+import hashlib
 import json
 from math import prod
 from pathlib import Path
@@ -8,22 +8,24 @@ from types import SimpleNamespace
 
 import msgspec
 import pytest
-
 import sglang.srt.model_executor.weight_runtime_manifest as weight_runtime_manifest_module
+from sglang.srt.model_executor.model_runner_components.weight_update_coordination import (
+    coordinated_weight_update,
+    mark_weight_update_mutation_started,
+)
 from sglang.srt.model_executor.weight_runtime_manifest import (
     LogicalTensorView,
+    RuntimeWeightBinding,
     WeightManifestError,
     WeightParallelTopology,
     WeightPlacementManifest,
+    WeightRuntimeBindingManifest,
+    WeightRuntimeManifest,
     WeightRuntimeManifestManager,
     WeightSnapshotCoordinator,
-    WeightTargetPlacementManifest,
     compose_weight_runtime_manifest,
     create_sglang_weight_runtime_manifest_manager,
     create_weight_runtime_manifest_manager,
-)
-from sglang.srt.model_executor.model_runner_components.weight_update_coordination import (
-    coordinated_weight_update,
 )
 from sglang.srt.model_executor.weight_semantics.qwen3_5 import (
     Qwen35WeightSemanticsAdapter,
@@ -227,9 +229,21 @@ class DummyWeightUpdater:
     @coordinated_weight_update
     def update(self, result, *, raise_error: bool = False):
         self.calls += 1
+        mark_weight_update_mutation_started()
         if raise_error:
             raise RuntimeError("update failed")
         return result
+
+
+def _production_disk_restore(
+    self,
+    model_path,
+    load_format,
+    weight_name_filter=None,
+    recapture_cuda_graph=False,
+) -> bool:
+    del self, model_path, load_format, recapture_cuda_graph
+    return weight_name_filter is None
 
 
 class ProductionShapeWeightUpdater:
@@ -237,7 +251,7 @@ class ProductionShapeWeightUpdater:
         self.begin_weight_update = coordinator.begin_update
         self.finish_weight_update = coordinator.finish_update
 
-    @coordinated_weight_update
+    @coordinated_weight_update(full_restore_if=_production_disk_restore)
     def update_weights_from_disk(
         self,
         model_path,
@@ -246,21 +260,25 @@ class ProductionShapeWeightUpdater:
         recapture_cuda_graph=False,
     ):
         del model_path, load_format, weight_name_filter, recapture_cuda_graph
+        mark_weight_update_mutation_started()
         return True, "disk update complete"
 
     @coordinated_weight_update
     def update_weights_from_distributed(self, *args, **kwargs):
         del args, kwargs
+        mark_weight_update_mutation_started()
         return True, "distributed update complete"
 
     @coordinated_weight_update
     def update_weights_from_tensor(self, *args, **kwargs):
         del args, kwargs
+        mark_weight_update_mutation_started()
         return True, "tensor update complete"
 
     @coordinated_weight_update
     def update_weights_from_ipc(self, *args, **kwargs):
         del args, kwargs
+        mark_weight_update_mutation_started()
         return True, "ipc update complete"
 
 
@@ -468,9 +486,361 @@ def test_target_placement_has_stable_semantics_without_runtime_location() -> Non
     assert same_layout == placement
 
 
-def test_source_and_target_share_one_placement_manifest_contract() -> None:
-    assert WeightTargetPlacementManifest is WeightPlacementManifest
+def manifest_contracts():
+    manager = WeightRuntimeManifestManager(
+        model=FakeModel([("weight", FakeTensor((4, 2)))]),
+        adapter=ReplicatedAdapter(),
+        topology=topology(),
+        allowed_devices=("cpu",),
+    )
+    parts = manager.snapshot_parts(
+        model_id="model",
+        revision="revision",
+        instance_id="instance",
+        worker_id="worker",
+        endpoint="endpoint",
+    )
+    return manager, {
+        "runtime": (
+            WeightRuntimeManifest,
+            compose_weight_runtime_manifest(parts.placement, parts.binding),
+        ),
+        "placement": (WeightPlacementManifest, parts.placement),
+        "binding": (WeightRuntimeBindingManifest, parts.binding),
+    }
 
+
+@pytest.mark.parametrize("manifest_kind", ("runtime", "placement", "binding"))
+def test_manifest_decoding_rejects_unknown_format_version(
+    manifest_kind: str,
+) -> None:
+    manager, contracts = manifest_contracts()
+    manifest_type, manifest = contracts[manifest_kind]
+    payload = msgspec.to_builtins(manifest)
+    payload["format_version"] = 999
+
+    try:
+        with pytest.raises(
+            WeightManifestError,
+            match="unsupported .* format_version",
+        ):
+            msgspec.json.decode(
+                msgspec.json.encode(payload),
+                type=manifest_type,
+            )
+    finally:
+        manager.release(contracts["binding"][1].lease_id)
+
+
+@pytest.mark.parametrize("manifest_kind", ("runtime", "placement", "binding"))
+def test_manifest_decoding_keeps_legacy_default_format_version(
+    manifest_kind: str,
+) -> None:
+    manager, contracts = manifest_contracts()
+    manifest_type, manifest = contracts[manifest_kind]
+    payload = msgspec.to_builtins(manifest)
+    del payload["format_version"]
+
+    try:
+        decoded = msgspec.json.decode(
+            msgspec.json.encode(payload),
+            type=manifest_type,
+        )
+        assert decoded.format_version == manifest.format_version
+    finally:
+        manager.release(contracts["binding"][1].lease_id)
+
+
+def test_placement_manifest_accepts_legacy_zero_moe_dp_identity() -> None:
+    manager, contracts = manifest_contracts()
+    payload = msgspec.to_builtins(contracts["placement"][1])
+    payload["format_version"] = 1
+    for tensor in payload["tensors"]:
+        tensor["rank"].pop("moe_dp", None)
+        tensor.pop("expert_axis", None)
+    payload["placement_id"] = hashlib.sha256(
+        msgspec.json.encode(("weight-placement-v2", tuple(payload["tensors"])))
+    ).hexdigest()[:32]
+
+    try:
+        decoded = msgspec.json.decode(
+            msgspec.json.encode(payload),
+            type=WeightPlacementManifest,
+        )
+        assert decoded.format_version == 1
+        assert all(tensor.rank.moe_dp == 0 for tensor in decoded.tensors)
+    finally:
+        manager.release(contracts["binding"][1].lease_id)
+
+
+def test_runtime_manifest_decodes_historical_v1_without_shard_dims() -> None:
+    _, contracts = manifest_contracts()
+    manifest_type, manifest = contracts["runtime"]
+    payload = msgspec.to_builtins(manifest)
+    payload["format_version"] = 1
+    for tensor in payload["tensors"]:
+        tensor.pop("shard_dims", None)
+        tensor.pop("expert_axis", None)
+
+    decoded = msgspec.json.decode(
+        msgspec.json.encode(payload),
+        type=manifest_type,
+    )
+
+    assert decoded.format_version == 1
+    assert all(tensor.shard_dims == () for tensor in decoded.tensors)
+
+
+def test_placement_manifest_rejects_geometry_changed_under_old_id() -> None:
+    manager, contracts = manifest_contracts()
+    payload = msgspec.to_builtins(contracts["placement"][1])
+    payload["tensors"][0]["global_shape"] = [2, 4]
+    payload["tensors"][0]["local_shape"] = [2, 4]
+
+    try:
+        with pytest.raises(
+            WeightManifestError,
+            match="placement_id does not match canonical tensor geometry",
+        ):
+            msgspec.json.decode(
+                msgspec.json.encode(payload),
+                type=WeightPlacementManifest,
+            )
+    finally:
+        manager.release(contracts["binding"][1].lease_id)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    (
+        ("empty_model_id", "model_id must be a non-empty string"),
+        ("empty_revision", "revision must be a non-empty string"),
+        ("empty_placement_id", "placement_id must not be empty"),
+        ("empty_instance_id", "instance_id must be a non-empty string"),
+        ("empty_lease_id", "lease_id must be a non-empty string"),
+        ("empty_fragments", "fragments must not be empty"),
+        ("negative_generation", "generation must be a non-negative integer"),
+        (
+            "duplicate_placement_fragment",
+            "duplicate placement fragment identity",
+        ),
+        ("duplicate_runtime_fragment", "duplicate runtime fragment identity"),
+    ),
+)
+def test_runtime_binding_manifest_rejects_invalid_identity_boundaries(
+    mutation: str,
+    message: str,
+) -> None:
+    manager = WeightRuntimeManifestManager(
+        model=FakeModel(
+            [
+                ("weight_a", FakeTensor((4, 2), address=0x10000)),
+                ("weight_b", FakeTensor((4, 2), address=0x20000)),
+            ]
+        ),
+        adapter=ReplicatedAdapter(),
+        topology=topology(),
+        allowed_devices=("cpu",),
+    )
+    parts = manager.snapshot_parts(
+        model_id="model",
+        revision="revision",
+        instance_id="instance",
+        worker_id="worker",
+        endpoint="endpoint",
+    )
+    payload = msgspec.to_builtins(parts.binding)
+    if mutation == "empty_model_id":
+        payload["model_id"] = ""
+    elif mutation == "empty_revision":
+        payload["revision"] = ""
+    elif mutation == "empty_placement_id":
+        payload["placement_id"] = ""
+    elif mutation == "empty_instance_id":
+        payload["instance_id"] = ""
+    elif mutation == "empty_lease_id":
+        payload["lease_id"] = ""
+    elif mutation == "empty_fragments":
+        payload["fragments"] = []
+    elif mutation == "negative_generation":
+        payload["generation"] = -1
+    elif mutation == "duplicate_placement_fragment":
+        payload["fragments"][1]["placement_fragment_id"] = payload["fragments"][0][
+            "placement_fragment_id"
+        ]
+    else:
+        payload["fragments"][1]["fragment_id"] = payload["fragments"][0]["fragment_id"]
+
+    try:
+        with pytest.raises(WeightManifestError, match=message):
+            msgspec.json.decode(
+                msgspec.json.encode(payload),
+                type=WeightRuntimeBindingManifest,
+            )
+    finally:
+        manager.release(parts.binding.lease_id)
+
+
+def test_runtime_binding_manifest_accepts_zero_generation() -> None:
+    manager, contracts = manifest_contracts()
+    binding = contracts["binding"][1]
+
+    try:
+        decoded = msgspec.json.decode(
+            msgspec.json.encode(
+                {
+                    **msgspec.to_builtins(binding),
+                    "generation": 0,
+                }
+            ),
+            type=WeightRuntimeBindingManifest,
+        )
+        assert decoded.generation == 0
+    finally:
+        manager.release(binding.lease_id)
+
+
+def test_runtime_binding_manifest_rejects_boolean_generation() -> None:
+    manager, contracts = manifest_contracts()
+    binding = contracts["binding"][1]
+
+    try:
+        with pytest.raises(
+            WeightManifestError,
+            match="generation must be a non-negative integer",
+        ):
+            msgspec.structs.replace(binding, generation=True)
+    finally:
+        manager.release(binding.lease_id)
+
+
+@pytest.mark.parametrize(
+    "field",
+    ("model_id", "revision", "instance_id", "lease_id"),
+)
+def test_runtime_binding_manifest_rejects_non_string_identity_fields(
+    field: str,
+) -> None:
+    manager, contracts = manifest_contracts()
+    binding = contracts["binding"][1]
+
+    try:
+        with pytest.raises(
+            WeightManifestError,
+            match=rf"{field} must be a non-empty string",
+        ):
+            msgspec.structs.replace(binding, **{field: 1})
+    finally:
+        manager.release(binding.lease_id)
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement", "message"),
+    (
+        (
+            "placement_fragment_id",
+            "",
+            "placement_fragment_id must be a non-empty string",
+        ),
+        (
+            "placement_fragment_id",
+            1,
+            "placement_fragment_id must be a non-empty string",
+        ),
+        ("fragment_id", "", "fragment_id must be a non-empty string"),
+        ("fragment_id", 1, "fragment_id must be a non-empty string"),
+        ("device", "", "device must be a non-empty string"),
+        ("device", 1, "device must be a non-empty string"),
+        ("worker_id", "", "worker_id must be a non-empty string"),
+        ("worker_id", 1, "worker_id must be a non-empty string"),
+        ("endpoint", "", "endpoint must be a non-empty string"),
+        ("endpoint", 1, "endpoint must be a non-empty string"),
+        ("address", 0, "address must be a positive uint64"),
+        ("address", -1, "address must be a positive uint64"),
+        ("address", True, "address must be a positive uint64"),
+        ("address", 1.5, "address must be a positive uint64"),
+        ("address", 1 << 64, "address must be a positive uint64"),
+        ("nbytes", 0, "nbytes must be a positive uint64"),
+        ("nbytes", -1, "nbytes must be a positive uint64"),
+        ("nbytes", True, "nbytes must be a positive uint64"),
+        ("nbytes", 1.5, "nbytes must be a positive uint64"),
+        ("nbytes", 1 << 64, "nbytes must be a positive uint64"),
+        (
+            "storage_offset",
+            -1,
+            "storage_offset must be a non-negative integer",
+        ),
+        (
+            "storage_offset",
+            True,
+            "storage_offset must be a non-negative integer",
+        ),
+        (
+            "storage_offset",
+            1.5,
+            "storage_offset must be a non-negative integer",
+        ),
+        ("is_contiguous", 1, "is_contiguous must be a boolean"),
+        ("is_contiguous", "true", "is_contiguous must be a boolean"),
+    ),
+)
+def test_runtime_weight_binding_rejects_invalid_dto_fields(
+    field: str,
+    replacement,
+    message: str,
+) -> None:
+    values = {
+        "placement_fragment_id": "placement-fragment",
+        "fragment_id": "runtime-fragment",
+        "address": 0x10000,
+        "nbytes": 16,
+        "storage_offset": 0,
+        "device": "cuda:0",
+        "is_contiguous": True,
+        "worker_id": "worker",
+        "endpoint": "worker:12345",
+    }
+    values[field] = replacement
+
+    with pytest.raises(WeightManifestError, match=message):
+        RuntimeWeightBinding(**values)
+
+
+def test_runtime_weight_binding_rejects_address_range_overflow() -> None:
+    with pytest.raises(
+        WeightManifestError,
+        match="runtime address range exceeds uint64",
+    ):
+        RuntimeWeightBinding(
+            placement_fragment_id="placement-fragment",
+            fragment_id="runtime-fragment",
+            address=(1 << 64) - 8,
+            nbytes=8,
+            storage_offset=0,
+            device="cuda:0",
+            is_contiguous=True,
+            worker_id="worker",
+            endpoint="worker:12345",
+        )
+
+
+def test_runtime_weight_binding_accepts_strict_false_contiguity() -> None:
+    binding = RuntimeWeightBinding(
+        placement_fragment_id="placement-fragment",
+        fragment_id="runtime-fragment",
+        address=0x10000,
+        nbytes=16,
+        storage_offset=0,
+        device="cuda:0",
+        is_contiguous=False,
+        worker_id="worker",
+        endpoint="worker:12345",
+    )
+
+    assert binding.is_contiguous is False
+
+
+def test_snapshot_parts_bind_runtime_to_the_published_placement() -> None:
     manager = WeightRuntimeManifestManager(
         model=FakeModel([("weight", FakeTensor((4, 2)))]),
         adapter=ReplicatedAdapter(),
@@ -488,95 +858,6 @@ def test_source_and_target_share_one_placement_manifest_contract() -> None:
     assert isinstance(parts.placement, WeightPlacementManifest)
     assert parts.binding.placement_id == parts.placement.placement_id
     manager.release(parts.binding.lease_id)
-
-
-def test_local_mooncake_split_capability_requires_the_complete_loader_api() -> None:
-    required_apis = {
-        "RuntimeBindingManifest",
-        "SourcePlacementManifest",
-        "TargetPlacementManifest",
-        "bind_logical_transfer_plan",
-        "bind_runtime_manifest",
-        "placement_manifest_from_runtime_manifest",
-        "plan_placement_transfer_to_local_target",
-        "runtime_binding_from_runtime_manifest",
-    }
-    api_only_module = SimpleNamespace(**{name: lambda: None for name in required_apis})
-    requested_capabilities = []
-
-    def supports(capability):
-        requested_capabilities.append(capability)
-        return capability == "placement_binding_v1"
-
-    def broken_supports(capability):
-        del capability
-        raise RuntimeError("mixed Mooncake wheel")
-
-    complete_module = SimpleNamespace(
-        supports_weight_transfer_capability=supports,
-        **{name: lambda: None for name in required_apis},
-    )
-
-    assert (
-        weight_runtime_manifest_module.local_mooncake_supports_placement_binding(
-            SimpleNamespace()
-        )
-        is False
-    )
-    assert (
-        weight_runtime_manifest_module.local_mooncake_supports_placement_binding(
-            api_only_module
-        )
-        is False
-    )
-    assert (
-        weight_runtime_manifest_module.local_mooncake_supports_placement_binding(
-            SimpleNamespace(
-                supports_weight_transfer_capability=lambda capability: False,
-                **{name: lambda: None for name in required_apis},
-            )
-        )
-        is False
-    )
-    assert (
-        weight_runtime_manifest_module.local_mooncake_supports_placement_binding(
-            SimpleNamespace(
-                supports_weight_transfer_capability=True,
-                **{name: lambda: None for name in required_apis},
-            )
-        )
-        is False
-    )
-    assert (
-        weight_runtime_manifest_module.local_mooncake_supports_placement_binding(
-            SimpleNamespace(
-                supports_weight_transfer_capability=broken_supports,
-                **{name: lambda: None for name in required_apis},
-            )
-        )
-        is False
-    )
-    assert (
-        weight_runtime_manifest_module.local_mooncake_supports_placement_binding(
-            complete_module
-        )
-        is True
-    )
-    assert requested_capabilities == ["placement_binding_v1"]
-    for missing in required_apis:
-        incomplete_module = SimpleNamespace(
-            supports_weight_transfer_capability=supports,
-            **{
-                name: (None if name == missing else lambda: None)
-                for name in required_apis
-            },
-        )
-        assert (
-            weight_runtime_manifest_module.local_mooncake_supports_placement_binding(
-                incomplete_module
-            )
-            is False
-        )
 
 
 def test_snapshot_parts_use_one_lease_and_one_physical_collection() -> None:
@@ -602,6 +883,33 @@ def test_snapshot_parts_use_one_lease_and_one_physical_collection() -> None:
     assert model.physical_collections == 1
     assert parts.placement.revision == parts.binding.revision
     manager.release(parts.binding.lease_id)
+
+
+def test_snapshot_parts_rejects_lease_expiry_during_collection() -> None:
+    clock = FakeClock(100.0)
+
+    class ExpiringTensor(FakeTensor):
+        def data_ptr(self) -> int:
+            clock.advance(31)
+            return super().data_ptr()
+
+    manager = WeightRuntimeManifestManager(
+        model=FakeModel([("weight", ExpiringTensor((4, 2)))]),
+        adapter=ReplicatedAdapter(),
+        topology=topology(),
+        allowed_devices=("cpu",),
+        coordinator=WeightSnapshotCoordinator(clock=clock),
+    )
+
+    with pytest.raises(WeightManifestError, match="lease expired"):
+        manager.snapshot_parts(
+            model_id="model",
+            revision="revision",
+            instance_id="instance",
+            worker_id="worker",
+            endpoint="endpoint",
+            lease_timeout_sec=30,
+        )
 
 
 def test_snapshot_parts_qualify_revision_from_the_acquired_generation() -> None:
@@ -711,6 +1019,207 @@ def test_runtime_binding_refreshes_addresses_and_composes_legacy_snapshot() -> N
     legacy_payload["lease_id"] = "<lease>"
     assert composed_payload == legacy_payload
     manager.release(legacy.lease_id)
+
+
+def test_runtime_binding_attestation_rejects_released_lease() -> None:
+    manager = WeightRuntimeManifestManager(
+        model=FakeModel([("weight", FakeTensor((4, 2)))]),
+        adapter=ReplicatedAdapter(),
+        topology=topology(),
+        allowed_devices=("cpu",),
+    )
+    placement = manager.placement(model_id="model", revision="revision")
+    binding = manager.snapshot_binding(
+        placement=placement,
+        instance_id="instance",
+        worker_id="worker",
+        endpoint="endpoint",
+    )
+
+    manager.attest_binding(binding)
+    manager.release(binding.lease_id)
+
+    with pytest.raises(WeightManifestError, match="snapshot lease does not exist"):
+        manager.attest_binding(binding)
+
+
+def test_target_binding_upgrade_atomically_consumes_its_snapshot_lease() -> None:
+    manager = WeightRuntimeManifestManager(
+        model=FakeModel([("weight", FakeTensor((4, 2)))]),
+        adapter=ReplicatedAdapter(),
+        topology=topology(),
+        allowed_devices=("cpu",),
+    )
+    placement = manager.placement(model_id="model", revision="revision")
+    binding = manager.snapshot_binding(
+        placement=placement,
+        instance_id="instance",
+        worker_id="worker",
+        endpoint="endpoint",
+    )
+    peer_lease, _ = manager.coordinator.acquire_snapshot()
+
+    with pytest.raises(WeightManifestError, match="another weight snapshot lease"):
+        manager.begin_target_update(binding, full_restore=False)
+    assert manager.has_lease(binding.lease_id)
+    manager.release(peer_lease)
+
+    token = manager.begin_target_update(binding, full_restore=False)
+    assert not manager.has_lease(binding.lease_id)
+    with pytest.raises(WeightManifestError, match="was not issued"):
+        manager.begin_target_update(binding, full_restore=False)
+    manager.finish_update(token, success=False)
+
+
+def test_restore_only_target_binding_cannot_be_a_source_or_incremental_update() -> None:
+    manager = WeightRuntimeManifestManager(
+        model=FakeModel([("weight", FakeTensor((4, 2)))]),
+        adapter=ReplicatedAdapter(),
+        topology=topology(),
+        allowed_devices=("cpu",),
+    )
+    placement = manager.placement(model_id="model", revision="revision")
+    failed = manager.coordinator.begin_update()
+    manager.coordinator.finish_update(failed, success=False)
+
+    with pytest.raises(WeightManifestError, match="full successful weight restore"):
+        manager.snapshot_binding(
+            placement=placement,
+            instance_id="instance",
+            worker_id="worker",
+            endpoint="endpoint",
+        )
+    restore_binding = manager.snapshot_binding(
+        placement=placement,
+        instance_id="instance",
+        worker_id="worker",
+        endpoint="endpoint",
+        full_restore=True,
+    )
+    with pytest.raises(WeightManifestError, match="cannot attest source weights"):
+        manager.attest_binding(restore_binding)
+    with pytest.raises(WeightManifestError, match="requires a full restore"):
+        manager.begin_target_update(restore_binding, full_restore=False)
+
+    token = manager.begin_target_update(restore_binding, full_restore=True)
+    generation = manager.finish_update(token, success=True)
+    assert manager.commit_revision(expected_generation=generation) == generation
+    lease_id, current_generation = manager.coordinator.acquire_snapshot()
+    assert current_generation == generation
+    manager.coordinator.release_snapshot(lease_id)
+
+
+def test_runtime_binding_attestation_rejects_reallocated_storage() -> None:
+    tensor = FakeTensor((4, 2), address=0x10000)
+    manager = WeightRuntimeManifestManager(
+        model=FakeModel([("weight", tensor)]),
+        adapter=ReplicatedAdapter(),
+        topology=topology(),
+        allowed_devices=("cpu",),
+    )
+    placement = manager.placement(model_id="model", revision="revision")
+    binding = manager.snapshot_binding(
+        placement=placement,
+        instance_id="instance",
+        worker_id="worker",
+        endpoint="endpoint",
+    )
+    tensor._address = 0x20000
+
+    with pytest.raises(WeightManifestError, match="storage changed"):
+        manager.attest_binding(binding)
+
+
+def test_runtime_binding_manifest_rejects_empty_fragments() -> None:
+    manager = WeightRuntimeManifestManager(
+        model=FakeModel([("weight", FakeTensor((4, 2)))]),
+        adapter=ReplicatedAdapter(),
+        topology=topology(),
+        allowed_devices=("cpu",),
+    )
+    placement = manager.placement(model_id="model", revision="revision")
+    binding = manager.snapshot_binding(
+        placement=placement,
+        instance_id="instance",
+        worker_id="worker",
+        endpoint="endpoint",
+    )
+    with pytest.raises(WeightManifestError, match="fragments must not be empty"):
+        msgspec.structs.replace(binding, fragments=())
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    (
+        ("worker_id", "other-worker"),
+        ("endpoint", "other-endpoint"),
+    ),
+)
+def test_runtime_binding_attestation_rejects_mixed_worker_identity(
+    field: str,
+    replacement: str,
+) -> None:
+    manager = WeightRuntimeManifestManager(
+        model=FakeModel(
+            [
+                ("weight_a", FakeTensor((4, 2), address=0x10000)),
+                ("weight_b", FakeTensor((4, 2), address=0x20000)),
+            ]
+        ),
+        adapter=ReplicatedAdapter(),
+        topology=topology(),
+        allowed_devices=("cpu",),
+    )
+    placement = manager.placement(model_id="model", revision="revision")
+    binding = manager.snapshot_binding(
+        placement=placement,
+        instance_id="instance",
+        worker_id="worker",
+        endpoint="endpoint",
+    )
+    fragments = (
+        binding.fragments[0],
+        msgspec.structs.replace(
+            binding.fragments[1],
+            **{field: replacement},
+        ),
+    )
+    mixed_binding = msgspec.structs.replace(binding, fragments=fragments)
+
+    with pytest.raises(
+        WeightManifestError,
+        match="fragments must use one worker_id and endpoint",
+    ):
+        manager.attest_binding(mixed_binding)
+
+
+def test_runtime_binding_attestation_rejects_changed_issued_endpoint() -> None:
+    manager = WeightRuntimeManifestManager(
+        model=FakeModel([("weight", FakeTensor((4, 2)))]),
+        adapter=ReplicatedAdapter(),
+        topology=topology(),
+        allowed_devices=("cpu",),
+    )
+    placement = manager.placement(model_id="model", revision="revision")
+    binding = manager.snapshot_binding(
+        placement=placement,
+        instance_id="instance",
+        worker_id="worker",
+        endpoint="endpoint",
+    )
+    changed_binding = msgspec.structs.replace(
+        binding,
+        fragments=tuple(
+            msgspec.structs.replace(fragment, endpoint="other-endpoint")
+            for fragment in binding.fragments
+        ),
+    )
+
+    with pytest.raises(
+        WeightManifestError,
+        match="differs from issued runtime binding",
+    ):
+        manager.attest_binding(changed_binding)
 
 
 def test_runtime_binding_rejects_a_placement_from_another_manager() -> None:
@@ -984,6 +1493,7 @@ def test_coordinated_update_fences_before_and_after_weight_mutation() -> None:
 
         @coordinated_weight_update
         def update(self):
+            mark_weight_update_mutation_started()
             events.append("mutation")
             return True, "updated"
 
@@ -1065,6 +1575,25 @@ def test_online_update_exception_poisons_runtime_snapshots() -> None:
         coordinator.acquire_snapshot()
 
 
+def test_preflight_rejection_cancels_without_poisoning_runtime_snapshots() -> None:
+    coordinator = WeightSnapshotCoordinator()
+
+    class PreflightRejectingUpdater:
+        def __init__(self) -> None:
+            self.begin_weight_update = coordinator.begin_update
+            self.finish_weight_update = coordinator.finish_update
+
+        @coordinated_weight_update
+        def update(self):
+            return False, "unsupported update"
+
+    assert PreflightRejectingUpdater().update() == (False, "unsupported update")
+    assert coordinator.generation == 1
+    lease_id, generation = coordinator.acquire_snapshot()
+    assert generation == 1
+    coordinator.release_snapshot(lease_id)
+
+
 def test_failed_weight_update_poison_snapshot_until_a_full_update_succeeds() -> None:
     coordinator = WeightSnapshotCoordinator()
     failed = coordinator.begin_update()
@@ -1100,6 +1629,7 @@ def test_full_restore_decorator_explicitly_selects_restore_mode() -> None:
 
         @coordinated_weight_update(full_restore=True)
         def restore(self):
+            mark_weight_update_mutation_started()
             return True, "restored"
 
     assert FullRestoreUpdater().restore() == (True, "restored")
@@ -2757,14 +3287,16 @@ def test_sglang_factory_builds_topology_outside_model_runner() -> None:
     )
 
     assert manager._topology == topology(
-        dp_rank=2,
-        dp_size=3,
+        dp_rank=0,
+        dp_size=1,
         tp_rank=1,
         tp_size=2,
         pp_rank=1,
         pp_size=2,
         ep_rank=3,
         ep_size=4,
+        moe_dp_rank=2,
+        moe_dp_size=3,
         moe_tp_rank=1,
         moe_tp_size=2,
         attention_tp_rank=1,
@@ -2782,6 +3314,52 @@ def test_qwen_dp_attention_is_rejected_until_vocab_replication_is_described() ->
     )
 
     with pytest.raises(WeightManifestError, match="DP attention"):
+        provider.snapshot(
+            model_id="model",
+            revision="revision",
+            instance_id="instance",
+            worker_id="worker",
+            endpoint="worker:12345",
+        )
+
+
+def test_qwen35_fused_shared_expert_runtime_is_rejected_before_snapshot() -> None:
+    class FusedSharedExpertModel(FakeModel):
+        def modules(self):
+            return iter(
+                (
+                    self,
+                    SimpleNamespace(num_fused_shared_experts=1),
+                )
+            )
+
+    provider = create_weight_runtime_manifest_manager(
+        model=FusedSharedExpertModel([]),
+        config=qwen_config(model_type="qwen3_5_moe_text"),
+        topology=topology(ep_size=2),
+        allowed_devices=("cpu",),
+    )
+
+    with pytest.raises(WeightManifestError, match="fused shared-expert"):
+        provider.snapshot(
+            model_id="model",
+            revision="revision",
+            instance_id="instance",
+            worker_id="worker",
+            endpoint="worker:12345",
+        )
+
+
+def test_qwen3_next_runtime_manifest_rejects_pipeline_parallelism() -> None:
+    provider = create_weight_runtime_manifest_manager(
+        model=FakeModel([]),
+        config=qwen_config(model_type="qwen3_next"),
+        topology=topology(pp_rank=1, pp_size=2),
+        allowed_devices=("cpu",),
+        moe_runner_backend="triton",
+    )
+
+    with pytest.raises(WeightManifestError, match="requires PP=1"):
         provider.snapshot(
             model_id="model",
             revision="revision",
@@ -2810,349 +3388,5 @@ def test_unsupported_model_is_lazy_and_fails_only_when_snapshot_is_requested() -
         )
 
 
-def test_model_runner_provider_is_lazy_after_layout_transforms() -> None:
-    """Normal inference must not traverse parameters for an unused exporter."""
-    source = Path("python/sglang/srt/model_executor/model_runner.py").read_text()
-    tree = ast.parse(source)
-    initialize = next(
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.FunctionDef) and node.name == "initialize"
-    )
-    calls = []
-    for statement in initialize.body:
-        if not isinstance(statement, ast.Expr) or not isinstance(
-            statement.value, ast.Call
-        ):
-            continue
-        if isinstance(statement.value.func, ast.Attribute):
-            calls.append(statement.value.func.attr)
-
-    assert "init_weight_runtime_manifest_manager" not in calls
-    assert "maybe_apply_post_load_model_transforms" in calls
-    assert "maybe_init_lora_manager" in calls
-
-
-def test_model_runner_target_builder_follows_local_mooncake_capability() -> None:
-    runner_tree = ast.parse(
-        Path("python/sglang/srt/model_executor/model_runner.py").read_text()
-    )
-    selector = next(
-        (
-            node
-            for node in ast.walk(runner_tree)
-            if isinstance(node, ast.FunctionDef)
-            and node.name == "_select_remote_instance_target_weight_manifest_builder"
-        ),
-        None,
-    )
-
-    assert selector is not None
-    selector_attributes = {
-        node.attr for node in ast.walk(selector) if isinstance(node, ast.Attribute)
-    }
-    assert "build_remote_instance_target_weight_manifest_session" in (
-        selector_attributes
-    )
-    assert "build_remote_instance_target_weight_runtime_manifest" in (
-        selector_attributes
-    )
-    assert any(
-        isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Name)
-        and node.func.id == "local_mooncake_supports_placement_binding"
-        for node in ast.walk(selector)
-    )
-
-    load_model = next(
-        node
-        for node in ast.walk(runner_tree)
-        if isinstance(node, ast.FunctionDef) and node.name == "load_model"
-    )
-    build_load_config = next(
-        node
-        for node in ast.walk(load_model)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Name)
-        and node.func.id == "build_load_config"
-    )
-    builder_value = next(
-        keyword.value
-        for keyword in build_load_config.keywords
-        if keyword.arg == "remote_instance_weight_runtime_manifest_builder"
-    )
-    assert (
-        isinstance(builder_value, ast.Call)
-        and isinstance(builder_value.func, ast.Attribute)
-        and builder_value.func.attr
-        == "_select_remote_instance_target_weight_manifest_builder"
-    )
-
-
-def test_model_runner_rejects_nontrivial_static_expert_placement() -> None:
-    source = Path("python/sglang/srt/model_executor/model_runner.py").read_text()
-
-    assert 'self.server_args.init_expert_location != "trivial"' in source
-    assert "self.server_args.ep_num_redundant_experts > 0" in source
-    assert "moe_runner_backend=self.server_args.moe_runner_backend" in source
-
-
-def test_qwen3_next_loader_records_gdn_runtime_layout() -> None:
-    source = Path("python/sglang/srt/models/qwen3_next.py").read_text()
-
-    assert source.count("_sglang_qwen3_next_gdn_layout") >= 2
-    assert '"grouped"' in source
-    assert '"component"' in source
-
-
-def test_model_runner_wires_all_online_updates_to_snapshot_coordinator() -> None:
-    runner_tree = ast.parse(
-        Path("python/sglang/srt/model_executor/model_runner.py").read_text()
-    )
-    init_updater = next(
-        node
-        for node in ast.walk(runner_tree)
-        if isinstance(node, ast.FunctionDef) and node.name == "init_weight_updater"
-    )
-    coordination_keys = {
-        key.value
-        for node in ast.walk(init_updater)
-        if isinstance(node, ast.Dict)
-        for key in node.keys
-        if isinstance(key, ast.Constant) and isinstance(key.value, str)
-    }
-    assert {"begin_weight_update", "finish_weight_update"} <= coordination_keys
-    assert any(
-        isinstance(node, ast.Attribute)
-        and node.attr == "enable_weight_runtime_manifest"
-        for node in ast.walk(init_updater)
-    )
-    coordinator_calls = [
-        node
-        for node in ast.walk(init_updater)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Name)
-        and node.func.id == "WeightSnapshotCoordinator"
-    ]
-    assert len(coordinator_calls) == 1
-    completion_fence = next(
-        (
-            keyword.value
-            for keyword in coordinator_calls[0].keywords
-            if keyword.arg == "completion_fence"
-        ),
-        None,
-    )
-    assert (
-        isinstance(completion_fence, ast.Attribute)
-        and isinstance(completion_fence.value, ast.Name)
-        and completion_fence.value.id == "current_platform"
-        and completion_fence.attr == "synchronize"
-    )
-
-    updater_tree = ast.parse(
-        Path(
-            "python/sglang/srt/model_executor/model_runner_components/weight_updater.py"
-        ).read_text()
-    )
-    public_updates = {
-        "update_weights_from_disk",
-        "update_weights_from_distributed",
-        "update_weights_from_tensor",
-        "update_weights_from_ipc",
-    }
-    methods = {
-        node.name: node
-        for node in ast.walk(updater_tree)
-        if isinstance(node, ast.FunctionDef) and node.name in public_updates
-    }
-    assert set(methods) == public_updates
-    for method in methods.values():
-        assert any(
-            isinstance(decorator, ast.Name)
-            and decorator.id == "coordinated_weight_update"
-            for decorator in method.decorator_list
-        )
-    disk_update = methods["update_weights_from_disk"]
-    disk_arguments = [argument.arg for argument in disk_update.args.args]
-    filter_index = disk_arguments.index("weight_name_filter")
-    default_index = filter_index - (
-        len(disk_arguments) - len(disk_update.args.defaults)
-    )
-    assert isinstance(disk_update.args.defaults[default_index], ast.Constant)
-    assert disk_update.args.defaults[default_index].value is None
-    assert any(
-        isinstance(node, ast.Compare)
-        and isinstance(node.left, ast.Name)
-        and node.left.id == "weight_name_filter"
-        and any(isinstance(operator, ast.IsNot) for operator in node.ops)
-        and any(
-            isinstance(comparator, ast.Constant) and comparator.value is None
-            for comparator in node.comparators
-        )
-        for node in ast.walk(disk_update)
-    )
-
-    tp_worker_tree = ast.parse(
-        Path("python/sglang/srt/managers/tp_worker.py").read_text()
-    )
-    tp_disk_update = next(
-        node
-        for node in ast.walk(tp_worker_tree)
-        if isinstance(node, ast.FunctionDef) and node.name == "update_weights_from_disk"
-    )
-    production_calls = [
-        node
-        for node in ast.walk(tp_disk_update)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr == "update_weights_from_disk"
-    ]
-    assert len(production_calls) == 1
-    assert not any(
-        keyword.arg == "weight_name_filter" for keyword in production_calls[0].keywords
-    )
-
-    scheduler_tree = ast.parse(
-        Path(
-            "python/sglang/srt/managers/scheduler_components/weight_updater.py"
-        ).read_text()
-    )
-    scheduler_disk_update = next(
-        node
-        for node in ast.walk(scheduler_tree)
-        if isinstance(node, ast.FunctionDef) and node.name == "update_weights_from_disk"
-    )
-    assert any(
-        isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr == "_run_weight_update_transaction"
-        for node in ast.walk(scheduler_disk_update)
-    )
-    finalize_update = next(
-        node
-        for node in ast.walk(scheduler_tree)
-        if isinstance(node, ast.FunctionDef) and node.name == "_finalize_weight_update"
-    )
-    finalization_calls = [
-        node
-        for node in ast.walk(finalize_update)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr in {"commit_revision", "poison_global_update_failure"}
-    ]
-    assert {node.func.attr for node in finalization_calls} == {
-        "commit_revision",
-        "poison_global_update_failure",
-    }
-    assert all(
-        any(keyword.arg == "expected_generation" for keyword in call.keywords)
-        for call in finalization_calls
-    )
-
-
-def test_model_runner_exposes_cross_rank_failure_poison_hook() -> None:
-    runner_tree = ast.parse(
-        Path("python/sglang/srt/model_executor/model_runner.py").read_text()
-    )
-    poison_method = next(
-        (
-            node
-            for node in ast.walk(runner_tree)
-            if isinstance(node, ast.FunctionDef)
-            and node.name == "poison_weight_runtime_after_global_failure"
-        ),
-        None,
-    )
-
-    assert poison_method is not None
-    assert any(
-        isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr == "poison_global_update_failure"
-        for node in ast.walk(poison_method)
-    )
-    assert any(
-        argument.arg == "expected_generation" for argument in poison_method.args.args
-    )
-
-
-def test_model_runner_releases_manifest_lease_on_cancellation() -> None:
-    runner_tree = ast.parse(
-        Path("python/sglang/srt/model_executor/model_runner.py").read_text()
-    )
-    methods = {
-        node.name: node
-        for node in ast.walk(runner_tree)
-        if isinstance(node, ast.FunctionDef)
-        and node.name
-        in {
-            "get_remote_instance_weight_runtime_manifest",
-            "get_remote_instance_weight_runtime_manifest_parts",
-        }
-    }
-
-    assert set(methods) == {
-        "get_remote_instance_weight_runtime_manifest",
-        "get_remote_instance_weight_runtime_manifest_parts",
-    }
-    for method in methods.values():
-        handlers = [
-            node for node in ast.walk(method) if isinstance(node, ast.ExceptHandler)
-        ]
-        assert any(
-            isinstance(handler.type, ast.Name) and handler.type.id == "BaseException"
-            for handler in handlers
-        )
-
-
-def test_model_runner_keeps_model_revision_independent_from_generation() -> None:
-    runner_tree = ast.parse(
-        Path("python/sglang/srt/model_executor/model_runner.py").read_text()
-    )
-    methods = {
-        node.name: node
-        for node in ast.walk(runner_tree)
-        if isinstance(node, ast.FunctionDef)
-        and node.name
-        in {
-            "get_weight_runtime_manifest",
-            "get_weight_runtime_manifest_parts",
-        }
-    }
-
-    assert set(methods) == {
-        "get_weight_runtime_manifest",
-        "get_weight_runtime_manifest_parts",
-    }
-    for method in methods.values():
-        assert not any(
-            isinstance(node, ast.Attribute) and node.attr == "generation"
-            for node in ast.walk(method)
-        )
-        snapshot_calls = [
-            node
-            for node in ast.walk(method)
-            if isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and node.func.attr in {"snapshot", "snapshot_parts"}
-        ]
-        assert len(snapshot_calls) == 1
-        assert all(
-            keyword.arg != "bind_revision_to_generation"
-            for keyword in snapshot_calls[0].keywords
-        )
-
-
-def test_runtime_manifest_exporter_is_disabled_by_default() -> None:
-    tree = ast.parse(Path("python/sglang/srt/server_args.py").read_text())
-    field = next(
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.AnnAssign)
-        and isinstance(node.target, ast.Name)
-        and node.target.id == "enable_weight_runtime_manifest"
-    )
-
-    assert isinstance(field.value, ast.Constant)
-    assert field.value.value is False
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

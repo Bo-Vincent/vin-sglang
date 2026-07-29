@@ -55,6 +55,7 @@ def _view(
     byte_offset: int,
     layer_id: int | None,
     expert_id: int | None = None,
+    expert_axis: int | None = None,
     layout: str,
     shard_dims: tuple[int, ...] | None = None,
 ) -> LogicalTensorView:
@@ -67,6 +68,7 @@ def _view(
         byte_offset=byte_offset,
         layer_id=layer_id,
         expert_id=expert_id,
+        expert_axis=expert_axis,
         layout_fingerprint=f"sglang:qwen3.5:{layout}:v1",
         shard_dims=(
             shard_dims
@@ -615,6 +617,7 @@ class Qwen35WeightSemanticsAdapter:
                         byte_offset=base + component_index * component_bytes,
                         layer_id=layer_id,
                         expert_id=None,
+                        expert_axis=0,
                         layout="moe-w13",
                         shard_dims=(0, 1),
                     )
@@ -652,6 +655,7 @@ class Qwen35WeightSemanticsAdapter:
                 byte_offset=local_index * expert_bytes,
                 layer_id=layer_id,
                 expert_id=None,
+                expert_axis=0,
                 layout="moe-w2",
                 shard_dims=(0, 2),
             )

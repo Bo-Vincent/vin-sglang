@@ -4,7 +4,6 @@ from math import prod
 from typing import Any, Sequence
 
 import msgspec
-
 from sglang.srt.model_executor.weight_runtime_manifest import (
     LogicalTensorView,
     WeightManifestError,
@@ -175,6 +174,7 @@ class Qwen3NextWeightSemanticsAdapter(Qwen35WeightSemanticsAdapter):
                         byte_offset=base + component_index * component_bytes,
                         layer_id=layer_id,
                         expert_id=None,
+                        expert_axis=0,
                         layout="moe-w13",
                         shard_dims=(0, 1),
                     )
@@ -241,6 +241,7 @@ class Qwen3NextWeightSemanticsAdapter(Qwen35WeightSemanticsAdapter):
                 byte_offset=local_index * expert_bytes,
                 layer_id=layer_id,
                 expert_id=None,
+                expert_axis=0,
                 layout="moe-w2",
                 shard_dims=(0, 2),
             )

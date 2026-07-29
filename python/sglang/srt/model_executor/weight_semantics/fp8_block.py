@@ -85,6 +85,7 @@ def _retag_weight_view(view: LogicalTensorView) -> LogicalTensorView:
         byte_offset=view.byte_offset,
         layer_id=view.layer_id,
         expert_id=view.expert_id,
+        expert_axis=view.expert_axis,
         layout_fingerprint=(
             f"{view.layout_fingerprint}|serialized-block-fp8:e4m3fn:128x128:weight:v1"
         ),
@@ -175,6 +176,7 @@ def _scale_view(
         ),
         layer_id=weight_view.layer_id,
         expert_id=weight_view.expert_id,
+        expert_axis=weight_view.expert_axis,
         layout_fingerprint=(
             f"{weight_view.layout_fingerprint}|serialized-block-fp8:"
             "fp32-inverse-scale:128x128:v1"
