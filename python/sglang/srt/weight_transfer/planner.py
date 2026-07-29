@@ -615,9 +615,11 @@ def _tensor_owner(
     expert_tensor = (
         descriptor.expert_axis is not None or descriptor.expert_id is not None
     )
+    # EP identifies shards of one logical expert tensor, while moe_dp identifies
+    # independent copies that must never be combined to manufacture coverage.
     return (
         fragment.rank.pp,
-        fragment.rank.ep if expert_tensor else None,
+        None,
         fragment.rank.moe_dp if expert_tensor else None,
     )
 

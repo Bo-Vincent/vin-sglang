@@ -960,6 +960,7 @@ def test_ep_reshard_uses_leading_expert_coordinate(
         "layers.0.experts.w1",
         global_shape=(8, 4, 2),
         shard_dims=(0,),
+        expert_axis=0,
     )
     owners = {tensor.tensor_id: 0}
     sources = build_placements(
