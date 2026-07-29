@@ -12,6 +12,7 @@ import fnmatch
 import gc
 import glob
 import hashlib
+import importlib
 import json
 import logging
 import math
@@ -27,26 +28,33 @@ from contextlib import ExitStack, contextmanager, suppress
 from typing import (
     TYPE_CHECKING,
     Any,
+    Callable,
     Dict,
     Generator,
     Iterable,
     List,
     Optional,
+    Protocol,
     Tuple,
     Union,
     cast,
 )
 
 import huggingface_hub
+import msgspec
 import numpy as np
 import torch
-
 from sglang.srt.constants import GIB_BYTES
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
+    LEGACY_HF_UNATTESTED,
     RemoteInstanceWeightLoaderBackend,
     RemoteInstanceWeightTransferWorldCoordinator,
+    bounded_execution_contract_error,
+    get_missing_legacy_runtime_v1_apis,
     get_remote_instance_transfer_engine_info_per_rank,
+    probe_remote_instance_weight_transfer_capabilities,
     register_memory_region,
+    require_bounded_execution_contract,
 )
 from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils import get_available_gpu_memory
@@ -64,10 +72,6 @@ except ImportError:
     get_max_memory = None
 
 from huggingface_hub import HfApi, hf_hub_download
-from torch import nn
-from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
-from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
-
 from sglang.srt.configs.load_config import LoadConfig, LoadFormat
 from sglang.srt.connector import (
     ConnectorType,
@@ -79,8 +83,15 @@ from sglang.srt.distributed import (
     model_parallel_is_initialized,
 )
 from sglang.srt.distributed.parallel_state import get_world_group
+from sglang.srt.environ import envs
 from sglang.srt.layers.modelopt_utils import QUANT_CFG_CHOICES
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.model_executor.weight_runtime_manifest import (
+    WeightParallelRank,
+    WeightPlacementManifest,
+    WeightRuntimeBindingManifest,
+    WeightRuntimeManifest,
+)
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     trigger_transferring_weights_request,
 )
@@ -88,9 +99,6 @@ from sglang.srt.model_loader.utils import (
     get_model_architecture,
     set_default_torch_dtype,
 )
-from sglang.srt.utils.common import is_cuda_alike
-
-from sglang.srt.environ import envs
 from sglang.srt.model_loader.weight_utils import (
     buffered_multi_thread_safetensors_weights_iterator,
     download_safetensors_index_file_from_hf,
@@ -119,7 +127,39 @@ from sglang.srt.utils import (
     rank0_log,
     set_weight_attrs,
 )
-from sglang.srt.utils.common import temp_set_env
+from sglang.srt.utils.common import is_cuda_alike, temp_set_env
+from sglang.srt.weight_transfer.api import (
+    execute_weight_load,
+    preflight_weight_transfer,
+    prepare_weight_load_from_plan,
+)
+from sglang.srt.weight_transfer.binding import (
+    project_source_bindings,
+    runtime_manifest_to_parts,
+)
+from sglang.srt.weight_transfer.planner import (
+    plan_weight_transfer,
+    plan_weight_transfer_to_local_target,
+    project_weight_transfer_plan_to_targets,
+)
+from sglang.srt.weight_transfer.provider import (
+    WeightLoadRequest,
+    WeightTargetLoadMode,
+    WeightTransferCompletionUnknownError,
+    WeightTransferError,
+    WeightTransferExecutionContext,
+    WeightTransferProvider,
+)
+from sglang.srt.weight_transfer.remote_protocol import (
+    ARTIFACT_WEIGHT_VERSION_V1,
+    HF_REVISION_V1,
+    PLACEMENT_BINDING_V1,
+    RUNTIME_MANIFEST_V1,
+    validate_manifest_revision_semantics,
+)
+from torch import nn
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
 
 # Constants for memory management
 DEFAULT_GPU_MEMORY_FRACTION_FOR_CALIBRATION = (
@@ -140,18 +180,351 @@ logger = logging.getLogger(__name__)
 _LEGACY_UNKNOWN_TRANSFER_QUARANTINE = []
 _HETEROGENEOUS_UNKNOWN_DRAIN_MAX_ATTEMPTS = 30
 _HETEROGENEOUS_UNKNOWN_DRAIN_TIMEOUT_MS = 1000
+_HETEROGENEOUS_QUARANTINE_COORDINATION_TIMEOUT_SEC = 5.0
+
+
+def _configured_weight_artifact_revision() -> str:
+    server_args = get_server_args()
+    revision = (
+        "default"
+        if server_args is None
+        else getattr(server_args, "weight_version", None)
+    )
+    if type(revision) is not str or not revision:
+        raise RuntimeError("the target weight artifact revision is not initialized")
+    return revision
+
+
+def _resolve_target_weight_revisions(
+    *,
+    target_artifact_revision: str | None,
+    target_hf_revision: str | None,
+    target_revision: str | None,
+) -> tuple[str, str]:
+    if target_revision is not None:
+        if target_artifact_revision is not None or target_hf_revision is not None:
+            raise ValueError(
+                "target_revision cannot be combined with explicit artifact or "
+                "Hugging Face revisions"
+            )
+        target_artifact_revision = target_revision
+        target_hf_revision = target_revision
+    if type(target_artifact_revision) is not str or not target_artifact_revision:
+        raise ValueError("target artifact revision must be a non-empty string")
+    if type(target_hf_revision) is not str or not target_hf_revision:
+        raise ValueError("target Hugging Face revision must be a non-empty string")
+    return target_artifact_revision, target_hf_revision
+
+
+def _resolve_remote_manifest_revision(
+    *,
+    manifest_format: str,
+    source_revision_semantics: str,
+    allow_legacy_hf_fallback: bool,
+    target_artifact_revision: str,
+    target_hf_revision: str,
+) -> str:
+    if source_revision_semantics == LEGACY_HF_UNATTESTED:
+        if not allow_legacy_hf_fallback:
+            raise RuntimeError(
+                "source did not attest artifact weight version "
+                f"{target_artifact_revision}"
+            )
+        return target_hf_revision
+
+    validate_manifest_revision_semantics(
+        manifest_format,
+        source_revision_semantics,
+    )
+    if source_revision_semantics == ARTIFACT_WEIGHT_VERSION_V1:
+        return target_artifact_revision
+    if not allow_legacy_hf_fallback:
+        raise RuntimeError(
+            f"source did not attest artifact weight version {target_artifact_revision}"
+        )
+    return target_hf_revision
+
+
+def _allow_legacy_hf_manifest_revision(
+    capabilities,
+    *,
+    target_artifact_revision: str,
+    target_hf_revision: str,
+) -> bool:
+    if capabilities.legacy_planner and not capabilities.native_executor:
+        return True
+    return (
+        capabilities.supports_runtime_v1
+        and target_artifact_revision == target_hf_revision
+    )
 
 
 @dataclasses.dataclass
 class _HeterogeneousUnknownTransferQuarantine:
-    pending_transfer_id: str
+    source_transfer_id: str
+    pending_transfer_id: str | None
+    transfer_executor: Any
     resources: ExitStack
+    coordinator: Any
     owners: tuple[Any, ...]
+    terminal_status: str | None = None
+    resources_closed: bool = False
+
+
+@dataclasses.dataclass(frozen=True)
+class _RemoteInstanceWeightLoadAttestor:
+    coordinator: Any
+    target_resource: Any
+    target_binding: Any
+
+    def attest(self, request: Any) -> None:
+        self.coordinator.raise_if_failed()
+        if tuple(request.plan.target_bindings) != (self.target_binding,):
+            raise RuntimeError(
+                "weight load request target binding changed before execution"
+            )
+        attest_binding = getattr(self.target_resource, "attest_binding", None)
+        if not callable(attest_binding):
+            raise RuntimeError("target runtime does not support binding attestation")
+        attest_binding(self.target_binding)
+
+
+class _LegacyMooncakeWeightBackend(Protocol):
+    RuntimeManifest: Any
+    MemoryRegistrationLease: Any
+    MooncakeTransferEngineReader: Callable[..., Any]
+    TransferCompletionUnknownError: type[BaseException]
+    TransferEngineError: type[Exception]
+    plan_runtime_transfer_to_local_target: Callable[..., Any]
+    bounded_execution_contract_version: int
+    supports_bounded_execution: bool
+
+
+@dataclasses.dataclass(frozen=True)
+class _PreparedNativeHeterogeneousWeightLoad:
+    source_placements: tuple[WeightPlacementManifest, ...]
+    source_bindings: tuple[WeightRuntimeBindingManifest, ...]
+    target_placement: WeightPlacementManifest
+    target_binding: WeightRuntimeBindingManifest
+    load_request: WeightLoadRequest
+    load_attestor: _RemoteInstanceWeightLoadAttestor
+    load_preflight: object
+    transfer_executor: WeightTransferProvider
+
+
+@dataclasses.dataclass(frozen=True)
+class _TargetPlacementEnvelope:
+    world_rank: int
+    parallel_rank: WeightParallelRank | None
+    placement: WeightPlacementManifest | None
+    error: str | None = None
+
+
+@dataclasses.dataclass(frozen=True)
+class _RankLocalTransferEnvelope:
+    world_rank: int
+    parallel_rank: WeightParallelRank | None
+    target_placement_id: str | None
+    logical_plan: Any | None
+    source_bindings: tuple[WeightRuntimeBindingManifest, ...] = ()
+    error: str | None = None
+
+
+@dataclasses.dataclass(frozen=True)
+class _RankLocalProviderPreflightOutcome:
+    world_rank: int
+    error: str | None = None
+    capability_fingerprint: tuple[str, bool, bool, bool] | None = None
+
+
+def _compact_target_planning_error(error: BaseException) -> str:
+    message = f"{type(error).__name__}: {error}"
+    return message[:1024]
+
+
+def _compact_provider_preflight_error(stage: str, error: BaseException) -> str:
+    return f"{stage} failed: {type(error).__name__}: {error}"[:1024]
+
+
+def _vote_provider_preflight(
+    world_group: Any,
+    local_error: str | None,
+    capability_fingerprint: tuple[str, bool, bool, bool] | None,
+) -> bool:
+    world_size = getattr(world_group, "world_size", 1)
+    local_rank = getattr(world_group, "rank_in_group", 0 if world_size == 1 else None)
+    if (
+        type(world_size) is not int
+        or world_size <= 0
+        or type(local_rank) is not int
+        or not 0 <= local_rank < world_size
+    ):
+        logger.error("Target-world provider preflight rank metadata is invalid")
+        return False
+
+    local_outcome = _RankLocalProviderPreflightOutcome(
+        world_rank=local_rank,
+        error=local_error,
+        capability_fingerprint=capability_fingerprint,
+    )
+    if world_size == 1:
+        outcomes = [local_outcome]
+    else:
+        execution_context = WeightTransferExecutionContext(
+            deadline_unix_sec=(
+                time.time() + _HETEROGENEOUS_QUARANTINE_COORDINATION_TIMEOUT_SEC
+            )
+        )
+        try:
+            outcomes = world_group.all_gather_object(
+                local_outcome,
+                phase="heterogeneous_provider.preflight",
+                execution_context=execution_context,
+            )
+        except Exception:
+            logger.exception("Cannot coordinate target-world provider preflight")
+            return False
+
+    by_rank = {}
+    if isinstance(outcomes, (list, tuple)) and len(outcomes) == world_size:
+        for outcome in outcomes:
+            if (
+                not isinstance(outcome, _RankLocalProviderPreflightOutcome)
+                or type(outcome.world_rank) is not int
+                or not 0 <= outcome.world_rank < world_size
+                or outcome.world_rank in by_rank
+                or (
+                    outcome.error is not None
+                    and (type(outcome.error) is not str or not outcome.error)
+                )
+                or (
+                    outcome.error is None
+                    and (
+                        not isinstance(outcome.capability_fingerprint, tuple)
+                        or len(outcome.capability_fingerprint) != 4
+                        or outcome.capability_fingerprint[0] not in {"native", "legacy"}
+                        or any(
+                            type(value) is not bool
+                            for value in outcome.capability_fingerprint[1:]
+                        )
+                    )
+                )
+            ):
+                break
+            by_rank[outcome.world_rank] = outcome
+    if tuple(sorted(by_rank)) != tuple(range(world_size)):
+        logger.error("Target-world provider preflight vote is invalid")
+        return False
+
+    for rank in range(world_size):
+        error = by_rank[rank].error
+        if error is not None:
+            logger.error(
+                "Target-world provider preflight failed at rank %d: %s",
+                rank,
+                error,
+            )
+            return False
+    reference_fingerprint = by_rank[0].capability_fingerprint
+    for rank in range(1, world_size):
+        if by_rank[rank].capability_fingerprint != reference_fingerprint:
+            logger.error(
+                "Target-world provider preflight capability mismatch: "
+                "rank %d differs from rank 0",
+                rank,
+            )
+            return False
+    return True
+
+
+def _preflight_bounded_native_weight_transfer(
+    provider: WeightTransferProvider,
+    request: WeightLoadRequest,
+    *,
+    attestor: _RemoteInstanceWeightLoadAttestor,
+) -> object:
+    preflight = preflight_weight_transfer(
+        provider,
+        request,
+        attestor=attestor,
+    )
+    capabilities = getattr(preflight, "_capabilities", None)
+    require_bounded_execution_contract(
+        provider,
+        role="native provider",
+        supports_bounded_execution=getattr(
+            capabilities,
+            "supports_bounded_execution",
+            None,
+        ),
+    )
+    return preflight
+
+
+def _placement_parallel_rank(
+    placement: WeightPlacementManifest,
+) -> WeightParallelRank:
+    ranks = {tensor.rank for tensor in placement.tensors}
+    if len(ranks) != 1:
+        raise ValueError("target placement must belong to one parallel rank")
+    return next(iter(ranks))
+
+
+@dataclasses.dataclass(frozen=True)
+class _PreparedLegacyHeterogeneousWeightLoad:
+    plan: Any
+    source_manifests: tuple[Any, ...]
+    source_registrations: tuple[Any, ...]
+    target_registrations: tuple[Any, ...]
+    target_manifest: Any
+    backend: _LegacyMooncakeWeightBackend
+
+
+_PreparedHeterogeneousWeightLoad = (
+    _PreparedNativeHeterogeneousWeightLoad | _PreparedLegacyHeterogeneousWeightLoad
+)
+
+
+def _load_legacy_mooncake_weight_backend() -> _LegacyMooncakeWeightBackend:
+    try:
+        backend = importlib.import_module("mooncake.weight_transfer")
+    except ImportError as error:
+        raise RuntimeError(
+            "Mooncake legacy runtime_v1 support is unavailable"
+        ) from error
+
+    missing = get_missing_legacy_runtime_v1_apis(backend)
+    if missing:
+        raise RuntimeError(
+            "Mooncake legacy runtime_v1 support is missing APIs: " + ", ".join(missing)
+        )
+    return cast(_LegacyMooncakeWeightBackend, backend)
+
+
+def _legacy_runtime_v1_supports_bounded_execution(
+    backend: _LegacyMooncakeWeightBackend,
+) -> bool:
+    return (
+        bounded_execution_contract_error(
+            backend,
+            role="legacy backend",
+            supports_bounded_execution=getattr(
+                backend,
+                "supports_bounded_execution",
+                None,
+            ),
+        )
+        is None
+    )
 
 
 _HETEROGENEOUS_UNKNOWN_TRANSFER_QUARANTINE: list[
     _HeterogeneousUnknownTransferQuarantine
 ] = []
+_WEIGHT_SNAPSHOT_UNKNOWN_LOAD_QUARANTINE: list[tuple[Any, ExitStack, Any]] = []
+_WEIGHT_SNAPSHOT_CLEANUP_QUARANTINE: list[Any] = []
+_WEIGHT_SNAPSHOT_ACTIVATION_QUARANTINE: list[Any] = []
+_WEIGHT_SNAPSHOT_CLEANUP_TIMEOUT_MS = 5_000
 
 
 def _transfer_completion_status_name(status: Any) -> str:
@@ -174,6 +547,359 @@ def _transfer_completion_status_name(status: Any) -> str:
         if candidate in text:
             return candidate
     return text
+
+
+_HETEROGENEOUS_TERMINAL_STATUSES = frozenset(
+    {"COMPLETED", "FAILED_DRAINED", "NO_SUBMISSION"}
+)
+_HETEROGENEOUS_ALL_COMPLETION_STATUSES = frozenset(
+    {
+        *_HETEROGENEOUS_TERMINAL_STATUSES,
+        "COMPLETION_UNKNOWN",
+    }
+)
+
+
+def _drain_quarantined_transfer(
+    item: _HeterogeneousUnknownTransferQuarantine,
+    *,
+    max_attempts: int,
+    timeout_ms: int,
+) -> str:
+    if item.terminal_status in _HETEROGENEOUS_TERMINAL_STATUSES:
+        return item.terminal_status
+    if not item.pending_transfer_id:
+        return "COMPLETION_UNKNOWN"
+    for _ in range(max_attempts):
+        try:
+            drain_completion = getattr(
+                item.transfer_executor,
+                "drain_completion",
+                None,
+            )
+            if callable(drain_completion):
+                status = drain_completion(
+                    item.pending_transfer_id,
+                    timeout_ms=timeout_ms,
+                )
+            else:
+                status = item.transfer_executor.drain_pending_transfer(
+                    item.pending_transfer_id,
+                    timeout_ms=timeout_ms,
+                )
+        except Exception:
+            logger.exception(
+                "Failed to drain quarantined heterogeneous transfer %s",
+                item.pending_transfer_id,
+            )
+            continue
+        status_name = _transfer_completion_status_name(status)
+        if status_name not in _HETEROGENEOUS_ALL_COMPLETION_STATUSES:
+            logger.error(
+                "Quarantined heterogeneous transfer %s returned invalid "
+                "completion status %r",
+                item.pending_transfer_id,
+                status,
+            )
+            continue
+        if status_name in _HETEROGENEOUS_TERMINAL_STATUSES:
+            item.terminal_status = status_name
+            return status_name
+    return "COMPLETION_UNKNOWN"
+
+
+def _validate_quarantine_metadata(
+    gathered: Any,
+    *,
+    world_size: int,
+    item_count: int,
+) -> tuple[tuple[tuple[int, str, str], ...], ...]:
+    if not isinstance(gathered, (list, tuple)) or len(gathered) != world_size:
+        raise ValueError("invalid quarantine metadata world size")
+    normalized = []
+    source_order = None
+    for rank, row in enumerate(gathered):
+        if type(row) is not tuple or len(row) != item_count:
+            raise ValueError("invalid quarantine metadata container")
+        checked = []
+        for entry in row:
+            if (
+                type(entry) is not tuple
+                or len(entry) != 3
+                or type(entry[0]) is not int
+                or entry[0] != rank
+                or type(entry[1]) is not str
+                or not entry[1]
+                or type(entry[2]) is not str
+                or not entry[2]
+            ):
+                raise ValueError("invalid quarantine metadata entry")
+            checked.append(entry)
+        checked = tuple(checked)
+        current_order = tuple(entry[1] for entry in checked)
+        if source_order is None:
+            source_order = current_order
+        elif current_order != source_order:
+            raise ValueError("quarantine source transfer order differs")
+        normalized.append(checked)
+    return tuple(normalized)
+
+
+def _validate_quarantine_statuses(
+    gathered: Any,
+    *,
+    metadata: tuple[tuple[tuple[int, str, str], ...], ...],
+) -> tuple[tuple[tuple[int, str, str, str], ...], ...]:
+    if not isinstance(gathered, (list, tuple)) or len(gathered) != len(metadata):
+        raise ValueError("invalid quarantine status world size")
+    normalized = []
+    for rank, (row, expected_row) in enumerate(zip(gathered, metadata, strict=True)):
+        if type(row) is not tuple or len(row) != len(expected_row):
+            raise ValueError("invalid quarantine status container")
+        checked = []
+        for entry, expected in zip(row, expected_row, strict=True):
+            if (
+                type(entry) is not tuple
+                or len(entry) != 4
+                or type(entry[0]) is not int
+                or entry[:3] != expected
+                or type(entry[3]) is not str
+                or entry[3] not in _HETEROGENEOUS_ALL_COMPLETION_STATUSES
+            ):
+                raise ValueError("invalid quarantine status entry")
+            checked.append(entry)
+        normalized.append(tuple(checked))
+    return tuple(normalized)
+
+
+def _validate_quarantine_closed(
+    gathered: Any,
+    *,
+    metadata: tuple[tuple[tuple[int, str, str], ...], ...],
+) -> tuple[tuple[tuple[int, str, str, bool], ...], ...]:
+    if not isinstance(gathered, (list, tuple)) or len(gathered) != len(metadata):
+        raise ValueError("invalid quarantine close world size")
+    normalized = []
+    for row, expected_row in zip(gathered, metadata, strict=True):
+        if type(row) is not tuple or len(row) != len(expected_row):
+            raise ValueError("invalid quarantine close container")
+        checked = []
+        for entry, expected in zip(row, expected_row, strict=True):
+            if (
+                type(entry) is not tuple
+                or len(entry) != 4
+                or entry[:3] != expected
+                or type(entry[3]) is not bool
+            ):
+                raise ValueError("invalid quarantine close entry")
+            checked.append(entry)
+        normalized.append(tuple(checked))
+    return tuple(normalized)
+
+
+def _validate_quarantine_releases(
+    gathered: Any,
+    *,
+    metadata: tuple[tuple[tuple[int, str, str], ...], ...],
+) -> tuple[tuple[tuple[int, str, str, bool], ...], ...]:
+    if not isinstance(gathered, (list, tuple)) or len(gathered) != len(metadata):
+        raise ValueError("invalid quarantine release world size")
+    normalized = []
+    for row, expected_row in zip(gathered, metadata, strict=True):
+        if type(row) is not tuple or len(row) != len(expected_row):
+            raise ValueError("invalid quarantine release container")
+        checked = []
+        for entry, expected in zip(row, expected_row, strict=True):
+            if (
+                type(entry) is not tuple
+                or len(entry) != 4
+                or entry[:3] != expected
+                or type(entry[3]) is not bool
+            ):
+                raise ValueError("invalid quarantine release entry")
+            checked.append(entry)
+        normalized.append(tuple(checked))
+    return tuple(normalized)
+
+
+def drain_heterogeneous_weight_transfer_quarantine(
+    *,
+    max_attempts: int = 1,
+    timeout_ms: int = _HETEROGENEOUS_UNKNOWN_DRAIN_TIMEOUT_MS,
+    execution_context: WeightTransferExecutionContext | None = None,
+) -> bool:
+    """Drain a quarantined target world without releasing live DMA buffers."""
+
+    if type(max_attempts) is not int or max_attempts <= 0:
+        raise ValueError("max_attempts must be a positive integer")
+    if type(timeout_ms) is not int or timeout_ms < 0:
+        raise ValueError("timeout_ms must be a non-negative integer")
+    if execution_context is None:
+        execution_context = WeightTransferExecutionContext(
+            deadline_unix_sec=(
+                time.time() + _HETEROGENEOUS_QUARANTINE_COORDINATION_TIMEOUT_SEC
+            )
+        )
+
+    world_group = get_world_group()
+    world_size = getattr(world_group, "world_size", 1)
+    rank = getattr(world_group, "rank_in_group", 0)
+    local_items = tuple(_HETEROGENEOUS_UNKNOWN_TRANSFER_QUARANTINE)
+    if world_size == 1 and not local_items:
+        return True
+    local_metadata = tuple(
+        (
+            rank,
+            item.source_transfer_id,
+            item.pending_transfer_id,
+        )
+        for item in local_items
+    )
+    try:
+        gathered_metadata = world_group.all_gather_object(
+            local_metadata,
+            phase="heterogeneous_quarantine.metadata",
+            execution_context=execution_context,
+        )
+        metadata = _validate_quarantine_metadata(
+            gathered_metadata,
+            world_size=world_size,
+            item_count=len(local_items),
+        )
+    except Exception:
+        logger.exception("Failed to validate quarantined target-world metadata")
+        return False
+    if not local_items:
+        return True
+
+    local_statuses = tuple(
+        (
+            rank,
+            item.source_transfer_id,
+            item.pending_transfer_id,
+            _drain_quarantined_transfer(
+                item,
+                max_attempts=max_attempts,
+                timeout_ms=timeout_ms,
+            ),
+        )
+        for item in local_items
+    )
+    try:
+        gathered_statuses = world_group.all_gather_object(
+            local_statuses,
+            phase="heterogeneous_quarantine.status",
+            execution_context=execution_context,
+        )
+        statuses = _validate_quarantine_statuses(
+            gathered_statuses,
+            metadata=metadata,
+        )
+    except Exception:
+        logger.exception("Failed to validate quarantined target-world statuses")
+        return False
+
+    terminal_indices = tuple(
+        index
+        for index in range(len(local_items))
+        if all(row[index][3] in _HETEROGENEOUS_TERMINAL_STATUSES for row in statuses)
+    )
+    if not terminal_indices:
+        return False
+
+    locally_closed = []
+    for index, item in enumerate(local_items):
+        if index in terminal_indices and not item.resources_closed:
+            try:
+                item.resources.close()
+            except Exception:
+                logger.exception(
+                    "Failed to close quarantined target resources for %s",
+                    item.source_transfer_id,
+                )
+            else:
+                item.resources_closed = True
+        locally_closed.append(
+            (
+                rank,
+                item.source_transfer_id,
+                item.pending_transfer_id,
+                item.resources_closed,
+            )
+        )
+    try:
+        gathered_closed = world_group.all_gather_object(
+            tuple(locally_closed),
+            phase="heterogeneous_quarantine.closed",
+            execution_context=execution_context,
+        )
+        closed = _validate_quarantine_closed(
+            gathered_closed,
+            metadata=metadata,
+        )
+    except Exception:
+        logger.exception("Failed to validate quarantined target-world resource closure")
+        return False
+
+    local_releases = []
+    for index, item in enumerate(local_items):
+        release_success = False
+        if index not in terminal_indices or not all(row[index][3] for row in closed):
+            local_releases.append(
+                (
+                    rank,
+                    item.source_transfer_id,
+                    item.pending_transfer_id,
+                    release_success,
+                )
+            )
+            continue
+        item = local_items[index]
+        try:
+            release_success = item.coordinator.release_after_terminal_recovery(
+                completion_ticket=item.pending_transfer_id,
+                local_terminal_status=statuses[rank][index][3],
+            )
+        except Exception:
+            logger.exception(
+                "Failed to release recovered source transfer %s",
+                item.source_transfer_id,
+            )
+        local_releases.append(
+            (
+                rank,
+                item.source_transfer_id,
+                item.pending_transfer_id,
+                bool(release_success),
+            )
+        )
+
+    try:
+        gathered_releases = world_group.all_gather_object(
+            tuple(local_releases),
+            phase="heterogeneous_quarantine.released",
+            execution_context=execution_context,
+        )
+        releases = _validate_quarantine_releases(
+            gathered_releases,
+            metadata=metadata,
+        )
+    except Exception:
+        logger.exception("Failed to validate quarantined target-world source release")
+        return False
+
+    released = {
+        id(local_items[index])
+        for index in terminal_indices
+        if all(row[index][3] for row in releases)
+    }
+    if released:
+        _HETEROGENEOUS_UNKNOWN_TRANSFER_QUARANTINE[:] = [
+            item
+            for item in _HETEROGENEOUS_UNKNOWN_TRANSFER_QUARANTINE
+            if id(item) not in released
+        ]
+    return not _HETEROGENEOUS_UNKNOWN_TRANSFER_QUARANTINE
 
 
 @contextmanager
@@ -378,6 +1104,12 @@ def _post_load_weights(model: nn.Module) -> None:
         model.post_load_weights()
 
 
+class WeightSnapshotActivation(Protocol):
+    def activate(self) -> None: ...
+
+    def close(self) -> None: ...
+
+
 class BaseModelLoader(ABC):
     """Base class for model loaders."""
 
@@ -398,6 +1130,11 @@ class BaseModelLoader(ABC):
     ) -> nn.Module:
         """Load a model with the given configurations."""
         raise NotImplementedError
+
+    def take_pending_weight_snapshot_activation(
+        self,
+    ) -> WeightSnapshotActivation | None:
+        return None
 
 
 class DefaultModelLoader(BaseModelLoader):
@@ -3101,6 +3838,535 @@ class GGUFModelLoader(BaseModelLoader):
         return model
 
 
+@dataclasses.dataclass(frozen=True)
+class _ColdStartWeightLoadAttestor:
+    target_resource: Any
+    target_binding: Any
+
+    def attest(self, request: Any) -> None:
+        if tuple(request.plan.target_bindings) != (self.target_binding,):
+            raise RuntimeError(
+                "weight snapshot target binding changed before execution"
+            )
+        attest_binding = getattr(self.target_resource, "attest_binding", None)
+        if not callable(attest_binding):
+            raise RuntimeError("target runtime does not support binding attestation")
+        attest_binding(self.target_binding)
+
+
+@dataclasses.dataclass
+class _PendingWeightSnapshotActivation:
+    """Own loader resources until startup activation finishes."""
+
+    ref: Any
+    catalog: Any
+    resources: ExitStack
+    backend: Any | None = None
+    deadline_unix_sec: float | None = None
+    _transaction_id: str | None = dataclasses.field(default=None, init=False)
+    _prepared_head: Any = dataclasses.field(default=None, init=False, repr=False)
+    _owns_serving_transition: bool = dataclasses.field(
+        default=False,
+        init=False,
+        repr=False,
+    )
+    _committed_head: Any = dataclasses.field(default=None, init=False, repr=False)
+    _state: str = dataclasses.field(default="loaded", init=False)
+    _closed: bool = dataclasses.field(default=False, init=False, repr=False)
+    _quarantined: bool = dataclasses.field(default=False, init=False, repr=False)
+
+    def _catalog_for_deadline(self, deadline_unix_sec: float | None):
+        deadlines = [
+            deadline
+            for deadline in (self.deadline_unix_sec, deadline_unix_sec)
+            if deadline is not None
+        ]
+        if not deadlines:
+            return self.catalog
+        if any(
+            isinstance(deadline, bool)
+            or not isinstance(deadline, (int, float))
+            or not math.isfinite(deadline)
+            for deadline in deadlines
+        ):
+            raise ValueError("weight snapshot activation deadline is invalid")
+        execution_context = WeightTransferExecutionContext(
+            deadline_unix_sec=min(deadlines)
+        )
+        if execution_context.expired():
+            raise TimeoutError("weight snapshot activation deadline expired")
+        with_execution_context = getattr(
+            self.catalog,
+            "with_execution_context",
+            None,
+        )
+        if callable(with_execution_context):
+            return with_execution_context(execution_context)
+        return self.catalog
+
+    def _loadable_head(self, catalog=None):
+        from sglang.srt.weight_transfer.storage import WeightRevisionState
+
+        catalog = self.catalog if catalog is None else catalog
+        snapshot = catalog.get_snapshot(self.ref)
+        if snapshot is None:
+            raise ValueError("published weight snapshot was not found")
+        identities = {
+            (placement.model_id, placement.revision)
+            for placement in snapshot.placements
+        }
+        if len(identities) != 1:
+            raise ValueError("weight snapshot has no canonical model revision")
+        model_id, revision = next(iter(identities))
+        head = catalog.get_revision_head(model_id, revision)
+        if (
+            head is None
+            or head.ref != self.ref
+            or head.state
+            not in {
+                WeightRevisionState.READY,
+                WeightRevisionState.SERVING,
+            }
+        ):
+            raise RuntimeError("weight snapshot revision head is not READY or SERVING")
+        return head
+
+    def _require_transaction(self, transaction_id: str) -> None:
+        if type(transaction_id) is not str or not transaction_id:
+            raise ValueError("activation transaction_id must be a non-empty string")
+        if self._transaction_id not in (None, transaction_id):
+            raise RuntimeError("weight snapshot activation transaction conflicts")
+        self._transaction_id = transaction_id
+
+    def prepare(
+        self,
+        transaction_id: str,
+        *,
+        deadline_unix_sec: float | None = None,
+    ):
+        from sglang.srt.weight_transfer.storage import WeightRevisionState
+
+        self._require_transaction(transaction_id)
+        if self._closed or self._quarantined:
+            raise RuntimeError("weight snapshot activation owner is unavailable")
+        catalog = self._catalog_for_deadline(deadline_unix_sec)
+        head = self._loadable_head(catalog)
+        if self._owns_serving_transition:
+            if self._committed_head is None or head != self._committed_head:
+                raise RuntimeError(
+                    "owned weight snapshot SERVING revision changed after commit"
+                )
+            self._prepared_head = head
+            self._state = "serving"
+            return head
+        self._prepared_head = head
+        self._owns_serving_transition = False
+        self._committed_head = None
+        self._state = (
+            "serving" if head.state is WeightRevisionState.SERVING else "prepared"
+        )
+        return head
+
+    def commit(
+        self,
+        transaction_id: str,
+        *,
+        deadline_unix_sec: float | None = None,
+    ):
+        from sglang.srt.weight_transfer.storage import WeightRevisionState
+
+        self._require_transaction(transaction_id)
+        if self._prepared_head is None:
+            raise RuntimeError("weight snapshot activation was not prepared")
+        catalog = self._catalog_for_deadline(deadline_unix_sec)
+        current = self._loadable_head(catalog)
+        if current.state is WeightRevisionState.SERVING:
+            self._state = "serving"
+            return current
+        if current != self._prepared_head:
+            raise RuntimeError("weight snapshot revision head changed after prepare")
+        updated = catalog.compare_and_set_revision(
+            model_id=current.model_id,
+            revision=current.revision,
+            expected=self._prepared_head,
+            new_ref=self.ref,
+            new_state=WeightRevisionState.SERVING,
+        )
+        if updated is None:
+            updated = self._loadable_head(catalog)
+            if updated.state is not WeightRevisionState.SERVING:
+                raise RuntimeError("weight snapshot SERVING CAS did not commit")
+        else:
+            self._committed_head = updated
+            self._owns_serving_transition = True
+        self._prepared_head = updated
+        self._state = "serving"
+        return updated
+
+    def reconcile(
+        self,
+        transaction_id: str,
+        *,
+        deadline_unix_sec: float | None = None,
+    ) -> str:
+        from sglang.srt.weight_transfer.storage import WeightRevisionState
+
+        self._require_transaction(transaction_id)
+        catalog = self._catalog_for_deadline(deadline_unix_sec)
+        try:
+            current = self._loadable_head(catalog)
+        except Exception:
+            return "conflict"
+        if current.state is WeightRevisionState.SERVING:
+            self._prepared_head = current
+            self._state = "serving"
+            return "serving"
+        if current == self._prepared_head:
+            self._state = "prepared"
+            return "prepared"
+        return "conflict"
+
+    def abort(
+        self,
+        transaction_id: str,
+        *,
+        deadline_unix_sec: float | None = None,
+    ) -> str:
+        from sglang.srt.weight_transfer.storage import WeightRevisionState
+
+        self._require_transaction(transaction_id)
+        if self._closed:
+            return "aborted"
+        catalog = self._catalog_for_deadline(deadline_unix_sec)
+        try:
+            current = self._loadable_head(catalog)
+        except Exception:
+            self.quarantine(catalog=catalog)
+            return "quarantined"
+        if self._owns_serving_transition:
+            if current == self._committed_head:
+                self.quarantine(current, catalog=catalog)
+            else:
+                self.quarantine(catalog=catalog)
+            return "quarantined"
+        if current.state is WeightRevisionState.SERVING:
+            self._state = "aborted"
+            self.close()
+            return "aborted"
+        if self._prepared_head is not None and current != self._prepared_head:
+            self.quarantine(catalog=catalog)
+            return "quarantined"
+        self._state = "aborted"
+        self.close()
+        return "aborted"
+
+    def quarantine(self, current=None, *, catalog=None) -> None:
+        from sglang.srt.weight_transfer.storage import WeightRevisionState
+
+        if self._quarantined:
+            return
+        catalog = self.catalog if catalog is None else catalog
+        self._quarantined = True
+        self._state = "quarantined"
+        _WEIGHT_SNAPSHOT_ACTIVATION_QUARANTINE.append(self)
+        try:
+            if current is None:
+                current = self._loadable_head(catalog)
+            if (
+                self._owns_serving_transition
+                and self._committed_head is not None
+                and current == self._committed_head
+                and current.state is WeightRevisionState.SERVING
+            ):
+                updated = catalog.compare_and_set_revision(
+                    model_id=current.model_id,
+                    revision=current.revision,
+                    expected=current,
+                    new_ref=self.ref,
+                    new_state=WeightRevisionState.IDLE,
+                )
+                if updated is None:
+                    observed = catalog.get_revision_head(
+                        current.model_id,
+                        current.revision,
+                    )
+                    if (
+                        observed is not None
+                        and observed.ref == self.ref
+                        and observed.state is WeightRevisionState.SERVING
+                    ):
+                        logger.error(
+                            "Quarantined weight snapshot remains SERVING after "
+                            "revision CAS conflict"
+                        )
+        except Exception:
+            logger.exception(
+                "Failed to move quarantined weight snapshot out of SERVING"
+            )
+
+    def activate(self) -> None:
+        from sglang.srt.weight_transfer.api import mark_weight_snapshot_serving
+
+        mark_weight_snapshot_serving(
+            self.ref,
+            catalog=self.catalog,
+        )
+        self._state = "serving"
+
+    def close(self) -> None:
+        if self._closed or self._quarantined:
+            return
+        if self._state == "cleanup_pending" and self.backend is not None:
+            try:
+                status = self.backend.close(
+                    timeout_ms=_WEIGHT_SNAPSHOT_CLEANUP_TIMEOUT_MS,
+                )
+                if not status.closed:
+                    retry_error = RuntimeError(
+                        "weight snapshot backend cleanup remains pending: "
+                        + ", ".join(status.pending_tickets)
+                    )
+                    retry_error.completion_unknown = True
+                    raise retry_error
+            except Exception:
+                logger.exception(
+                    "Weight snapshot activation cleanup retry remains pending"
+                )
+                raise
+            self._closed = True
+            self._state = "closed"
+            return
+        try:
+            self.resources.close()
+        except Exception as error:
+            if self.backend is not None:
+                try:
+                    status = self.backend.close(
+                        timeout_ms=_WEIGHT_SNAPSHOT_CLEANUP_TIMEOUT_MS,
+                    )
+                    if not status.closed:
+                        retry_error = RuntimeError(
+                            "weight snapshot backend cleanup remains pending: "
+                            + ", ".join(status.pending_tickets)
+                        )
+                        retry_error.completion_unknown = True
+                        raise retry_error
+                except Exception as retry_error:
+                    if self not in _WEIGHT_SNAPSHOT_CLEANUP_QUARANTINE:
+                        _WEIGHT_SNAPSHOT_CLEANUP_QUARANTINE.append(self)
+                    self._state = "cleanup_pending"
+                    logger.exception(
+                        "Weight snapshot activation cleanup remains pending; "
+                        "retaining the owner for retry"
+                    )
+                    raise retry_error from error
+                logger.warning(
+                    "Weight snapshot activation cleanup completed on backend retry"
+                )
+            else:
+                if self not in _WEIGHT_SNAPSHOT_CLEANUP_QUARANTINE:
+                    _WEIGHT_SNAPSHOT_CLEANUP_QUARANTINE.append(self)
+                logger.exception(
+                    "Weight snapshot activation finished, but loader resource "
+                    "cleanup failed; retaining the owner for process lifetime"
+                )
+        self._closed = True
+        if self._state != "aborted":
+            self._state = "closed"
+
+
+class WeightSnapshotModelLoader(BaseModelLoader):
+    """Load a published semantic snapshot into final non-serving buffers."""
+
+    def __init__(self, load_config: LoadConfig):
+        super().__init__(load_config)
+        from sglang.srt.weight_transfer.store_runtime import WeightSnapshotLoadSpec
+
+        self.spec = WeightSnapshotLoadSpec.from_mapping(
+            cast(dict[str, Any], load_config.model_loader_extra_config or {})
+        )
+        self._pending_activation: _PendingWeightSnapshotActivation | None = None
+
+    def take_pending_weight_snapshot_activation(
+        self,
+    ) -> WeightSnapshotActivation | None:
+        pending = self._pending_activation
+        self._pending_activation = None
+        return pending
+
+    def download_model(self, model_config: ModelConfig) -> None:
+        del model_config
+
+    def _backend_context(
+        self,
+        execution_context: WeightTransferExecutionContext,
+    ):
+        from sglang.srt.weight_transfer.store_runtime import (
+            open_weight_snapshot_backend,
+        )
+
+        factory = self.load_config.weight_snapshot_backend_factory
+        if callable(factory):
+            return factory(self.spec)
+        if not model_parallel_is_initialized():
+            return open_weight_snapshot_backend(
+                self.spec,
+                execution_context=execution_context,
+            )
+        world_group = get_world_group()
+        return open_weight_snapshot_backend(
+            self.spec,
+            rank=world_group.rank_in_group,
+            world_size=world_group.world_size,
+            execution_context=execution_context,
+        )
+
+    def load_model(
+        self,
+        *,
+        model_config: ModelConfig,
+        device_config: DeviceConfig,
+    ) -> nn.Module:
+        from sglang.srt.model_executor.weight_runtime_manifest import (
+            WeightPlacementManifest,
+            WeightRuntimeBindingManifest,
+        )
+        from sglang.srt.weight_transfer.api import (
+            load_weight_snapshot,
+        )
+        from sglang.srt.weight_transfer.provider import (
+            WeightTargetLoadMode,
+            WeightTransferCompletionUnknownError,
+        )
+        from sglang.srt.weight_transfer.store_runtime import WeightSnapshotBackend
+
+        target_builder = (
+            self.load_config.remote_instance_weight_runtime_manifest_builder
+        )
+        if not callable(target_builder):
+            raise RuntimeError(
+                "weight snapshot loading requires --enable-weight-runtime-manifest"
+            )
+        if self._pending_activation is not None:
+            raise RuntimeError(
+                "weight snapshot activation is still owned by the loader"
+            )
+
+        quant_config = _get_quantization_config(model_config, self.load_config)
+        with set_default_torch_dtype(model_config.dtype):
+            with torch.device(device_config.device):
+                model = _initialize_model(
+                    model_config,
+                    self.load_config,
+                    quant_config,
+                )
+
+        execution_context = WeightTransferExecutionContext(
+            deadline_unix_sec=time.time() + self.spec.load_timeout_sec,
+        )
+        resources = ExitStack()
+        retain_resources = False
+        try:
+            backend = resources.enter_context(self._backend_context(execution_context))
+            if not isinstance(backend, WeightSnapshotBackend):
+                raise ValueError(
+                    "weight snapshot backend factory returned an invalid backend"
+                )
+            if backend.provider.name != self.spec.ref.provider:
+                raise ValueError(
+                    "weight snapshot provider differs from the storage ref"
+                )
+            require_bounded_execution_contract(
+                backend.provider,
+                role="weight snapshot provider",
+            )
+            snapshot = backend.catalog.get_snapshot(self.spec.ref)
+            if snapshot is None:
+                raise ValueError("published weight snapshot was not found")
+            source_identities = {
+                (placement.model_id, placement.revision)
+                for placement in snapshot.placements
+            }
+            expected_identity = (self.spec.model_id, self.spec.revision)
+            if source_identities != {expected_identity}:
+                raise ValueError(
+                    "published weight snapshot model identity differs from load spec"
+                )
+
+            instance_id = self.spec.instance_id or (
+                f"sglang-weight-snapshot:{os.getpid()}:{id(model)}"
+            )
+            target_resource = resources.enter_context(
+                target_builder(
+                    model=model,
+                    model_id=self.spec.model_id,
+                    revision=self.spec.revision,
+                    instance_id=instance_id,
+                    endpoint=backend.endpoint,
+                )
+            )
+            target_placement = getattr(target_resource, "placement", None)
+            bind = getattr(target_resource, "bind", None)
+            if not isinstance(
+                target_placement, WeightPlacementManifest
+            ) or not callable(bind):
+                raise ValueError(
+                    "weight snapshot target builder did not return placement/bind"
+                )
+            target_binding = resources.enter_context(bind())
+            if not isinstance(target_binding, WeightRuntimeBindingManifest):
+                raise ValueError("weight snapshot target binding is invalid")
+
+            load_started = time.perf_counter()
+            receipt = load_weight_snapshot(
+                self.spec.ref,
+                catalog=backend.catalog,
+                target_placements=(target_placement,),
+                target_bindings=(target_binding,),
+                provider=backend.provider,
+                target_mode=WeightTargetLoadMode.COLD_START,
+                attestor=_ColdStartWeightLoadAttestor(
+                    target_resource=target_resource,
+                    target_binding=target_binding,
+                ),
+                execution_context=execution_context,
+            )
+            phase_text = ", ".join(
+                f"{name}={seconds:.4f}s"
+                for name, seconds in receipt.provider_phase_seconds
+            )
+            logger.info(
+                "Loaded weight snapshot: provider=%s, logical_bytes=%d, "
+                "compact_regions=%d, elapsed=%.4fs, phases=[%s]",
+                receipt.provider,
+                receipt.total_bytes,
+                receipt.region_count,
+                time.perf_counter() - load_started,
+                phase_text,
+            )
+            current_platform.synchronize()
+            _post_load_weights(model)
+            model = model.eval()
+            self._pending_activation = _PendingWeightSnapshotActivation(
+                ref=self.spec.ref,
+                catalog=backend.catalog,
+                resources=resources,
+                backend=backend,
+                deadline_unix_sec=execution_context.deadline_unix_sec,
+            )
+            resources = ExitStack()
+        except WeightTransferCompletionUnknownError as error:
+            retain_resources = True
+            _WEIGHT_SNAPSHOT_UNKNOWN_LOAD_QUARANTINE.append(
+                (model, resources, error.completion_ticket)
+            )
+            raise
+        finally:
+            if not retain_resources:
+                resources.close()
+        return model
+
+
 class RemoteInstanceModelLoader(BaseModelLoader):
     """Model loader that can load Tensors from remote sglang instance."""
 
@@ -3173,6 +4439,11 @@ class RemoteInstanceModelLoader(BaseModelLoader):
 
             # transfer weights
             seed_url = f"http://{load_config.remote_instance_weight_loader_seed_instance_ip}:{load_config.remote_instance_weight_loader_seed_instance_service_port}"
+            provider_factory = getattr(
+                load_config,
+                "remote_instance_weight_transfer_provider_factory",
+                None,
+            )
             if load_config.remote_instance_weight_runtime_manifest_builder is not None:
                 success = self.load_model_from_remote_instance_by_transfer_engine_heterogeneous(
                     model,
@@ -3181,9 +4452,16 @@ class RemoteInstanceModelLoader(BaseModelLoader):
                     load_config.remote_instance_weight_loader_transfer_engine_session_id,
                     load_config.remote_instance_weight_runtime_manifest_builder,
                     target_model_id=model_config.model_path,
-                    target_revision=model_config.revision or "default",
+                    target_artifact_revision=_configured_weight_artifact_revision(),
+                    target_hf_revision=model_config.revision or "default",
+                    provider_factory=provider_factory,
                 )
             else:
+                if provider_factory is not None:
+                    raise RuntimeError(
+                        "configured weight transfer provider requires a runtime "
+                        "manifest builder"
+                    )
                 success = self.load_model_from_remote_instance_by_transfer_engine(
                     model,
                     load_config.remote_instance_weight_loader_transfer_engine,
@@ -3401,6 +4679,593 @@ class RemoteInstanceModelLoader(BaseModelLoader):
                 f"{model_id}@{revision}: {sorted(mismatches)}"
             )
 
+    @staticmethod
+    def _coerce_weight_manifest_inventory(inventory, manifest_type):
+        if isinstance(inventory, manifest_type):
+            return inventory
+        return msgspec.convert(inventory, type=manifest_type)
+
+    @staticmethod
+    def _migrate_runtime_v1_inventory(inventory):
+        if not isinstance(inventory, collections.abc.Mapping):
+            return inventory
+        if inventory.get("format_version", 1) != 1:
+            return inventory
+
+        migrated = dict(inventory)
+        migrated["format_version"] = 1
+        tensors = inventory.get("tensors")
+        if not isinstance(tensors, (list, tuple)):
+            return migrated
+
+        migrated_tensors = []
+        for tensor in tensors:
+            if (
+                isinstance(tensor, collections.abc.Mapping)
+                and "shard_dims" not in tensor
+            ):
+                tensor = dict(tensor)
+                partition_dim = tensor.get("partition_dim")
+                tensor["shard_dims"] = () if partition_dim is None else (partition_dim,)
+            migrated_tensors.append(tensor)
+        migrated["tensors"] = tuple(migrated_tensors)
+        return migrated
+
+    def _adapt_runtime_v1_source_inventories(self, inventories):
+        if not inventories:
+            raise ValueError("source runtime manifest inventories must not be empty")
+        parts = tuple(
+            runtime_manifest_to_parts(
+                self._coerce_weight_manifest_inventory(
+                    self._migrate_runtime_v1_inventory(inventory),
+                    WeightRuntimeManifest,
+                )
+            )
+            for inventory in inventories
+        )
+        return (
+            tuple(part.placement for part in parts),
+            tuple(part.binding for part in parts),
+        )
+
+    def _plan_rank_local_transfer_envelopes(
+        self,
+        *,
+        gathered_targets,
+        owner_source_session,
+        target_model_id,
+        manifest_revision,
+        world_size,
+        phase_seconds,
+    ) -> list[_RankLocalTransferEnvelope]:
+        if (
+            not isinstance(gathered_targets, (list, tuple))
+            or len(gathered_targets) != world_size
+        ):
+            raise ValueError("target placement gather is incomplete")
+
+        targets = []
+        placement_ids = set()
+        parallel_ranks = set()
+        for expected_rank, item in enumerate(gathered_targets):
+            if not isinstance(item, _TargetPlacementEnvelope):
+                raise ValueError("target placement envelope is invalid")
+            if item.world_rank != expected_rank:
+                raise ValueError("target placement envelope rank differs")
+            if item.error is not None:
+                raise RuntimeError(
+                    f"target rank {expected_rank} placement failed: {item.error}"
+                )
+            if not isinstance(
+                item.placement, WeightPlacementManifest
+            ) or not isinstance(item.parallel_rank, WeightParallelRank):
+                raise ValueError("target placement envelope is incomplete")
+            if _placement_parallel_rank(item.placement) != item.parallel_rank:
+                raise ValueError("target placement parallel rank differs")
+            if item.placement.placement_id in placement_ids:
+                raise ValueError("duplicate target placement")
+            if item.parallel_rank in parallel_ranks:
+                raise ValueError("duplicate target parallel rank")
+            placement_ids.add(item.placement.placement_id)
+            parallel_ranks.add(item.parallel_rank)
+            targets.append(item)
+
+        if owner_source_session is None:
+            raise RuntimeError("target root does not own the source manifest payload")
+        source_placement_inventories = getattr(
+            owner_source_session,
+            "source_placements",
+            None,
+        )
+        source_binding_inventories = getattr(
+            owner_source_session,
+            "source_bindings",
+            None,
+        )
+        source_started = time.perf_counter()
+        if (
+            not source_placement_inventories
+            or not source_binding_inventories
+            or len(source_placement_inventories) != len(source_binding_inventories)
+        ):
+            raise ValueError(
+                "source placement and runtime binding inventories must be paired"
+            )
+        source_placements = tuple(
+            self._coerce_weight_manifest_inventory(
+                inventory,
+                WeightPlacementManifest,
+            )
+            for inventory in source_placement_inventories
+        )
+        source_bindings = tuple(
+            self._coerce_weight_manifest_inventory(
+                inventory,
+                WeightRuntimeBindingManifest,
+            )
+            for inventory in source_binding_inventories
+        )
+        self._require_manifest_identity(
+            source_placements,
+            model_id=target_model_id,
+            revision=manifest_revision,
+            role="source",
+        )
+        source_bindings = tuple(
+            project_source_bindings(source_placements, source_bindings)
+        )
+        phase_seconds["source_manifest"] = time.perf_counter() - source_started
+
+        target_placements = tuple(item.placement for item in targets)
+        expected_topology = tuple(item.parallel_rank for item in targets)
+        plan_started = time.perf_counter()
+        global_plan = plan_weight_transfer(
+            source_placements,
+            target_placements,
+            expected_target_topology=expected_topology,
+        )
+        local_plans = project_weight_transfer_plan_to_targets(global_plan)
+        result = {}
+        for item in targets:
+            local_plan = local_plans[item.placement.placement_id]
+            local_bindings = tuple(
+                project_source_bindings(
+                    local_plan.source_placements,
+                    source_bindings,
+                )
+            )
+            result[item.world_rank] = _RankLocalTransferEnvelope(
+                world_rank=item.world_rank,
+                parallel_rank=item.parallel_rank,
+                target_placement_id=item.placement.placement_id,
+                logical_plan=local_plan,
+                source_bindings=local_bindings,
+            )
+        phase_seconds["plan"] = time.perf_counter() - plan_started
+        return [result[rank] for rank in range(world_size)]
+
+    def _prepare_distributed_native_heterogeneous_weight_load(
+        self,
+        *,
+        model,
+        coordinator,
+        world_group,
+        transfer_resources,
+        target_manifest_builder,
+        target_model_id,
+        manifest_revision,
+        local_session_id,
+        transfer_executor,
+        phase_seconds,
+    ) -> _PreparedNativeHeterogeneousWeightLoad:
+        if transfer_executor is None:
+            raise RuntimeError(
+                "placement_binding_v1 requires a configured weight transfer provider"
+            )
+        local_rank = getattr(world_group, "rank_in_group", None)
+        world_size = getattr(world_group, "world_size", None)
+        if (
+            type(local_rank) is not int
+            or type(world_size) is not int
+            or not 0 <= local_rank < world_size
+        ):
+            raise ValueError("target world rank metadata is invalid")
+
+        target_resource = None
+        target_placement = None
+        parallel_rank = None
+        target_error = None
+        target_started = time.perf_counter()
+        try:
+            target_resource = transfer_resources.enter_context(
+                target_manifest_builder(
+                    model=model,
+                    model_id=target_model_id,
+                    revision=manifest_revision,
+                    instance_id=f"sglang:{local_session_id}",
+                    endpoint=local_session_id,
+                )
+            )
+            if not hasattr(target_resource, "placement") or not callable(
+                getattr(target_resource, "bind", None)
+            ):
+                raise ValueError(
+                    "placement_binding_v1 requires a target manifest session "
+                    "with placement and bind()"
+                )
+            target_placement = self._coerce_weight_manifest_inventory(
+                target_resource.placement,
+                WeightPlacementManifest,
+            )
+            self._require_manifest_identity(
+                (target_placement,),
+                model_id=target_model_id,
+                revision=manifest_revision,
+                role="target",
+            )
+            parallel_rank = _placement_parallel_rank(target_placement)
+        except BaseException as error:
+            target_error = _compact_target_planning_error(error)
+        phase_seconds["target_manifest"] = time.perf_counter() - target_started
+
+        local_target = _TargetPlacementEnvelope(
+            world_rank=local_rank,
+            parallel_rank=parallel_rank,
+            placement=target_placement,
+            error=target_error,
+        )
+        scattered = None
+        try:
+            gathered_targets = world_group.gather_object(local_target, dst=0)
+            scatter_inputs = None
+            if local_rank == 0:
+                try:
+                    scatter_inputs = self._plan_rank_local_transfer_envelopes(
+                        gathered_targets=gathered_targets,
+                        owner_source_session=coordinator.owner_source_session,
+                        target_model_id=target_model_id,
+                        manifest_revision=manifest_revision,
+                        world_size=world_size,
+                        phase_seconds=phase_seconds,
+                    )
+                except BaseException as error:
+                    compact_error = _compact_target_planning_error(error)
+                    scatter_inputs = [
+                        _RankLocalTransferEnvelope(
+                            world_rank=rank,
+                            parallel_rank=None,
+                            target_placement_id=None,
+                            logical_plan=None,
+                            error=compact_error,
+                        )
+                        for rank in range(world_size)
+                    ]
+            scattered = world_group.scatter_object(scatter_inputs, src=0)
+            gathered_targets = None
+            scatter_inputs = None
+        finally:
+            clear_owner_source_session = getattr(
+                coordinator,
+                "clear_owner_source_session",
+                None,
+            )
+            if callable(clear_owner_source_session):
+                clear_owner_source_session()
+
+        if not isinstance(scattered, _RankLocalTransferEnvelope):
+            raise ValueError("rank-local transfer envelope is invalid")
+        if scattered.world_rank != local_rank:
+            raise ValueError("rank-local transfer envelope rank differs")
+        if scattered.error is not None:
+            raise RuntimeError(scattered.error)
+        if target_resource is None or target_placement is None or parallel_rank is None:
+            raise RuntimeError("local target placement was not built")
+        if (
+            scattered.parallel_rank != parallel_rank
+            or scattered.target_placement_id != target_placement.placement_id
+            or scattered.logical_plan is None
+        ):
+            raise ValueError("rank-local transfer envelope target differs")
+
+        logical_plan = scattered.logical_plan
+        if logical_plan.target_placements != (target_placement,):
+            raise ValueError("rank-local transfer target placement differs")
+        if len(logical_plan.target_executors) != 1:
+            raise ValueError("rank-local transfer must have one target executor")
+        target_executor = logical_plan.target_executors[0]
+        if (
+            target_executor.placement_id != target_placement.placement_id
+            or target_executor.rank != parallel_rank
+        ):
+            raise ValueError("rank-local target executor differs")
+        source_bindings = tuple(scattered.source_bindings)
+        if (
+            tuple(
+                project_source_bindings(
+                    logical_plan.source_placements,
+                    source_bindings,
+                )
+            )
+            != source_bindings
+        ):
+            raise ValueError("rank-local source binding closure differs")
+
+        binding_started = time.perf_counter()
+        target_binding = self._coerce_weight_manifest_inventory(
+            transfer_resources.enter_context(target_resource.bind()),
+            WeightRuntimeBindingManifest,
+        )
+        load_request = prepare_weight_load_from_plan(
+            logical_plan,
+            source_bindings=source_bindings,
+            target_bindings=(target_binding,),
+        )
+        phase_seconds["binding"] = time.perf_counter() - binding_started
+        load_attestor = _RemoteInstanceWeightLoadAttestor(
+            coordinator=coordinator,
+            target_resource=target_resource,
+            target_binding=target_binding,
+        )
+        load_preflight = _preflight_bounded_native_weight_transfer(
+            transfer_executor,
+            load_request,
+            attestor=load_attestor,
+        )
+        return _PreparedNativeHeterogeneousWeightLoad(
+            source_placements=logical_plan.source_placements,
+            source_bindings=source_bindings,
+            target_placement=target_placement,
+            target_binding=target_binding,
+            load_request=load_request,
+            load_attestor=load_attestor,
+            load_preflight=load_preflight,
+            transfer_executor=transfer_executor,
+        )
+
+    def _prepare_native_heterogeneous_weight_load(
+        self,
+        *,
+        model,
+        coordinator,
+        transfer_resources,
+        source_placement_inventories,
+        source_binding_inventories,
+        target_manifest_builder,
+        target_model_id,
+        manifest_revision,
+        local_session_id,
+        transfer_executor,
+        phase_seconds,
+    ) -> _PreparedNativeHeterogeneousWeightLoad:
+        if transfer_executor is None:
+            raise RuntimeError(
+                "placement_binding_v1 requires a configured weight transfer provider"
+            )
+        source_started = time.perf_counter()
+        if (
+            not source_placement_inventories
+            or not source_binding_inventories
+            or len(source_placement_inventories) != len(source_binding_inventories)
+        ):
+            raise ValueError(
+                "source placement and runtime binding inventories must be paired"
+            )
+        source_placements = tuple(
+            self._coerce_weight_manifest_inventory(
+                inventory,
+                WeightPlacementManifest,
+            )
+            for inventory in source_placement_inventories
+        )
+        source_bindings = tuple(
+            self._coerce_weight_manifest_inventory(
+                inventory,
+                WeightRuntimeBindingManifest,
+            )
+            for inventory in source_binding_inventories
+        )
+        phase_seconds["source_manifest"] = time.perf_counter() - source_started
+        self._require_manifest_identity(
+            source_placements,
+            model_id=target_model_id,
+            revision=manifest_revision,
+            role="source",
+        )
+
+        target_started = time.perf_counter()
+        target_resource = transfer_resources.enter_context(
+            target_manifest_builder(
+                model=model,
+                model_id=target_model_id,
+                revision=manifest_revision,
+                instance_id=f"sglang:{local_session_id}",
+                endpoint=local_session_id,
+            )
+        )
+        if not hasattr(target_resource, "placement") or not callable(
+            getattr(target_resource, "bind", None)
+        ):
+            raise ValueError(
+                "placement_binding_v1 requires a target manifest session with "
+                "placement and bind()"
+            )
+        target_placement = self._coerce_weight_manifest_inventory(
+            target_resource.placement,
+            WeightPlacementManifest,
+        )
+        self._require_manifest_identity(
+            (target_placement,),
+            model_id=target_model_id,
+            revision=manifest_revision,
+            role="target",
+        )
+        phase_seconds["target_manifest"] = time.perf_counter() - target_started
+
+        plan_started = time.perf_counter()
+        logical_plan = plan_weight_transfer_to_local_target(
+            source_placements,
+            target_placement,
+        )
+        phase_seconds["plan"] = time.perf_counter() - plan_started
+
+        binding_started = time.perf_counter()
+        target_binding = self._coerce_weight_manifest_inventory(
+            transfer_resources.enter_context(target_resource.bind()),
+            WeightRuntimeBindingManifest,
+        )
+        load_request = prepare_weight_load_from_plan(
+            logical_plan,
+            source_bindings=source_bindings,
+            target_bindings=(target_binding,),
+        )
+        phase_seconds["binding"] = time.perf_counter() - binding_started
+        load_attestor = _RemoteInstanceWeightLoadAttestor(
+            coordinator=coordinator,
+            target_resource=target_resource,
+            target_binding=target_binding,
+        )
+        load_preflight = _preflight_bounded_native_weight_transfer(
+            transfer_executor,
+            load_request,
+            attestor=load_attestor,
+        )
+        return _PreparedNativeHeterogeneousWeightLoad(
+            source_placements=source_placements,
+            source_bindings=source_bindings,
+            target_placement=target_placement,
+            target_binding=target_binding,
+            load_request=load_request,
+            load_attestor=load_attestor,
+            load_preflight=load_preflight,
+            transfer_executor=transfer_executor,
+        )
+
+    def _prepare_legacy_heterogeneous_weight_load(
+        self,
+        *,
+        model,
+        transfer_resources,
+        inventories,
+        target_manifest_builder,
+        target_model_id,
+        manifest_revision,
+        local_session_id,
+        phase_seconds,
+    ) -> _PreparedLegacyHeterogeneousWeightLoad:
+        source_started = time.perf_counter()
+        backend = _load_legacy_mooncake_weight_backend()
+        if not inventories:
+            raise ValueError("source runtime manifest inventories must not be empty")
+        source_manifests = tuple(
+            backend.RuntimeManifest.from_runtime_inventory(inventory)
+            for inventory in inventories
+        )
+        phase_seconds["source_manifest"] = time.perf_counter() - source_started
+        self._require_manifest_identity(
+            source_manifests,
+            model_id=target_model_id,
+            revision=manifest_revision,
+            role="source",
+        )
+
+        target_started = time.perf_counter()
+        selected_target_builder = self._runtime_v1_target_manifest_builder(
+            target_manifest_builder
+        )
+        target_resource = transfer_resources.enter_context(
+            selected_target_builder(
+                model=model,
+                model_id=target_model_id,
+                revision=manifest_revision,
+                instance_id=f"sglang:{local_session_id}",
+                endpoint=local_session_id,
+            )
+        )
+        target_manifest = backend.RuntimeManifest.from_runtime_inventory(
+            target_resource
+        )
+        self._require_manifest_identity(
+            (target_manifest,),
+            model_id=target_model_id,
+            revision=manifest_revision,
+            role="target",
+        )
+        phase_seconds["target_manifest"] = time.perf_counter() - target_started
+
+        plan_started = time.perf_counter()
+        plan = backend.plan_runtime_transfer_to_local_target(
+            source_manifests,
+            target_manifest,
+        )
+        phase_seconds["plan"] = time.perf_counter() - plan_started
+        source_registrations = tuple(
+            backend.MemoryRegistrationLease.from_fragment(
+                fragment,
+                runtime_lease_id=manifest.lease_id,
+            )
+            for manifest in source_manifests
+            for fragment in manifest.fragments
+        )
+        target_registrations = tuple(
+            backend.MemoryRegistrationLease.from_fragment(
+                fragment,
+                runtime_lease_id=target_manifest.lease_id,
+            )
+            for fragment in target_manifest.fragments
+        )
+        return _PreparedLegacyHeterogeneousWeightLoad(
+            plan=plan,
+            source_manifests=source_manifests,
+            source_registrations=source_registrations,
+            target_registrations=target_registrations,
+            target_manifest=target_manifest,
+            backend=backend,
+        )
+
+    @staticmethod
+    def _execute_native_heterogeneous_weight_load(
+        prepared: _PreparedNativeHeterogeneousWeightLoad,
+        phase_seconds: dict[str, float],
+        execution_context: WeightTransferExecutionContext,
+    ) -> Iterable[Any]:
+        load_receipt = execute_weight_load(
+            prepared.load_request,
+            provider=prepared.transfer_executor,
+            target_mode=WeightTargetLoadMode.COLD_START,
+            attestor=prepared.load_attestor,
+            preflight=prepared.load_preflight,
+            execution_context=execution_context,
+        )
+        provider_phases = dict(load_receipt.provider_phase_seconds)
+        phase_seconds["attestation"] += provider_phases.get("attest", 0.0)
+        phase_seconds["provider_probe"] = provider_phases.get("probe", 0.0)
+        phase_seconds["lowering"] = provider_phases.get("prepare", 0.0)
+        phase_seconds["data_transfer"] = provider_phases.get(
+            "submit", 0.0
+        ) + provider_phases.get("wait", 0.0)
+        phase_seconds["provider_synchronize"] = provider_phases.get("synchronize", 0.0)
+        phase_seconds["provider_release"] = provider_phases.get("release", 0.0)
+        return load_receipt.backend_receipts
+
+    @staticmethod
+    def _execute_legacy_heterogeneous_weight_load(
+        prepared: _PreparedLegacyHeterogeneousWeightLoad,
+        transfer_executor: Any,
+        execution_context: WeightTransferExecutionContext,
+    ) -> Iterable[Any]:
+        if execution_context.expired():
+            raise TimeoutError("remote weight transfer deadline expired")
+        return transfer_executor.execute(
+            prepared.plan,
+            prepared.source_manifests,
+            prepared.target_manifest,
+            source_pre_registered=True,
+            source_registrations=prepared.source_registrations,
+            target_pre_registered=True,
+            target_registrations=prepared.target_registrations,
+            execution_context=execution_context,
+        )
+
     def load_model_from_remote_instance_by_transfer_engine_heterogeneous(
         self,
         model,
@@ -3410,14 +5275,39 @@ class RemoteInstanceModelLoader(BaseModelLoader):
         target_manifest_builder,
         *,
         target_model_id: str,
-        target_revision: str,
+        target_artifact_revision: str | None = None,
+        target_hf_revision: str | None = None,
+        target_revision: str | None = None,
+        provider_factory=None,
     ) -> bool:
+        target_artifact_revision, target_hf_revision = _resolve_target_weight_revisions(
+            target_artifact_revision=target_artifact_revision,
+            target_hf_revision=target_hf_revision,
+            target_revision=target_revision,
+        )
         world_group = get_world_group()
+        quarantine_execution_context = WeightTransferExecutionContext(
+            deadline_unix_sec=(
+                time.time() + _HETEROGENEOUS_QUARANTINE_COORDINATION_TIMEOUT_SEC
+            )
+        )
+        try:
+            drain_heterogeneous_weight_transfer_quarantine(
+                max_attempts=1,
+                timeout_ms=_HETEROGENEOUS_UNKNOWN_DRAIN_TIMEOUT_MS,
+                execution_context=quarantine_execution_context,
+            )
+        except Exception:
+            logger.exception("Failed to recover a previous heterogeneous transfer")
         local_quarantined = bool(_HETEROGENEOUS_UNKNOWN_TRANSFER_QUARANTINE)
         world_size = getattr(world_group, "world_size", 1)
         if world_size > 1:
             try:
-                quarantine_flags = world_group.all_gather_object(local_quarantined)
+                quarantine_flags = world_group.all_gather_object(
+                    local_quarantined,
+                    phase="heterogeneous_quarantine.preflight",
+                    execution_context=quarantine_execution_context,
+                )
             except Exception:
                 logger.exception("Cannot coordinate the target-world quarantine state")
                 return False
@@ -3442,32 +5332,143 @@ class RemoteInstanceModelLoader(BaseModelLoader):
                 "--torchao-config because source and target layouts differ."
             )
             return False
-        try:
-            from mooncake.weight_transfer import (
-                MemoryRegistrationLease,
-                MooncakeTransferEngineReader,
-                RuntimeManifest,
-                TransferCompletionUnknownError,
-                TransferEngineError,
-                plan_runtime_transfer_to_local_target,
-            )
-        except Exception:
-            logger.exception("Cannot import Mooncake heterogeneous weight transfer")
-            return False
-
         started = time.perf_counter()
         phase_seconds = {
             "acquire": 0.0,
             "source_manifest": 0.0,
             "target_manifest": 0.0,
             "plan": 0.0,
+            "binding": 0.0,
+            "provider_setup": 0.0,
+            "attestation": 0.0,
+            "provider_probe": 0.0,
+            "lowering": 0.0,
+            "data_transfer": 0.0,
+            "provider_synchronize": 0.0,
+            "provider_release": 0.0,
             "transfer": 0.0,
             "synchronize": 0.0,
             "post_load": 0.0,
             "release": 0.0,
         }
+        provider_started = time.perf_counter()
+        native_provider = None
+        legacy_backend = None
+        capabilities = None
+        provider_preflight_error = None
+        if provider_factory is not None:
+            if not callable(provider_factory):
+                provider_preflight_error = (
+                    "configured weight transfer provider factory is not callable"
+                )
+            else:
+                try:
+                    native_provider = provider_factory(
+                        transfer_engine,
+                        max_batch_operations=8192,
+                    )
+                except Exception as error:
+                    provider_preflight_error = _compact_provider_preflight_error(
+                        "configured provider factory",
+                        error,
+                    )
+            if provider_preflight_error is None:
+                try:
+                    capabilities = probe_remote_instance_weight_transfer_capabilities(
+                        provider=native_provider,
+                    )
+                except Exception as error:
+                    provider_preflight_error = _compact_provider_preflight_error(
+                        "configured provider capability probe",
+                        error,
+                    )
+            if (
+                provider_preflight_error is None
+                and capabilities is not None
+                and not capabilities.native_executor
+            ):
+                provider_preflight_error = (
+                    capabilities.native_contract_error
+                    or "configured provider does not satisfy the native provider contract"
+                )
+        else:
+            try:
+                legacy_backend = _load_legacy_mooncake_weight_backend()
+            except RuntimeError as error:
+                legacy_backend = None
+                provider_preflight_error = _compact_provider_preflight_error(
+                    "legacy backend setup",
+                    error,
+                )
+            if provider_preflight_error is None:
+                try:
+                    capabilities = probe_remote_instance_weight_transfer_capabilities(
+                        legacy_backend=legacy_backend,
+                    )
+                except Exception as error:
+                    provider_preflight_error = _compact_provider_preflight_error(
+                        "legacy backend capability probe",
+                        error,
+                    )
+        phase_seconds["provider_setup"] = time.perf_counter() - provider_started
+        if (
+            provider_preflight_error is None
+            and capabilities is not None
+            and capabilities.legacy_planner
+            and not capabilities.native_executor
+            and (
+                legacy_backend is None
+                or not _legacy_runtime_v1_supports_bounded_execution(legacy_backend)
+            )
+        ):
+            provider_preflight_error = (
+                "Mooncake legacy runtime_v1 execution cannot satisfy the bounded "
+                "target-world deadline; configure a native weight transfer provider"
+            )
+        if (
+            provider_preflight_error is None
+            and capabilities is not None
+            and legacy_backend is not None
+            and not capabilities.legacy_planner
+        ):
+            provider_preflight_error = (
+                capabilities.legacy_contract_error
+                or "legacy backend does not satisfy the runtime_v1 provider contract"
+            )
+        if provider_preflight_error is None and capabilities is None:
+            provider_preflight_error = (
+                "provider capability probe returned no capabilities"
+            )
+        capability_fingerprint = None
+        if provider_preflight_error is None:
+            capability_fingerprint = (
+                "native" if provider_factory is not None else "legacy",
+                capabilities.native_executor,
+                capabilities.canonical_adapter,
+                capabilities.legacy_planner,
+            )
+        if not _vote_provider_preflight(
+            world_group,
+            provider_preflight_error,
+            capability_fingerprint,
+        ):
+            return False
+        requested_revision_semantics = (
+            ARTIFACT_WEIGHT_VERSION_V1
+            if capabilities.supports_placement_binding_v1
+            else HF_REVISION_V1
+        )
+        allow_legacy_hf_fallback = _allow_legacy_hf_manifest_revision(
+            capabilities,
+            target_artifact_revision=target_artifact_revision,
+            target_hf_revision=target_hf_revision,
+        )
         coordinator = RemoteInstanceWeightTransferWorldCoordinator(
-            seed_url, world_group
+            seed_url,
+            world_group,
+            capabilities=capabilities,
+            manifest_revision_semantics=requested_revision_semantics,
+            allow_legacy_hf_fallback=allow_legacy_hf_fallback,
         )
         acquire_started = time.perf_counter()
         try:
@@ -3479,299 +5480,83 @@ class RemoteInstanceModelLoader(BaseModelLoader):
         if transfer_session is None:
             logger.error("Cannot acquire remote weight transfer session.")
             return False
-        inventories = transfer_session.manifests
-        source_placement_inventories = getattr(
-            transfer_session, "source_placements", None
+        deadline_unix_sec = getattr(transfer_session, "deadline_unix_sec", None)
+        if deadline_unix_sec is None:
+            coordinator_context = getattr(coordinator, "execution_context", None)
+            deadline_unix_sec = getattr(
+                coordinator_context,
+                "deadline_unix_sec",
+                None,
+            )
+        if deadline_unix_sec is None:
+            logger.error(
+                "Remote weight transfer session is missing the required "
+                "absolute deadline"
+            )
+            return False
+        try:
+            execution_context = WeightTransferExecutionContext(
+                deadline_unix_sec=deadline_unix_sec,
+            )
+        except ValueError:
+            logger.exception("Target-world transfer session deadline is invalid")
+            return False
+        inventories = getattr(transfer_session, "manifests", ())
+        manifest_format = getattr(
+            transfer_session,
+            "manifest_format",
+            RUNTIME_MANIFEST_V1,
         )
-        source_binding_inventories = getattr(transfer_session, "source_bindings", None)
-        manifest_format = getattr(transfer_session, "manifest_format", "runtime_v1")
+        revision_semantics = getattr(
+            transfer_session,
+            "manifest_revision_semantics",
+            LEGACY_HF_UNATTESTED,
+        )
+        negotiated_legacy_hf_fallback = getattr(
+            transfer_session,
+            "allow_legacy_hf_fallback",
+            allow_legacy_hf_fallback,
+        )
+        identity_error = None
+        try:
+            manifest_revision = _resolve_remote_manifest_revision(
+                manifest_format=manifest_format,
+                source_revision_semantics=revision_semantics,
+                allow_legacy_hf_fallback=negotiated_legacy_hf_fallback,
+                target_artifact_revision=target_artifact_revision,
+                target_hf_revision=target_hf_revision,
+            )
+        except (RuntimeError, ValueError) as error:
+            identity_error = error
+            manifest_revision = target_hf_revision
         transfer_success = False
         release_safe = True
         release_success = False
         receipts = ()
         plan = None
-        try:
-            with ExitStack() as transfer_resources:
-                planning_error = None
-                try:
-                    source_manifest_started = time.perf_counter()
-                    source_placements = ()
-                    source_bindings = ()
-                    if manifest_format == "placement_binding_v1":
-                        if (
-                            not source_placement_inventories
-                            or not source_binding_inventories
-                            or len(source_placement_inventories)
-                            != len(source_binding_inventories)
-                        ):
-                            raise ValueError(
-                                "source placement and runtime binding inventories "
-                                "must be paired"
-                            )
-                        from mooncake.weight_transfer import (
-                            RuntimeBindingManifest,
-                            SourcePlacementManifest,
-                            bind_runtime_manifest,
-                        )
+        transfer_executor = native_provider
+        prepared: _PreparedHeterogeneousWeightLoad | None = None
+        execution_manifest_format = manifest_format
+        completion_unknown_errors = (WeightTransferCompletionUnknownError,)
+        legacy_transfer_errors = ()
+        pending_transfer_id = None
+        local_terminal_status = "NO_SUBMISSION"
+        finish_completed = False
 
-                        source_placements = tuple(
-                            SourcePlacementManifest.from_runtime_inventory(inventory)
-                            for inventory in source_placement_inventories
-                        )
-                        source_bindings = tuple(
-                            RuntimeBindingManifest.from_runtime_inventory(inventory)
-                            for inventory in source_binding_inventories
-                        )
-                        source_manifests = tuple(
-                            bind_runtime_manifest(placement, binding)
-                            for placement, binding in zip(
-                                source_placements, source_bindings
-                            )
-                        )
-                    elif manifest_format == "runtime_v1":
-                        if not inventories:
-                            raise ValueError(
-                                "source runtime manifest inventories must not be empty"
-                            )
-                        source_manifests = tuple(
-                            RuntimeManifest.from_runtime_inventory(inventory)
-                            for inventory in inventories
-                        )
-                    else:
-                        raise ValueError(
-                            f"unsupported source manifest format: {manifest_format}"
-                        )
-                    phase_seconds["source_manifest"] = (
-                        time.perf_counter() - source_manifest_started
-                    )
-                    source_identity_manifests = (
-                        source_placements if source_placements else source_manifests
-                    )
-                    self._require_manifest_identity(
-                        source_identity_manifests,
-                        model_id=target_model_id,
-                        revision=target_revision,
-                        role="source",
-                    )
-                    target_manifest_started = time.perf_counter()
-                    selected_target_builder = target_manifest_builder
-                    if manifest_format == "runtime_v1":
-                        selected_target_builder = (
-                            self._runtime_v1_target_manifest_builder(
-                                target_manifest_builder
-                            )
-                        )
-                    target_resource = transfer_resources.enter_context(
-                        selected_target_builder(
-                            model=model,
-                            model_id=target_model_id,
-                            revision=target_revision,
-                            instance_id=f"sglang:{local_session_id}",
-                            endpoint=local_session_id,
-                        )
-                    )
-                    if manifest_format == "placement_binding_v1":
-                        if not hasattr(target_resource, "placement") or not callable(
-                            getattr(target_resource, "bind", None)
-                        ):
-                            raise ValueError(
-                                "placement_binding_v1 requires a target manifest "
-                                "session with placement and bind()"
-                            )
-                        from mooncake.weight_transfer import (
-                            RuntimeBindingManifest,
-                            TargetPlacementManifest,
-                            bind_logical_transfer_plan,
-                            bind_runtime_manifest,
-                            plan_placement_transfer_to_local_target,
-                        )
-
-                        target_placement = (
-                            TargetPlacementManifest.from_runtime_inventory(
-                                target_resource.placement
-                            )
-                        )
-                        self._require_manifest_identity(
-                            (target_placement,),
-                            model_id=target_model_id,
-                            revision=target_revision,
-                            role="target",
-                        )
-                        phase_seconds["target_manifest"] = (
-                            time.perf_counter() - target_manifest_started
-                        )
-                        plan_started = time.perf_counter()
-                        logical_plan = plan_placement_transfer_to_local_target(
-                            source_placements, target_placement
-                        )
-                        target_binding_inventory = transfer_resources.enter_context(
-                            target_resource.bind()
-                        )
-                        target_binding = RuntimeBindingManifest.from_runtime_inventory(
-                            target_binding_inventory
-                        )
-                        target_manifest = bind_runtime_manifest(
-                            target_placement, target_binding
-                        )
-                        plan = bind_logical_transfer_plan(
-                            logical_plan,
-                            (target_binding,),
-                            source_bindings=source_bindings,
-                        )
-                        phase_seconds["plan"] = time.perf_counter() - plan_started
-                    else:
-                        target_manifest = RuntimeManifest.from_runtime_inventory(
-                            target_resource
-                        )
-                        self._require_manifest_identity(
-                            (target_manifest,),
-                            model_id=target_model_id,
-                            revision=target_revision,
-                            role="target",
-                        )
-                        phase_seconds["target_manifest"] = (
-                            time.perf_counter() - target_manifest_started
-                        )
-                        plan_started = time.perf_counter()
-                        plan = plan_runtime_transfer_to_local_target(
-                            source_manifests, target_manifest
-                        )
-                        phase_seconds["plan"] = time.perf_counter() - plan_started
-                    source_registrations = tuple(
-                        MemoryRegistrationLease.from_fragment(
-                            fragment,
-                            runtime_lease_id=manifest.lease_id,
-                        )
-                        for manifest in source_manifests
-                        for fragment in manifest.fragments
-                    )
-                    target_registrations = tuple(
-                        MemoryRegistrationLease.from_fragment(
-                            fragment,
-                            runtime_lease_id=target_manifest.lease_id,
-                        )
-                        for fragment in target_manifest.fragments
-                    )
-                except Exception as error:
-                    planning_error = error
-
-                world_ready = coordinator.ready_for_transfer(planning_error is None)
-                if planning_error is not None:
-                    raise planning_error
-                if not world_ready:
-                    raise RuntimeError(
-                        "target world is not ready for heterogeneous weight transfer"
-                    )
-
-                transfer_started = time.perf_counter()
-                reader = MooncakeTransferEngineReader(
-                    transfer_engine,
-                    max_batch_operations=8192,
-                )
-                release_safe = False
-                try:
-                    receipts = reader.execute(
-                        plan,
-                        source_manifests,
-                        target_manifest,
-                        source_pre_registered=True,
-                        source_registrations=source_registrations,
-                        target_pre_registered=True,
-                        target_registrations=target_registrations,
-                    )
-                except TransferCompletionUnknownError as error:
-                    logger.error(
-                        "Transfer completion is unknown; retaining the target model, "
-                        "runtime binding, registrations, and source lease while "
-                        "draining %s",
-                        error.pending_transfer_id,
-                    )
-                    pending_interrupt = None
-                    for _ in range(_HETEROGENEOUS_UNKNOWN_DRAIN_MAX_ATTEMPTS):
-                        try:
-                            terminal_status = reader.drain_pending_transfer(
-                                error.pending_transfer_id,
-                                timeout_ms=_HETEROGENEOUS_UNKNOWN_DRAIN_TIMEOUT_MS,
-                            )
-                        except BaseException as drain_error:
-                            if isinstance(drain_error, Exception):
-                                logger.exception(
-                                    "Failed to query pending transfer %s; target "
-                                    "resources remain quarantined",
-                                    error.pending_transfer_id,
-                                )
-                                time.sleep(1)
-                            else:
-                                if pending_interrupt is None:
-                                    pending_interrupt = drain_error
-                                logger.warning(
-                                    "Deferring process interruption until pending "
-                                    "transfer %s reaches a terminal state",
-                                    error.pending_transfer_id,
-                                )
-                            continue
-                        if terminal_status == "COMPLETION_UNKNOWN":
-                            continue
-                        release_safe = True
-                        if pending_interrupt is not None:
-                            raise pending_interrupt
-                        raise TransferEngineError(
-                            "heterogeneous transfer became terminal after an "
-                            f"unknown completion state: {terminal_status}"
-                        ) from error
-                    quarantine_resources = transfer_resources.pop_all()
-                    _HETEROGENEOUS_UNKNOWN_TRANSFER_QUARANTINE.append(
-                        _HeterogeneousUnknownTransferQuarantine(
-                            pending_transfer_id=error.pending_transfer_id,
-                            resources=quarantine_resources,
-                            owners=(
-                                model,
-                                transfer_engine,
-                                reader,
-                                tuple(source_manifests),
-                                target_manifest,
-                                source_registrations,
-                                target_registrations,
-                                transfer_session,
-                                plan,
-                            ),
-                        )
-                    )
-                    logger.critical(
-                        "Pending transfer %s did not reach a terminal state after "
-                        "%d drain attempts; target resources are retained for "
-                        "process lifetime and source release remains blocked",
-                        error.pending_transfer_id,
-                        _HETEROGENEOUS_UNKNOWN_DRAIN_MAX_ATTEMPTS,
-                    )
-                    if pending_interrupt is not None:
-                        raise pending_interrupt
-                    raise
-                release_safe = True
-                phase_seconds["transfer"] = time.perf_counter() - transfer_started
-            synchronize_started = time.perf_counter()
-            current_platform.synchronize()
-            phase_seconds["synchronize"] = time.perf_counter() - synchronize_started
-            post_load_started = time.perf_counter()
-            _post_load_weights(model)
-            phase_seconds["post_load"] = time.perf_counter() - post_load_started
-            transfer_success = True
-        except TransferCompletionUnknownError:
-            release_safe = False
-            logger.exception(
-                "Heterogeneous remote-instance transfer completion remains unknown; "
-                "target resources and source lease must remain quarantined"
+        def finish_before_target_release() -> None:
+            nonlocal finish_completed
+            nonlocal release_success
+            nonlocal transfer_success
+            if finish_completed:
+                return
+            finish_completed = True
+            clear_owner_source_session = getattr(
+                coordinator,
+                "clear_owner_source_session",
+                None,
             )
-        except TransferEngineError:
-            release_safe = True
-            logger.exception(
-                "Heterogeneous remote-instance Transfer Engine loading failed with "
-                "a known terminal completion state"
-            )
-        except Exception:
-            release_safe = True
-            logger.exception("Heterogeneous remote-instance weight loading failed")
-        finally:
+            if callable(clear_owner_source_session):
+                clear_owner_source_session()
             release_started = time.perf_counter()
             try:
                 transfer_success, release_success = coordinator.finish(
@@ -3783,6 +5568,318 @@ class RemoteInstanceModelLoader(BaseModelLoader):
                 release_success = False
                 logger.exception("Failed to finish remote weight transfer session")
             phase_seconds["release"] = time.perf_counter() - release_started
+
+            world_release_safe = getattr(
+                coordinator,
+                "world_release_safe",
+                release_success and release_safe,
+            )
+            if world_release_safe and release_success:
+                return
+
+            ticket = pending_transfer_id
+            if not ticket:
+                rank = getattr(world_group, "rank_in_group", 0)
+                ticket_kind = (
+                    local_terminal_status.lower().replace("_", "-")
+                    if local_terminal_status in _HETEROGENEOUS_TERMINAL_STATUSES
+                    else "completion-unknown"
+                )
+                ticket = f"{transfer_session.transfer_id}:{ticket_kind}-rank-{rank}"
+            quarantine_resources = transfer_resources.pop_all()
+            _HETEROGENEOUS_UNKNOWN_TRANSFER_QUARANTINE.append(
+                _HeterogeneousUnknownTransferQuarantine(
+                    source_transfer_id=transfer_session.transfer_id,
+                    pending_transfer_id=ticket,
+                    transfer_executor=transfer_executor,
+                    resources=quarantine_resources,
+                    coordinator=coordinator,
+                    owners=(
+                        model,
+                        transfer_engine,
+                        transfer_executor,
+                        transfer_session,
+                        prepared,
+                    ),
+                    terminal_status=local_terminal_status,
+                )
+            )
+            logger.critical(
+                "Target world did not prove terminal completion for source "
+                "transfer %s; target resources and source lease remain "
+                "quarantined",
+                transfer_session.transfer_id,
+            )
+
+        try:
+            with ExitStack() as transfer_resources:
+                planning_error = None
+                try:
+                    if identity_error is not None:
+                        raise identity_error
+                    if manifest_format == PLACEMENT_BINDING_V1:
+                        if not capabilities.native_executor:
+                            raise RuntimeError(
+                                "placement_binding_v1 requires the native "
+                                "weight transfer executor"
+                            )
+                        prepared = (
+                            self._prepare_distributed_native_heterogeneous_weight_load(
+                                model=model,
+                                coordinator=coordinator,
+                                world_group=world_group,
+                                transfer_resources=transfer_resources,
+                                target_manifest_builder=target_manifest_builder,
+                                target_model_id=target_model_id,
+                                manifest_revision=manifest_revision,
+                                local_session_id=local_session_id,
+                                transfer_executor=transfer_executor,
+                                phase_seconds=phase_seconds,
+                            )
+                        )
+                    elif manifest_format == RUNTIME_MANIFEST_V1:
+                        if (
+                            capabilities.native_executor
+                            and capabilities.canonical_adapter
+                        ):
+                            (
+                                adapted_source_placements,
+                                adapted_source_bindings,
+                            ) = self._adapt_runtime_v1_source_inventories(inventories)
+                            prepared = self._prepare_native_heterogeneous_weight_load(
+                                model=model,
+                                coordinator=coordinator,
+                                transfer_resources=transfer_resources,
+                                source_placement_inventories=(
+                                    adapted_source_placements
+                                ),
+                                source_binding_inventories=(adapted_source_bindings),
+                                target_manifest_builder=target_manifest_builder,
+                                target_model_id=target_model_id,
+                                manifest_revision=manifest_revision,
+                                local_session_id=local_session_id,
+                                transfer_executor=transfer_executor,
+                                phase_seconds=phase_seconds,
+                            )
+                            execution_manifest_format = PLACEMENT_BINDING_V1
+                        elif capabilities.legacy_planner:
+                            prepared = self._prepare_legacy_heterogeneous_weight_load(
+                                model=model,
+                                transfer_resources=transfer_resources,
+                                inventories=inventories,
+                                target_manifest_builder=target_manifest_builder,
+                                target_model_id=target_model_id,
+                                manifest_revision=manifest_revision,
+                                local_session_id=local_session_id,
+                                phase_seconds=phase_seconds,
+                            )
+                        else:
+                            raise RuntimeError(
+                                "runtime_v1 requires either the SGLang canonical "
+                                "adapter with native executor or the explicit "
+                                "Mooncake legacy planner API"
+                            )
+                    else:
+                        raise ValueError(
+                            f"unsupported source manifest format: {manifest_format}"
+                        )
+                    if isinstance(prepared, _PreparedNativeHeterogeneousWeightLoad):
+                        plan = prepared.load_request.plan
+                        transfer_executor = prepared.transfer_executor
+                    else:
+                        plan = prepared.plan
+                        completion_unknown_errors = (
+                            WeightTransferCompletionUnknownError,
+                            prepared.backend.TransferCompletionUnknownError,
+                        )
+                        legacy_transfer_errors = (prepared.backend.TransferEngineError,)
+                except BaseException as error:
+                    planning_error = error
+
+                transfer_resources.callback(finish_before_target_release)
+                world_ready = coordinator.ready_for_transfer(planning_error is None)
+                if planning_error is not None:
+                    raise planning_error
+                if not world_ready:
+                    raise RuntimeError(
+                        "target world is not ready for heterogeneous weight transfer"
+                    )
+
+                transfer_started = time.perf_counter()
+                release_safe = False
+                local_terminal_status = None
+                try:
+                    if isinstance(prepared, _PreparedNativeHeterogeneousWeightLoad):
+                        receipts = self._execute_native_heterogeneous_weight_load(
+                            prepared,
+                            phase_seconds,
+                            execution_context,
+                        )
+                    elif isinstance(prepared, _PreparedLegacyHeterogeneousWeightLoad):
+                        transfer_executor = (
+                            prepared.backend.MooncakeTransferEngineReader(
+                                transfer_engine,
+                                max_batch_operations=8192,
+                            )
+                        )
+                        receipts = self._execute_legacy_heterogeneous_weight_load(
+                            prepared,
+                            transfer_executor,
+                            execution_context,
+                        )
+                    else:
+                        raise RuntimeError(
+                            "heterogeneous weight load execution was not prepared"
+                        )
+                except completion_unknown_errors as error:
+                    pending_transfer_id = getattr(
+                        error,
+                        "completion_ticket",
+                        None,
+                    ) or getattr(error, "pending_transfer_id", None)
+                    if not pending_transfer_id:
+                        logger.critical(
+                            "Completion-unknown transfer has no drain ticket; "
+                            "resources remain quarantined for process lifetime"
+                        )
+                        raise
+                    logger.error(
+                        "Transfer completion is unknown; retaining the target model, "
+                        "runtime binding, registrations, and source lease while "
+                        "draining %s",
+                        pending_transfer_id,
+                    )
+                    pending_interrupt = None
+                    for _ in range(_HETEROGENEOUS_UNKNOWN_DRAIN_MAX_ATTEMPTS):
+                        try:
+                            drain_completion = getattr(
+                                transfer_executor,
+                                "drain_completion",
+                                None,
+                            )
+                            if callable(drain_completion):
+                                terminal_status = drain_completion(
+                                    pending_transfer_id,
+                                    timeout_ms=(
+                                        _HETEROGENEOUS_UNKNOWN_DRAIN_TIMEOUT_MS
+                                    ),
+                                )
+                            else:
+                                terminal_status = (
+                                    transfer_executor.drain_pending_transfer(
+                                        pending_transfer_id,
+                                        timeout_ms=(
+                                            _HETEROGENEOUS_UNKNOWN_DRAIN_TIMEOUT_MS
+                                        ),
+                                    )
+                                )
+                        except BaseException as drain_error:
+                            if isinstance(drain_error, Exception):
+                                logger.exception(
+                                    "Failed to query pending transfer %s; target "
+                                    "resources remain quarantined",
+                                    pending_transfer_id,
+                                )
+                                time.sleep(1)
+                            else:
+                                if pending_interrupt is None:
+                                    pending_interrupt = drain_error
+                                logger.warning(
+                                    "Deferring process interruption until pending "
+                                    "transfer %s reaches a terminal state",
+                                    pending_transfer_id,
+                                )
+                            continue
+                        status_name = _transfer_completion_status_name(terminal_status)
+                        if status_name == "COMPLETION_UNKNOWN":
+                            continue
+                        if status_name not in _HETEROGENEOUS_TERMINAL_STATUSES:
+                            logger.error(
+                                "Pending transfer %s returned invalid "
+                                "completion status %r",
+                                pending_transfer_id,
+                                terminal_status,
+                            )
+                            continue
+                        local_terminal_status = status_name
+                        release_safe = True
+                        if pending_interrupt is not None:
+                            raise pending_interrupt
+                        terminal_error_type = (
+                            prepared.backend.TransferEngineError
+                            if isinstance(
+                                prepared,
+                                _PreparedLegacyHeterogeneousWeightLoad,
+                            )
+                            else RuntimeError
+                        )
+                        raise terminal_error_type(
+                            "heterogeneous transfer became terminal after an "
+                            f"unknown completion state: {status_name}"
+                        ) from error
+                    logger.critical(
+                        "Pending transfer %s did not reach a terminal state after "
+                        "%d drain attempts; the target-world finish barrier will "
+                        "retain resources and the source lease",
+                        pending_transfer_id,
+                        _HETEROGENEOUS_UNKNOWN_DRAIN_MAX_ATTEMPTS,
+                    )
+                    if pending_interrupt is not None:
+                        raise pending_interrupt
+                    raise
+                except WeightTransferError as error:
+                    release_safe = error.completion_known
+                    if release_safe:
+                        local_terminal_status = "FAILED_DRAINED"
+                    raise
+                except legacy_transfer_errors:
+                    release_safe = True
+                    local_terminal_status = "FAILED_DRAINED"
+                    raise
+                except Exception:
+                    release_safe = False
+                    raise
+                release_safe = True
+                local_terminal_status = "COMPLETED"
+                phase_seconds["transfer"] = time.perf_counter() - transfer_started
+                if isinstance(prepared, _PreparedLegacyHeterogeneousWeightLoad):
+                    phase_seconds["data_transfer"] = phase_seconds["transfer"]
+                synchronize_started = time.perf_counter()
+                current_platform.synchronize()
+                phase_seconds["synchronize"] = time.perf_counter() - synchronize_started
+                post_load_started = time.perf_counter()
+                _post_load_weights(model)
+                phase_seconds["post_load"] = time.perf_counter() - post_load_started
+                transfer_success = True
+        except completion_unknown_errors:
+            release_safe = False
+            logger.exception(
+                "Heterogeneous remote-instance transfer completion remains unknown; "
+                "target resources and source lease must remain quarantined"
+            )
+        except WeightTransferError as error:
+            release_safe = error.completion_known
+            if release_safe:
+                logger.exception(
+                    "Heterogeneous remote-instance weight loading failed with "
+                    "a known terminal completion state"
+                )
+            else:
+                logger.exception(
+                    "Heterogeneous remote-instance weight loading failed without "
+                    "a terminal completion proof; resources remain quarantined"
+                )
+        except legacy_transfer_errors:
+            release_safe = True
+            logger.exception(
+                "Heterogeneous remote-instance Transfer Engine loading failed with "
+                "a known terminal completion state"
+            )
+        except Exception:
+            logger.exception("Heterogeneous remote-instance weight loading failed")
+        finally:
+            if not finish_completed:
+                finish_before_target_release()
 
         if not transfer_success:
             logger.error(
@@ -3801,13 +5898,19 @@ class RemoteInstanceModelLoader(BaseModelLoader):
             )
             return False
 
+        try:
+            target_rank = int(get_parallel().world_rank)
+        except (AssertionError, AttributeError, RuntimeError):
+            target_rank = int(getattr(world_group, "rank_in_group", 0))
         logger.info(
             "Loaded heterogeneous remote-instance weights: "
-            "manifest_format=%s, transfer_id=%s, release_success=true, bytes=%d, "
+            "manifest_format=%s, transfer_id=%s, target_rank=%d, "
+            "release_success=true, bytes=%d, "
             "compact_operations=%d, segments=%d, elapsed=%.4fs; "
             "phases: %s",
-            manifest_format,
+            execution_manifest_format,
             transfer_session.transfer_id,
+            target_rank,
             sum(receipt.nbytes for receipt in receipts),
             len(plan.operations),
             sum(receipt.operation_count for receipt in receipts),
@@ -4632,6 +6735,7 @@ def get_model_loader(
     model_optloader_allowed = model_config and load_config.load_format not in (
         LoadFormat.RUNAI_STREAMER,
         LoadFormat.REMOTE_INSTANCE,
+        LoadFormat.WEIGHT_SNAPSHOT,
     )
 
     if model_optloader_allowed and (
@@ -4703,6 +6807,9 @@ def get_model_loader(
 
     if load_config.load_format == LoadFormat.REMOTE_INSTANCE:
         return RemoteInstanceModelLoader(load_config)
+
+    if load_config.load_format == LoadFormat.WEIGHT_SNAPSHOT:
+        return WeightSnapshotModelLoader(load_config)
 
     if load_config.load_format == LoadFormat.PRIVATE:
         import importlib

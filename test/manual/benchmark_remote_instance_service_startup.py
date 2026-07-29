@@ -19,20 +19,20 @@ Homogeneous example (runs all three modes by default):
 
 PYTHONPATH=python python test/manual/benchmark_remote_instance_service_startup.py \
   --model /models/Qwen3.5-0.8B --source-gpus 0,1 --target-gpus 2,3 \
-  --source-tp-size 2 --target-tp-size 2 --drop-page-cache --iterations 4
+  --source-tp-size 2 --target-tp-size 2 --drop-page-cache --iterations 6
 
 Large-model legacy example (runtime-manifest semantics may be model-specific):
 
 PYTHONPATH=python python test/manual/benchmark_remote_instance_service_startup.py \
   --model /models/Qwen2-72B --source-gpus 0,1 --target-gpus 2,3 \
   --source-tp-size 2 --target-tp-size 2 --modes cold,legacy \
-  --drop-page-cache --iterations 3
+  --drop-page-cache --iterations 6
 
 Heterogeneous example (legacy is reported as ineligible when TPs differ):
 
 PYTHONPATH=python python test/manual/benchmark_remote_instance_service_startup.py \
   --model /models/Qwen3.5-0.8B --source-gpus 0,1 --target-gpus 2,3,4,5 \
-  --source-tp-size 2 --target-tp-size 4 --drop-page-cache --iterations 3
+  --source-tp-size 2 --target-tp-size 4 --drop-page-cache --iterations 6
 """
 
 from __future__ import annotations
@@ -41,6 +41,7 @@ import argparse
 import json
 import math
 import os
+import re
 import signal
 import socket
 import statistics
@@ -57,6 +58,9 @@ import requests
 ALL_MODES = ("cold", "legacy", "manifest")
 REUSE_MODES = ("legacy", "manifest")
 MIN_PERCENTILE_SAMPLES = 5
+MIN_MEASURED_ITERATIONS = 5
+SERVER_TERMINATION_GRACE_S = 30.0
+SERVER_KILL_TIMEOUT_S = 30.0
 REUSE_REQUIRED_LOG_MARKERS = {
     "legacy": (
         "Loading weights from remote instance ...",
@@ -86,10 +90,30 @@ REUSE_FORBIDDEN_LOG_MARKERS = (
 
 
 def _p95(values: list[float]) -> float | None:
-    if not values:
+    if len(values) < MIN_PERCENTILE_SAMPLES:
         return None
     ordered = sorted(values)
     return ordered[max(0, math.ceil(len(ordered) * 0.95) - 1)]
+
+
+def _coefficient_of_variation(values: list[float]) -> float | None:
+    if len(values) < MIN_PERCENTILE_SAMPLES:
+        return None
+    mean = statistics.mean(values)
+    if mean == 0:
+        return None
+    return statistics.pstdev(values) / mean
+
+
+def _series_summary(values: list[float]) -> dict[str, float | None]:
+    return {
+        "p50": statistics.median(values),
+        "p95": _p95(values),
+        "mean": statistics.mean(values),
+        "min": min(values),
+        "max": max(values),
+        "cv": _coefficient_of_variation(values),
+    }
 
 
 @dataclass
@@ -440,11 +464,27 @@ def _assert_process_alive(server: ServerProcess) -> None:
 def _assert_port_available(port: int) -> None:
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             probe.bind(("127.0.0.1", port))
     except OSError as error:
         owners = sorted(_listening_port_owner_pids(port))
         owner_text = f" by listening PID(s) {owners}" if owners else ""
         raise RuntimeError(f"port {port} is already in use{owner_text}") from error
+
+
+def _wait_port_released(port: int, timeout_s: float) -> None:
+    deadline = time.monotonic() + timeout_s
+    while True:
+        try:
+            _assert_port_available(port)
+            return
+        except RuntimeError as error:
+            remaining_s = deadline - time.monotonic()
+            if remaining_s <= 0:
+                raise RuntimeError(
+                    f"port {port} was not released within {timeout_s:.1f}s"
+                ) from error
+            time.sleep(min(0.1, remaining_s))
 
 
 def _assert_server_identity(
@@ -504,6 +544,105 @@ def _assert_reuse_log_contract(mode: str, log_path: Path) -> dict[str, Any]:
     }
 
 
+def _parse_manifest_transfer_metrics(
+    log_path: Path,
+    *,
+    expected_target_ranks: tuple[int, ...] | None = None,
+) -> dict[str, Any]:
+    marker = "Loaded heterogeneous remote-instance weights:"
+    lines = [
+        line
+        for line in log_path.read_text(errors="replace").splitlines()
+        if marker in line
+    ]
+    if not lines:
+        raise RuntimeError(f"manifest transfer metrics are missing: {log_path}")
+
+    rank_metrics = []
+    for line in lines:
+        rank_match = re.search(r"\btarget_rank=(\d+),", line)
+        match = re.search(
+            r"\bbytes=(\d+), "
+            r"compact_operations=(\d+), segments=(\d+), "
+            r"elapsed=([0-9]+(?:\.[0-9]+)?)s; phases: (.+)$",
+            line,
+        )
+        if match is None:
+            raise RuntimeError(
+                f"manifest transfer metrics are malformed in {log_path}: {line}"
+            )
+        phases_s = {
+            name: float(value)
+            for name, value in re.findall(
+                r"\b([a-z_]+)=([0-9]+(?:\.[0-9]+)?)s", match.group(5)
+            )
+        }
+        rank_metrics.append(
+            {
+                "target_rank": (
+                    None if rank_match is None else int(rank_match.group(1))
+                ),
+                "logical_bytes": int(match.group(1)),
+                "compact_operations": int(match.group(2)),
+                "segments": int(match.group(3)),
+                "elapsed_s": float(match.group(4)),
+                "phases_s": phases_s,
+            }
+        )
+
+    rank_ids = [metric["target_rank"] for metric in rank_metrics]
+    if len(rank_metrics) > 1 and (
+        any(rank is None for rank in rank_ids) or len(set(rank_ids)) != len(rank_ids)
+    ):
+        raise RuntimeError(
+            "manifest transfer metrics need unique target_rank values for "
+            f"multiple rank records in {log_path}"
+        )
+
+    if expected_target_ranks is not None:
+        if any(rank is None for rank in rank_ids) or tuple(sorted(rank_ids)) != tuple(
+            expected_target_ranks
+        ):
+            raise RuntimeError(
+                "manifest transfer metrics do not cover the expected target ranks: "
+                f"expected={expected_target_ranks}, actual={tuple(sorted(rank_ids))}"
+            )
+
+    logical_bytes = sum(metric["logical_bytes"] for metric in rank_metrics)
+    elapsed_s = max(metric["elapsed_s"] for metric in rank_metrics)
+    phases_s = {
+        phase: max(
+            metric["phases_s"][phase]
+            for metric in rank_metrics
+            if phase in metric["phases_s"]
+        )
+        for phase in sorted(
+            {phase for metric in rank_metrics for phase in metric["phases_s"]}
+        )
+    }
+    data_transfer_s = phases_s.get("data_transfer")
+    if data_transfer_s is None or data_transfer_s <= 0 or elapsed_s <= 0:
+        raise RuntimeError(
+            f"manifest transfer durations must be positive in {log_path}: "
+            f"elapsed={elapsed_s}, data_transfer={data_transfer_s}"
+        )
+
+    data_transfer_gb_per_s = logical_bytes / data_transfer_s / 1e9
+    return {
+        "logical_bytes": logical_bytes,
+        "compact_operations": sum(
+            metric["compact_operations"] for metric in rank_metrics
+        ),
+        "segments": sum(metric["segments"] for metric in rank_metrics),
+        "elapsed_s": elapsed_s,
+        "phases_s": phases_s,
+        "data_transfer_logical_gb_per_s": data_transfer_gb_per_s,
+        "data_transfer_logical_gbps": data_transfer_gb_per_s * 8,
+        "end_to_end_logical_gb_per_s": logical_bytes / elapsed_s / 1e9,
+        "rank_metrics": rank_metrics,
+    }
+
+
 def _wait_ready(server: ServerProcess, port: int, timeout_s: float) -> float:
     if port != server.port:
         raise ValueError(
@@ -519,7 +658,7 @@ def _wait_ready(server: ServerProcess, port: int, timeout_s: float) -> float:
             continue
         before_health = _assert_server_identity(server, owner_pids)
         try:
-            response = requests.get(url, timeout=1)
+            response = requests.get(url, timeout=3)
             if response.status_code == 200:
                 server.ready_identity = {
                     "before_health": before_health,
@@ -746,15 +885,63 @@ def _collect_source_baseline(
     }
 
 
+def _process_group_alive(process_group: int) -> bool:
+    try:
+        os.killpg(process_group, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _wait_process_group_exit(process_group: int, timeout_s: float) -> bool:
+    deadline = time.monotonic() + timeout_s
+    while _process_group_alive(process_group):
+        remaining_s = deadline - time.monotonic()
+        if remaining_s <= 0:
+            return False
+        time.sleep(min(0.1, remaining_s))
+    return True
+
+
 def _stop_server(server: ServerProcess) -> None:
-    if server.process.poll() is None:
-        os.killpg(server.process.pid, signal.SIGTERM)
+    process_group = server.process.pid
+
+    def signal_group(sig: signal.Signals) -> None:
         try:
-            server.process.wait(timeout=30)
-        except subprocess.TimeoutExpired:
-            os.killpg(server.process.pid, signal.SIGKILL)
-            server.process.wait(timeout=30)
-    server.log_file.close()
+            os.killpg(process_group, sig)
+        except ProcessLookupError:
+            pass
+
+    try:
+        signal_group(signal.SIGTERM)
+        term_deadline = time.monotonic() + SERVER_TERMINATION_GRACE_S
+        if server.process.poll() is None:
+            try:
+                server.process.wait(timeout=max(0.0, term_deadline - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                pass
+
+        group_exited = _wait_process_group_exit(
+            process_group,
+            timeout_s=max(0.0, term_deadline - time.monotonic()),
+        )
+        if not group_exited:
+            signal_group(signal.SIGKILL)
+            try:
+                server.process.wait(timeout=SERVER_KILL_TIMEOUT_S)
+            except subprocess.TimeoutExpired:
+                pass
+            if not _wait_process_group_exit(
+                process_group, timeout_s=SERVER_KILL_TIMEOUT_S
+            ):
+                raise RuntimeError(
+                    f"server process group {process_group} did not exit after SIGKILL"
+                )
+        _wait_port_released(server.port, timeout_s=30.0)
+    finally:
+        server.log_file.close()
 
 
 def _assert_iteration_consistency(
@@ -810,6 +997,7 @@ def _run_target(
     source_baseline_p95_s: float,
     target_expected: dict[str, Any] | None,
     recorder: ResponseRecorder,
+    expected_target_ranks: tuple[int, ...] | None = None,
 ) -> dict[str, Any]:
     if args.drop_page_cache:
         _drop_page_cache()
@@ -884,6 +1072,14 @@ def _run_target(
             if mode in REUSE_MODES
             else None
         )
+        transfer_metrics = (
+            _parse_manifest_transfer_metrics(
+                server.log_path,
+                expected_target_ranks=expected_target_ranks,
+            )
+            if mode == "manifest"
+            else None
+        )
         return {
             "mode": mode,
             "iteration": iteration,
@@ -897,6 +1093,7 @@ def _run_target(
             },
             "source_probe": probe_summary,
             "reuse_log_contract": reuse_log_contract,
+            "transfer_metrics": transfer_metrics,
             "server_identity": {
                 "root_pid": server.process.pid,
                 "port": server.port,
@@ -916,12 +1113,16 @@ def _run_target(
 def _mode_summary(records: list[dict[str, Any]]) -> dict[str, Any]:
     ready = [record["spawn_to_ready_s"] for record in records]
     first_generation = [record["first_generation_s"] for record in records]
-    return {
+    summary = {
         "iterations": len(records),
         "spawn_to_ready_p50_s": statistics.median(ready),
+        "spawn_to_ready_p95_s": _p95(ready),
         "spawn_to_ready_mean_s": statistics.mean(ready),
+        "spawn_to_ready_cv": _coefficient_of_variation(ready),
         "first_generation_p50_s": statistics.median(first_generation),
+        "first_generation_p95_s": _p95(first_generation),
         "first_generation_mean_s": statistics.mean(first_generation),
+        "first_generation_cv": _coefficient_of_variation(first_generation),
         "source_probe_success_count": sum(
             record["source_probe"]["success_count"] for record in records
         ),
@@ -932,6 +1133,88 @@ def _mode_summary(records: list[dict[str, Any]]) -> dict[str, Any]:
             record["source_probe"]["mismatch_count"] for record in records
         ),
     }
+    transfer_metrics = [
+        record["transfer_metrics"]
+        for record in records
+        if record.get("transfer_metrics") is not None
+    ]
+    if transfer_metrics:
+        phases = sorted(
+            {name for metrics in transfer_metrics for name in metrics["phases_s"]}
+        )
+        summary["transfer"] = {
+            "iterations": len(transfer_metrics),
+            "logical_bytes": _series_summary(
+                [metrics["logical_bytes"] for metrics in transfer_metrics]
+            ),
+            "compact_operations": _series_summary(
+                [metrics["compact_operations"] for metrics in transfer_metrics]
+            ),
+            "segments": _series_summary(
+                [metrics["segments"] for metrics in transfer_metrics]
+            ),
+            "elapsed_s": _series_summary(
+                [metrics["elapsed_s"] for metrics in transfer_metrics]
+            ),
+            "data_transfer_logical_gb_per_s_p50": statistics.median(
+                [
+                    metrics["data_transfer_logical_gb_per_s"]
+                    for metrics in transfer_metrics
+                ]
+            ),
+            "data_transfer_logical_gb_per_s_p95": _p95(
+                [
+                    metrics["data_transfer_logical_gb_per_s"]
+                    for metrics in transfer_metrics
+                ]
+            ),
+            "data_transfer_logical_gb_per_s_cv": _coefficient_of_variation(
+                [
+                    metrics["data_transfer_logical_gb_per_s"]
+                    for metrics in transfer_metrics
+                ]
+            ),
+            "data_transfer_logical_gbps_p50": statistics.median(
+                [metrics["data_transfer_logical_gbps"] for metrics in transfer_metrics]
+            ),
+            "end_to_end_logical_gb_per_s_p50": statistics.median(
+                [metrics["end_to_end_logical_gb_per_s"] for metrics in transfer_metrics]
+            ),
+            "phases_s": {
+                phase: _series_summary(
+                    [
+                        metrics["phases_s"][phase]
+                        for metrics in transfer_metrics
+                        if phase in metrics["phases_s"]
+                    ]
+                )
+                for phase in phases
+            },
+        }
+        per_rank = {}
+        for metrics in transfer_metrics:
+            for rank_metric in metrics.get("rank_metrics", ()):
+                rank = rank_metric["target_rank"]
+                if rank is None:
+                    continue
+                per_rank.setdefault(rank, []).append(rank_metric)
+        if per_rank:
+            summary["transfer"]["per_rank"] = {
+                str(rank): {
+                    metric_name: _series_summary(
+                        [metric[metric_name] for metric in rank_records]
+                    )
+                    for metric_name in (
+                        "logical_bytes",
+                        "compact_operations",
+                        "segments",
+                        "elapsed_s",
+                    )
+                    for rank_records in (records_for_rank,)
+                }
+                for rank, records_for_rank in sorted(per_rank.items())
+            }
+    return summary
 
 
 def _reuse_comparison(
@@ -941,16 +1224,25 @@ def _reuse_comparison(
     max_reuse_to_cold_ratio: float,
 ) -> dict[str, Any]:
     cold_p50 = cold["spawn_to_ready_p50_s"]
+    cold_p95 = cold["spawn_to_ready_p95_s"]
     cold_mean = cold["spawn_to_ready_mean_s"]
     reuse_p50 = reuse["spawn_to_ready_p50_s"]
+    reuse_p95 = reuse["spawn_to_ready_p95_s"]
     reuse_mean = reuse["spawn_to_ready_mean_s"]
     threshold_s = cold_p50 * max_reuse_to_cold_ratio
     return {
         "cold_spawn_to_ready_p50_s": cold_p50,
         "reuse_spawn_to_ready_p50_s": reuse_p50,
+        "cold_spawn_to_ready_p95_s": cold_p95,
+        "reuse_spawn_to_ready_p95_s": reuse_p95,
         "cold_spawn_to_ready_mean_s": cold_mean,
         "reuse_spawn_to_ready_mean_s": reuse_mean,
         "p50_speedup": cold_p50 / reuse_p50,
+        "p95_speedup": (
+            cold_p95 / reuse_p95
+            if cold_p95 is not None and reuse_p95 is not None
+            else None
+        ),
         "mean_speedup": cold_mean / reuse_mean,
         "reuse_to_cold_p50_ratio": reuse_p50 / cold_p50,
         "p50_improvement_ratio": (cold_p50 - reuse_p50) / cold_p50,
@@ -1003,14 +1295,17 @@ def _ordered_modes(modes) -> list[str]:
 
 def _execution_schedule(modes, iterations: int) -> list[list[str]]:
     ordered = _ordered_modes(modes)
-    prefix = ["cold"] if "cold" in ordered else []
-    reuse = [mode for mode in ordered if mode != "cold"]
-    if not reuse:
-        return [prefix.copy() for _ in range(iterations)]
+    if not ordered:
+        return []
+    if iterations % len(ordered):
+        raise ValueError(
+            "iterations must form complete rotation blocks for the "
+            f"{len(ordered)} executed modes"
+        )
     schedule = []
     for iteration in range(iterations):
-        offset = iteration % len(reuse)
-        schedule.append(prefix + reuse[offset:] + reuse[:offset])
+        offset = iteration % len(ordered)
+        schedule.append(ordered[offset:] + ordered[:offset])
     return schedule
 
 
@@ -1030,6 +1325,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     responses_path = output_dir / "responses.jsonl"
     result_path = output_dir / "benchmark-result.json"
     recorder = ResponseRecorder(responses_path)
+    expected_target_ranks = tuple(
+        range(args.target_tp_size * args.target_pp_size * args.target_dp_size)
+    )
     source: ServerProcess | None = None
     result: dict[str, Any] | None = None
     try:
@@ -1047,9 +1345,27 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         executed_modes = _ordered_modes(executed_modes)
         execution_schedule = _execution_schedule(executed_modes, args.iterations)
         records: dict[str, list[dict[str, Any]]] = {mode: [] for mode in executed_modes}
+        warmup_records: dict[str, dict[str, Any]] = {}
         cold_target_baselines = []
+        cold_target_baseline = None
+        for mode in executed_modes:
+            warmup_record = _run_target(
+                args,
+                source_server=source,
+                mode=mode,
+                iteration=-1,
+                output_dir=output_dir,
+                source_baseline=source_baseline,
+                source_baseline_p95_s=baseline["latency_p95_s"],
+                target_expected=_target_expected_response(mode, cold_target_baseline),
+                recorder=recorder,
+                expected_target_ranks=expected_target_ranks,
+            )
+            warmup_records[mode] = warmup_record
+            if mode == "cold":
+                cold_target_baseline = warmup_record["target_deterministic_response"]
+
         for iteration, iteration_modes in enumerate(execution_schedule):
-            cold_target_baseline = None
             for mode in iteration_modes:
                 record = _run_target(
                     args,
@@ -1059,10 +1375,13 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     output_dir=output_dir,
                     source_baseline=source_baseline,
                     source_baseline_p95_s=baseline["latency_p95_s"],
-                    target_expected=_target_expected_response(
-                        mode, cold_target_baseline
+                    target_expected=(
+                        cold_target_baseline
+                        if mode == "cold"
+                        else _target_expected_response(mode, cold_target_baseline)
                     ),
                     recorder=recorder,
+                    expected_target_ranks=expected_target_ranks,
                 )
                 records[mode].append(record)
                 if mode == "cold":
@@ -1108,6 +1427,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             },
             "modes_requested": list(args.modes),
             "modes_executed": executed_modes,
+            "warmup_mode_order": executed_modes,
             "mode_execution_schedule": execution_schedule,
             "skipped_modes": skipped_modes,
             "iterations": args.iterations,
@@ -1147,6 +1467,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "log": str(source.log_path),
             },
             "records": records,
+            "warmup_records": warmup_records,
             "summary": {
                 "by_mode": by_mode,
                 "comparisons": comparisons,
@@ -1182,6 +1503,26 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     return result
 
 
+def _benchmark_exit_code(
+    result: dict[str, Any],
+    *,
+    report_only: bool,
+) -> int:
+    if report_only:
+        return 0
+    by_mode = result.get("summary", {}).get("by_mode", {})
+    measured_counts = [
+        summary.get("iterations", 0)
+        for mode, summary in by_mode.items()
+        if mode in result.get("modes_executed", ())
+    ]
+    if not measured_counts or min(measured_counts) < MIN_MEASURED_ITERATIONS:
+        return 2
+    passed = result["summary"]["all_executed_reuse_modes_pass_threshold"]
+    reuse_requested = bool(set(result.get("modes_requested", ())) & set(REUSE_MODES))
+    return 2 if passed is False or (reuse_requested and passed is None) else 0
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -1214,7 +1555,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--disable-custom-all-reduce", action="store_true")
     parser.add_argument("--disable-shared-experts-fusion", action="store_true")
     parser.add_argument("--moe-runner-backend", default="")
-    parser.add_argument("--iterations", type=int, default=4)
+    parser.add_argument("--iterations", type=int, default=6)
     parser.add_argument("--timeout-s", type=float, default=1200)
     parser.add_argument("--request-timeout-s", type=float, default=120)
     parser.add_argument("--probe-interval-s", type=float, default=0.2)
@@ -1245,11 +1586,21 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--drop-page-cache", action="store_true")
+    parser.add_argument(
+        "--report-only",
+        action="store_true",
+        help="Write measurements without failing the process on the speed gate.",
+    )
     parser.add_argument("--output-dir", default="remote-instance-service-benchmark")
     args = parser.parse_args()
 
     if args.iterations <= 0:
         parser.error("iterations must be positive")
+    if not args.report_only and args.iterations < MIN_MEASURED_ITERATIONS:
+        parser.error(
+            f"iterations must be at least {MIN_MEASURED_ITERATIONS} "
+            "unless --report-only is set"
+        )
     if (
         min(
             args.source_tp_size,
@@ -1307,14 +1658,20 @@ def parse_args() -> argparse.Namespace:
     if not 0 < args.max_reuse_to_cold_ratio <= 1:
         parser.error("max-reuse-to-cold-ratio must be in (0, 1]")
     eligible_modes, _ = _eligible_modes(args)
-    reuse_mode_count = len(set(eligible_modes) & set(REUSE_MODES))
-    if reuse_mode_count > 1 and args.iterations % reuse_mode_count:
-        parser.error(
-            "iterations must form complete reuse-mode ordering cycles for the "
-            "eligible modes"
-        )
+    try:
+        _execution_schedule(eligible_modes, args.iterations)
+    except ValueError as error:
+        parser.error(str(error))
     return args
 
 
 if __name__ == "__main__":
-    print("REMOTE_INSTANCE_SERVICE_BENCHMARK_JSON=" + json.dumps(run(parse_args())))
+    parsed_args = parse_args()
+    benchmark_result = run(parsed_args)
+    print("REMOTE_INSTANCE_SERVICE_BENCHMARK_JSON=" + json.dumps(benchmark_result))
+    raise SystemExit(
+        _benchmark_exit_code(
+            benchmark_result,
+            report_only=parsed_args.report_only,
+        )
+    )

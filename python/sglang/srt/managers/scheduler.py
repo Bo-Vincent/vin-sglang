@@ -23,6 +23,7 @@ import time
 from array import array
 from collections import deque
 from contextlib import contextmanager, nullcontext
+from datetime import timedelta
 from functools import partial
 from http import HTTPStatus
 from typing import Any, Deque, Dict, List, Optional, Tuple, Union
@@ -35,9 +36,6 @@ import psutil  # isort: skip
 import setproctitle
 import torch
 import torch.distributed
-from torch.cuda import Stream as CudaStream
-from torch.distributed import barrier
-
 from sglang.kernels.ops.mamba.triton_ops import (
     initialize_mamba_selective_state_update_backend,
 )
@@ -94,6 +92,7 @@ from sglang.srt.managers.io_struct import (
     ClearHiCacheReqInput,
     ClearHiCacheReqOutput,
     CloseSessionReqInput,
+    CommitWeightMaterializationReqInput,
     ConfigureLoggingReq,
     ContinueGenerationReqInput,
     DestroyWeightsUpdateGroupReqInput,
@@ -108,6 +107,7 @@ from sglang.srt.managers.io_struct import (
     FreezeGCReq,
     GetInternalStateReq,
     GetInternalStateReqOutput,
+    GetRemoteInstanceWeightTransferSessionReqInput,
     GetWeightsByNameReqInput,
     HealthCheckOutput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
@@ -121,12 +121,13 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqOutput,
     OpenSessionReqInput,
     PauseGenerationReqInput,
+    PrepareWeightMaterializationReqInput,
     ProfileReq,
     ReleaseMemoryOccupationReqInput,
     ReleaseRemoteInstanceWeightTransferReqInput,
-    RenewRemoteInstanceWeightTransferReqInput,
     RemoveExternalCorpusReqInput,
     RemoveExternalCorpusReqOutput,
+    RenewRemoteInstanceWeightTransferReqInput,
     ResumeMemoryOccupationReqInput,
     RpcReqInput,
     RpcReqOutput,
@@ -147,7 +148,10 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromTensorReqInput,
+    WeightSnapshotActivationReqInput,
     sock_send,
+    weight_snapshot_activation_request_context,
+    weight_update_request_context,
 )
 from sglang.srt.managers.load_snapshot import create_load_snapshot_writer
 from sglang.srt.managers.min_free_slots_delayer import (
@@ -233,6 +237,9 @@ from sglang.srt.managers.utils import (
 from sglang.srt.mem_cache import kv_cache_builder
 from sglang.srt.mem_cache.common import maybe_cache_unfinished_req, release_kv_cache
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
+from sglang.srt.model_executor.weight_runtime_manifest import (
+    MAX_REMOTE_INSTANCE_WEIGHT_TRANSFER_LEASE_TIMEOUT_SEC,
+)
 from sglang.srt.model_loader.utils import get_resolved_model_impl
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
 from sglang.srt.observability.metrics_collector import SchedulerMetricsCollector
@@ -281,6 +288,8 @@ from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
 from sglang.srt.utils.tensor_bridge import use_mlx
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
+from torch.cuda import Stream as CudaStream
+from torch.distributed import barrier
 
 if is_mps():
     CudaStreamContext = nullcontext
@@ -806,12 +815,12 @@ class Scheduler(
             self.server_args.speculative_draft_load_format
             or self.server_args.load_format
         )
-        if (
-            not self.spec_algorithm.is_ngram()
-            and draft_load_format == "remote_instance"
-        ):
+        if not self.spec_algorithm.is_ngram() and draft_load_format in {
+            "remote_instance",
+            "weight_snapshot",
+        }:
             raise RuntimeError(
-                "remote_instance is not supported for a speculative draft worker"
+                f"{draft_load_format} is not supported for a speculative draft worker"
             )
 
         # Launch a draft worker for speculative decoding
@@ -1418,12 +1427,28 @@ class Scheduler(
                     self.weight_updater.defer_begin_remote_instance_weight_transfer,
                 ),
                 (
+                    GetRemoteInstanceWeightTransferSessionReqInput,
+                    self.weight_updater.defer_get_remote_instance_weight_transfer_session,
+                ),
+                (
                     ReleaseRemoteInstanceWeightTransferReqInput,
                     self.weight_updater.defer_release_remote_instance_weight_transfer,
                 ),
                 (
                     RenewRemoteInstanceWeightTransferReqInput,
                     self.weight_updater.defer_renew_remote_instance_weight_transfer,
+                ),
+                (
+                    PrepareWeightMaterializationReqInput,
+                    self.weight_updater.defer_prepare_weight_materialization,
+                ),
+                (
+                    CommitWeightMaterializationReqInput,
+                    self.weight_updater.defer_commit_weight_materialization,
+                ),
+                (
+                    WeightSnapshotActivationReqInput,
+                    self.weight_updater.update_weight_snapshot_activation,
                 ),
                 (
                     UpdateWeightsFromDistributedReqInput,
@@ -1519,6 +1544,7 @@ class Scheduler(
     def release_host_resources(self) -> None:
         # Release pinned host buffers in userspace on graceful shutdown; see
         # HostKVCache.destroy. Called from run_scheduler_process's finally.
+        self.weight_updater.close_remote_instance_weight_transfer_executor()
         if self.hisparse_coordinator is not None:
             self.hisparse_coordinator.destroy()
         self.tree_cache.release_host_resources()
@@ -1745,7 +1771,21 @@ class Scheduler(
                 )
                 continue
 
-            output = self._request_dispatcher(recv_req)
+            if isinstance(recv_req, WeightSnapshotActivationReqInput):
+                request_context = weight_snapshot_activation_request_context(recv_req)
+            elif isinstance(
+                recv_req,
+                (
+                    UpdateWeightsFromDistributedReqInput,
+                    UpdateWeightsFromTensorReqInput,
+                    UpdateWeightsFromIPCReqInput,
+                ),
+            ):
+                request_context = weight_update_request_context(recv_req)
+            else:
+                request_context = nullcontext()
+            with request_context:
+                output = self._request_dispatcher(recv_req)
             if output is not None:
                 if not isinstance(output, RpcReqOutput):
                     self.ipc_channels.send_to_tokenizer.send_output(output, recv_req)
@@ -1772,13 +1812,29 @@ class Scheduler(
 
     def init_weight_updater(self) -> None:
         remote_weight_transfer_cpu_group = self.world_group.cpu_group
+        remote_weight_transfer_control_cpu_group = self.world_group.cpu_group
+        weight_materialization_cpu_group = self.world_group.cpu_group
         if (
             self.server_args.enable_weight_runtime_manifest
             and len(self.world_group.ranks) > 1
         ):
+            group_timeout = timedelta(
+                seconds=MAX_REMOTE_INSTANCE_WEIGHT_TRANSFER_LEASE_TIMEOUT_SEC
+            )
             remote_weight_transfer_cpu_group = torch.distributed.new_group(
                 ranks=self.world_group.ranks,
                 backend="gloo",
+                timeout=group_timeout,
+            )
+            remote_weight_transfer_control_cpu_group = torch.distributed.new_group(
+                ranks=self.world_group.ranks,
+                backend="gloo",
+                timeout=group_timeout,
+            )
+            weight_materialization_cpu_group = torch.distributed.new_group(
+                ranks=self.world_group.ranks,
+                backend="gloo",
+                timeout=group_timeout,
             )
         self.weight_updater = SchedulerWeightUpdaterManager(
             tp_worker=self.tp_worker,
@@ -1789,6 +1845,10 @@ class Scheduler(
             flush_cache=self.flush_cache,
             is_fully_idle=self.is_fully_idle,
             remote_weight_transfer_cpu_group=remote_weight_transfer_cpu_group,
+            remote_weight_transfer_control_cpu_group=(
+                remote_weight_transfer_control_cpu_group
+            ),
+            weight_materialization_cpu_group=weight_materialization_cpu_group,
             scheduler=self,
             metrics_collector=self.metrics_collector,
         )
@@ -1939,9 +1999,15 @@ class Scheduler(
             ),
             get_disagg_decode_prealloc_queue=lambda: self.disagg_decode_prealloc_queue,
             get_disagg_decode_transfer_queue=lambda: self.disagg_decode_transfer_queue,
-            get_spec_total_num_accept_tokens=lambda: self.metrics_reporter.spec_total_num_accept_tokens,
-            get_spec_total_num_forward_ct=lambda: self.metrics_reporter.spec_total_num_forward_ct,
-            get_total_prefill_uncached_tokens=lambda: self.total_prefill_uncached_tokens,
+            get_spec_total_num_accept_tokens=lambda: (
+                self.metrics_reporter.spec_total_num_accept_tokens
+            ),
+            get_spec_total_num_forward_ct=lambda: (
+                self.metrics_reporter.spec_total_num_forward_ct
+            ),
+            get_total_prefill_uncached_tokens=lambda: (
+                self.total_prefill_uncached_tokens
+            ),
             get_total_prefill_busy_us=lambda: self.total_prefill_busy_us,
             get_decode_moment_totals=lambda: self.decode_moment_totals,
         )
@@ -3066,9 +3132,8 @@ class Scheduler(
                     running_batch.batch_is_full = True
 
             if running_batch.batch_is_full:
-                if (
-                    not self.enable_priority_preemption
-                    or not adder.preempt_to_schedule(req, self.server_args)
+                if not self.enable_priority_preemption or not adder.preempt_to_schedule(
+                    req, self.server_args
                 ):
                     break
 

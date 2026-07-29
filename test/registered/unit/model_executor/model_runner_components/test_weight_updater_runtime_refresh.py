@@ -17,6 +17,11 @@ LOAD_MODEL_UTILS_PATH = (
     REPO_ROOT
     / "python/sglang/srt/model_executor/model_runner_components/load_model_utils.py"
 )
+WEIGHT_UPDATE_COORDINATION_PATH = (
+    REPO_ROOT
+    / "python/sglang/srt/model_executor/model_runner_components"
+    / "weight_update_coordination.py"
+)
 WEIGHT_UPDATER_PATH = (
     REPO_ROOT
     / "python/sglang/srt/model_executor/model_runner_components/weight_updater.py"
@@ -206,10 +211,16 @@ def runtime_modules(monkeypatch):
         "sglang.srt.distributed.parallel_state",
         monkey_patch_vllm_parallel_state=lambda reverse=False: None,
     )
+    _install_module(
+        monkeypatch,
+        "sglang.kernels.ops.attention.dsv4.gemm",
+        hpc_bf16xfp32_gemm_enabled=lambda: False,
+    )
     loader_module = _install_module(
         monkeypatch,
         "sglang.srt.model_loader.loader",
         DefaultModelLoader=_DefaultModelLoader,
+        WeightSnapshotActivation=object,
         get_model_loader=lambda *args, **kwargs: None,
     )
     _install_module(
@@ -236,12 +247,10 @@ def runtime_modules(monkeypatch):
         "sglang.srt.model_loader.weight_utils",
         default_weight_loader=lambda parameter, tensor: None,
     )
-    _install_module(
+    weight_update_coordination = _load_source_module(
         monkeypatch,
         "sglang.srt.model_executor.model_runner_components.weight_update_coordination",
-        begin_uncoordinated_update=lambda: None,
-        coordinated_weight_update=lambda method: method,
-        finish_uncoordinated_update=lambda token, success: None,
+        WEIGHT_UPDATE_COORDINATION_PATH,
     )
     _install_module(
         monkeypatch,
@@ -300,6 +309,7 @@ def runtime_modules(monkeypatch):
         load_model_utils=load_model_utils,
         loader_module=loader_module,
         torch=torch,
+        weight_update_coordination=weight_update_coordination,
         weight_updater=weight_updater,
     )
 
@@ -314,7 +324,9 @@ def _make_updater(module, model, **overrides):
         "get_model": lambda: model,
         "update_model_fields": lambda *args, **kwargs: None,
         "recapture_cuda_graph": lambda: None,
-        "get_model_runner": lambda: object(),
+        "get_model_runner": lambda: SimpleNamespace(
+            server_args=SimpleNamespace(weight_cache_mode="off")
+        ),
     }
     values.update(overrides)
     return module.WeightUpdater(**values)
@@ -560,3 +572,49 @@ def test_ipc_update_does_not_refresh_after_failure(runtime_modules, monkeypatch)
 
     assert success is False
     _assert_not_refreshed(model)
+
+
+def test_real_weight_updater_reports_mutation_through_explicit_observer(
+    runtime_modules,
+):
+    coordination = runtime_modules.weight_update_coordination
+    updater = _make_updater(runtime_modules.weight_updater, _Model())
+
+    with coordination.observe_weight_update_mutation() as observation:
+        success, _ = updater.update_weights_from_tensor(
+            [("weight", _FakeTensor())],
+            load_format=None,
+        )
+
+    assert success is True
+    assert observation.mutation_started is True
+    assert not hasattr(updater, "_sglang_last_weight_mutation_started")
+
+
+def test_real_weight_updater_reports_no_pre_mutation_change(
+    runtime_modules, monkeypatch
+):
+    coordination = runtime_modules.weight_update_coordination
+    module = runtime_modules.weight_updater
+    updater = _make_updater(module, _Model())
+    monkeypatch.setattr(
+        module,
+        "_unsupported_derived_weight_cache_error",
+        lambda: "unsupported",
+    )
+
+    with coordination.observe_weight_update_mutation() as observation:
+        success, message = updater.update_weights_from_tensor(
+            [("weight", _FakeTensor())],
+            load_format=None,
+        )
+
+    assert success is False
+    assert message == "unsupported"
+    assert observation.mutation_started is False
+    assert not hasattr(updater, "_sglang_last_weight_mutation_started")
+
+
+if __name__ == "__main__":
+    pytest_args = ["-x" if argument == "-f" else argument for argument in sys.argv[1:]]
+    raise SystemExit(pytest.main([__file__, *pytest_args]))

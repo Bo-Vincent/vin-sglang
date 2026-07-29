@@ -6,7 +6,6 @@ from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
 import torch
-
 from sglang.srt.environ import envs
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     RemoteInstanceWeightLoaderBackend,
@@ -115,6 +114,17 @@ class RemoteInstanceWeightTransporter:
                     "runtime manifest references storage outside registered "
                     "TransferEngine memory"
                 )
+
+    def create_weight_transfer_provider(self, engine: Any, **kwargs: Any):
+        if engine is not self.engine or engine is None:
+            raise RuntimeError(
+                "weight transfer provider received a different transport instance"
+            )
+        from sglang.srt.weight_transfer.mooncake import (
+            MooncakeWeightTransferProvider,
+        )
+
+        return MooncakeWeightTransferProvider(engine, **kwargs)
 
     def _register_to_engine_info_bootstrap(self: RemoteInstanceWeightTransporter):
         """Register transfer engine info with the EngineInfoBootstrapServer via HTTP PUT.

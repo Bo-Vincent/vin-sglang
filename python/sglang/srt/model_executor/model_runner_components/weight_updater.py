@@ -6,11 +6,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple, Union
 
 import torch
-
 from sglang.srt.configs.load_config import LoadConfig
-from sglang.srt.model_loader.loader import DefaultModelLoader, get_model_loader
-from sglang.srt.model_loader.utils import set_default_torch_dtype
-from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.model_executor.model_runner_components.load_model_utils import (
     refresh_runtime_weight_state,
 )
@@ -18,7 +14,11 @@ from sglang.srt.model_executor.model_runner_components.weight_update_coordinatio
     begin_uncoordinated_update,
     coordinated_weight_update,
     finish_uncoordinated_update,
+    mark_weight_update_mutation_started,
 )
+from sglang.srt.model_loader.loader import DefaultModelLoader, get_model_loader
+from sglang.srt.model_loader.utils import set_default_torch_dtype
+from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.platforms import current_platform
 from sglang.srt.utils import (
     MultiprocessingSerializer,
@@ -38,6 +38,17 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 logger = logging.getLogger(__name__)
+
+
+def _is_complete_disk_restore(
+    self,
+    model_path,
+    load_format,
+    weight_name_filter=None,
+    recapture_cuda_graph=False,
+) -> bool:
+    del self, model_path, load_format, recapture_cuda_graph
+    return weight_name_filter is None
 
 
 def _unsupported_derived_weight_cache_error() -> Optional[str]:
@@ -71,6 +82,7 @@ class WeightUpdater:
     recapture_cuda_graph: Callable[[], None]
     get_model_runner: Callable[[], ModelRunner]
     begin_weight_update: Callable[[], Any] = begin_uncoordinated_update
+    cancel_weight_update: Optional[Callable[[Any], None]] = None
     finish_weight_update: Callable[..., None] = finish_uncoordinated_update
     _model_update_group: dict = field(default_factory=dict)
 
@@ -93,9 +105,9 @@ class WeightUpdater:
         weights/parameters online, and broadcasts them to the inference
         engine through the `_model_update_group` process group.
         """
-        assert (
-            torch.distributed.is_initialized()
-        ), "Default torch process group must be initialized"
+        assert torch.distributed.is_initialized(), (
+            "Default torch process group must be initialized"
+        )
         assert group_name != "", "Group name cannot be empty"
 
         rank = rank_offset + self.tp_rank
@@ -148,7 +160,7 @@ class WeightUpdater:
                 f"Restart with --weight-cache-mode off to use this operation."
             )
 
-    @coordinated_weight_update
+    @coordinated_weight_update(full_restore_if=_is_complete_disk_restore)
     def update_weights_from_disk(
         self: WeightUpdater,
         model_path: str,
@@ -199,6 +211,7 @@ class WeightUpdater:
                 message = f"Failed to get weights iterator: {e}."
                 return False, message
             try:
+                mark_weight_update_mutation_started()
                 model = model_load_weights(self.get_model(), iter)
             except Exception as e:
                 message = (
@@ -284,6 +297,7 @@ class WeightUpdater:
             for handle in handles:
                 handle.wait()
 
+            mark_weight_update_mutation_started()
             self.get_model().load_weights(weights)
             refresh_runtime_weight_state(self.get_model())
             return True, "Succeeded to update parameter online."
@@ -320,6 +334,7 @@ class WeightUpdater:
                 group=self._model_update_group[group_name],
             )
             reconstructed_tensors = bucket.reconstruct_tensors()
+            mark_weight_update_mutation_started()
             self.get_model().load_weights(reconstructed_tensors)
             refresh_runtime_weight_state(self.get_model())
             return True, "Succeeded to update parameter online."
@@ -358,16 +373,28 @@ class WeightUpdater:
             (name, _unwrap_tensor(tensor, tp_rank=self.tp_rank, device=infered_device))
             for name, tensor in named_tensors
         ]
+        model = self.get_model()
         if load_format == "direct":
-            _model_load_weights_direct(self.get_model(), named_tensors)
+
+            def load_weights():
+                _model_load_weights_direct(model, named_tensors)
+
         elif load_format in self.custom_weight_loaders:
             custom_loader = dynamic_import(load_format)
-            custom_loader(self.get_model(), named_tensors)
+
+            def load_weights():
+                custom_loader(model, named_tensors)
+
         elif load_format is None:
-            self.get_model().load_weights(named_tensors)
+
+            def load_weights():
+                model.load_weights(named_tensors)
+
         else:
             raise NotImplementedError(f"Unknown load_format={load_format}")
-        refresh_runtime_weight_state(self.get_model())
+        mark_weight_update_mutation_started()
+        load_weights()
+        refresh_runtime_weight_state(model)
         return True, "Success"
 
     def _update_weights_from_flattened_bucket(
@@ -398,6 +425,7 @@ class WeightUpdater:
         reconstructed_tensors = bucket.reconstruct_tensors()
 
         # Load the reconstructed tensors using the standard method
+        mark_weight_update_mutation_started()
         self.get_model().load_weights(reconstructed_tensors)
         refresh_runtime_weight_state(self.get_model())
 
@@ -418,6 +446,7 @@ class WeightUpdater:
 
             # Create a worker extension that integrates with SGLang's model
             worker = SGLangCheckpointEngineWorkerExtensionImpl(self.get_model_runner())
+            mark_weight_update_mutation_started()
             worker.update_weights_from_ipc(recv_req.zmq_handles)
             refresh_runtime_weight_state(self.get_model())
             return True, "IPC weight update completed successfully"

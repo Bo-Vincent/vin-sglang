@@ -3,14 +3,20 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import math
+import secrets
 import time
 import uuid
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import fastapi
-
-from sglang.srt.managers.communicator import FanOutCommunicator
+from sglang.srt.managers.communicator import (
+    FanOutCancelledBeforeDispatch,
+    FanOutCommunicator,
+    FanOutCompletionUnknownError,
+    FanOutDeadlineExpiredBeforeDispatch,
+)
 from sglang.srt.managers.io_struct import (
     AddExternalCorpusReqInput,
     AddExternalCorpusReqOutput,
@@ -24,6 +30,8 @@ from sglang.srt.managers.io_struct import (
     ClearHiCacheReqInput,
     ClearHiCacheReqOutput,
     CloseSessionReqInput,
+    CommitWeightMaterializationReqInput,
+    CommitWeightMaterializationReqOutput,
     ContinueGenerationReqInput,
     DestroyWeightsUpdateGroupReqInput,
     DestroyWeightsUpdateGroupReqOutput,
@@ -38,6 +46,8 @@ from sglang.srt.managers.io_struct import (
     FlushCacheReqOutput,
     GetInternalStateReq,
     GetInternalStateReqOutput,
+    GetRemoteInstanceWeightTransferSessionReqInput,
+    GetRemoteInstanceWeightTransferSessionReqOutput,
     GetWeightsByNameReqInput,
     GetWeightsByNameReqOutput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
@@ -51,8 +61,11 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqInput,
     LoadLoRAAdapterReqOutput,
     LoRAUpdateOutput,
+    MaterializeWeightsReqInput,
     OpenSessionReqInput,
     PauseGenerationReqInput,
+    PrepareWeightMaterializationReqInput,
+    PrepareWeightMaterializationReqOutput,
     ProfileReq,
     ProfileReqOutput,
     ProfileReqType,
@@ -81,8 +94,15 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromIPCReqOutput,
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
+    WeightMaterializationSessionState,
+    WeightSnapshotActivationReqInput,
+    WeightSnapshotActivationReqOutput,
 )
 from sglang.srt.managers.load_snapshot import LoadSnapshot
+from sglang.srt.managers.weight_materialization import (
+    is_published_materialization_state,
+    reduce_materialization_states,
+)
 from sglang.srt.model_executor.weight_runtime_manifest import (
     DEFAULT_REMOTE_INSTANCE_WEIGHT_TRANSFER_LEASE_TIMEOUT_SEC,
     validate_remote_instance_weight_transfer_lease_timeout,
@@ -93,6 +113,13 @@ from sglang.srt.utils import (
     normalize_serialized_named_tensor_payloads,
 )
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
+from sglang.srt.weight_transfer.remote_protocol import (
+    ARTIFACT_WEIGHT_VERSION_V1,
+    HF_REVISION_V1,
+    PLACEMENT_BINDING_V1,
+    RUNTIME_MANIFEST_V1,
+    validate_manifest_revision_semantics,
+)
 from sglang.utils import TypeBasedDispatcher
 
 if TYPE_CHECKING:
@@ -114,7 +141,47 @@ class RemoteInstanceWeightTransferBeginError(RuntimeError):
         self.session_state = session_state
 
 
+class RemoteInstanceWeightTransferControlError(RuntimeError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        transfer_id: str,
+        session_state: str,
+        lease_fence: str | None,
+        generation: int | None,
+    ) -> None:
+        super().__init__(message)
+        self.transfer_id = transfer_id
+        self.session_state = session_state
+        self.lease_fence = lease_fence
+        self.generation = generation
+        self.completion_unknown = True
+        self.cleanup_pending = session_state == "cleanup_pending"
+        self.retryable = False
+        self.reconcile_required = True
+
+
+class WeightMaterializationError(RuntimeError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        materialization_id: str,
+        session_state: WeightMaterializationSessionState | str,
+        completion_ticket: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.materialization_id = materialization_id
+        self.session_state = WeightMaterializationSessionState(session_state)
+        self.completion_ticket = completion_ticket
+
+
 _REMOTE_WEIGHT_TRANSFER_SESSION_INDEX_LIMIT = 4096
+_CONTROL_CLEANUP_TIMEOUT_SEC = 60
+_ADMIN_PAUSE_OWNER = "admin"
+_REMOTE_WEIGHT_TRANSFER_PAUSE_OWNER_PREFIX = "remote-weight-transfer:"
+_REMOTE_WEIGHT_TRANSFER_BEGIN_FENCE_PREFIX = "begin-v1:"
 
 
 def _remote_weight_transfer_session_index(manager) -> Dict[str, Dict[str, Any]]:
@@ -144,7 +211,7 @@ def _remote_weight_transfer_lease_identity(payloads) -> Tuple[List[str], int | N
 
 
 def _remote_weight_transfer_result_payloads(results, manifest_format: str) -> List:
-    field = "bindings" if manifest_format == "placement_binding_v1" else "manifests"
+    field = "bindings" if manifest_format == PLACEMENT_BINDING_V1 else "manifests"
     return [
         payload
         for result in results
@@ -176,9 +243,11 @@ def _remember_remote_weight_transfer_session(
     *,
     transfer_id: str,
     manifest_format: str,
+    manifest_revision_semantics: str,
     deadline_unix_sec: float | None,
     payloads,
     session_state: str,
+    lease_fence: str | None = None,
 ) -> Dict[str, Any]:
     index = _remote_weight_transfer_session_index(manager)
     existing = index.get(transfer_id, {})
@@ -192,6 +261,7 @@ def _remember_remote_weight_transfer_session(
             generation if generation is not None else existing.get("generation")
         ),
         "manifest_format": manifest_format,
+        "manifest_revision_semantics": manifest_revision_semantics,
         "deadline_unix_sec": deadline_unix_sec,
         "expired": session_state == "expired",
         "session_state": session_state,
@@ -199,6 +269,9 @@ def _remember_remote_weight_transfer_session(
         "last_release_success": existing.get("last_release_success"),
         "last_release_message": existing.get("last_release_message"),
     }
+    current_fence = lease_fence or existing.get("lease_fence")
+    if current_fence is not None:
+        record["lease_fence"] = current_fence
     index[transfer_id] = record
     while len(index) > _REMOTE_WEIGHT_TRANSFER_SESSION_INDEX_LIMIT:
         released_id = next(
@@ -213,6 +286,59 @@ def _remember_remote_weight_transfer_session(
             break
         index.pop(released_id)
     return record
+
+
+def _resolve_remote_weight_transfer_control_identity(
+    manager,
+    transfer_reference: str,
+) -> tuple[str, Dict[str, Any] | None]:
+    if type(transfer_reference) is not str or not transfer_reference:
+        raise ValueError("transfer_id must be a non-empty string")
+    index = _remote_weight_transfer_session_index(manager)
+    direct = _refresh_remote_weight_transfer_session(manager, transfer_reference)
+    if direct is not None:
+        return transfer_reference, direct
+    matches = [
+        transfer_id
+        for transfer_id, record in index.items()
+        if record.get("lease_fence") == transfer_reference
+    ]
+    if len(matches) > 1:
+        raise RuntimeError("remote weight transfer lease fence is ambiguous")
+    if matches:
+        transfer_id = matches[0]
+        return transfer_id, _refresh_remote_weight_transfer_session(
+            manager, transfer_id
+        )
+    return transfer_reference, None
+
+
+def _resolve_unfenced_remote_weight_transfer_control(
+    manager,
+    transfer_reference: str,
+) -> str:
+    transfer_id, session = _resolve_remote_weight_transfer_control_identity(
+        manager,
+        transfer_reference,
+    )
+    if session is not None and session.get("lease_fence") is not None:
+        raise ValueError(
+            "lease_fence and generation are required for a fenced "
+            "remote weight transfer"
+        )
+    return transfer_id
+
+
+def _validate_remote_weight_transfer_control_identity(
+    lease_fence: str | None,
+    generation: int | None,
+) -> None:
+    if (lease_fence is None) != (generation is None):
+        raise ValueError("lease_fence and generation must be provided together")
+    if lease_fence is not None and (type(lease_fence) is not str or not lease_fence):
+        raise ValueError("lease_fence must be a non-empty string")
+    if generation is not None and (type(generation) is not int or generation <= 0):
+        raise ValueError("generation must be a positive integer")
 
 
 def _refresh_remote_weight_transfer_session(
@@ -242,6 +368,9 @@ def _record_remote_weight_transfer_release(
     attempted_at: float,
     success: bool,
     message: str,
+    completion_unknown: bool = False,
+    lease_fence: str | None = None,
+    generation: int | None = None,
 ) -> None:
     index = _remote_weight_transfer_session_index(manager)
     record = _refresh_remote_weight_transfer_session(manager, transfer_id)
@@ -259,8 +388,49 @@ def _record_remote_weight_transfer_release(
     record["last_release_attempt_unix_sec"] = attempted_at
     record["last_release_success"] = success
     record["last_release_message"] = message
+    if lease_fence is not None:
+        record["lease_fence"] = lease_fence
+    if generation is not None:
+        record["generation"] = generation
     if success:
         record["session_state"] = "released"
+    elif completion_unknown:
+        record["session_state"] = "cleanup_pending"
+        record["completion_unknown"] = True
+        record["reconcile_required"] = True
+    index[transfer_id] = record
+
+
+def _record_remote_weight_transfer_completion_unknown(
+    manager,
+    *,
+    transfer_id: str,
+    session_state: str,
+    lease_fence: str | None,
+    generation: int | None,
+) -> None:
+    index = _remote_weight_transfer_session_index(manager)
+    record = _refresh_remote_weight_transfer_session(manager, transfer_id)
+    if record is None:
+        record = {
+            "transfer_id": transfer_id,
+            "lease_id": None,
+            "lease_ids": [],
+            "generation": None,
+            "manifest_format": None,
+            "deadline_unix_sec": None,
+            "expired": False,
+            "last_release_attempt_unix_sec": None,
+            "last_release_success": None,
+            "last_release_message": None,
+        }
+    record["session_state"] = session_state
+    record["completion_unknown"] = True
+    record["reconcile_required"] = True
+    if lease_fence is not None:
+        record["lease_fence"] = lease_fence
+    if generation is not None:
+        record["generation"] = generation
     index[transfer_id] = record
 
 
@@ -296,6 +466,258 @@ async def _finish_control_task(task: asyncio.Task):
         except asyncio.CancelledError:
             continue
     return task.result()
+
+
+def _fan_out_may_have_dispatched(error: BaseException) -> bool:
+    return not isinstance(
+        error,
+        (
+            FanOutCancelledBeforeDispatch,
+            FanOutDeadlineExpiredBeforeDispatch,
+        ),
+    )
+
+
+async def _release_uncertain_remote_weight_transfer(
+    manager,
+    *,
+    transfer_id: str,
+    lease_fence: str | None = None,
+    generation: int | None = None,
+    attempts: int = 3,
+) -> bool:
+    if lease_fence is None or generation is None:
+        return False
+    for _ in range(attempts):
+        try:
+            (
+                success,
+                _,
+            ) = await TokenizerControlMixin.release_remote_instance_weight_transfer(
+                manager,
+                transfer_id,
+                lease_fence=lease_fence,
+                generation=generation,
+            )
+        except Exception:
+            logger.exception(
+                "Failed to clean up uncertain remote weight transfer %s",
+                transfer_id,
+            )
+            success = False
+        if success:
+            return True
+    return False
+
+
+def _weight_materialization_active_ids(manager) -> set[str]:
+    active_ids = getattr(manager, "_weight_materialization_active_ids", None)
+    if active_ids is None:
+        active_ids = set()
+        manager._weight_materialization_active_ids = active_ids
+    return active_ids
+
+
+def _serving_weight_revision(manager) -> str:
+    revision = getattr(manager, "runtime_weight_revision", None)
+    if type(revision) is not str or not revision:
+        raise RuntimeError("the serving weight revision is not initialized")
+    return revision
+
+
+def _hf_model_revision(manager) -> str:
+    revision = getattr(manager.server_args, "revision", None) or "default"
+    if type(revision) is not str or not revision:
+        raise RuntimeError("the Hugging Face model revision is invalid")
+    return revision
+
+
+def _require_weight_snapshot_export_allowed(manager) -> None:
+    if getattr(manager, "weight_update_fail_closed", False):
+        raise RuntimeError(
+            "weight snapshot export is disabled after an incomplete weight update"
+        )
+
+
+def _validate_next_weight_revision(manager, revision: str | None) -> None:
+    if not manager.server_args.enable_weight_runtime_manifest:
+        return
+    if type(revision) is not str or not revision:
+        raise ValueError(
+            "online weight updates require weight_version when runtime manifests "
+            "are enabled"
+        )
+    if revision == _serving_weight_revision(manager):
+        raise ValueError("weight_version must identify a new weight artifact")
+
+
+def _record_weight_update_safety(
+    manager,
+    results,
+    *,
+    full_restore: bool,
+) -> None:
+    results = tuple(results)
+    if any(getattr(result, "fail_closed", False) for result in results):
+        manager.weight_update_fail_closed = True
+    elif full_restore and results and all(result.success for result in results):
+        manager.weight_update_fail_closed = False
+
+
+def _finish_weight_update_transaction(
+    manager,
+    results,
+    *,
+    weight_version: str | None,
+    full_restore: bool,
+) -> tuple[bool, str]:
+    _record_weight_update_safety(manager, results, full_restore=full_restore)
+    success, message = FanOutCommunicator.merge_results(results)
+    if success and weight_version is not None:
+        manager._update_weight_version_if_provided(weight_version)
+        message += f" Weight version updated to {weight_version}."
+    return success, message
+
+
+async def _call_weight_update_communicator(manager, communicator, request):
+    if hasattr(request, "request_id"):
+        request.request_id = uuid.uuid4().hex
+    try:
+        return await communicator(request)
+    except (
+        FanOutCancelledBeforeDispatch,
+        FanOutDeadlineExpiredBeforeDispatch,
+    ):
+        raise
+    except BaseException:
+        manager.weight_update_fail_closed = True
+        raise
+
+
+def _weight_materialization_fan_out(manager) -> int:
+    communicator = manager.prepare_weight_materialization_communicator
+    fan_out = getattr(communicator, "_fan_out", None)
+    if type(fan_out) is int and fan_out > 0:
+        return fan_out
+    return int(getattr(manager.server_args, "dp_size", 1))
+
+
+def _weight_materialization_result_state(
+    results,
+    default: WeightMaterializationSessionState | str,
+) -> WeightMaterializationSessionState:
+    return reduce_materialization_states(
+        (getattr(result, "session_state", None) for result in results),
+        default=default,
+        completion_unknown=any(
+            getattr(result, "completion_unknown", False) for result in results
+        ),
+    )
+
+
+def _ordered_weight_materialization_results(
+    results,
+    *,
+    materialization_id: str,
+    expected_fan_out: int,
+    phase: str,
+    allow_identical_duplicates: bool,
+):
+    if not results:
+        raise WeightMaterializationError(
+            f"{phase} returned no responses",
+            materialization_id=materialization_id,
+            session_state=WeightMaterializationSessionState.FAILED,
+        )
+
+    by_rank = {}
+    for result in results:
+        if result.materialization_id != materialization_id:
+            raise WeightMaterializationError(
+                f"{phase} returned a mismatched materialization_id",
+                materialization_id=materialization_id,
+                session_state=WeightMaterializationSessionState.CONFLICT,
+            )
+        rank = result.external_dp_rank
+        if type(rank) is not int or rank < 0 or rank >= expected_fan_out:
+            raise WeightMaterializationError(
+                f"{phase} returned invalid external_dp_rank {rank!r}",
+                materialization_id=materialization_id,
+                session_state=WeightMaterializationSessionState.CONFLICT,
+            )
+        by_rank.setdefault(rank, []).append(result)
+
+    expected_ranks = set(range(expected_fan_out))
+    if set(by_rank) != expected_ranks:
+        raise WeightMaterializationError(
+            f"{phase} responses do not cover external DP ranks "
+            f"{sorted(expected_ranks)}",
+            materialization_id=materialization_id,
+            session_state=WeightMaterializationSessionState.CONFLICT,
+        )
+
+    ordered = []
+    for rank in sorted(by_rank):
+        rank_results = by_rank[rank]
+        if len(rank_results) > 1:
+            if not allow_identical_duplicates or any(
+                result != rank_results[0] for result in rank_results[1:]
+            ):
+                raise WeightMaterializationError(
+                    f"{phase} returned duplicate responses for external DP rank {rank}",
+                    materialization_id=materialization_id,
+                    session_state=WeightMaterializationSessionState.CONFLICT,
+                )
+        ordered.append(rank_results[0])
+    return ordered
+
+
+async def _cleanup_weight_materialization(
+    manager,
+    *,
+    materialization_id: str,
+    storage_options: Dict[str, Any],
+) -> WeightMaterializationSessionState:
+    deadline_unix_sec = time.time() + _CONTROL_CLEANUP_TIMEOUT_SEC
+    request = CommitWeightMaterializationReqInput(
+        materialization_id=materialization_id,
+        request_id=uuid.uuid4().hex,
+        selected_external_dp_rank=None,
+        storage_options=storage_options,
+        phase="cleanup",
+        deadline_unix_sec=deadline_unix_sec,
+    )
+    cleanup_task = asyncio.create_task(
+        manager.commit_weight_materialization_communicator(
+            request,
+            deadline_unix_sec=deadline_unix_sec,
+        )
+    )
+    try:
+        results = await asyncio.shield(cleanup_task)
+    except asyncio.CancelledError:
+        results = await _finish_control_task(cleanup_task)
+    except Exception:
+        logger.exception(
+            "Failed to clean up weight materialization %s",
+            materialization_id,
+        )
+        return WeightMaterializationSessionState.CLEANUP_PENDING
+
+    if not results or any(not result.success for result in results):
+        logger.error(
+            "Weight materialization cleanup did not complete for %s: %s",
+            materialization_id,
+            " | ".join(getattr(result, "message", "") for result in results),
+        )
+        return _weight_materialization_result_state(
+            results,
+            WeightMaterializationSessionState.CLEANUP_PENDING,
+        )
+    return _weight_materialization_result_state(
+        results,
+        WeightMaterializationSessionState.CLEANUP_PENDING,
+    )
 
 
 _RUNTIME_TENSOR_SEMANTIC_FIELDS = (
@@ -489,7 +911,13 @@ def _merge_placement_binding_groups(
 _COMMUNICATOR_SPECS = [
     ("init_weights_update_group", InitWeightsUpdateGroupReqOutput),
     ("destroy_weights_update_group", DestroyWeightsUpdateGroupReqOutput),
-    ("update_weights_from_distributed", UpdateWeightsFromDistributedReqOutput),
+    (
+        "update_weights_from_distributed",
+        UpdateWeightsFromDistributedReqOutput,
+        "queueing",
+        "request_id",
+        "responder_id",
+    ),
     (
         "init_weights_send_group_for_remote_instance",
         InitWeightsSendGroupForRemoteInstanceReqOutput,
@@ -499,22 +927,65 @@ _COMMUNICATOR_SPECS = [
         "begin_remote_instance_weight_transfer",
         BeginRemoteInstanceWeightTransferReqOutput,
         "queueing",
-        "transfer_id",
+        "request_id",
+        "external_dp_rank",
+    ),
+    (
+        "get_remote_instance_weight_transfer_session",
+        GetRemoteInstanceWeightTransferSessionReqOutput,
+        "queueing",
+        "request_id",
+        "external_dp_rank",
     ),
     (
         "release_remote_instance_weight_transfer",
         ReleaseRemoteInstanceWeightTransferReqOutput,
         "queueing",
-        "transfer_id",
+        "request_id",
+        "external_dp_rank",
     ),
     (
         "renew_remote_instance_weight_transfer",
         RenewRemoteInstanceWeightTransferReqOutput,
         "queueing",
-        "transfer_id",
+        "request_id",
+        "external_dp_rank",
     ),
-    ("update_weights_from_tensor", UpdateWeightsFromTensorReqOutput),
-    ("update_weights_from_ipc", UpdateWeightsFromIPCReqOutput),
+    (
+        "prepare_weight_materialization",
+        PrepareWeightMaterializationReqOutput,
+        "queueing",
+        "request_id",
+        "external_dp_rank",
+    ),
+    (
+        "commit_weight_materialization",
+        CommitWeightMaterializationReqOutput,
+        "queueing",
+        "request_id",
+        "external_dp_rank",
+    ),
+    (
+        "weight_snapshot_activation",
+        WeightSnapshotActivationReqOutput,
+        "queueing",
+        "request_id",
+        "responder_id",
+    ),
+    (
+        "update_weights_from_tensor",
+        UpdateWeightsFromTensorReqOutput,
+        "queueing",
+        "request_id",
+        "responder_id",
+    ),
+    (
+        "update_weights_from_ipc",
+        UpdateWeightsFromIPCReqOutput,
+        "queueing",
+        "request_id",
+        "responder_id",
+    ),
     ("get_weights_by_name", GetWeightsByNameReqOutput),
     ("release_memory_occupation", ReleaseMemoryOccupationReqOutput),
     ("resume_memory_occupation", ResumeMemoryOccupationReqOutput),
@@ -543,18 +1014,260 @@ class TokenizerControlMixin:
     FanOutCommunicator, as opposed to data-plane inference requests multiplexed by rid.
     """
 
+    def _require_single_tokenizer_weight_update_owner(
+        self: TokenizerManager,
+    ) -> None:
+        if getattr(self.server_args, "tokenizer_worker_num", 1) != 1:
+            raise fastapi.HTTPException(
+                status_code=409,
+                detail=(
+                    "online weight updates require a single tokenizer worker; "
+                    "restart with --tokenizer-worker-num 1"
+                ),
+            )
+
+    def _get_generation_pause_transition_lock(self: TokenizerManager) -> asyncio.Lock:
+        lock = getattr(self, "_generation_pause_transition_lock", None)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._generation_pause_transition_lock = lock
+        return lock
+
+    def _get_generation_pause_owners(self: TokenizerManager) -> set[str]:
+        owners = getattr(self, "_generation_pause_owners", None)
+        if owners is None:
+            owners = set()
+            if getattr(self, "is_pause", False):
+                owners.add(_ADMIN_PAUSE_OWNER)
+            self._generation_pause_owners = owners
+        return owners
+
+    def _get_generation_pause_resume_pending(
+        self: TokenizerManager,
+    ) -> set[str]:
+        owners = getattr(self, "_generation_pause_resume_pending", None)
+        if owners is None:
+            owners = set()
+            self._generation_pause_resume_pending = owners
+        return owners
+
+    def _get_generation_pause_unconfirmed(
+        self: TokenizerManager,
+    ) -> set[str]:
+        owners = getattr(self, "_generation_pause_unconfirmed", None)
+        if owners is None:
+            owners = set()
+            self._generation_pause_unconfirmed = owners
+        return owners
+
+    def _get_generation_continue_unconfirmed(
+        self: TokenizerManager,
+    ) -> set[str]:
+        owners = getattr(self, "_generation_continue_unconfirmed", None)
+        if owners is None:
+            owners = set()
+            self._generation_continue_unconfirmed = owners
+        return owners
+
+    def _migrate_generation_pause_resume_pending(
+        self: TokenizerManager,
+    ) -> tuple[set[str], set[str]]:
+        legacy = TokenizerControlMixin._get_generation_pause_resume_pending(self)
+        pause_unconfirmed = TokenizerControlMixin._get_generation_pause_unconfirmed(
+            self
+        )
+        continue_unconfirmed = (
+            TokenizerControlMixin._get_generation_continue_unconfirmed(self)
+        )
+        latest = getattr(self, "_latest_pause_transitions", {})
+        committed = getattr(self, "_committed_pause_transitions", {})
+
+        for pending in (pause_unconfirmed, continue_unconfirmed):
+            for owner in tuple(pending):
+                identity = latest.get(owner)
+                if (
+                    identity is not None
+                    and committed.get(identity.transition_id) == identity
+                ):
+                    pending.discard(owner)
+
+        for owner in tuple(legacy):
+            identity = latest.get(owner)
+            if (
+                identity is not None
+                and committed.get(identity.transition_id) == identity
+            ):
+                legacy.discard(owner)
+                continue
+            if identity is not None and identity.action == "continue":
+                continue_unconfirmed.add(owner)
+            else:
+                pause_unconfirmed.add(owner)
+            legacy.discard(owner)
+        return pause_unconfirmed, continue_unconfirmed
+
+    async def _acquire_generation_pause(
+        self: TokenizerManager,
+        owner: str,
+        obj: PauseGenerationReqInput,
+    ) -> None:
+        async with TokenizerControlMixin._get_generation_pause_transition_lock(self):
+            owners = TokenizerControlMixin._get_generation_pause_owners(self)
+            pause_unconfirmed, continue_unconfirmed = (
+                TokenizerControlMixin._migrate_generation_pause_resume_pending(self)
+            )
+            was_owner = owner in owners
+            should_dispatch = (
+                not owners
+                or owner == _ADMIN_PAUSE_OWNER
+                or bool(pause_unconfirmed)
+                or bool(continue_unconfirmed)
+            )
+            async with self.is_pause_cond:
+                owners.add(owner)
+                self.is_pause = True
+
+            if not should_dispatch:
+                return
+
+            obj.rid = owner
+            pause_impl = getattr(self, "_pause_generation_impl", None)
+            if pause_impl is None:
+                pause_impl = self.pause_generation
+            try:
+                await pause_impl(obj)
+            except BaseException as error:
+                async with self.is_pause_cond:
+                    if _fan_out_may_have_dispatched(error):
+                        pause_unconfirmed.add(owner)
+                        continue_unconfirmed.discard(owner)
+                    elif not was_owner:
+                        owners.discard(owner)
+                        pause_unconfirmed.discard(owner)
+                        continue_unconfirmed.discard(owner)
+                    self.is_pause = bool(owners)
+                    if not self.is_pause:
+                        self.is_pause_cond.notify_all()
+                raise
+            pause_unconfirmed.clear()
+            continue_unconfirmed.clear()
+
+    async def _release_generation_pause(
+        self: TokenizerManager,
+        owner: str,
+        obj: ContinueGenerationReqInput,
+    ) -> None:
+        async with TokenizerControlMixin._get_generation_pause_transition_lock(self):
+            owners = TokenizerControlMixin._get_generation_pause_owners(self)
+            pause_unconfirmed, continue_unconfirmed = (
+                TokenizerControlMixin._migrate_generation_pause_resume_pending(self)
+            )
+            if owner not in owners:
+                pause_unconfirmed.discard(owner)
+                continue_unconfirmed.discard(owner)
+                return
+
+            async with self.is_pause_cond:
+                if owners - {owner}:
+                    owners.remove(owner)
+                    pause_unconfirmed.discard(owner)
+                    continue_unconfirmed.discard(owner)
+                    self.is_pause = True
+                    return
+
+            obj.rid = owner
+            continue_impl = getattr(self, "_continue_generation_impl", None)
+            if continue_impl is None:
+                continue_impl = self.continue_generation
+            try:
+                await continue_impl(obj)
+            except BaseException as error:
+                async with self.is_pause_cond:
+                    if _fan_out_may_have_dispatched(error):
+                        pause_unconfirmed.discard(owner)
+                        continue_unconfirmed.add(owner)
+                    else:
+                        continue_unconfirmed.discard(owner)
+                    self.is_pause = True
+                raise
+
+            async with self.is_pause_cond:
+                owners.remove(owner)
+                pause_unconfirmed.clear()
+                continue_unconfirmed.clear()
+                self.is_pause = bool(owners)
+                if not self.is_pause:
+                    self.is_pause_cond.notify_all()
+
     @asynccontextmanager
     async def _remote_instance_weight_transfer_pause(self: TokenizerManager):
-        owns_pause = not getattr(self, "is_pause", False)
-        if owns_pause:
-            await self.pause_generation(PauseGenerationReqInput(mode="in_place"))
-        try:
-            yield
-        finally:
-            if owns_pause:
+        lock = getattr(self, "_remote_weight_transfer_pause_lock", None)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._remote_weight_transfer_pause_lock = lock
+
+        async with lock:
+            release_pause = getattr(self, "_release_generation_pause", None)
+            if release_pause is None:
+
+                async def release_pause(owner, obj):
+                    return await TokenizerControlMixin._release_generation_pause(
+                        self,
+                        owner,
+                        obj,
+                    )
+
+            acquire_pause = getattr(self, "_acquire_generation_pause", None)
+            if acquire_pause is None:
+
+                async def acquire_pause(owner, obj):
+                    return await TokenizerControlMixin._acquire_generation_pause(
+                        self,
+                        owner,
+                        obj,
+                    )
+
+            pause_unconfirmed, continue_unconfirmed = (
+                TokenizerControlMixin._migrate_generation_pause_resume_pending(self)
+            )
+            owners = TokenizerControlMixin._get_generation_pause_owners(self)
+            unconfirmed = pause_unconfirmed | continue_unconfirmed
+            for stale_owner in unconfirmed - owners:
+                pause_unconfirmed.discard(stale_owner)
+                continue_unconfirmed.discard(stale_owner)
+
+            remote_owners = sorted(
+                owner
+                for owner in owners
+                if owner.startswith(_REMOTE_WEIGHT_TRANSFER_PAUSE_OWNER_PREFIX)
+            )
+            if remote_owners:
+                owner = remote_owners[0]
+                for pending_owner in remote_owners[1:]:
+                    await release_pause(
+                        pending_owner,
+                        ContinueGenerationReqInput(torch_empty_cache=False),
+                    )
+                if owner in pause_unconfirmed or owner in continue_unconfirmed:
+                    await acquire_pause(
+                        owner,
+                        PauseGenerationReqInput(mode="in_place"),
+                    )
+            else:
+                owner = (
+                    f"{_REMOTE_WEIGHT_TRANSFER_PAUSE_OWNER_PREFIX}{uuid.uuid4().hex}"
+                )
+                await acquire_pause(
+                    owner,
+                    PauseGenerationReqInput(mode="in_place"),
+                )
+            try:
+                yield
+            finally:
                 resume_task = asyncio.create_task(
-                    self.continue_generation(
-                        ContinueGenerationReqInput(torch_empty_cache=False)
+                    release_pause(
+                        owner,
+                        ContinueGenerationReqInput(torch_empty_cache=False),
                     )
                 )
                 await _finish_control_task(resume_task)
@@ -565,11 +1278,13 @@ class TokenizerControlMixin:
             name, resp_type = spec[0], spec[1]
             mode = spec[2] if len(spec) > 2 else "queueing"
             correlation_attr = spec[3] if len(spec) > 3 else None
+            responder_attr = spec[4] if len(spec) > 4 else None
             comm = FanOutCommunicator(
                 self._dispatch_to_scheduler,
                 server_args.dp_size,
                 mode,
                 correlation_attr,
+                responder_attr,
             )
             setattr(self, f"{name}_communicator", comm)
             dispatch_pairs.append((resp_type, comm.handle_recv))
@@ -712,6 +1427,103 @@ class TokenizerControlMixin:
             await self.flush_cache_communicator(FlushCacheReqInput(timeout_s=timeout_s))
         )[0]
 
+    async def update_weight_snapshot_activation(
+        self: TokenizerManager,
+        action: str,
+    ) -> Tuple[bool, str]:
+        self.auto_create_handle_loop()
+        if action not in {"activate", "close"}:
+            raise ValueError("weight snapshot activation action is invalid")
+
+        transaction_id = uuid.uuid4().hex
+        transaction_deadline_unix_sec = time.time() + _CONTROL_CLEANUP_TIMEOUT_SEC
+
+        async def run_phase(
+            phase: str,
+            *,
+            request_action: str = "activate",
+            deadline_unix_sec: float = transaction_deadline_unix_sec,
+        ):
+            return await self.weight_snapshot_activation_communicator(
+                WeightSnapshotActivationReqInput(
+                    action=request_action,
+                    phase=phase,
+                    transaction_id=transaction_id,
+                    request_id=uuid.uuid4().hex,
+                    deadline_unix_sec=deadline_unix_sec,
+                ),
+                deadline_unix_sec=deadline_unix_sec,
+            )
+
+        def phase_succeeded(results, phase: str, states: set[str]) -> bool:
+            return bool(results) and all(
+                result.success
+                and result.phase == phase
+                and result.transaction_id == transaction_id
+                and result.state in states
+                for result in results
+            )
+
+        async def abort(message: str) -> Tuple[bool, str]:
+            cleanup_deadline_unix_sec = time.time() + _CONTROL_CLEANUP_TIMEOUT_SEC
+            try:
+                results = await run_phase(
+                    "abort",
+                    deadline_unix_sec=cleanup_deadline_unix_sec,
+                )
+            except BaseException as error:
+                return False, f"{message}; abort completion is unknown: {error}"
+            states = {result.state for result in results}
+            if phase_succeeded(results, "abort", {"aborted"}):
+                return False, message
+            if "quarantined" in states:
+                return False, f"{message}; activation resources are quarantined"
+            return (
+                False,
+                f"{message}; abort failed: {FanOutCommunicator.merge_results(results)[1]}",
+            )
+
+        if action == "close":
+            results = await run_phase("close", request_action="close")
+            return FanOutCommunicator.merge_results(results)
+
+        try:
+            prepared = await run_phase("prepare")
+        except BaseException as error:
+            return await abort(f"weight snapshot activation prepare failed: {error}")
+        if not phase_succeeded(prepared, "prepare", {"prepared", "serving"}):
+            return await abort(
+                "weight snapshot activation prepare failed: "
+                + FanOutCommunicator.merge_results(prepared)[1]
+            )
+
+        commit_message = ""
+        try:
+            committed = await run_phase("commit")
+            commit_message = FanOutCommunicator.merge_results(committed)[1]
+            if phase_succeeded(
+                committed,
+                "commit",
+                {"serving"},
+            ):
+                return True, commit_message
+        except BaseException as error:
+            commit_message = str(error)
+
+        try:
+            reconciled = await run_phase("reconcile")
+        except BaseException as error:
+            return await abort(
+                "weight snapshot activation commit could not be reconciled: "
+                f"{commit_message}; reconcile error: {error}"
+            )
+        if phase_succeeded(reconciled, "reconcile", {"serving"}):
+            return True, "weight snapshot activation reconciled as SERVING"
+        return await abort(
+            "weight snapshot activation commit could not be reconciled: "
+            f"{commit_message}; " + FanOutCommunicator.merge_results(reconciled)[1]
+        )
+
     async def clear_hicache_storage(self: TokenizerManager) -> ClearHiCacheReqOutput:
         """Clear the hierarchical cache storage."""
         self.auto_create_handle_loop()
@@ -827,9 +1639,9 @@ class TokenizerControlMixin:
         request: Optional[fastapi.Request] = None,
     ) -> Tuple[bool, str]:
         self.auto_create_handle_loop()
-        assert (
-            self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
-        ), "dp_size must be 1 or dp attention must be enabled for update weights from distributed"
+        assert self.server_args.dp_size == 1 or self.server_args.enable_dp_attention, (
+            "dp_size must be 1 or dp attention must be enabled for update weights from distributed"
+        )
 
         results = await self.init_weights_update_group_communicator(obj)
         return FanOutCommunicator.merge_results(results)
@@ -840,9 +1652,9 @@ class TokenizerControlMixin:
         request: Optional[fastapi.Request] = None,
     ) -> Tuple[bool, str]:
         self.auto_create_handle_loop()
-        assert (
-            self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
-        ), "dp_size must be 1 or dp attention must be enabled for destroy parameter update group"
+        assert self.server_args.dp_size == 1 or self.server_args.enable_dp_attention, (
+            "dp_size must be 1 or dp attention must be enabled for destroy parameter update group"
+        )
 
         results = await self.destroy_weights_update_group_communicator(obj)
         return FanOutCommunicator.merge_results(results)
@@ -852,30 +1664,34 @@ class TokenizerControlMixin:
         obj: UpdateWeightsFromDistributedReqInput,
         request: Optional[fastapi.Request] = None,
     ) -> Tuple[bool, str]:
+        self._require_single_tokenizer_weight_update_owner()
         self.auto_create_handle_loop()
-        assert (
-            self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
-        ), "dp_size must be 1 or dp attention must be enabled for update weights from distributed"
-
+        assert self.server_args.dp_size == 1 or self.server_args.enable_dp_attention, (
+            "dp_size must be 1 or dp attention must be enabled for update weights from distributed"
+        )
         if obj.abort_all_requests:
             self.abort_request(abort_all=True)
 
+        async def update_locked():
+            async with self.model_update_lock.writer_lock:
+                _validate_next_weight_revision(self, obj.weight_version)
+                results = await _call_weight_update_communicator(
+                    self,
+                    self.update_weights_from_distributed_communicator,
+                    obj,
+                )
+                return _finish_weight_update_transaction(
+                    self,
+                    results,
+                    weight_version=obj.weight_version,
+                    full_restore=False,
+                )
+
         # Hold is_pause_cond while updating to prevent unpause from racing.
         async with self.is_pause_cond:
-            is_paused = self.is_pause
-            if is_paused:
-                results = await self.update_weights_from_distributed_communicator(obj)
-
-        if not is_paused:
-            async with self.model_update_lock.writer_lock:
-                results = await self.update_weights_from_distributed_communicator(obj)
-
-        success, message = FanOutCommunicator.merge_results(results)
-        if success and obj.weight_version is not None:
-            self._update_weight_version_if_provided(obj.weight_version)
-            message += f" Weight version updated to {obj.weight_version}."
-
-        return success, message
+            if self.is_pause:
+                return await update_locked()
+        return await update_locked()
 
     async def init_weights_send_group_for_remote_instance(
         self: TokenizerManager,
@@ -884,9 +1700,9 @@ class TokenizerControlMixin:
     ) -> Tuple[bool, str]:
         self.auto_create_handle_loop()
         # TODO: support DP
-        assert (
-            self.server_args.dp_size == 1
-        ), "dp_size must be 1 for init_weights_send_group_for_remote_instance"
+        assert self.server_args.dp_size == 1, (
+            "dp_size must be 1 for init_weights_send_group_for_remote_instance"
+        )
         result = (
             await self.init_weights_send_group_for_remote_instance_communicator(obj)
         )[0]
@@ -899,19 +1715,312 @@ class TokenizerControlMixin:
     ) -> Tuple[bool, str]:
         self.auto_create_handle_loop()
         # TODO: support DP
-        assert (
-            self.server_args.dp_size == 1
-        ), "dp_size must be 1 for send_weights_to_remote_instance"
+        assert self.server_args.dp_size == 1, (
+            "dp_size must be 1 for send_weights_to_remote_instance"
+        )
         result = (await self.send_weights_to_remote_instance_communicator(obj))[0]
         return result.success, result.message
+
+    async def materialize_weights(
+        self: TokenizerManager,
+        obj: MaterializeWeightsReqInput,
+        request: Optional[fastapi.Request] = None,
+    ) -> Dict[str, Any]:
+        materialization_id = (
+            uuid.uuid4().hex
+            if obj.materialization_id is None
+            else obj.materialization_id
+        )
+        if type(materialization_id) is not str or not materialization_id.strip():
+            raise ValueError("materialization_id must be a non-empty string")
+        if not isinstance(obj.storage_options, dict):
+            raise ValueError("storage_options must be a dictionary")
+        validate_remote_instance_weight_transfer_lease_timeout(obj.lease_timeout_sec)
+        deadline_unix_sec = time.time() + obj.lease_timeout_sec
+
+        if not self.server_args.enable_weight_runtime_manifest:
+            raise WeightMaterializationError(
+                "weight materialization requires --enable-weight-runtime-manifest",
+                materialization_id=materialization_id,
+                session_state=WeightMaterializationSessionState.DISABLED,
+            )
+
+        self.auto_create_handle_loop()
+        expected_fan_out = _weight_materialization_fan_out(self)
+        selected_rank = obj.source_external_dp_rank
+        if selected_rank is not None and (
+            type(selected_rank) is not int
+            or selected_rank < 0
+            or selected_rank >= expected_fan_out
+        ):
+            raise ValueError(
+                f"source_external_dp_rank must be an integer in [0, {expected_fan_out})"
+            )
+
+        active_ids = _weight_materialization_active_ids(self)
+        if materialization_id in active_ids:
+            raise WeightMaterializationError(
+                "weight materialization is already active",
+                materialization_id=materialization_id,
+                session_state=WeightMaterializationSessionState.CONFLICT,
+            )
+        active_ids.add(materialization_id)
+        storage_options = dict(obj.storage_options)
+        cleanup_candidate = False
+
+        try:
+            async with self.model_update_lock.snapshot_reader_lock:
+                _require_weight_snapshot_export_allowed(self)
+                try:
+                    prepare_results = (
+                        await self.prepare_weight_materialization_communicator(
+                            PrepareWeightMaterializationReqInput(
+                                materialization_id=materialization_id,
+                                request_id=uuid.uuid4().hex,
+                                model_id=self.server_args.model_path,
+                                revision=_serving_weight_revision(self),
+                                lease_timeout_sec=obj.lease_timeout_sec,
+                                deadline_unix_sec=deadline_unix_sec,
+                            ),
+                            deadline_unix_sec=deadline_unix_sec,
+                        )
+                    )
+                    cleanup_candidate = True
+                    prepared = _ordered_weight_materialization_results(
+                        prepare_results,
+                        materialization_id=materialization_id,
+                        expected_fan_out=expected_fan_out,
+                        phase="weight materialization prepare",
+                        allow_identical_duplicates=True,
+                    )
+                    prepare_failures = [
+                        result.message for result in prepared if not result.success
+                    ]
+                    if prepare_failures:
+                        raise WeightMaterializationError(
+                            "weight materialization prepare failed: "
+                            + " | ".join(prepare_failures),
+                            materialization_id=materialization_id,
+                            session_state=_weight_materialization_result_state(
+                                prepared,
+                                WeightMaterializationSessionState.FAILED,
+                            ),
+                        )
+
+                    generations = {result.generation for result in prepared}
+                    digests = {result.logical_payload_digest for result in prepared}
+                    byte_counts = {result.total_bytes for result in prepared}
+                    if (
+                        len(generations) != 1
+                        or None in generations
+                        or len(digests) != 1
+                        or None in digests
+                        or not next(iter(digests))
+                        or len(byte_counts) != 1
+                        or None in byte_counts
+                    ):
+                        raise WeightMaterializationError(
+                            "source DP replicas returned inconsistent generation, "
+                            "logical payload digest, or total bytes",
+                            materialization_id=materialization_id,
+                            session_state=WeightMaterializationSessionState.CONFLICT,
+                        )
+                    generation = next(iter(generations))
+                    logical_payload_digest = next(iter(digests))
+                    total_bytes = next(iter(byte_counts))
+                    if (
+                        type(generation) is not int
+                        or generation < 0
+                        or type(logical_payload_digest) is not str
+                        or not logical_payload_digest
+                        or type(total_bytes) is not int
+                        or total_bytes < 0
+                    ):
+                        raise WeightMaterializationError(
+                            "source DP replicas returned invalid generation, "
+                            "logical payload digest, or total bytes",
+                            materialization_id=materialization_id,
+                            session_state=WeightMaterializationSessionState.CONFLICT,
+                        )
+
+                    selected_rank = (
+                        prepared[0].external_dp_rank
+                        if selected_rank is None
+                        else selected_rank
+                    )
+                    commit_results = (
+                        await self.commit_weight_materialization_communicator(
+                            CommitWeightMaterializationReqInput(
+                                materialization_id=materialization_id,
+                                request_id=uuid.uuid4().hex,
+                                selected_external_dp_rank=selected_rank,
+                                storage_options=storage_options,
+                                deadline_unix_sec=deadline_unix_sec,
+                            ),
+                            deadline_unix_sec=deadline_unix_sec,
+                        )
+                    )
+                    committed = _ordered_weight_materialization_results(
+                        commit_results,
+                        materialization_id=materialization_id,
+                        expected_fan_out=expected_fan_out,
+                        phase="weight materialization commit",
+                        allow_identical_duplicates=False,
+                    )
+                    commit_failures = [
+                        result.message
+                        for result in committed
+                        if not result.success or result.completion_unknown
+                    ]
+                    if commit_failures:
+                        completion_tickets = {
+                            result.completion_ticket
+                            for result in committed
+                            if result.completion_ticket
+                        }
+                        raise WeightMaterializationError(
+                            "weight materialization commit failed: "
+                            + " | ".join(commit_failures),
+                            materialization_id=materialization_id,
+                            session_state=_weight_materialization_result_state(
+                                committed,
+                                WeightMaterializationSessionState.FAILED,
+                            ),
+                            completion_ticket=(
+                                next(iter(completion_tickets))
+                                if len(completion_tickets) == 1
+                                else None
+                            ),
+                        )
+
+                    refs = [
+                        result.ref for result in committed if result.ref is not None
+                    ]
+                    if len(refs) != 1:
+                        raise WeightMaterializationError(
+                            "weight materialization commit must return exactly one "
+                            "storage ref",
+                            materialization_id=materialization_id,
+                            session_state=WeightMaterializationSessionState.CONFLICT,
+                        )
+                    selected_results = [
+                        result for result in committed if result.selected
+                    ]
+                    if (
+                        len(selected_results) != 1
+                        or selected_results[0].external_dp_rank != selected_rank
+                        or selected_results[0].ref != refs[0]
+                        or any(
+                            result.selected or result.ref is not None
+                            for result in committed
+                            if result.external_dp_rank != selected_rank
+                        )
+                    ):
+                        raise WeightMaterializationError(
+                            "weight materialization commit returned inconsistent "
+                            "source selection or refs",
+                            materialization_id=materialization_id,
+                            session_state=WeightMaterializationSessionState.CONFLICT,
+                        )
+                    if not isinstance(refs[0], dict) or not refs[0]:
+                        raise WeightMaterializationError(
+                            "weight materialization commit returned an invalid "
+                            "storage ref",
+                            materialization_id=materialization_id,
+                            session_state=WeightMaterializationSessionState.CONFLICT,
+                        )
+
+                    selected_result = selected_results[0]
+                    cleanup_state = None
+                    selected_state = WeightMaterializationSessionState(
+                        selected_result.session_state
+                    )
+                    if (
+                        is_published_materialization_state(selected_state)
+                        and selected_state
+                        is not WeightMaterializationSessionState.PUBLISHED
+                    ):
+                        cleanup_state = await _cleanup_weight_materialization(
+                            self,
+                            materialization_id=materialization_id,
+                            storage_options=storage_options,
+                        )
+                    session_state = cleanup_state or selected_result.session_state
+                    return {
+                        "materialization_id": materialization_id,
+                        "ref": dict(refs[0]),
+                        "selected_external_dp_rank": selected_rank,
+                        "total_bytes": total_bytes,
+                        "session_state": session_state,
+                        "cleanup_state": cleanup_state,
+                        "completion_unknown": (
+                            session_state
+                            == WeightMaterializationSessionState.COMPLETION_UNKNOWN
+                        ),
+                        "completion_ticket": selected_result.completion_ticket,
+                    }
+                except (
+                    FanOutCancelledBeforeDispatch,
+                    FanOutDeadlineExpiredBeforeDispatch,
+                ):
+                    if cleanup_candidate:
+                        await _cleanup_weight_materialization(
+                            self,
+                            materialization_id=materialization_id,
+                            storage_options=storage_options,
+                        )
+                    raise
+                except asyncio.CancelledError:
+                    await _cleanup_weight_materialization(
+                        self,
+                        materialization_id=materialization_id,
+                        storage_options=storage_options,
+                    )
+                    raise
+                except WeightMaterializationError as error:
+                    cleanup_state = await _cleanup_weight_materialization(
+                        self,
+                        materialization_id=materialization_id,
+                        storage_options=storage_options,
+                    )
+                    if cleanup_state in (
+                        WeightMaterializationSessionState.CLEANUP_PENDING,
+                        WeightMaterializationSessionState.COMPLETION_UNKNOWN,
+                    ):
+                        error.session_state = cleanup_state
+                    raise
+                except Exception as error:
+                    cleanup_state = await _cleanup_weight_materialization(
+                        self,
+                        materialization_id=materialization_id,
+                        storage_options=storage_options,
+                    )
+                    raise WeightMaterializationError(
+                        f"weight materialization failed: {error}",
+                        materialization_id=materialization_id,
+                        session_state=(
+                            cleanup_state
+                            if cleanup_state
+                            in (
+                                WeightMaterializationSessionState.CLEANUP_PENDING,
+                                WeightMaterializationSessionState.COMPLETION_UNKNOWN,
+                            )
+                            else WeightMaterializationSessionState.FAILED
+                        ),
+                    ) from error
+        finally:
+            active_ids.discard(materialization_id)
 
     async def begin_remote_instance_weight_transfer(
         self: TokenizerManager,
         lease_timeout_sec: int = (
             DEFAULT_REMOTE_INSTANCE_WEIGHT_TRANSFER_LEASE_TIMEOUT_SEC
         ),
-        manifest_format: str = "runtime_v1",
+        manifest_format: str = RUNTIME_MANIFEST_V1,
         transfer_id: str | None = None,
+        *,
+        manifest_revision_semantics: str = HF_REVISION_V1,
+        lease_fence: str | None = None,
     ) -> dict:
         """Pause for snapshot capture, then serve while the lease is held."""
         if not self.server_args.enable_weight_runtime_manifest:
@@ -920,21 +2029,35 @@ class TokenizerControlMixin:
                 "--enable-weight-runtime-manifest"
             )
         validate_remote_instance_weight_transfer_lease_timeout(lease_timeout_sec)
-        if manifest_format not in ("runtime_v1", "placement_binding_v1"):
-            raise ValueError(f"unsupported source manifest format: {manifest_format}")
+        validate_manifest_revision_semantics(
+            manifest_format,
+            manifest_revision_semantics,
+        )
         if transfer_id is not None and (
             type(transfer_id) is not str or not transfer_id
         ):
             raise ValueError("transfer_id must be a non-empty string")
+        if lease_fence is not None and (
+            type(lease_fence) is not str or not lease_fence
+        ):
+            raise ValueError("lease_fence must be a non-empty string")
+        _require_weight_snapshot_export_allowed(self)
 
         self.auto_create_handle_loop()
         transfer_id = transfer_id or uuid.uuid4().hex
+        # The caller value is accepted for wire compatibility, but a new lease
+        # always starts with a source-issued begin token.
+        lease_fence = (
+            f"{_REMOTE_WEIGHT_TRANSFER_BEGIN_FENCE_PREFIX}{secrets.token_urlsafe(32)}"
+        )
         async with _remote_weight_transfer_begin_lock(self):
             return await TokenizerControlMixin._begin_remote_instance_weight_transfer(
                 self,
                 lease_timeout_sec=lease_timeout_sec,
                 manifest_format=manifest_format,
+                manifest_revision_semantics=manifest_revision_semantics,
                 transfer_id=transfer_id,
+                lease_fence=lease_fence,
             )
 
     async def _begin_remote_instance_weight_transfer(
@@ -942,16 +2065,11 @@ class TokenizerControlMixin:
         *,
         lease_timeout_sec: int,
         manifest_format: str,
+        manifest_revision_semantics: str,
         transfer_id: str,
+        lease_fence: str,
     ) -> dict:
         deadline_unix_sec = time.time() + lease_timeout_sec
-        request = BeginRemoteInstanceWeightTransferReqInput(
-            transfer_id=transfer_id,
-            model_id=self.server_args.model_path,
-            revision=getattr(self.server_args, "revision", None) or "default",
-            lease_timeout_sec=lease_timeout_sec,
-            manifest_format=manifest_format,
-        )
         results = None
 
         async def capture_snapshot():
@@ -959,9 +2077,30 @@ class TokenizerControlMixin:
             async with TokenizerControlMixin._remote_instance_weight_transfer_pause(
                 self
             ):
-                results = await self.begin_remote_instance_weight_transfer_communicator(
-                    request
-                )
+                async with self.model_update_lock.reader_lock:
+                    _require_weight_snapshot_export_allowed(self)
+                    revision = (
+                        _serving_weight_revision(self)
+                        if manifest_revision_semantics == ARTIFACT_WEIGHT_VERSION_V1
+                        else _hf_model_revision(self)
+                    )
+                    request = BeginRemoteInstanceWeightTransferReqInput(
+                        transfer_id=transfer_id,
+                        model_id=self.server_args.model_path,
+                        revision=revision,
+                        lease_timeout_sec=lease_timeout_sec,
+                        manifest_format=manifest_format,
+                        manifest_revision_semantics=manifest_revision_semantics,
+                        request_id=uuid.uuid4().hex,
+                        deadline_unix_sec=deadline_unix_sec,
+                        lease_fence=lease_fence,
+                    )
+                    results = (
+                        await self.begin_remote_instance_weight_transfer_communicator(
+                            request,
+                            deadline_unix_sec=deadline_unix_sec,
+                        )
+                    )
             return results
 
         capture_task = asyncio.create_task(capture_snapshot())
@@ -977,21 +2116,59 @@ class TokenizerControlMixin:
             cleanup_candidate = _remote_weight_transfer_created_by_request(
                 results or ()
             )
-            if cleanup_candidate or capture_error is not None:
+            cleanup_uncertain = (
+                capture_error is not None
+                and _fan_out_may_have_dispatched(capture_error)
+            )
+            if cleanup_candidate or cleanup_uncertain:
+                cleanup_payloads = _remote_weight_transfer_result_payloads(
+                    results or (), manifest_format
+                )
+                _, payload_generation = _remote_weight_transfer_lease_identity(
+                    cleanup_payloads
+                )
+                reported_fences = {
+                    getattr(result, "lease_fence", None)
+                    for result in (results or ())
+                    if getattr(result, "lease_fence", None) is not None
+                }
+                cleanup_lease_fence = (
+                    next(iter(reported_fences))
+                    if len(reported_fences) == 1
+                    else (lease_fence if not reported_fences else None)
+                )
+                reported_generations = {
+                    getattr(result, "generation", None)
+                    for result in (results or ())
+                    if getattr(result, "generation", None) is not None
+                }
+                cleanup_generation = (
+                    next(iter(reported_generations))
+                    if len(reported_generations) == 1
+                    else (payload_generation if not reported_generations else None)
+                )
+                if (
+                    cleanup_generation is not None
+                    and payload_generation is not None
+                    and cleanup_generation != payload_generation
+                ):
+                    cleanup_generation = None
                 _remember_remote_weight_transfer_session(
                     self,
                     transfer_id=transfer_id,
                     manifest_format=manifest_format,
+                    manifest_revision_semantics=manifest_revision_semantics,
                     deadline_unix_sec=deadline_unix_sec,
-                    payloads=_remote_weight_transfer_result_payloads(
-                        results or (), manifest_format
-                    ),
+                    payloads=cleanup_payloads,
                     session_state="cleanup_pending",
+                    lease_fence=cleanup_lease_fence or lease_fence,
                 )
-            if cleanup_candidate:
                 cleanup_task = asyncio.create_task(
-                    TokenizerControlMixin.release_remote_instance_weight_transfer(
-                        self, transfer_id
+                    _release_uncertain_remote_weight_transfer(
+                        self,
+                        transfer_id=transfer_id,
+                        lease_fence=cleanup_lease_fence,
+                        generation=cleanup_generation,
                     )
                 )
                 try:
@@ -1004,7 +2181,30 @@ class TokenizerControlMixin:
             raise
         except Exception as error:
             if results is None:
-                raise
+                if not _fan_out_may_have_dispatched(error):
+                    raise
+                _remember_remote_weight_transfer_session(
+                    self,
+                    transfer_id=transfer_id,
+                    manifest_format=manifest_format,
+                    manifest_revision_semantics=manifest_revision_semantics,
+                    deadline_unix_sec=deadline_unix_sec,
+                    payloads=(),
+                    session_state="cleanup_pending",
+                    lease_fence=lease_fence,
+                )
+                cleanup_succeeded = await _release_uncertain_remote_weight_transfer(
+                    self,
+                    transfer_id=transfer_id,
+                    lease_fence=lease_fence,
+                )
+                raise RemoteInstanceWeightTransferBeginError(
+                    f"Source snapshot response was lost after dispatch: {error}",
+                    transfer_id=transfer_id,
+                    session_state=(
+                        "failed" if cleanup_succeeded else "cleanup_pending"
+                    ),
+                ) from error
             session_states = [
                 getattr(result, "session_state", "unknown") for result in results
             ]
@@ -1028,11 +2228,13 @@ class TokenizerControlMixin:
                 self,
                 transfer_id=transfer_id,
                 manifest_format=manifest_format,
+                manifest_revision_semantics=manifest_revision_semantics,
                 deadline_unix_sec=deadline_unix_sec,
                 payloads=_remote_weight_transfer_result_payloads(
                     results, manifest_format
                 ),
                 session_state="cleanup_pending",
+                lease_fence=lease_fence,
             )
             raise RemoteInstanceWeightTransferBeginError(
                 f"Failed to resume source generation after snapshot capture: {error}",
@@ -1040,24 +2242,73 @@ class TokenizerControlMixin:
                 session_state="cleanup_pending",
             ) from error
         failures = [result.message for result in results if not result.success]
+        reported_fences = {
+            getattr(result, "lease_fence", None)
+            for result in results
+            if getattr(result, "lease_fence", None) is not None
+        }
+        if len(reported_fences) > 1:
+            failures.append("source workers returned inconsistent lease fences")
+        authoritative_lease_fence = (
+            next(iter(reported_fences)) if reported_fences else lease_fence
+        )
+        lease_fence = authoritative_lease_fence
         manifests = None
         placements = None
         bindings = None
         if not results:
             failures.append("source workers returned no transfer responses")
         elif not failures:
-            try:
-                if manifest_format == "placement_binding_v1":
-                    placements, bindings = _merge_placement_binding_groups(
-                        [result.placements for result in results],
-                        [result.bindings for result in results],
-                    )
-                else:
-                    manifests = _merge_runtime_manifest_groups(
-                        [result.manifests for result in results]
-                    )
-            except RuntimeError as error:
-                failures.append(str(error))
+            result_semantics = {
+                getattr(result, "manifest_revision_semantics", HF_REVISION_V1)
+                for result in results
+            }
+            if result_semantics != {manifest_revision_semantics}:
+                failures.append(
+                    "source workers returned incompatible manifest revision semantics"
+                )
+            else:
+                try:
+                    if manifest_format == PLACEMENT_BINDING_V1:
+                        placements, bindings = _merge_placement_binding_groups(
+                            [result.placements for result in results],
+                            [result.bindings for result in results],
+                        )
+                    else:
+                        manifests = _merge_runtime_manifest_groups(
+                            [result.manifests for result in results]
+                        )
+                except RuntimeError as error:
+                    failures.append(str(error))
+        raw_session_payloads = _remote_weight_transfer_result_payloads(
+            results, manifest_format
+        )
+        session_payloads = (
+            bindings if manifest_format == PLACEMENT_BINDING_V1 else manifests
+        ) or []
+        _, payload_generation = _remote_weight_transfer_lease_identity(
+            raw_session_payloads
+        )
+        reported_generations = {
+            getattr(result, "generation", None)
+            for result in results
+            if getattr(result, "generation", None) is not None
+        }
+        if len(reported_generations) > 1:
+            failures.append("source workers returned inconsistent snapshot generation")
+        generation = (
+            next(iter(reported_generations))
+            if reported_generations
+            else payload_generation
+        )
+        if (
+            generation is not None
+            and payload_generation is not None
+            and generation != payload_generation
+        ):
+            failures.append(
+                "source snapshot generation does not match scheduler authority"
+            )
         if failures:
             session_states = [
                 getattr(result, "session_state", "unknown") for result in results
@@ -1066,11 +2317,23 @@ class TokenizerControlMixin:
             cleanup_succeeded = False
             cleanup_cancellation = None
             if cleanup_candidate:
+                _remember_remote_weight_transfer_session(
+                    self,
+                    transfer_id=transfer_id,
+                    manifest_format=manifest_format,
+                    manifest_revision_semantics=manifest_revision_semantics,
+                    deadline_unix_sec=deadline_unix_sec,
+                    payloads=raw_session_payloads,
+                    session_state="cleanup_pending",
+                    lease_fence=lease_fence,
+                )
                 for _ in range(3):
                     cleanup_task = asyncio.create_task(
                         TokenizerControlMixin.release_remote_instance_weight_transfer(
                             self,
                             transfer_id,
+                            lease_fence=lease_fence,
+                            generation=generation,
                         )
                     )
                     try:
@@ -1111,11 +2374,13 @@ class TokenizerControlMixin:
                     self,
                     transfer_id=transfer_id,
                     manifest_format=manifest_format,
+                    manifest_revision_semantics=manifest_revision_semantics,
                     deadline_unix_sec=deadline_unix_sec,
                     payloads=_remote_weight_transfer_result_payloads(
                         results, manifest_format
                     ),
                     session_state=session_state,
+                    lease_fence=lease_fence,
                 )
             if cleanup_cancellation is not None:
                 raise cleanup_cancellation
@@ -1124,7 +2389,7 @@ class TokenizerControlMixin:
                 transfer_id=transfer_id,
                 session_state=session_state,
             )
-        if manifest_format == "placement_binding_v1":
+        if manifest_format == PLACEMENT_BINDING_V1:
             assert placements is not None and bindings is not None
             session_payloads = bindings
             response = {
@@ -1132,6 +2397,7 @@ class TokenizerControlMixin:
                 "source_weight_placements": placements,
                 "source_weight_runtime_bindings": bindings,
                 "lease_timeout_sec": lease_timeout_sec,
+                "manifest_revision_semantics": manifest_revision_semantics,
             }
         else:
             assert manifests is not None
@@ -1140,7 +2406,14 @@ class TokenizerControlMixin:
                 "transfer_id": transfer_id,
                 "weight_runtime_manifests": manifests,
                 "lease_timeout_sec": lease_timeout_sec,
+                "manifest_revision_semantics": manifest_revision_semantics,
             }
+        if generation is None:
+            raise RuntimeError(
+                "source workers returned no authoritative snapshot generation"
+            )
+        response["lease_fence"] = authoritative_lease_fence
+        response["generation"] = generation
         reused = bool(results) and all(
             getattr(result, "session_state", "created") == "reused"
             for result in results
@@ -1150,6 +2423,7 @@ class TokenizerControlMixin:
             self,
             transfer_id=transfer_id,
             manifest_format=manifest_format,
+            manifest_revision_semantics=manifest_revision_semantics,
             deadline_unix_sec=(
                 existing.get("deadline_unix_sec")
                 if reused and existing is not None
@@ -1157,14 +2431,31 @@ class TokenizerControlMixin:
             ),
             payloads=session_payloads,
             session_state="reused" if reused and existing is None else "active",
+            lease_fence=authoritative_lease_fence,
         )
         return response
 
     async def release_remote_instance_weight_transfer(
-        self: TokenizerManager, transfer_id: str
+        self: TokenizerManager,
+        transfer_id: str,
+        *,
+        lease_fence: str | None = None,
+        generation: int | None = None,
     ) -> Tuple[bool, str]:
+        _validate_remote_weight_transfer_control_identity(lease_fence, generation)
         self.auto_create_handle_loop()
+        if lease_fence is None:
+            transfer_id = _resolve_unfenced_remote_weight_transfer_control(
+                self,
+                transfer_id,
+            )
+        else:
+            if type(transfer_id) is not str or not transfer_id:
+                raise ValueError("transfer_id must be a non-empty string")
         attempted_at = time.time()
+        request_id = uuid.uuid4().hex
+        deadline_unix_sec = time.time() + _CONTROL_CLEANUP_TIMEOUT_SEC
+        completion_unknown_error = None
         try:
             async with TokenizerControlMixin._remote_instance_weight_transfer_pause(
                 self
@@ -1172,19 +2463,31 @@ class TokenizerControlMixin:
                 results = (
                     await self.release_remote_instance_weight_transfer_communicator(
                         ReleaseRemoteInstanceWeightTransferReqInput(
-                            transfer_id=transfer_id
-                        )
+                            transfer_id=transfer_id,
+                            request_id=request_id,
+                            lease_fence=lease_fence,
+                            generation=generation,
+                            deadline_unix_sec=deadline_unix_sec,
+                        ),
+                        deadline_unix_sec=deadline_unix_sec,
                     )
                 )
             success, message = FanOutCommunicator.merge_results(results)
         except Exception as error:
             success, message = False, str(error)
+            if isinstance(error, FanOutCompletionUnknownError) or bool(
+                getattr(error, "completion_unknown", False)
+            ):
+                completion_unknown_error = error
         _record_remote_weight_transfer_release(
             self,
             transfer_id=transfer_id,
             attempted_at=attempted_at,
             success=success,
             message=message,
+            completion_unknown=completion_unknown_error is not None,
+            lease_fence=lease_fence,
+            generation=generation,
         )
         log = logger.info if success else logger.warning
         log(
@@ -1194,6 +2497,14 @@ class TokenizerControlMixin:
             success,
             message,
         )
+        if completion_unknown_error is not None:
+            raise RemoteInstanceWeightTransferControlError(
+                message,
+                transfer_id=transfer_id,
+                session_state="cleanup_pending",
+                lease_fence=lease_fence,
+                generation=generation,
+            ) from completion_unknown_error
         return success, message
 
     async def renew_remote_instance_weight_transfer(
@@ -1202,28 +2513,95 @@ class TokenizerControlMixin:
         lease_timeout_sec: int = (
             DEFAULT_REMOTE_INSTANCE_WEIGHT_TRANSFER_LEASE_TIMEOUT_SEC
         ),
+        *,
+        lease_fence: str | None = None,
+        generation: int | None = None,
     ) -> Tuple[bool, str]:
         validate_remote_instance_weight_transfer_lease_timeout(lease_timeout_sec)
+        _validate_remote_weight_transfer_control_identity(lease_fence, generation)
         self.auto_create_handle_loop()
-        deadline_unix_sec = time.time() + lease_timeout_sec
+        if lease_fence is None:
+            transfer_id = _resolve_unfenced_remote_weight_transfer_control(
+                self,
+                transfer_id,
+            )
+        elif type(transfer_id) is not str or not transfer_id:
+            raise ValueError("transfer_id must be a non-empty string")
+        legacy_deadline_unix_sec = time.time() + lease_timeout_sec
+        request_id = uuid.uuid4().hex
+        granted_deadline_unix_sec = None
+        deadline_unix_sec = time.time() + min(
+            lease_timeout_sec, _CONTROL_CLEANUP_TIMEOUT_SEC
+        )
+        completion_unknown_error = None
         try:
-            async with TokenizerControlMixin._remote_instance_weight_transfer_pause(
-                self
-            ):
-                results = await self.renew_remote_instance_weight_transfer_communicator(
-                    RenewRemoteInstanceWeightTransferReqInput(
-                        transfer_id=transfer_id,
-                        lease_timeout_sec=lease_timeout_sec,
-                    )
-                )
+            results = await self.renew_remote_instance_weight_transfer_communicator(
+                RenewRemoteInstanceWeightTransferReqInput(
+                    transfer_id=transfer_id,
+                    lease_timeout_sec=lease_timeout_sec,
+                    request_id=request_id,
+                    lease_fence=lease_fence,
+                    generation=generation,
+                    deadline_unix_sec=deadline_unix_sec,
+                ),
+                deadline_unix_sec=deadline_unix_sec,
+            )
             success, message = FanOutCommunicator.merge_results(results)
+            if success:
+                granted_deadlines = [
+                    getattr(result, "deadline_unix_sec", None) for result in results
+                ]
+                present_deadlines = [
+                    deadline for deadline in granted_deadlines if deadline is not None
+                ]
+                if present_deadlines and len(present_deadlines) != len(
+                    granted_deadlines
+                ):
+                    success = False
+                    message = (
+                        "Source replicas returned mixed legacy and authoritative "
+                        "lease deadlines."
+                    )
+                elif any(
+                    isinstance(deadline, bool)
+                    or not isinstance(deadline, (int, float))
+                    or not math.isfinite(deadline)
+                    or deadline <= 0
+                    for deadline in present_deadlines
+                ):
+                    success = False
+                    message = "Source replicas returned an invalid lease deadline."
+                elif present_deadlines:
+                    granted_deadline_unix_sec = min(present_deadlines)
+                else:
+                    granted_deadline_unix_sec = legacy_deadline_unix_sec
         except Exception as error:
             success, message = False, str(error)
+            if isinstance(error, FanOutCompletionUnknownError) or bool(
+                getattr(error, "completion_unknown", False)
+            ):
+                completion_unknown_error = error
+        if completion_unknown_error is not None:
+            _record_remote_weight_transfer_completion_unknown(
+                self,
+                transfer_id=transfer_id,
+                session_state="completion_unknown",
+                lease_fence=lease_fence,
+                generation=generation,
+            )
+            raise RemoteInstanceWeightTransferControlError(
+                message,
+                transfer_id=transfer_id,
+                session_state="completion_unknown",
+                lease_fence=lease_fence,
+                generation=generation,
+            ) from completion_unknown_error
         if success:
+            assert granted_deadline_unix_sec is not None
             _record_remote_weight_transfer_renewal(
                 self,
                 transfer_id=transfer_id,
-                deadline_unix_sec=deadline_unix_sec,
+                deadline_unix_sec=granted_deadline_unix_sec,
             )
         return success, message
 
@@ -1238,22 +2616,90 @@ class TokenizerControlMixin:
         return [session for session in sessions if session is not None]
 
     async def get_remote_instance_weight_transfer_session(
-        self: TokenizerManager, transfer_id: str
+        self: TokenizerManager,
+        transfer_id: str,
+        *,
+        lease_fence: str | None = None,
+        generation: int | None = None,
     ) -> Dict[str, Any] | None:
         if type(transfer_id) is not str or not transfer_id:
             raise ValueError("transfer_id must be a non-empty string")
-        return _refresh_remote_weight_transfer_session(self, transfer_id)
+        _validate_remote_weight_transfer_control_identity(lease_fence, generation)
+        local_session = _refresh_remote_weight_transfer_session(self, transfer_id)
+        communicator = getattr(
+            self,
+            "get_remote_instance_weight_transfer_session_communicator",
+            None,
+        )
+        if communicator is None:
+            return local_session
+
+        self.auto_create_handle_loop()
+        if lease_fence is None and local_session is not None:
+            lease_fence = local_session.get("lease_fence")
+            generation = local_session.get("generation")
+        deadline_unix_sec = time.time() + _CONTROL_CLEANUP_TIMEOUT_SEC
+        request_id = uuid.uuid4().hex
+        results = await communicator(
+            GetRemoteInstanceWeightTransferSessionReqInput(
+                transfer_id=transfer_id,
+                request_id=request_id,
+                lease_fence=lease_fence,
+                generation=generation,
+                deadline_unix_sec=deadline_unix_sec,
+            ),
+            deadline_unix_sec=deadline_unix_sec,
+        )
+        success, message = FanOutCommunicator.merge_results(results)
+        if not success:
+            if results and all(
+                getattr(result, "session_state", "unknown") == "unknown"
+                for result in results
+            ):
+                return None
+            raise RuntimeError(message)
+
+        states = {result.session_state for result in results}
+        fences = {result.lease_fence for result in results}
+        generations = {result.generation for result in results}
+        if len(states) != 1 or len(fences) != 1 or len(generations) != 1:
+            raise RuntimeError(
+                "source workers returned inconsistent transfer session identity"
+            )
+        session_state = next(iter(states))
+        authoritative_fence = next(iter(fences))
+        authoritative_generation = next(iter(generations))
+        deadlines = [
+            result.deadline_unix_sec
+            for result in results
+            if result.deadline_unix_sec is not None
+        ]
+        deadline = min(deadlines) if deadlines else None
+
+        record = dict(local_session or {})
+        record.update(
+            {
+                "transfer_id": transfer_id,
+                "lease_fence": authoritative_fence,
+                "generation": authoritative_generation,
+                "deadline_unix_sec": deadline,
+                "expired": session_state == "expired",
+                "session_state": session_state,
+            }
+        )
+        _remote_weight_transfer_session_index(self)[transfer_id] = record
+        return dict(record)
 
     async def update_weights_from_tensor(
         self: TokenizerManager,
         obj: UpdateWeightsFromTensorReqInput,
         request: Optional[fastapi.Request] = None,
     ) -> Tuple[bool, str]:
+        self._require_single_tokenizer_weight_update_owner()
         self.auto_create_handle_loop()
-        assert (
-            self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
-        ), "dp_size must be 1 or dp attention must be enabled for update weights from tensor"
-
+        assert self.server_args.dp_size == 1 or self.server_args.enable_dp_attention, (
+            "dp_size must be 1 or dp attention must be enabled for update weights from tensor"
+        )
         if obj.abort_all_requests:
             self.abort_request(abort_all=True)
 
@@ -1261,21 +2707,25 @@ class TokenizerControlMixin:
             obj.serialized_named_tensors
         )
 
-        async with self.is_pause_cond:
-            is_paused = self.is_pause
-            if is_paused:
-                results = await self.update_weights_from_tensor_communicator(obj)
-
-        if not is_paused:
+        async def update_locked():
             async with self.model_update_lock.writer_lock:
-                results = await self.update_weights_from_tensor_communicator(obj)
+                _validate_next_weight_revision(self, obj.weight_version)
+                results = await _call_weight_update_communicator(
+                    self,
+                    self.update_weights_from_tensor_communicator,
+                    obj,
+                )
+                return _finish_weight_update_transaction(
+                    self,
+                    results,
+                    weight_version=obj.weight_version,
+                    full_restore=False,
+                )
 
-        success, message = FanOutCommunicator.merge_results(results)
-        if success and obj.weight_version is not None:
-            self._update_weight_version_if_provided(obj.weight_version)
-            message += f" Weight version updated to {obj.weight_version}."
-
-        return success, message
+        async with self.is_pause_cond:
+            if self.is_pause:
+                return await update_locked()
+        return await update_locked()
 
     async def update_weights_from_ipc(
         self: TokenizerManager,
@@ -1283,32 +2733,40 @@ class TokenizerControlMixin:
         request: Optional[fastapi.Request] = None,
     ) -> Tuple[bool, str]:
         """Update weights via IPC for checkpoint-engine integration."""
+        self._require_single_tokenizer_weight_update_owner()
         self.auto_create_handle_loop()
         try:
             # For now, we only support single data parallel instance
             assert (
                 self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
-            ), "dp_size must be 1 or dp attention must be enabled for update weights from IPC"
+            ), (
+                "dp_size must be 1 or dp attention must be enabled for update weights from IPC"
+            )
             logger.info("Starting IPC weight update")
 
-            async with self.is_pause_cond:
-                is_paused = self.is_pause
-                if is_paused:
-                    result = (await self.update_weights_from_ipc_communicator(obj))[0]
-                    success, message = result.success, result.message
-
-            if not is_paused:
+            async def update_locked():
                 async with self.model_update_lock.writer_lock:
-                    result = (await self.update_weights_from_ipc_communicator(obj))[0]
-                    success, message = result.success, result.message
+                    _validate_next_weight_revision(self, obj.weight_version)
+                    results = await _call_weight_update_communicator(
+                        self,
+                        self.update_weights_from_ipc_communicator,
+                        obj,
+                    )
+                    return _finish_weight_update_transaction(
+                        self,
+                        results,
+                        weight_version=obj.weight_version,
+                        full_restore=False,
+                    )
+
+            async with self.is_pause_cond:
+                if self.is_pause:
+                    return await update_locked()
+            return await update_locked()
         except Exception as e:
             error_msg = f"IPC weight update failed: {str(e)}"
             logger.error(error_msg)
             success, message = False, error_msg
-
-        if success and obj.weight_version is not None:
-            self._update_weight_version_if_provided(obj.weight_version)
-            message += f" Weight version updated to {obj.weight_version}."
 
         return success, message
 
@@ -1316,9 +2774,9 @@ class TokenizerControlMixin:
         self: TokenizerManager,
         obj: UnloadLoRAAdapterReqInput,
     ) -> UnloadLoRAAdapterReqOutput:
-        assert (
-            self.lora_update_lock.locked()
-        ), "self.lora_update_lock must be locked in order for self._unload_lora_adapter_locked() to be called"
+        assert self.lora_update_lock.locked(), (
+            "self.lora_update_lock must be locked in order for self._unload_lora_adapter_locked() to be called"
+        )
 
         # Unregister the LoRA adapter from the registry to stop new requests for this adapter
         # from being started.
@@ -1347,9 +2805,9 @@ class TokenizerControlMixin:
 
             # TODO (lifuhuang): Remove this after we verify that dynamic lora loading works
             # with dp_size > 1.
-            assert (
-                self.server_args.dp_size == 1
-            ), "dp_size must be 1 for dynamic lora loading"
+            assert self.server_args.dp_size == 1, (
+                "dp_size must be 1 for dynamic lora loading"
+            )
             logger.info(
                 "Start load Lora adapter. Lora name=%s, path=%s",
                 obj.lora_name,
@@ -1423,9 +2881,9 @@ class TokenizerControlMixin:
                     "LoRA is not enabled. Please set `--enable-lora` to enable LoRA."
                 )
 
-            assert (
-                self.server_args.dp_size == 1
-            ), "dp_size must be 1 for dynamic lora loading"
+            assert self.server_args.dp_size == 1, (
+                "dp_size must be 1 for dynamic lora loading"
+            )
             logger.info(
                 "Start load Lora adapter from tensors. Lora name=%s",
                 obj.lora_name,
@@ -1493,15 +2951,15 @@ class TokenizerControlMixin:
                     "LoRA is not enabled. Please set `--enable-lora` to enable LoRA."
                 )
 
-            assert (
-                obj.lora_name is not None
-            ), "lora_name must be provided to unload LoRA adapter"
+            assert obj.lora_name is not None, (
+                "lora_name must be provided to unload LoRA adapter"
+            )
 
             # TODO (lifuhuang): Remove this after we verify that dynamic lora loading works
             # with dp_size > 1.
-            assert (
-                self.server_args.dp_size == 1
-            ), "dp_size must be 1 for dynamic lora loading"
+            assert self.server_args.dp_size == 1, (
+                "dp_size must be 1 for dynamic lora loading"
+            )
             logger.info(
                 "Start unload Lora adapter. Lora name=%s",
                 obj.lora_name,
@@ -1574,9 +3032,9 @@ class TokenizerControlMixin:
     async def get_internal_state(self: TokenizerManager) -> List[Dict[Any, Any]]:
         self.auto_create_handle_loop()
         req = GetInternalStateReq()
-        responses: List[GetInternalStateReqOutput] = (
-            await self.get_internal_state_communicator(req)
-        )
+        responses: List[
+            GetInternalStateReqOutput
+        ] = await self.get_internal_state_communicator(req)
         # Many DP ranks
         return [res.internal_state for res in responses]
 
@@ -1584,9 +3042,9 @@ class TokenizerControlMixin:
         self: TokenizerManager, obj: SetInternalStateReq
     ) -> List[bool]:
         self.auto_create_handle_loop()
-        responses: List[SetInternalStateReqOutput] = (
-            await self.set_internal_state_communicator(obj)
-        )
+        responses: List[
+            SetInternalStateReqOutput
+        ] = await self.set_internal_state_communicator(obj)
         return [res.updated for res in responses]
 
     async def dumper_control(
@@ -1664,6 +3122,7 @@ class TokenizerControlMixin:
     ) -> None:
         """Update weight version if provided."""
         if weight_version is not None:
+            self.runtime_weight_revision = weight_version
             self.server_args.override(
                 "tokenizer.weight_version", weight_version=weight_version
             )

@@ -22,12 +22,16 @@ instead, such as sglang.srt.utils.common.
 
 from __future__ import annotations
 
+import contextvars
 import copy
 import logging
+import os
 import pickle
+import socket
 import uuid
 from array import array
 from collections import Counter
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import (
@@ -48,13 +52,13 @@ import torch
 import zmq
 import zmq.asyncio
 from pydantic import PlainValidator
-
 from sglang.srt.environ import envs
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.managers.schedule_batch import Modality
 from sglang.srt.model_executor.weight_runtime_manifest import (
     DEFAULT_REMOTE_INSTANCE_WEIGHT_TRANSFER_LEASE_TIMEOUT_SEC,
+    MAX_REMOTE_INSTANCE_WEIGHT_TRANSFER_LEASE_TIMEOUT_SEC,
 )
 from sglang.srt.multimodal.mm_utils import has_valid_data
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -64,6 +68,10 @@ from sglang.srt.utils.msgspec_utils import (
     Base64Bytes,
     msgspec_struct_pydantic_core_schema,
 )
+from sglang.srt.weight_transfer.remote_protocol import (
+    HF_REVISION_V1,
+    RUNTIME_MANIFEST_V1,
+)
 
 # Handle serialization of Image for pydantic
 if TYPE_CHECKING:
@@ -72,6 +80,105 @@ else:
     Image = Any
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class _ControlRequestContext:
+    request_id: str
+    responder_id: str
+    transaction_id: Optional[str] = None
+    phase: Optional[str] = None
+    deadline_unix_sec: Optional[float] = None
+    state: str = "unknown"
+
+
+_CONTROL_RESPONDER_PID: Optional[int] = None
+_CONTROL_RESPONDER_ID: Optional[str] = None
+_WEIGHT_UPDATE_REQUEST_CONTEXT = contextvars.ContextVar(
+    "sglang_weight_update_request",
+    default=None,
+)
+_WEIGHT_SNAPSHOT_ACTIVATION_CONTEXT = contextvars.ContextVar(
+    "sglang_weight_snapshot_activation_request",
+    default=None,
+)
+
+
+def _stable_control_responder_id() -> str:
+    global _CONTROL_RESPONDER_ID, _CONTROL_RESPONDER_PID
+    pid = os.getpid()
+    if pid != _CONTROL_RESPONDER_PID:
+        _CONTROL_RESPONDER_PID = pid
+        _CONTROL_RESPONDER_ID = f"{socket.gethostname()}:{pid}"
+    assert _CONTROL_RESPONDER_ID is not None
+    return _CONTROL_RESPONDER_ID
+
+
+def _get_weight_update_request_context() -> Optional[_ControlRequestContext]:
+    return _WEIGHT_UPDATE_REQUEST_CONTEXT.get()
+
+
+@contextmanager
+def weight_update_request_context(request):
+    context = (
+        _ControlRequestContext(
+            request_id=request.request_id,
+            responder_id=_stable_control_responder_id(),
+        )
+        if request.request_id
+        else None
+    )
+    token = _WEIGHT_UPDATE_REQUEST_CONTEXT.set(context)
+    try:
+        yield
+    finally:
+        _WEIGHT_UPDATE_REQUEST_CONTEXT.reset(token)
+
+
+def get_weight_snapshot_activation_context() -> Optional[_ControlRequestContext]:
+    return _WEIGHT_SNAPSHOT_ACTIVATION_CONTEXT.get()
+
+
+def set_weight_snapshot_activation_result(state: str) -> None:
+    context = get_weight_snapshot_activation_context()
+    if context is None:
+        return
+    _WEIGHT_SNAPSHOT_ACTIVATION_CONTEXT.set(
+        _ControlRequestContext(
+            request_id=context.request_id,
+            responder_id=context.responder_id,
+            transaction_id=context.transaction_id,
+            phase=context.phase,
+            deadline_unix_sec=context.deadline_unix_sec,
+            state=state,
+        )
+    )
+
+
+def _take_weight_snapshot_activation_context() -> Optional[_ControlRequestContext]:
+    context = get_weight_snapshot_activation_context()
+    _WEIGHT_SNAPSHOT_ACTIVATION_CONTEXT.set(None)
+    return context
+
+
+@contextmanager
+def weight_snapshot_activation_request_context(request):
+    if not request.request_id:
+        yield
+        return
+    token = _WEIGHT_SNAPSHOT_ACTIVATION_CONTEXT.set(
+        _ControlRequestContext(
+            request_id=request.request_id,
+            responder_id=_stable_control_responder_id(),
+            transaction_id=request.transaction_id,
+            phase=request.phase,
+            deadline_unix_sec=request.deadline_unix_sec,
+        )
+    )
+    try:
+        yield
+    finally:
+        _WEIGHT_SNAPSHOT_ACTIVATION_CONTEXT.reset(token)
 
 
 class BaseReq(msgspec.Struct, tag=True, kw_only=True, array_like=True):
@@ -1522,9 +1629,13 @@ class ContinueGenerationReqInput(BaseReq, kw_only=True):
 
 
 class TokenizerWorkerRegistrationReq(BaseReq, kw_only=True):
-    """Sent by each TokenizerWorker on startup to register its IPC name with the router."""
+    """Register or unregister one tokenizer worker process."""
 
     worker_ipc_name: str
+    worker_pid: int = 0
+    process_start_time: float = 0.0
+    worker_token: str = ""
+    unregister: bool = False
 
 
 class PauseContinueBroadcastReq(BaseReq, kw_only=True):
@@ -1554,8 +1665,10 @@ class UpdateWeightFromDiskReqInput(BaseReq, kw_only=True):
     token_step: int = 0
     # Whether to flush the cache after updating weights
     flush_cache: bool = True
+    timeout_sec: float = 3600.0
     # Tensor metadata from the JSON request body, so it is already msgpack-native.
     manifest: Optional[Dict[str, Any]] = None
+    request_id: Optional[str] = None
 
 
 class UpdateWeightFromDiskReqOutput(BaseReq, kw_only=True):
@@ -1563,6 +1676,9 @@ class UpdateWeightFromDiskReqOutput(BaseReq, kw_only=True):
     message: str
     # Number of paused requests during weight sync.
     num_paused_requests: int = 0
+    fail_closed: bool = False
+    request_id: Optional[str] = None
+    external_dp_rank: Optional[int] = None
 
 
 class UpdateWeightsFromDistributedReqInput(BaseReq, kw_only=True):
@@ -1581,11 +1697,24 @@ class UpdateWeightsFromDistributedReqInput(BaseReq, kw_only=True):
     load_format: Optional[str] = None
     # Whether to call torch.cuda.empty_cache() during flush
     torch_empty_cache: bool = False
+    request_id: Optional[str] = None
 
 
 class UpdateWeightsFromDistributedReqOutput(BaseReq, kw_only=True):
     success: bool
     message: str
+    fail_closed: bool = False
+    request_id: Optional[str] = None
+    responder_id: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        context = _get_weight_update_request_context()
+        if context is None:
+            return
+        if self.request_id is None:
+            self.request_id = context.request_id
+        if self.responder_id is None:
+            self.responder_id = context.responder_id
 
 
 class UpdateWeightsFromTensorReqInput(BaseReq, kw_only=True):
@@ -1609,11 +1738,132 @@ class UpdateWeightsFromTensorReqInput(BaseReq, kw_only=True):
     disable_draft_model: Optional[bool] = None
     # Whether to call torch.cuda.empty_cache() during flush
     torch_empty_cache: bool = False
+    request_id: Optional[str] = None
 
 
 class UpdateWeightsFromTensorReqOutput(BaseReq, kw_only=True):
     success: bool
     message: str
+    fail_closed: bool = False
+    request_id: Optional[str] = None
+    responder_id: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        context = _get_weight_update_request_context()
+        if context is None:
+            return
+        if self.request_id is None:
+            self.request_id = context.request_id
+        if self.responder_id is None:
+            self.responder_id = context.responder_id
+
+
+class MaterializeWeightsReqInput(BaseReq, kw_only=True):
+    storage_options: Dict[str, Any]
+    materialization_id: Optional[str] = None
+    source_external_dp_rank: Optional[int] = None
+    lease_timeout_sec: int = MAX_REMOTE_INSTANCE_WEIGHT_TRANSFER_LEASE_TIMEOUT_SEC
+
+
+class WeightMaterializationSessionState(str, Enum):
+    UNKNOWN = "unknown"
+    DISABLED = "disabled"
+    PREPARED = "prepared"
+    COMMITTING = "committing"
+    RECOVERING = "recovering"
+    CLEANING = "cleaning"
+    FAILED = "failed"
+    CONFLICT = "conflict"
+    NOT_FOUND = "not_found"
+    CLEANUP_PENDING = "cleanup_pending"
+    COMPLETION_UNKNOWN = "completion_unknown"
+    FINALIZE_PENDING = "finalize_pending"
+    SKIPPED = "skipped"
+    RELEASED = "released"
+    PUBLISHED = "published"
+    PUBLISHED_CLEANUP_PENDING = "published_cleanup_pending"
+    PUBLISHED_CLEANUP_FAILED = "published_cleanup_failed"
+
+
+class WeightSnapshotActivationReqInput(BaseReq, kw_only=True):
+    action: Literal["activate", "close"]
+    phase: Literal["prepare", "commit", "reconcile", "abort", "close"] = "commit"
+    transaction_id: Optional[str] = None
+    request_id: Optional[str] = None
+    deadline_unix_sec: Optional[float] = None
+
+
+class WeightSnapshotActivationReqOutput(BaseReq, kw_only=True):
+    action: Literal["activate", "close"]
+    success: bool
+    message: str
+    phase: Literal["prepare", "commit", "reconcile", "abort", "close"] = "commit"
+    transaction_id: Optional[str] = None
+    request_id: Optional[str] = None
+    responder_id: Optional[str] = None
+    state: str = "unknown"
+
+    def __post_init__(self) -> None:
+        context = _take_weight_snapshot_activation_context()
+        if context is None:
+            return
+        self.phase = context.phase or self.phase
+        if self.transaction_id is None:
+            self.transaction_id = context.transaction_id
+        if self.request_id is None:
+            self.request_id = context.request_id
+        if self.responder_id is None:
+            self.responder_id = context.responder_id
+        if self.state == "unknown":
+            self.state = context.state
+
+
+class PrepareWeightMaterializationReqInput(BaseReq, kw_only=True):
+    materialization_id: str
+    request_id: str
+    model_id: str
+    revision: str
+    lease_timeout_sec: int
+    deadline_unix_sec: Optional[float] = None
+
+
+class PrepareWeightMaterializationReqOutput(BaseReq, kw_only=True):
+    materialization_id: str
+    request_id: str
+    success: bool
+    message: str
+    external_dp_rank: int
+    generation: Optional[int] = None
+    logical_payload_digest: Optional[str] = None
+    total_bytes: Optional[int] = None
+    session_state: WeightMaterializationSessionState = (
+        WeightMaterializationSessionState.UNKNOWN
+    )
+
+
+class CommitWeightMaterializationReqInput(BaseReq, kw_only=True):
+    materialization_id: str
+    request_id: str
+    selected_external_dp_rank: Optional[int]
+    storage_options: Dict[str, Any]
+    phase: Literal["commit", "cleanup", "recover"] = "commit"
+    deadline_unix_sec: Optional[float] = None
+
+
+class CommitWeightMaterializationReqOutput(BaseReq, kw_only=True):
+    materialization_id: str
+    request_id: str
+    success: bool
+    message: str
+    external_dp_rank: int
+    selected: bool = False
+    ref: Optional[Dict[str, Any]] = None
+    completion_unknown: bool = False
+    completion_ticket: Optional[str] = None
+    session_state: WeightMaterializationSessionState = (
+        WeightMaterializationSessionState.UNKNOWN
+    )
+    phase: Literal["commit", "cleanup", "recover"] = "commit"
 
 
 class InitWeightsSendGroupForRemoteInstanceReqInput(BaseReq, kw_only=True):
@@ -1642,11 +1892,24 @@ class UpdateWeightsFromIPCReqInput(BaseReq, kw_only=True):
     weight_version: Optional[str] = None
     # Whether to call torch.cuda.empty_cache() during flush
     torch_empty_cache: bool = False
+    request_id: Optional[str] = None
 
 
 class UpdateWeightsFromIPCReqOutput(BaseReq, kw_only=True):
     success: bool
     message: str
+    fail_closed: bool = False
+    request_id: Optional[str] = None
+    responder_id: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        context = _get_weight_update_request_context()
+        if context is None:
+            return
+        if self.request_id is None:
+            self.request_id = context.request_id
+        if self.responder_id is None:
+            self.responder_id = context.responder_id
 
 
 class InitWeightsSendGroupForRemoteInstanceReqOutput(BaseReq, kw_only=True):
@@ -1673,7 +1936,11 @@ class BeginRemoteInstanceWeightTransferReqInput(BaseReq, kw_only=True):
     model_id: str
     revision: str
     lease_timeout_sec: int = DEFAULT_REMOTE_INSTANCE_WEIGHT_TRANSFER_LEASE_TIMEOUT_SEC
-    manifest_format: str = "runtime_v1"
+    manifest_format: str = RUNTIME_MANIFEST_V1
+    manifest_revision_semantics: str = HF_REVISION_V1
+    request_id: Optional[str] = None
+    deadline_unix_sec: Optional[float] = None
+    lease_fence: Optional[str] = None
 
 
 class BeginRemoteInstanceWeightTransferReqOutput(BaseReq, kw_only=True):
@@ -1684,27 +1951,65 @@ class BeginRemoteInstanceWeightTransferReqOutput(BaseReq, kw_only=True):
     manifests: Optional[List[Dict[str, Any]]] = None
     placements: Optional[List[Dict[str, Any]]] = None
     bindings: Optional[List[Dict[str, Any]]] = None
+    manifest_revision_semantics: str = HF_REVISION_V1
+    request_id: Optional[str] = None
+    external_dp_rank: Optional[int] = None
+    lease_fence: Optional[str] = None
+    generation: Optional[int] = None
+
+
+class GetRemoteInstanceWeightTransferSessionReqInput(BaseReq, kw_only=True):
+    transfer_id: str
+    request_id: Optional[str] = None
+    lease_fence: Optional[str] = None
+    generation: Optional[int] = None
+    deadline_unix_sec: Optional[float] = None
+
+
+class GetRemoteInstanceWeightTransferSessionReqOutput(BaseReq, kw_only=True):
+    transfer_id: str
+    success: bool
+    message: str
+    session_state: str = "unknown"
+    lease_fence: Optional[str] = None
+    generation: Optional[int] = None
+    deadline_unix_sec: Optional[float] = None
+    request_id: Optional[str] = None
+    external_dp_rank: Optional[int] = None
 
 
 class ReleaseRemoteInstanceWeightTransferReqInput(BaseReq, kw_only=True):
     transfer_id: str
+    request_id: Optional[str] = None
+    lease_fence: Optional[str] = None
+    generation: Optional[int] = None
+    deadline_unix_sec: Optional[float] = None
 
 
 class ReleaseRemoteInstanceWeightTransferReqOutput(BaseReq, kw_only=True):
     transfer_id: str
     success: bool
     message: str
+    request_id: Optional[str] = None
+    external_dp_rank: Optional[int] = None
 
 
 class RenewRemoteInstanceWeightTransferReqInput(BaseReq, kw_only=True):
     transfer_id: str
     lease_timeout_sec: int = DEFAULT_REMOTE_INSTANCE_WEIGHT_TRANSFER_LEASE_TIMEOUT_SEC
+    request_id: Optional[str] = None
+    lease_fence: Optional[str] = None
+    generation: Optional[int] = None
+    deadline_unix_sec: Optional[float] = None
 
 
 class RenewRemoteInstanceWeightTransferReqOutput(BaseReq, kw_only=True):
     transfer_id: str
     success: bool
     message: str
+    request_id: Optional[str] = None
+    external_dp_rank: Optional[int] = None
+    deadline_unix_sec: Optional[float] = None
 
 
 class UpdateExpertBackupReq(BaseReq, kw_only=True):
