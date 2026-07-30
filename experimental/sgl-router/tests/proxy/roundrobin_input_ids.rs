@@ -46,7 +46,6 @@ fn config() -> Config {
             cache_aware: None,
             sticky: None,
             fused: None,
-            eligibility: None,
         },
         discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
             urls: vec!["http://placeholder:0".into()],

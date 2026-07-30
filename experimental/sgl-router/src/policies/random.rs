@@ -17,7 +17,6 @@ impl RandomPolicy {
 
 impl ScoringPolicy for RandomPolicy {
     /// Argmax of n iid uniforms IS a uniform choice: exactly the old `choose`.
-    /// Never constrains: a coin toss is not an eligibility rule.
     fn scores(&self, workers: &[Arc<Worker>], _ctx: &SelectionContext<'_>) -> Vec<f32> {
         let mut rng = rand::thread_rng();
         (0..workers.len()).map(|_| rng.gen()).collect()

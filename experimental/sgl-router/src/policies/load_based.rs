@@ -21,9 +21,6 @@ impl ScoringPolicy for LoadBasedPolicy {
     /// the CURRENT fleet -- relative, not absolute, so it cannot saturate:
     /// `1 - load/256` reads a busy fleet as all-`0.0`, tied inside
     /// `TIE_EPSILON`, so the term dies exactly when load matters most.
-    ///
-    /// Purely a preference: "everybody is busy" is not a reason to refuse to
-    /// route, so this term never constrains. Capacity is `--filter`'s job.
     fn scores(&self, workers: &[Arc<Worker>], _ctx: &SelectionContext<'_>) -> Vec<f32> {
         let loads: Vec<usize> = workers.iter().map(|w| w.active_load()).collect();
         let lo = loads.iter().min().copied().unwrap_or(0);

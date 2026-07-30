@@ -95,11 +95,6 @@ pub enum PolicyKind {
     /// contributes, so the terms trade off continuously.
     #[value(name = "fused_score")]
     FusedScore,
-    /// Capacity as a hard constraint: reject any worker already carrying
-    /// `--max-in-flight` requests. A `--filter` entry, not a `--policy`:
-    /// standalone it can only fall back on the selector's load tiebreak.
-    #[value(name = "overloaded")]
-    Overloaded,
     /// Cache-aware routing fed by SGLang's ZMQ KV-cache event publisher.
     /// Requires the model to have a tokenizer loaded; cache_aware tuning
     /// lives on `ModelConfig::cache_aware`.
@@ -174,7 +169,7 @@ pub struct ModelConfig {
     pub tokenizer_path: String,
     pub policy: PolicyKind,
     pub circuit_breaker: Option<CircuitBreakerConfig>,
-    /// Tuning for cache-aware routing. Ignored unless
+    /// Tuning for the cache-aware ZMQ policy. Ignored unless
     /// `policy = "cache_aware_zmq"`. `None` falls back to defaults at
     /// policy construction time.
     pub cache_aware: Option<CacheAwareConfig>,
@@ -188,29 +183,6 @@ pub struct ModelConfig {
     /// [`crate::config::cli::Cli::into_config`]), defaulting to
     /// [`DEFAULT_FUSE`] when `--fuse` is omitted.
     pub fused: Option<Vec<FusedTerm>>,
-    /// Hard constraints applied before scoring. `Some` exactly when
-    /// `--filter` is given (built by [`crate::config::cli::Cli::into_config`]).
-    pub eligibility: Option<EligibilityConfig>,
-}
-
-/// The `--filter` layer: which constraints run, in priority order, and the
-/// parameters the ones that need them read.
-///
-/// Parameters live here rather than on each filter's own config struct because
-/// a filter is also reachable as a `--fuse` term (`prefix_cache` is both), and
-/// two config homes for one policy is how the two halves drift apart.
-#[derive(Debug, Clone, Default)]
-pub struct EligibilityConfig {
-    /// Filters in priority order, spelled as `--policy` spells them. When two
-    /// cannot both be satisfied the LATER one yields; see
-    /// `crate::policies::scoring::admit`.
-    pub filters: Vec<PolicyKind>,
-    /// `overloaded`: in-flight count at which a worker stops being eligible.
-    pub max_in_flight: Option<usize>,
-    /// `prefix_cache`: share of the prompt a worker must already hold to stay
-    /// eligible. Also what makes `prefix_cache` report itself as a filter at
-    /// all -- without it the term is a pure preference.
-    pub min_prefix_share: Option<f32>,
 }
 
 /// The pair `--policy fused_score` composes when `--fuse` is omitted, so the
@@ -227,7 +199,7 @@ pub const DEFAULT_FUSE: [PolicyKind; 2] = [PolicyKind::PrefixCache, PolicyKind::
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct FusedTerm {
     pub kind: PolicyKind,
-    /// Weight override; `None` keeps the term's own `Criterion::weight()`.
+    /// Weight override; `None` keeps the term's own `ScoringPolicy::weight()`.
     pub weight: Option<f32>,
 }
 
@@ -264,16 +236,8 @@ fn parse_fuse_weight(name: &str, raw: &str) -> Result<f32, String> {
     Ok(w)
 }
 
-/// External KV Indexer client settings.
-#[derive(Debug, Clone)]
-pub struct KvIndexerEndpointConfig {
-    pub url: String,
-    pub query_timeout_ms: u64,
-    pub query_max_inflight: usize,
-}
-
-/// Per-model cache-aware tuning.
-#[derive(Debug, Clone)]
+/// Per-model cache-aware-ZMQ tuning.
+#[derive(Debug, Clone, Copy)]
 pub struct CacheAwareConfig {
     /// Lower bound on `matched_blocks / total_blocks` for the tree match
     /// to win the selection. Below this, the policy falls back to
@@ -289,9 +253,6 @@ pub struct CacheAwareConfig {
     /// that the absolute check is gated on. Default 1.1 — 10 % relative
     /// difference triggers re-balancing.
     pub balance_rel_threshold: f32,
-    /// Optional external KV Indexer client configuration. When configured, it
-    /// replaces the local ZMQ radix tree as the cache signal.
-    pub kv_indexer_endpoint: Option<KvIndexerEndpointConfig>,
 }
 
 impl Default for CacheAwareConfig {
@@ -300,7 +261,6 @@ impl Default for CacheAwareConfig {
             cache_threshold: default_cache_threshold(),
             balance_abs_threshold: default_balance_abs(),
             balance_rel_threshold: default_balance_rel(),
-            kv_indexer_endpoint: None,
         }
     }
 }

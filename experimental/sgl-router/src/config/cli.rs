@@ -12,14 +12,9 @@ use std::num::NonZeroU32;
 use crate::config::{
     default_cb_cool_down, default_proxy_request_timeout_secs, default_stale_request_timeout_secs,
     resolve_mode, ActiveLoadConfig, CacheAwareConfig, CircuitBreakerConfig, Config,
-    DiscoveryBackend, EligibilityConfig, FusedTerm, K8sDiscoveryConfig, KvIndexerEndpointConfig,
-    LogFormat, ModelConfig, DEFAULT_FUSE,
-    ObservabilityConfig, PolicyKind, ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig,
-    StickyConfig,
+    DiscoveryBackend, FusedTerm, K8sDiscoveryConfig, LogFormat, ModelConfig, ObservabilityConfig,
+    PolicyKind, ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig, StickyConfig, DEFAULT_FUSE,
 };
-
-const DEFAULT_KV_INDEXER_QUERY_TIMEOUT_MS: u64 = 100;
-const DEFAULT_KV_INDEXER_QUERY_MAX_INFLIGHT: usize = sgl_kv_indexer::DEFAULT_QUERY_MAX_INFLIGHT;
 
 /// `sgl-router` — slim KV-aware OpenAI-compatible router for SGLang workers.
 ///
@@ -74,18 +69,6 @@ pub struct Cli {
     /// Multiplicative load spread gating the absolute balance check.
     #[arg(long)]
     pub balance_rel_threshold: Option<f32>,
-    /// External KV indexer gRPC endpoint used as the authoritative cache signal.
-    /// Needs an explicit scheme, e.g. `http://10.0.0.1:50051`.
-    #[arg(long)]
-    pub kv_indexer_endpoint: Option<String>,
-    /// KV Indexer query timeout in milliseconds. Requires
-    /// `--kv-indexer-endpoint`; defaults to 100.
-    #[arg(long)]
-    pub kv_indexer_query_timeout_ms: Option<u64>,
-    /// Maximum concurrent KV Indexer queries issued by this Router. Requires
-    /// `--kv-indexer-endpoint`; defaults to 32.
-    #[arg(long)]
-    pub kv_indexer_query_max_inflight: Option<usize>,
 
     // ---- fused-score composition (only used by `--policy fused_score`) ----
     /// Policies to sum, spelled exactly as `--policy` spells them and each
@@ -95,24 +78,6 @@ pub struct Cli {
     /// terms default to `prefix_cache,load_based`.
     #[arg(long, value_delimiter = ',')]
     pub fuse: Vec<FusedTerm>,
-
-    // ---- eligibility (`--filter`), applied before any scoring ----
-    /// Hard constraints applied before scoring, spelled as `--policy` spells
-    /// them: `--filter overloaded,prefix_cache`. A rejected worker cannot be
-    /// scored back in, which no `--fuse` weight can promise. Works with ANY
-    /// `--policy`. Order is priority: when two cannot both be satisfied the
-    /// LATER one yields.
-    #[arg(long, value_delimiter = ',')]
-    pub filter: Vec<PolicyKind>,
-    /// In-flight count at which `--filter overloaded` stops admitting a
-    /// worker. Router-local, so N replicas make the effective cap N times it.
-    #[arg(long)]
-    pub max_in_flight: Option<usize>,
-    /// Share of the prompt (0, 1] a worker must hold for
-    /// `--filter prefix_cache` to admit it. The `--fuse prefix_cache` term
-    /// scores the depth either way.
-    #[arg(long)]
-    pub prefix_cache_min_share: Option<f32>,
 
     // ---- sticky-session policy (only used by `--policy sticky`) ----
     /// Request header carrying the routing key for sticky-session routing.
@@ -201,33 +166,11 @@ impl Cli {
         }
         let tuned_cache_aware = self.cache_threshold.is_some()
             || self.balance_abs_threshold.is_some()
-            || self.balance_rel_threshold.is_some()
-            || self.kv_indexer_endpoint.is_some()
-            || self.kv_indexer_query_timeout_ms.is_some()
-            || self.kv_indexer_query_max_inflight.is_some();
+            || self.balance_rel_threshold.is_some();
         if tuned_cache_aware && self.policy != PolicyKind::CacheAwareZmq {
             return Err(anyhow!(
-                "cache-aware tuning flags require --policy cache_aware_zmq"
-            ));
-        }
-        if self.kv_indexer_query_timeout_ms == Some(0) {
-            return Err(anyhow!(
-                "--kv-indexer-query-timeout-ms must be greater than zero"
-            ));
-        }
-        if self.kv_indexer_query_timeout_ms.is_some() && self.kv_indexer_endpoint.is_none() {
-            return Err(anyhow!(
-                "--kv-indexer-query-timeout-ms requires --kv-indexer-endpoint"
-            ));
-        }
-        if self.kv_indexer_query_max_inflight == Some(0) {
-            return Err(anyhow!(
-                "--kv-indexer-query-max-inflight must be greater than zero"
-            ));
-        }
-        if self.kv_indexer_query_max_inflight.is_some() && self.kv_indexer_endpoint.is_none() {
-            return Err(anyhow!(
-                "--kv-indexer-query-max-inflight requires --kv-indexer-endpoint"
+                "--cache-threshold / --balance-abs-threshold / --balance-rel-threshold \
+                 require --policy cache_aware_zmq"
             ));
         }
 
@@ -264,41 +207,6 @@ impl Cli {
         } else {
             None
         };
-
-        // Deliberately NOT gated on `--policy`: a constraint is orthogonal to
-        // how the survivors are ranked, so it composes with every policy.
-        for (i, kind) in self.filter.iter().enumerate() {
-            if self.filter[..i].contains(kind) {
-                return Err(anyhow!("--filter: `{kind}` is listed more than once"));
-            }
-        }
-        // Each parameter is paired with its filter in BOTH directions: a knob
-        // with no reader is as much a misconfiguration as a reader with no
-        // knob, and both are silent at runtime.
-        let has = |k: PolicyKind| self.filter.contains(&k);
-        if self.max_in_flight.is_some() != has(PolicyKind::Overloaded) {
-            return Err(anyhow!(
-                "--max-in-flight and `--filter overloaded` require each other"
-            ));
-        }
-        if self.prefix_cache_min_share.is_some() != has(PolicyKind::PrefixCache) {
-            return Err(anyhow!(
-                "--prefix-cache-min-share and `--filter prefix_cache` require each other"
-            ));
-        }
-        // `0.0` would build a filter that admits everyone, which reads as
-        // "constrained" in the config and is not.
-        if self
-            .prefix_cache_min_share
-            .is_some_and(|s| !(s > 0.0 && s <= 1.0))
-        {
-            return Err(anyhow!("--prefix-cache-min-share must be in (0, 1]"));
-        }
-        let eligibility = (!self.filter.is_empty()).then(|| EligibilityConfig {
-            filters: self.filter.clone(),
-            max_in_flight: self.max_in_flight,
-            min_prefix_share: self.prefix_cache_min_share,
-        });
 
         let tuned_sticky = self.routing_key_header.is_some()
             || self.sticky_fallback_policy.is_some()
@@ -376,12 +284,6 @@ impl Cli {
         // Only build a CacheAwareConfig when the operator tuned at least
         // one knob; otherwise leave it None so the policy uses its own
         // defaults. Unset knobs fall back to the per-field defaults.
-        let kv_indexer_query_timeout_ms = self
-            .kv_indexer_query_timeout_ms
-            .unwrap_or(DEFAULT_KV_INDEXER_QUERY_TIMEOUT_MS);
-        let kv_indexer_query_max_inflight = self
-            .kv_indexer_query_max_inflight
-            .unwrap_or(DEFAULT_KV_INDEXER_QUERY_MAX_INFLIGHT);
         let cache_aware = if tuned_cache_aware {
             let d = CacheAwareConfig::default();
             Some(CacheAwareConfig {
@@ -392,11 +294,6 @@ impl Cli {
                 balance_rel_threshold: self
                     .balance_rel_threshold
                     .unwrap_or(d.balance_rel_threshold),
-                kv_indexer_endpoint: self.kv_indexer_endpoint.map(|url| KvIndexerEndpointConfig {
-                    url,
-                    query_timeout_ms: kv_indexer_query_timeout_ms,
-                    query_max_inflight: kv_indexer_query_max_inflight,
-                }),
             })
         } else {
             None
@@ -421,7 +318,6 @@ impl Cli {
                 cache_aware,
                 sticky,
                 fused,
-                eligibility,
             },
             discovery,
             proxy: ProxyConfig {
@@ -900,109 +796,6 @@ mod tests {
     }
 
     #[test]
-    fn kv_indexer_reuses_cache_aware_policy_config() {
-        let c = into_config_owned(with_model(&[
-            "--worker-urls",
-            "http://x:30000",
-            "--policy",
-            "cache_aware_zmq",
-            "--kv-indexer-endpoint",
-            "http://indexer:50051",
-            "--kv-indexer-query-timeout-ms",
-            "75",
-            "--kv-indexer-query-max-inflight",
-            "17",
-        ]))
-        .unwrap();
-        let cache = c.model.cache_aware.expect("cache-aware config");
-        let indexer = cache.kv_indexer_endpoint.expect("Indexer config");
-        assert_eq!(indexer.url, "http://indexer:50051");
-        assert_eq!(indexer.query_timeout_ms, 75);
-        assert_eq!(indexer.query_max_inflight, 17);
-    }
-
-    #[test]
-    fn kv_indexer_uses_safe_query_defaults() {
-        let c = into_config_owned(with_model(&[
-            "--worker-urls",
-            "http://x:30000",
-            "--policy",
-            "cache_aware_zmq",
-            "--kv-indexer-endpoint",
-            "http://indexer:50051",
-        ]))
-        .unwrap();
-        let indexer = c
-            .model
-            .cache_aware
-            .expect("cache-aware config")
-            .kv_indexer_endpoint
-            .expect("Indexer config");
-        assert_eq!(indexer.query_timeout_ms, 100);
-        assert_eq!(indexer.query_max_inflight, 32);
-    }
-
-    #[test]
-    fn kv_indexer_requires_cache_aware_policy() {
-        let err = into_config_owned(with_model(&[
-            "--worker-urls",
-            "http://x:30000",
-            "--kv-indexer-endpoint",
-            "http://indexer:50051",
-        ]))
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("require --policy cache_aware_zmq"));
-    }
-
-    #[test]
-    fn kv_indexer_timeout_requires_endpoint() {
-        let err = into_config_owned(with_model(&[
-            "--worker-urls",
-            "http://x:30000",
-            "--policy",
-            "cache_aware_zmq",
-            "--kv-indexer-query-timeout-ms",
-            "75",
-        ]))
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("requires --kv-indexer-endpoint"));
-    }
-
-    #[test]
-    fn kv_indexer_max_inflight_requires_endpoint() {
-        let err = into_config_owned(with_model(&[
-            "--worker-urls",
-            "http://x:30000",
-            "--policy",
-            "cache_aware_zmq",
-            "--kv-indexer-query-max-inflight",
-            "17",
-        ]))
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("requires --kv-indexer-endpoint"));
-    }
-
-    #[test]
-    fn kv_indexer_max_inflight_must_be_positive() {
-        let err = into_config_owned(with_model(&[
-            "--worker-urls",
-            "http://x:30000",
-            "--policy",
-            "cache_aware_zmq",
-            "--kv-indexer-endpoint",
-            "http://indexer:50051",
-            "--kv-indexer-query-max-inflight",
-            "0",
-        ]))
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("must be greater than zero"));
-    }
-
-    #[test]
     fn no_cache_aware_flags_leaves_none() {
         let c = into_config_owned(with_model(&[
             "--worker-urls",
@@ -1101,75 +894,6 @@ mod tests {
         assert_eq!(s.fallback_policy, PolicyKind::LoadBased);
         assert_eq!(s.idle_secs, 120);
         assert_eq!(s.eviction_interval_secs, 15);
-    }
-
-    /// `--filter` composes with ANY policy, keeps its order (which is
-    /// priority), and leaves the layer OFF when unused -- otherwise every
-    /// existing deployment silently grows a constraint stage.
-    #[test]
-    fn filter_builds_the_eligibility_config_in_order_and_is_off_by_default() {
-        let c = into_config_owned(with_model(&[
-            "--worker-urls",
-            "http://x:30000",
-            "--policy",
-            "round_robin",
-            "--filter",
-            "overloaded,prefix_cache",
-            "--max-in-flight",
-            "64",
-            "--prefix-cache-min-share",
-            "0.6",
-        ]))
-        .unwrap();
-        let e = c.model.eligibility.expect("--filter must build the config");
-        assert_eq!(
-            e.filters,
-            vec![PolicyKind::Overloaded, PolicyKind::PrefixCache],
-            "order is priority, so it must survive parsing",
-        );
-        assert_eq!((e.max_in_flight, e.min_prefix_share), (Some(64), Some(0.6)));
-        assert_eq!(
-            c.model.policy,
-            PolicyKind::RoundRobin,
-            "not gated on --policy"
-        );
-
-        let bare = into_config_owned(with_model(&["--worker-urls", "http://x:30000"])).unwrap();
-        assert!(bare.model.eligibility.is_none(), "no --filter, no layer");
-    }
-
-    /// Every way to misconfigure the layer, each of which is SILENT at
-    /// runtime: a knob with no reader, a reader with no knob, a repeat that
-    /// would need two configs of one filter, and a floor that admits all.
-    #[test]
-    fn filter_misconfigurations_fail_at_startup() {
-        let cases: [(&[&str], &str); 6] = [
-            (&["--filter", "overloaded"], "require each other"),
-            (&["--max-in-flight", "64"], "require each other"),
-            (&["--filter", "prefix_cache"], "require each other"),
-            (&["--prefix-cache-min-share", "0.6"], "require each other"),
-            (
-                &["--filter", "overloaded,overloaded", "--max-in-flight", "64"],
-                "listed more than once",
-            ),
-            (
-                &[
-                    "--filter",
-                    "prefix_cache",
-                    "--prefix-cache-min-share",
-                    "0.0",
-                ],
-                "must be in (0, 1]",
-            ),
-        ];
-        for (extra, want) in cases {
-            let mut args = vec!["--worker-urls", "http://x:30000"];
-            args.extend_from_slice(extra);
-            let err = into_config_owned(with_model(&args))
-                .unwrap_err()
-                .to_string();
-            assert!(err.contains(want), "for {extra:?} got: {err}");
-        }
     }
 
     #[test]
