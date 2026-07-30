@@ -121,6 +121,7 @@ impl AppContext {
                     circuit_breaker: None,
                     cache_aware: None,
                     sticky: None,
+                    fused: None,
                 },
                 discovery: crate::config::DiscoveryBackend::StaticUrls(
                     crate::config::StaticUrlsDiscoveryConfig {
