@@ -3,6 +3,7 @@
 
 use crate::discovery::{ModelId, WorkerMode};
 use crate::policies::kv_events::{compute_block_hashes, compute_block_hashes_bigram};
+use crate::policies::admission::{resolve_prefill, CandidateRange};
 use crate::policies::registry::{PdPoolResolver, PdResolveError};
 use crate::policies::{request_tokens_for, ExternalPrefixSignal, RequestTokens, SelectionContext};
 use crate::server::app_context::AppContext;
@@ -193,6 +194,19 @@ pub async fn chat_completions(
         _ => None,
     };
 
+    // Admission 与 ActiveLoadRegistry 共用同一份请求输入 work：优先复用 ingress
+    // tokenizer 的精确长度；没有 tokenizer 时才用既有保守估算。该值不是
+    // prefill queue-ms 预测，只用于本请求的容量投影。
+    let prefill_load = request_tokens
+        .as_ref()
+        .map(|tokens| tokens.ids.len().max(1))
+        .unwrap_or_else(|| estimate_prefill_tokens(&body));
+    let request_input_tokens = prefill_load as u64;
+    let candidate_range = CandidateRange::global(&workers);
+    // 一次不可变 snapshot 同时供 proposal 的 P2/Cache tie-break、Admission 与
+    // Guard 使用，避免同一请求在不同阶段读取到互相矛盾的监控状态。
+    let load_snapshot = ctx.load_monitor.snapshot();
+
     // Sticky-session routing key. When the sticky policy is configured,
     // read the routing key from the operator-chosen header into the
     // selection context; the policy pins it to a worker. Other policies
@@ -205,15 +219,61 @@ pub async fn chat_completions(
         .and_then(|s| headers.get(s.header_name.as_str()))
         .and_then(|v| v.to_str().ok())
         .filter(|s| !s.is_empty());
+    let session_id = ctx
+        .config
+        .model
+        .affinity
+        .as_ref()
+        .and_then(|config| headers.get(config.session_id_header.as_str()))
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty());
     let selection_ctx = SelectionContext::with_routing_key(&model_id, Some(&body), routing_key)
+        .with_session_id(session_id)
+        .with_candidate_range_id(candidate_range.id)
+        .with_input_tokens(request_input_tokens)
         .with_request_tokens(request_tokens.as_ref().map(|t| t.ids.as_slice()))
-        .with_external_prefix(external_prefix.as_ref());
-    let worker =
+        .with_external_prefix(external_prefix.as_ref())
+        .with_load_snapshot(&load_snapshot);
+    // Step 1 policy 在同一候选域内提出 primary + optional backup。共享层先做
+    // hard Admission，再做可选 Guard；旧 policy 明确不 opt-in，保持原有 primary
+    // 直接 dispatch 语义。
+    let proposal =
         policy
-            .select(&workers, &selection_ctx)
+            .propose(&workers, &selection_ctx)
             .ok_or_else(|| ApiError::PolicySelectionFailed {
                 model: model_str.clone(),
             })?;
+    let worker = if policy.uses_shared_prefill_admission() {
+        let decision = resolve_prefill(
+            &candidate_range,
+            &proposal,
+            request_input_tokens,
+            &load_snapshot,
+        )
+        .ok_or_else(|| ApiError::PolicySelectionFailed {
+            model: model_str.clone(),
+        })?;
+        tracing::debug!(
+            model = %model_str,
+            policy = ?proposal.kind,
+            range = %decision.candidate_range_id,
+            primary = %decision.primary.url,
+            backup = ?decision.backup.as_ref().map(|worker| worker.url.as_str()),
+            selected = %decision.selected.url,
+            reason = ?decision.reason,
+            load_snapshot_version = decision.load_snapshot_version,
+            "prefill policy decision",
+        );
+        decision.selected
+    } else {
+        tracing::debug!(
+            model = %model_str,
+            policy = ?proposal.kind,
+            selected = %proposal.primary.url,
+            "prefill policy decision without shared admission",
+        );
+        proposal.primary
+    };
 
     // PD-mode decoder affinity. When the selected prefill worker is
     // part of a PD-disagg deployment, also resolve the matching decode
@@ -287,14 +347,6 @@ pub async fn chat_completions(
     // future decode-side scheduler — current decode selection is
     // host-affinity only.
     let guard = worker.load_guard();
-    // Use the exact token count from the ingress tokenization when available;
-    // fall back to the byte-count heuristic for load-only policies that don't
-    // tokenize. The exact count makes the cache-aware load-imbalance fast-path
-    // accurate rather than off by the char/token ratio.
-    let prefill_load = request_tokens
-        .as_ref()
-        .map(|t| t.ids.len().max(1))
-        .unwrap_or_else(|| estimate_prefill_tokens(&body));
     let active_guard =
         ctx.active_load
             .register(worker.id.clone(), worker.url.clone(), prefill_load, 0);

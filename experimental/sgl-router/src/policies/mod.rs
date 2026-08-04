@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 pub mod active_load;
+pub mod admission;
+pub mod cache_aware;
 pub mod cache_aware_zmq;
 pub mod factory;
 pub mod kv_events;
@@ -11,9 +13,11 @@ pub mod random;
 pub mod registry;
 pub mod round_robin;
 pub mod scoring;
+pub mod session_aware;
 pub mod sticky;
 
 use crate::discovery::ModelId;
+use crate::load_monitor::LoadMonitorSnapshot;
 use crate::policies::scoring::{EligibilityFilter, ScoringPolicy};
 use crate::server::metrics::MetricsRegistry;
 use crate::tokenizer::{adapter, TokenizerRegistry};
@@ -178,8 +182,8 @@ pub(crate) fn extract_prompt_text_from_value(v: &serde_json::Value) -> Option<St
 /// Selection input — carries the request body and the routing tokens
 /// (computed once at ingress) so cache-aware policies can hash prefix
 /// tokens without reshaping the [`Policy`] trait or re-tokenizing.  Today's
-/// load-only policies (round-robin, random, power-of-two, load-based) read
-/// only `workers`; sticky reads `routing_key`.
+/// P2 与 Cache-Aware 并列命中会读取可选的不可变 LoadMonitor snapshot；没有
+/// 快照时退化为 Router 本地 active-load。sticky 只读取 `routing_key`。
 ///
 /// Constructed via [`Self::new`] / [`Self::with_routing_key`]; the
 /// ingress-computed tokens are attached with [`Self::with_request_tokens`].
@@ -189,8 +193,12 @@ pub struct SelectionContext<'a> {
     model: &'a ModelId,
     request_body: Option<&'a [u8]>,
     routing_key: Option<&'a str>,
+    session_id: Option<&'a str>,
+    candidate_range_id: &'a str,
+    input_tokens: Option<u64>,
     request_tokens: Option<&'a [u32]>,
     external_prefix: Option<&'a ExternalPrefixSignal>,
+    load_snapshot: Option<&'a LoadMonitorSnapshot>,
 }
 
 impl<'a> SelectionContext<'a> {
@@ -199,8 +207,12 @@ impl<'a> SelectionContext<'a> {
             model,
             request_body,
             routing_key: None,
+            session_id: None,
+            candidate_range_id: "global",
+            input_tokens: None,
             request_tokens: None,
             external_prefix: None,
+            load_snapshot: None,
         }
     }
 
@@ -213,8 +225,12 @@ impl<'a> SelectionContext<'a> {
             model,
             request_body,
             routing_key,
+            session_id: None,
+            candidate_range_id: "global",
+            input_tokens: None,
             request_tokens: None,
             external_prefix: None,
+            load_snapshot: None,
         }
     }
 
@@ -226,11 +242,39 @@ impl<'a> SelectionContext<'a> {
         self
     }
 
+    /// 附加 Session-Aware 的 session id。它与旧 sticky routing key 分开，避免
+    /// 新 policy 的软 Guard 改变 sticky 的既有 pin 语义。
+    pub fn with_session_id(mut self, session_id: Option<&'a str>) -> Self {
+        self.session_id = session_id;
+        self
+    }
+
+    /// 标识本次 policy 允许选择的候选域。Step 1 固定为 `global`；未来 Bucket
+    /// 使用稳定 bucket id，使 stable pair 在同一 Bucket 内可复现。
+    pub fn with_candidate_range_id(mut self, candidate_range_id: &'a str) -> Self {
+        self.candidate_range_id = candidate_range_id;
+        self
+    }
+
+    /// 附加本请求的 input token 数。Admission 以它估算新 prefill work；没有
+    /// tokenizer 时 ingress 可提供既有的保守字节估算值。
+    pub fn with_input_tokens(mut self, input_tokens: u64) -> Self {
+        self.input_tokens = Some(input_tokens);
+        self
+    }
+
     pub fn with_external_prefix(
         mut self,
         external_prefix: Option<&'a ExternalPrefixSignal>,
     ) -> Self {
         self.external_prefix = external_prefix;
+        self
+    }
+
+    /// 附加一次请求开始时取得的不可变 LoadMonitor 快照。policy 只读取它，
+    /// 不会在热路径向 LoadMonitor 或 worker 发同步查询。
+    pub fn with_load_snapshot(mut self, load_snapshot: &'a LoadMonitorSnapshot) -> Self {
+        self.load_snapshot = Some(load_snapshot);
         self
     }
 
@@ -246,6 +290,18 @@ impl<'a> SelectionContext<'a> {
         self.routing_key
     }
 
+    pub fn session_id(&self) -> Option<&str> {
+        self.session_id
+    }
+
+    pub fn candidate_range_id(&self) -> &str {
+        self.candidate_range_id
+    }
+
+    pub fn input_tokens(&self) -> Option<u64> {
+        self.input_tokens
+    }
+
     /// Ingress-precomputed routing tokens, if any. `None` means the policy
     /// must derive tokens itself (e.g. a caller that didn't pre-tokenize).
     pub fn request_tokens(&self) -> Option<&[u32]> {
@@ -255,10 +311,129 @@ impl<'a> SelectionContext<'a> {
     pub fn external_prefix(&self) -> Option<&ExternalPrefixSignal> {
         self.external_prefix
     }
+
+    pub fn load_snapshot(&self) -> Option<&LoadMonitorSnapshot> {
+        self.load_snapshot
+    }
+}
+
+/// policy 在 hard admission、soft guard 与 dispatch 之前给出的候选决定。
+///
+/// 旧 policy 通过默认 [`Policy::propose`] 只产生 `primary`。未来的
+/// Session-Aware 与 Cache-Aware 可提供稳定的 `backup`；Router 随后对这份
+/// 不可变提案执行 admission/guard，而不是让 policy 直接修改外部状态。
+#[derive(Clone)]
+pub struct SelectionProposal {
+    pub primary: Arc<Worker>,
+    pub backup: Option<Arc<Worker>>,
+    pub kind: ProposalKind,
+    pub guard_hints: GuardHints,
+    /// Policy 前置硬过滤后仍允许用于 Admission fallback 的 worker。
+    /// `None` 表示没有额外 EligibilityFilter，fallback 可使用整个候选域。
+    pub eligible_workers: Option<Vec<Arc<Worker>>>,
+}
+
+impl SelectionProposal {
+    /// 创建无 backup 的提案，严格保持旧的单 worker 选择行为。
+    pub fn primary(primary: Arc<Worker>) -> Self {
+        Self {
+            primary,
+            backup: None,
+            kind: ProposalKind::Generic,
+            guard_hints: GuardHints::default(),
+            eligible_workers: None,
+        }
+    }
+
+    /// 创建包含 primary 与 backup 的通用提案。P2、Session-Aware 与
+    /// Cache-Aware 通过后续 builder 追加其具体类型和 Guard 配置。
+    pub fn with_backup(primary: Arc<Worker>, backup: Arc<Worker>) -> Self {
+        Self {
+            primary,
+            backup: Some(backup),
+            kind: ProposalKind::PowerOfTwo,
+            guard_hints: GuardHints::default(),
+            eligible_workers: None,
+        }
+    }
+
+    pub fn with_kind(mut self, kind: ProposalKind) -> Self {
+        self.kind = kind;
+        self
+    }
+
+    pub fn with_guard_hints(mut self, guard_hints: GuardHints) -> Self {
+        self.guard_hints = guard_hints;
+        self
+    }
+
+    pub fn with_eligible_workers(mut self, workers: Vec<Arc<Worker>>) -> Self {
+        self.eligible_workers = Some(workers);
+        self
+    }
+}
+
+/// 提案产生者的语义类型。它只描述 primary/backup 的来源；Admission 始终
+/// 使用同一套硬容量规则，不能因 policy 类型而绕过。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProposalKind {
+    Generic,
+    PowerOfTwo,
+    SessionAffinity,
+    CacheAffinity,
+    Score,
+}
+
+/// Guard 的可选软约束。由产生 proposal 的 policy 填充，且仅在 primary 和
+/// backup 都通过 Admission 后解释。
+#[derive(Debug, Clone)]
+pub struct GuardHints {
+    /// Cache-Aware 命中可复用的输入 token 数；没有 indexer 命中时为 `None`。
+    pub matched_prefix_tokens: Option<u64>,
+    /// 缓存收益不足时是否允许选择 backup。
+    pub enable_cache_benefit: bool,
+    /// Session/Cache 的软亲和性是否允许按压力逃逸到 backup。
+    pub enable_pressure_guard: bool,
+    /// 压力逃逸需要超过的未命中 prefill token 绝对差。
+    pub pressure_abs_threshold_tokens: u64,
+    /// 压力逃逸需要超过的相对倍率。
+    pub pressure_rel_threshold: f64,
+}
+
+impl Default for GuardHints {
+    fn default() -> Self {
+        Self {
+            matched_prefix_tokens: None,
+            enable_cache_benefit: false,
+            enable_pressure_guard: false,
+            pressure_abs_threshold_tokens: 0,
+            pressure_rel_threshold: 1.0,
+        }
+    }
 }
 
 pub trait Policy: Send + Sync + std::fmt::Debug {
     fn select(&self, workers: &[Arc<Worker>], ctx: &SelectionContext<'_>) -> Option<Arc<Worker>>;
+
+    /// 提出 primary worker；policy 有稳定 backup 时也一并返回。
+    ///
+    /// 默认实现刻意委托给既有 `select()` 契约。已有 P2、sticky 与 legacy
+    /// cache-aware policy 的行为不变，而请求路径获得未来 Admission、Guard、
+    /// Bucket 和 Reservation 的唯一扩展点。
+    fn propose(
+        &self,
+        workers: &[Arc<Worker>],
+        ctx: &SelectionContext<'_>,
+    ) -> Option<SelectionProposal> {
+        self.select(workers, ctx).map(SelectionProposal::primary)
+    }
+
+    /// 是否进入 Step 1 的共享 Prefill Admission / Guard。默认关闭以保持既有
+    /// policy（尤其 sticky 与 cache_aware_zmq）的路由语义不变；新 policy
+    /// 需要显式 opt-in，不能因为 Router 增加共享层而被隐式改写。
+    fn uses_shared_prefill_admission(&self) -> bool {
+        false
+    }
 
     /// Whether this policy's ROUTING decision needs the request tokens (i.e.
     /// it routes by prompt prefix). Ingress tokenization itself is no longer
@@ -328,5 +503,427 @@ impl PolicyRegistry {
         for entry in self.by_model.iter() {
             entry.value().attach_metrics(Arc::clone(&metrics));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::discovery::{WorkerId, WorkerMode, WorkerSpec};
+    use crate::load_monitor::{
+        AggregateLoad, Freshness, LoadMonitorSnapshot, WorkerSnapshot,
+    };
+    use crate::policies::admission::{resolve_prefill, CandidateRange, DecisionReason};
+    use crate::policies::cache_aware::CacheAwarePolicy;
+    use crate::policies::power_of_two::PowerOfTwoChoicesPolicy;
+    use crate::policies::round_robin::RoundRobinPolicy;
+    use crate::policies::session_aware::SessionAwarePolicy;
+    use crate::config::AffinityConfig;
+
+    fn worker(id: &str) -> Arc<Worker> {
+        Arc::new(Worker::new(WorkerSpec {
+            id: WorkerId(id.into()),
+            url: format!("http://{id}:30000"),
+            mode: WorkerMode::Plain,
+            model_ids: vec![ModelId("model".into())],
+            bootstrap_port: None,
+        }))
+    }
+
+    #[test]
+    fn default_proposal_preserves_legacy_single_worker_selection() {
+        let model = ModelId("model".into());
+        let ctx = SelectionContext::new(&model, None);
+        let only = worker("only");
+        let policy = PowerOfTwoChoicesPolicy::new();
+
+        let proposal = policy
+            .propose(&[Arc::clone(&only)], &ctx)
+            .expect("one candidate must produce a proposal");
+        assert_eq!(proposal.primary.id, only.id);
+        assert!(proposal.backup.is_none());
+    }
+
+    #[test]
+    fn only_step_one_policies_opt_into_shared_prefill_admission() {
+        assert!(PowerOfTwoChoicesPolicy::new().uses_shared_prefill_admission());
+        assert!(SessionAwarePolicy::new(AffinityConfig::default()).uses_shared_prefill_admission());
+        assert!(CacheAwarePolicy::new(AffinityConfig::default()).uses_shared_prefill_admission());
+        assert!(!RoundRobinPolicy::new().uses_shared_prefill_admission());
+    }
+
+    #[test]
+    fn power_of_two_proposal_keeps_the_other_sample_as_backup() {
+        let model = ModelId("model".into());
+        let ctx = SelectionContext::new(&model, None);
+        let workers = vec![worker("first"), worker("second")];
+        let policy = PowerOfTwoChoicesPolicy::new();
+
+        let proposal = policy
+            .propose(&workers, &ctx)
+            .expect("two candidates must produce a proposal");
+        let backup = proposal.backup.expect("P2 must retain its second sample");
+
+        assert_ne!(proposal.primary.id, backup.id);
+        assert_eq!(proposal.kind, ProposalKind::PowerOfTwo);
+    }
+
+    #[test]
+    fn power_of_two_orders_its_sample_with_fresh_load_monitor_snapshot() {
+        let model = ModelId("model".into());
+        let busy = worker("busy");
+        let idle = worker("idle");
+        let workers = vec![Arc::clone(&busy), Arc::clone(&idle)];
+        let load_snapshot = snapshot(&[
+            (
+                &busy,
+                AggregateLoad {
+                    num_waiting_uncached_tokens: 512,
+                    max_running_requests: 8,
+                    max_total_num_tokens: 4_096,
+                    ..Default::default()
+                },
+            ),
+            (
+                &idle,
+                AggregateLoad {
+                    num_waiting_uncached_tokens: 16,
+                    max_running_requests: 8,
+                    max_total_num_tokens: 4_096,
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let ctx = SelectionContext::new(&model, None).with_load_snapshot(&load_snapshot);
+
+        let proposal = PowerOfTwoChoicesPolicy::new()
+            .propose(&workers, &ctx)
+            .expect("two candidates must produce a proposal");
+
+        assert_eq!(proposal.primary.id, idle.id);
+        assert_eq!(proposal.backup.expect("P2 keeps its other sample").id, busy.id);
+    }
+
+    #[test]
+    fn session_affinity_reuses_primary_and_stable_backup_without_remapping() {
+        let model = ModelId("model".into());
+        let workers = vec![worker("first"), worker("second"), worker("third")];
+        let policy = SessionAwarePolicy::new(AffinityConfig {
+            stable_pair: true,
+            ..Default::default()
+        });
+        let ctx = SelectionContext::new(&model, None).with_session_id(Some("session-a"));
+
+        let first = policy
+            .propose(&workers, &ctx)
+            .expect("a new session must get an initial P2 proposal");
+        let second = policy
+            .propose(&workers, &ctx)
+            .expect("a mapped session must produce an affinity proposal");
+        let third = policy
+            .propose(&workers, &ctx)
+            .expect("the session assignment must remain stable");
+
+        assert_eq!(second.kind, ProposalKind::SessionAffinity);
+        assert_eq!(second.primary.id, first.primary.id);
+        assert_eq!(third.primary.id, second.primary.id);
+        assert_eq!(
+            third.backup.expect("stable pair has backup").id,
+            second.backup.expect("stable pair has backup").id,
+        );
+    }
+
+    #[test]
+    fn cache_affinity_uses_longest_routable_prefix_holder() {
+        let model = ModelId("model".into());
+        let hot = worker("hot");
+        let other = worker("other");
+        let workers = vec![Arc::clone(&hot), Arc::clone(&other)];
+        let signal = ExternalPrefixSignal {
+            outcome: sgl_kv_indexer::PrefixOutcome::Matched {
+                matches: vec![
+                    sgl_kv_indexer::PrefixMatch {
+                        address: "http://gone:30000".into(),
+                        matched_prefix_blocks: 8,
+                        worker_id: "gone".into(),
+                    },
+                    sgl_kv_indexer::PrefixMatch {
+                        address: hot.url.clone(),
+                        matched_prefix_blocks: 6,
+                        worker_id: "hot".into(),
+                    },
+                    sgl_kv_indexer::PrefixMatch {
+                        address: other.url.clone(),
+                        matched_prefix_blocks: 4,
+                        worker_id: "other".into(),
+                    },
+                ],
+                best_prefix_blocks: 8,
+            },
+            query_blocks: 8,
+        };
+        let ctx = SelectionContext::new(&model, None)
+            .with_request_tokens(Some(&[1, 2, 3, 4, 5, 6, 7, 8]))
+            .with_input_tokens(80)
+            .with_external_prefix(Some(&signal));
+        let policy = CacheAwarePolicy::new(AffinityConfig::default());
+
+        let proposal = policy
+            .propose(&workers, &ctx)
+            .expect("a routable indexer hit must propose a worker");
+
+        assert_eq!(proposal.kind, ProposalKind::CacheAffinity);
+        assert_eq!(proposal.primary.id, hot.id);
+        assert_eq!(proposal.guard_hints.matched_prefix_tokens, Some(60));
+    }
+
+    #[test]
+    fn cache_affinity_without_signal_degrades_to_a_plain_p2_proposal() {
+        let model = ModelId("model".into());
+        let workers = vec![worker("first"), worker("second")];
+        let policy = CacheAwarePolicy::new(AffinityConfig::default());
+        let ctx = SelectionContext::new(&model, None);
+
+        let proposal = policy
+            .propose(&workers, &ctx)
+            .expect("cache miss must still route through P2");
+
+        assert_eq!(proposal.kind, ProposalKind::PowerOfTwo);
+        assert!(proposal.backup.is_some());
+        assert!(!proposal.guard_hints.enable_cache_benefit);
+    }
+
+    fn snapshot(entries: &[(&Arc<Worker>, AggregateLoad)]) -> LoadMonitorSnapshot {
+        LoadMonitorSnapshot {
+            enabled: true,
+            version: 1,
+            captured_at: Some("2026-08-04T00:00:00Z".into()),
+            workers: entries
+                .iter()
+                .map(|(worker, aggregate)| WorkerSnapshot {
+                    worker_id: worker.id.0.clone(),
+                    url: worker.url.clone(),
+                    mode: worker.mode(),
+                    model_ids: worker.model_ids.iter().map(|m| m.0.clone()).collect(),
+                    freshness: Freshness::Fresh,
+                    source_instance_id: None,
+                    sequence_id: None,
+                    report_time_unix_ms: None,
+                    last_error: None,
+                    received_at: None,
+                    expires_at: None,
+                    aggregate: Some(aggregate.clone()),
+                    ranks: Vec::new(),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn admission_uses_admitted_backup_before_scanning_candidate_range() {
+        let primary = worker("primary");
+        let backup = worker("backup");
+        let fallback = worker("fallback");
+        let workers = vec![
+            Arc::clone(&primary),
+            Arc::clone(&backup),
+            Arc::clone(&fallback),
+        ];
+        let snapshot = snapshot(&[
+            (
+                &primary,
+                AggregateLoad {
+                    num_running_reqs: 4,
+                    max_running_requests: 4,
+                    num_total_tokens: 10,
+                    max_total_num_tokens: 1_000,
+                    ..Default::default()
+                },
+            ),
+            (
+                &backup,
+                AggregateLoad {
+                    max_running_requests: 4,
+                    num_total_tokens: 10,
+                    max_total_num_tokens: 1_000,
+                    ..Default::default()
+                },
+            ),
+            (
+                &fallback,
+                AggregateLoad {
+                    max_running_requests: 4,
+                    num_total_tokens: 10,
+                    max_total_num_tokens: 1_000,
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let range = CandidateRange::global(&workers);
+        let proposal = SelectionProposal::with_backup(Arc::clone(&primary), Arc::clone(&backup));
+
+        let decision = resolve_prefill(&range, &proposal, 32, &snapshot)
+            .expect("an admitted backup must be selected");
+
+        assert_eq!(decision.selected.id, backup.id);
+        assert_eq!(decision.reason, DecisionReason::BackupPrimaryAdmission);
+    }
+
+    #[test]
+    fn disabled_monitor_does_not_hard_reject_a_registry_healthy_primary() {
+        let primary = worker("primary");
+        let workers = vec![Arc::clone(&primary)];
+        let snapshot = LoadMonitorSnapshot {
+            enabled: false,
+            version: 0,
+            captured_at: None,
+            workers: Vec::new(),
+        };
+
+        let decision = resolve_prefill(
+            &CandidateRange::global(&workers),
+            &SelectionProposal::primary(Arc::clone(&primary)),
+            1_000_000,
+            &snapshot,
+        )
+        .expect("disabled reporting must preserve the healthy registry candidate");
+
+        assert_eq!(decision.selected.id, primary.id);
+        assert_eq!(decision.reason, DecisionReason::Primary);
+    }
+
+    #[test]
+    fn cache_benefit_guard_runs_only_after_both_candidates_are_admitted() {
+        let primary = worker("primary");
+        let backup = worker("backup");
+        let workers = vec![Arc::clone(&primary), Arc::clone(&backup)];
+        let snapshot = snapshot(&[
+            (
+                &primary,
+                AggregateLoad {
+                    max_running_requests: 4,
+                    max_total_num_tokens: 1_000,
+                    ..Default::default()
+                },
+            ),
+            (
+                &backup,
+                AggregateLoad {
+                    max_running_requests: 4,
+                    max_total_num_tokens: 1_000,
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let proposal = SelectionProposal::with_backup(primary, backup).with_guard_hints(GuardHints {
+            matched_prefix_tokens: Some(32),
+            enable_cache_benefit: true,
+            ..Default::default()
+        });
+
+        let decision = resolve_prefill(
+            &CandidateRange::global(&workers),
+            &proposal,
+            80,
+            &snapshot,
+        )
+        .expect("both candidates fit capacity");
+
+        assert_eq!(decision.reason, DecisionReason::BackupCacheBenefit);
+    }
+
+    #[test]
+    fn pressure_guard_uses_fresh_waiting_uncached_tokens_not_local_load() {
+        let primary = worker("primary");
+        let backup = worker("backup");
+        let workers = vec![Arc::clone(&primary), Arc::clone(&backup)];
+        let snapshot = snapshot(&[
+            (
+                &primary,
+                AggregateLoad {
+                    num_waiting_uncached_tokens: 200,
+                    max_running_requests: 4,
+                    max_total_num_tokens: 1_000,
+                    ..Default::default()
+                },
+            ),
+            (
+                &backup,
+                AggregateLoad {
+                    num_waiting_uncached_tokens: 20,
+                    max_running_requests: 4,
+                    max_total_num_tokens: 1_000,
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let proposal = SelectionProposal::with_backup(primary, backup).with_guard_hints(GuardHints {
+            enable_pressure_guard: true,
+            pressure_abs_threshold_tokens: 100,
+            pressure_rel_threshold: 2.0,
+            ..Default::default()
+        });
+
+        let decision = resolve_prefill(
+            &CandidateRange::global(&workers),
+            &proposal,
+            80,
+            &snapshot,
+        )
+        .expect("both candidates fit capacity");
+
+        assert_eq!(decision.reason, DecisionReason::BackupPressureGuard);
+    }
+
+    #[test]
+    fn admission_scans_range_only_after_primary_and_backup_both_fail() {
+        let primary = worker("primary");
+        let backup = worker("backup");
+        let fallback = worker("fallback");
+        let workers = vec![
+            Arc::clone(&primary),
+            Arc::clone(&backup),
+            Arc::clone(&fallback),
+        ];
+        let snapshot = snapshot(&[
+            (
+                &primary,
+                AggregateLoad {
+                    num_running_reqs: 4,
+                    max_running_requests: 4,
+                    max_total_num_tokens: 1_000,
+                    ..Default::default()
+                },
+            ),
+            (
+                &backup,
+                AggregateLoad {
+                    num_total_tokens: 990,
+                    max_running_requests: 4,
+                    max_total_num_tokens: 1_000,
+                    ..Default::default()
+                },
+            ),
+            (
+                &fallback,
+                AggregateLoad {
+                    max_running_requests: 4,
+                    max_total_num_tokens: 1_000,
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let proposal = SelectionProposal::with_backup(primary, backup);
+
+        let decision = resolve_prefill(
+            &CandidateRange::global(&workers),
+            &proposal,
+            32,
+            &snapshot,
+        )
+        .expect("an admitted range fallback must be selected");
+
+        assert_eq!(decision.selected.id, fallback.id);
+        assert_eq!(decision.reason, DecisionReason::RangeFallback);
     }
 }

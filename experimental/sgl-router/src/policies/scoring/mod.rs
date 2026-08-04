@@ -23,7 +23,7 @@ pub mod admission;
 pub mod argmax;
 pub mod prefix_cache;
 
-use crate::policies::{Policy, SelectionContext};
+use crate::policies::{Policy, SelectionContext, SelectionProposal};
 use crate::workers::Worker;
 use argmax::{Selector, ARGMAX};
 use std::sync::Arc;
@@ -293,6 +293,24 @@ impl Policy for Pipeline {
         self.inner.select(&eligible, ctx)
     }
 
+    /// 保留 inner policy 的 primary/backup proposal。否则 Pipeline 会通过默认
+    /// `Policy::propose` 重新降成单 primary，破坏 P2、Session-Aware 与
+    /// Cache-Aware 的共享 Admission / Guard 链路。
+    fn propose(
+        &self,
+        workers: &[Arc<Worker>],
+        ctx: &SelectionContext<'_>,
+    ) -> Option<SelectionProposal> {
+        let eligible = admit(self.views(), workers, ctx)?;
+        self.inner
+            .propose(&eligible, ctx)
+            .map(|proposal| proposal.with_eligible_workers(eligible))
+    }
+
+    fn uses_shared_prefill_admission(&self) -> bool {
+        self.inner.uses_shared_prefill_admission()
+    }
+
     /// An upper bound over BOTH layers: over-reporting costs one tokenization,
     /// under-reporting silently blinds a prompt-routed filter or term.
     fn needs_request_tokens(&self) -> bool {
@@ -301,6 +319,55 @@ impl Policy for Pipeline {
 
     fn attach_metrics(&self, metrics: Arc<crate::server::metrics::MetricsRegistry>) {
         self.inner.attach_metrics(metrics);
+    }
+}
+
+/// Step 1 顶层 Score policy。它复用既有 score 组合器的排序语义，但显式进入
+/// Router 共享 Prefill Admission；上游兼容入口 `fused_score` 保持原行为。
+#[derive(Debug)]
+pub struct ScorePolicy {
+    inner: Arc<dyn Policy>,
+}
+
+impl ScorePolicy {
+    pub fn new(inner: Arc<dyn Policy>) -> Self {
+        Self { inner }
+    }
+}
+
+impl Policy for ScorePolicy {
+    fn select(&self, workers: &[Arc<Worker>], ctx: &SelectionContext<'_>) -> Option<Arc<Worker>> {
+        self.inner.select(workers, ctx)
+    }
+
+    fn propose(
+        &self,
+        workers: &[Arc<Worker>],
+        ctx: &SelectionContext<'_>,
+    ) -> Option<SelectionProposal> {
+        self.inner
+            .propose(workers, ctx)
+            .map(|proposal| proposal.with_kind(crate::policies::ProposalKind::Score))
+    }
+
+    fn uses_shared_prefill_admission(&self) -> bool {
+        true
+    }
+
+    fn needs_request_tokens(&self) -> bool {
+        self.inner.needs_request_tokens()
+    }
+
+    fn attach_metrics(&self, metrics: Arc<crate::server::metrics::MetricsRegistry>) {
+        self.inner.attach_metrics(metrics);
+    }
+
+    fn as_scoring(&self) -> Option<&dyn ScoringPolicy> {
+        self.inner.as_scoring()
+    }
+
+    fn as_filter(&self) -> Option<&dyn EligibilityFilter> {
+        self.inner.as_filter()
     }
 }
 
@@ -333,6 +400,9 @@ pub(crate) fn refs(
 mod tests {
     use super::*;
     use crate::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
+    use crate::load_monitor::{AggregateLoad, Freshness, LoadMonitorSnapshot, WorkerSnapshot};
+    use crate::policies::admission::{resolve_prefill, CandidateRange};
+    use crate::policies::power_of_two::PowerOfTwoChoicesPolicy;
     use crate::policies::round_robin::RoundRobinPolicy;
 
     fn worker(id: &str) -> Arc<Worker> {
@@ -554,6 +624,78 @@ mod tests {
         )
         .unwrap();
         assert_eq!(open.select(&ws, &ctx).unwrap().url, ws[2].url);
+    }
+
+    #[test]
+    fn pipeline_preserves_the_inner_step_one_proposal_and_admission_opt_in() {
+        let ws = fleet();
+        let model = ModelId("tiny".into());
+        let ctx = SelectionContext::new(&model, None);
+        let pipeline = Pipeline::new(
+            vec![Arc::new(Keep(vec!["a", "b", "c"], OnEmpty::Abstain))],
+            Arc::new(PowerOfTwoChoicesPolicy::new()),
+        )
+        .expect("valid filter and inner policy");
+
+        let proposal = pipeline
+            .propose(&ws, &ctx)
+            .expect("eligible P2 must retain a pair");
+
+        assert!(proposal.backup.is_some(), "Pipeline must not collapse P2 to one primary");
+        assert!(pipeline.uses_shared_prefill_admission());
+    }
+
+    #[test]
+    fn shared_admission_fallback_cannot_reintroduce_a_filtered_worker() {
+        let ws = fleet();
+        let model = ModelId("tiny".into());
+        let ctx = SelectionContext::new(&model, None);
+        let pipeline = Pipeline::new(
+            vec![Arc::new(Keep(vec!["a", "b"], OnEmpty::Abstain))],
+            Arc::new(PowerOfTwoChoicesPolicy::new()),
+        )
+        .expect("valid filter and inner policy");
+        let proposal = pipeline
+            .propose(&ws, &ctx)
+            .expect("the two eligible workers produce a P2 proposal");
+        let snapshot = LoadMonitorSnapshot {
+            enabled: true,
+            version: 1,
+            captured_at: None,
+            workers: ws
+                .iter()
+                .enumerate()
+                .map(|(index, worker)| WorkerSnapshot {
+                    worker_id: worker.id.0.clone(),
+                    url: worker.url.clone(),
+                    mode: worker.mode(),
+                    model_ids: worker
+                        .model_ids
+                        .iter()
+                        .map(|model| model.0.clone())
+                        .collect(),
+                    freshness: Freshness::Fresh,
+                    source_instance_id: None,
+                    sequence_id: None,
+                    report_time_unix_ms: None,
+                    last_error: None,
+                    received_at: None,
+                    expires_at: None,
+                    aggregate: Some(AggregateLoad {
+                        num_running_reqs: u64::from(index < 2) * 4,
+                        max_running_requests: 4,
+                        max_total_num_tokens: 4_096,
+                        ..Default::default()
+                    }),
+                    ranks: Vec::new(),
+                })
+                .collect(),
+        };
+
+        assert!(
+            resolve_prefill(&CandidateRange::global(&ws), &proposal, 32, &snapshot).is_none(),
+            "hard admission may refuse the filtered domain, but must never route to rejected c"
+        );
     }
 
     /// Order is priority: the LOWER-priority filter yields, and what the

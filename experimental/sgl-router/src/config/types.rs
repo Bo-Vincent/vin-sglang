@@ -104,7 +104,8 @@ impl Default for ActiveLoadConfig {
 ///
 /// Accepted on the CLI (`--policy`) as `round_robin` / `random` /
 /// `power_of_two` / `load_based` / `prefix_cache` / `fused_score` /
-/// `cache_aware_zmq` / `sticky`.
+/// `score_policy` / `session_aware` / `cache_aware` / `cache_aware_zmq` /
+/// `sticky`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 pub enum PolicyKind {
     #[default]
@@ -128,6 +129,20 @@ pub enum PolicyKind {
     /// contributes, so the terms trade off continuously.
     #[value(name = "fused_score")]
     FusedScore,
+    /// Step 1 的稳定顶层 score policy。内部复用通用的
+    /// [`FusedScorePolicy`](crate::policies::scoring::FusedScorePolicy)
+    /// 组合器，但在 policy registry 中与 P2、Session-Aware、
+    /// Cache-Aware 并列，而不是后两者的配置开关。
+    #[value(name = "score_policy")]
+    ScorePolicy,
+    /// Session affinity policy，带稳定或采样的 backup。Session-ID 与旧 sticky
+    /// routing key 刻意分开。
+    #[value(name = "session_aware")]
+    SessionAware,
+    /// 由 ingress 已准备的外部 Indexer 信号驱动的 Cache affinity policy；旧 ZMQ
+    /// policy 保持独立实现。
+    #[value(name = "cache_aware")]
+    CacheAware,
     /// Capacity as a hard constraint: reject any worker already carrying
     /// `--max-in-flight` requests. A `--filter` entry, not a `--policy`:
     /// standalone it can only fall back on the selector's load tiebreak.
@@ -207,17 +222,19 @@ pub struct ModelConfig {
     pub tokenizer_path: String,
     pub policy: PolicyKind,
     pub circuit_breaker: Option<CircuitBreakerConfig>,
-    /// Tuning for cache-aware routing. Ignored unless
-    /// `policy = "cache_aware_zmq"`. `None` falls back to defaults at
-    /// policy construction time.
+    /// 旧 ZMQ Cache-Aware 的阈值，以及新 Cache-Aware / 旧 ZMQ 共享的可选
+    /// external Indexer endpoint。`None` 时 policy 使用自身默认值或退化到 P2。
     pub cache_aware: Option<CacheAwareConfig>,
     /// Tuning for the sticky-session policy. `Some` exactly when
     /// `policy = "sticky"` (built by [`crate::config::cli::Cli::into_config`]).
     /// The chat handler reads `sticky.header_name` to populate
     /// [`crate::policies::SelectionContext::routing_key`].
     pub sticky: Option<StickyConfig>,
-    /// Terms the fused-score policy sums. `Some` exactly when
-    /// `policy = "fused_score"` (built by
+    /// Shared Session-Aware / Cache-Aware affinity and soft-guard settings.
+    /// `Some` exactly when either of those policies is selected.
+    pub affinity: Option<AffinityConfig>,
+    /// Terms the score-composition policy sums. `Some` exactly when
+    /// `policy = "fused_score"` or `policy = "score_policy"` (built by
     /// [`crate::config::cli::Cli::into_config`]), defaulting to
     /// [`DEFAULT_FUSE`] when `--fuse` is omitted.
     pub fused: Option<Vec<FusedTerm>>,
@@ -343,6 +360,55 @@ fn default_balance_rel() -> f32 {
 /// matches the router's other emitted/consumed metadata headers
 /// (`x-sgl-decode-url`, `x-sgl-router-error-code`).
 pub const DEFAULT_STICKY_HEADER: &str = "x-sgl-routing-key";
+
+/// Session-Aware 默认读取的请求 header。它与旧 sticky 的 routing-key 分开：
+/// 前者表达 agent/session 的 affinity，后者保持旧 policy 的完整语义。
+pub const DEFAULT_SESSION_ID_HEADER: &str = "x-session-id";
+
+/// Affinity primary 在 Admission 后是否可以因软压力约束切到 backup。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum AffinityMode {
+    /// primary 通过 hard admission 后保持 affinity，不允许压力逃逸。
+    #[value(name = "strict")]
+    Strict,
+    /// primary/backup 都准入时，可由 Pressure Guard 选择明显更低压力的 backup。
+    #[default]
+    #[value(name = "soft")]
+    Soft,
+}
+
+/// Session-Aware 与新 Cache-Aware 共用的 affinity / guard 配置。
+///
+/// Bucket 不在此配置中：未来 Bucket 只能提供 CandidateRange，不能把范围规则
+/// 塞进具体 affinity policy。
+#[derive(Debug, Clone)]
+pub struct AffinityConfig {
+    pub session_id_header: String,
+    pub session_idle_secs: u64,
+    pub session_eviction_interval_secs: u64,
+    pub stable_pair: bool,
+    pub mode: AffinityMode,
+    pub pressure_guard: bool,
+    pub pressure_abs_threshold_tokens: u64,
+    pub pressure_rel_threshold: f64,
+    pub cache_benefit: bool,
+}
+
+impl Default for AffinityConfig {
+    fn default() -> Self {
+        Self {
+            session_id_header: DEFAULT_SESSION_ID_HEADER.to_string(),
+            session_idle_secs: default_sticky_idle_secs(),
+            session_eviction_interval_secs: default_sticky_eviction_interval_secs(),
+            stable_pair: false,
+            mode: AffinityMode::Soft,
+            pressure_guard: true,
+            pressure_abs_threshold_tokens: 1_024,
+            pressure_rel_threshold: 1.5,
+            cache_benefit: true,
+        }
+    }
+}
 
 /// Per-model sticky-session tuning. Built from the `--routing-key-header`
 /// / `--sticky-*` flags by [`crate::config::cli::Cli::into_config`], which

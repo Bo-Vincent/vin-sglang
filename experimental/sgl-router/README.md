@@ -86,7 +86,11 @@ open-source or fake engine. Engine builds that enforce `ADMIN_FORCE` on this
 endpoint currently reject registration with 401/403; authenticated reporting
 is outside this Router-only change.
 
-External KV indexer as the cache-aware signal source:
+## Legacy Cache-Aware ZMQ policy
+
+The existing `cache_aware_zmq` policy can additionally consume an external
+KV-indexer signal while keeping its local ZMQ subscription and legacy
+threshold behavior:
 
 ```bash
 sgl-router \
@@ -97,10 +101,74 @@ sgl-router \
   --kv-indexer-endpoint http://10.0.0.10:50051
 ```
 
-The existing cache-aware policy and thresholds are reused. Setting
-`--kv-indexer-endpoint` adds the indexer as the preferred routing signal while
-the router-local ZMQ subscription remains active. RPC failures fall through to
-the existing cache-aware policy.
+Setting `--kv-indexer-endpoint` adds the indexer as the preferred routing
+signal while the router-local ZMQ subscription remains active. RPC failures
+fall through to the legacy policy.
+
+## Session-Aware and Cache-Aware policies
+
+`power_of_two`, `session_aware`, `cache_aware`, and `score_policy` are the new
+Step 1 policies. They produce a primary plus an optional backup inside the
+current healthy Prefill candidate range. The Router then applies shared hard
+admission (fresh engine running/KV capacity when available); affinity policies
+may additionally apply Cache Benefit / Pressure Guard before the final worker
+is dispatched.
+
+```bash
+sgl-router \
+  --model-id qwen3 \
+  --tokenizer-path /models/qwen3/tokenizer.json \
+  --worker-urls http://10.0.0.1:30000 http://10.0.0.2:30000 \
+  --policy session_aware \
+  --session-id-header x-session-id \
+  --session-idle-secs 600 \
+  --session-eviction-interval-secs 60 \
+  --stable-pair \
+  --affinity-mode soft
+```
+
+```bash
+sgl-router \
+  --model-id qwen3 \
+  --tokenizer-path /models/qwen3/tokenizer.json \
+  --worker-urls http://10.0.0.1:30000 http://10.0.0.2:30000 \
+  --policy cache_aware \
+  --kv-indexer-endpoint http://10.0.0.10:50051 \
+  --stable-pair
+```
+
+`cache_aware` only reads the indexer result prepared at ingress; it never
+issues a synchronous Indexer RPC from the selection path. Missing, stale, or
+disabled LoadMonitor data does not hard-reject registry-healthy workers.
+Bucket/SLO policy is not enabled by these flags yet: it will replace the
+candidate range before policy selection, not rewrite these policies. The
+legacy `sticky` and `cache_aware_zmq` policies keep their existing direct
+dispatch behavior; they do not silently opt into this new shared layer.
+
+## Score policy
+
+`score_policy` is a top-level policy, parallel to `power_of_two`,
+`session_aware`, and `cache_aware`. It uses the generic score
+composition implementation internally; it does not turn Session or Cache
+affinity into a collection of flags. As a new top-level policy it participates
+in shared hard Prefill admission, but it has no affinity backup or soft
+Cache/Pressure Guard. The compatibility spelling `fused_score` retains its
+existing behavior.
+
+```bash
+sgl-router \
+  --model-id qwen3 \
+  --tokenizer-path /models/qwen3/tokenizer.json \
+  --worker-urls http://10.0.0.1:30000 http://10.0.0.2:30000 \
+  --policy score_policy \
+  --fuse prefix_cache=2.0,load_based=0.3
+```
+
+When `--fuse` is omitted, `score_policy` uses `prefix_cache,load_based`.
+`load_based` is currently a router-local active-load **soft score**, not an
+Engine LoadMonitor prefill-queue estimate or a hard admission rule. The
+upstream spelling `fused_score` remains available for compatibility; use
+`score_policy` for new Step 1 configuration.
 
 ## License
 
