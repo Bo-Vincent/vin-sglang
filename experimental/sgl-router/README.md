@@ -140,10 +140,11 @@ sgl-router \
 `cache_aware` only reads the indexer result prepared at ingress; it never
 issues a synchronous Indexer RPC from the selection path. Missing, stale, or
 disabled LoadMonitor data does not hard-reject registry-healthy workers.
-Bucket/SLO policy is not enabled by these flags yet: it will replace the
-candidate range before policy selection, not rewrite these policies. The
-legacy `sticky` and `cache_aware_zmq` policies keep their existing direct
-dispatch behavior; they do not silently opt into this new shared layer.
+Static Bucket/SLO routing is opt-in through `--bucket-config`: it replaces the
+P/D candidate domain before policy selection and does not rewrite these
+policies. Without that option the candidate domain remains global. The legacy
+`sticky` and `cache_aware_zmq` policies keep their existing direct-dispatch
+behavior; they do not silently opt into this new shared layer.
 
 ## Score policy
 

@@ -1,8 +1,13 @@
 # Router Policy Step 1 集成与实现计划
 
 日期：2026-08-04
-状态：代码实现完成；Rust toolchain 验证待环境恢复
+状态：历史背景；当前实现与验证状态见 Router v2 方案和执行计划
 分支：`codex/router-policy-integration`
+
+> **已被后续方案取代：** `vin/router-v2` 的实现范围与验证状态以
+> [Router Policy Step 1 与 Step 2 方案设计](router-policy-step1-step2-design.md)
+> 和 [Router v2 执行计划](plans/2026-08-04-router-v2-execution.md) 为准。本文件只保留
+> 早期 GlobalDomain Prefill 共享链路的历史背景，不描述当前 Decode / Bucket 代码。
 
 > **For Codex:** 按 `superpowers:executing-plans` 逐项执行；每个行为先写
 > 失败测试，再写最小实现。

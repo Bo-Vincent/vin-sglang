@@ -3,8 +3,10 @@
 
 pub mod active_load;
 pub mod admission;
+pub mod buckets;
 pub mod cache_aware;
 pub mod cache_aware_zmq;
+pub mod decode;
 pub mod factory;
 pub mod kv_events;
 pub mod load_based;
@@ -199,6 +201,8 @@ pub struct SelectionContext<'a> {
     request_tokens: Option<&'a [u32]>,
     external_prefix: Option<&'a ExternalPrefixSignal>,
     load_snapshot: Option<&'a LoadMonitorSnapshot>,
+    affinity_lookup_enabled: bool,
+    affinity_assignment_enabled: bool,
 }
 
 impl<'a> SelectionContext<'a> {
@@ -213,6 +217,8 @@ impl<'a> SelectionContext<'a> {
             request_tokens: None,
             external_prefix: None,
             load_snapshot: None,
+            affinity_lookup_enabled: true,
+            affinity_assignment_enabled: true,
         }
     }
 
@@ -231,6 +237,8 @@ impl<'a> SelectionContext<'a> {
             request_tokens: None,
             external_prefix: None,
             load_snapshot: None,
+            affinity_lookup_enabled: true,
+            affinity_assignment_enabled: true,
         }
     }
 
@@ -278,6 +286,21 @@ impl<'a> SelectionContext<'a> {
         self
     }
 
+    /// `affinity_aware_range=global` 的 target Bucket fallback。它保留其他
+    /// policy 输入，但强制 Session/Cache 退化为 P2，也不修改 SessionMap。
+    pub fn without_affinity_lookup(mut self) -> Self {
+        self.affinity_lookup_enabled = false;
+        self.affinity_assignment_enabled = false;
+        self
+    }
+
+    /// 全局 affinity 探测只读取已有 Session/Cache 状态，不能因为一次尚未经过
+    /// Bucket/SLO 校验的探测而写入新的 SessionMap。
+    pub fn without_affinity_assignment(mut self) -> Self {
+        self.affinity_assignment_enabled = false;
+        self
+    }
+
     pub fn model(&self) -> &ModelId {
         self.model
     }
@@ -314,6 +337,14 @@ impl<'a> SelectionContext<'a> {
 
     pub fn load_snapshot(&self) -> Option<&LoadMonitorSnapshot> {
         self.load_snapshot
+    }
+
+    pub fn affinity_lookup_enabled(&self) -> bool {
+        self.affinity_lookup_enabled
+    }
+
+    pub fn affinity_assignment_enabled(&self) -> bool {
+        self.affinity_assignment_enabled
     }
 }
 
@@ -435,6 +466,12 @@ pub trait Policy: Send + Sync + std::fmt::Debug {
         false
     }
 
+    /// 只有 Session-Aware 与新 Cache-Aware 参与 `affinity_aware_range`。
+    /// `sticky` 和旧 ZMQ Cache-Aware 保持独立语义。
+    fn is_bucket_affinity_policy(&self) -> bool {
+        false
+    }
+
     /// Whether this policy's ROUTING decision needs the request tokens (i.e.
     /// it routes by prompt prefix). Ingress tokenization itself is no longer
     /// gated on this — that is a model property (`has_chat_encoder`) decided at
@@ -509,16 +546,14 @@ impl PolicyRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{AffinityAwareRange, AffinityConfig};
     use crate::discovery::{WorkerId, WorkerMode, WorkerSpec};
-    use crate::load_monitor::{
-        AggregateLoad, Freshness, LoadMonitorSnapshot, WorkerSnapshot,
-    };
+    use crate::load_monitor::{AggregateLoad, Freshness, LoadMonitorSnapshot, WorkerSnapshot};
     use crate::policies::admission::{resolve_prefill, CandidateRange, DecisionReason};
     use crate::policies::cache_aware::CacheAwarePolicy;
     use crate::policies::power_of_two::PowerOfTwoChoicesPolicy;
     use crate::policies::round_robin::RoundRobinPolicy;
     use crate::policies::session_aware::SessionAwarePolicy;
-    use crate::config::AffinityConfig;
 
     fn worker(id: &str) -> Arc<Worker> {
         Arc::new(Worker::new(WorkerSpec {
@@ -601,7 +636,10 @@ mod tests {
             .expect("two candidates must produce a proposal");
 
         assert_eq!(proposal.primary.id, idle.id);
-        assert_eq!(proposal.backup.expect("P2 keeps its other sample").id, busy.id);
+        assert_eq!(
+            proposal.backup.expect("P2 keeps its other sample").id,
+            busy.id
+        );
     }
 
     #[test]
@@ -630,6 +668,72 @@ mod tests {
         assert_eq!(
             third.backup.expect("stable pair has backup").id,
             second.backup.expect("stable pair has backup").id,
+        );
+    }
+
+    #[test]
+    fn read_only_affinity_probe_does_not_create_a_session_assignment() {
+        let model = ModelId("model".into());
+        let workers = vec![worker("first"), worker("second")];
+        let policy = SessionAwarePolicy::new(AffinityConfig::default());
+        let probe = SelectionContext::new(&model, None)
+            .with_session_id(Some("session-a"))
+            .without_affinity_assignment();
+
+        let first = policy
+            .propose(&workers, &probe)
+            .expect("read-only probe still gets a P2 candidate");
+        assert_eq!(first.kind, ProposalKind::PowerOfTwo);
+
+        let normal = SelectionContext::new(&model, None).with_session_id(Some("session-a"));
+        let second = policy
+            .propose(&workers, &normal)
+            .expect("first admitted route creates the session assignment");
+        assert_eq!(second.kind, ProposalKind::PowerOfTwo);
+
+        let mapped = policy
+            .propose(&workers, &normal)
+            .expect("subsequent route resolves the admitted assignment");
+        assert_eq!(mapped.kind, ProposalKind::SessionAffinity);
+    }
+
+    #[test]
+    fn bucket_scoped_session_affinity_remembers_each_bucket_independently() {
+        let model = ModelId("model".into());
+        let short = worker("short");
+        let long = worker("long");
+        let policy = SessionAwarePolicy::new(AffinityConfig {
+            aware_range: AffinityAwareRange::Bucket,
+            ..Default::default()
+        });
+        let short_ctx = SelectionContext::new(&model, None)
+            .with_session_id(Some("session-a"))
+            .with_candidate_range_id("p-short");
+        let long_ctx = SelectionContext::new(&model, None)
+            .with_session_id(Some("session-a"))
+            .with_candidate_range_id("p-long");
+
+        policy
+            .propose(&[Arc::clone(&short)], &short_ctx)
+            .expect("short bucket creates its assignment");
+        policy
+            .propose(&[Arc::clone(&long)], &long_ctx)
+            .expect("long bucket creates an independent assignment");
+        let returned = policy
+            .propose(&[short], &short_ctx)
+            .expect("returning to short bucket reuses its assignment");
+
+        assert_eq!(returned.kind, ProposalKind::SessionAffinity);
+    }
+
+    #[test]
+    fn decode_pressure_tie_is_not_broken_by_worker_id() {
+        let a = worker("a");
+        let z = worker("z");
+        assert_eq!(
+            admission::compare_decode_pressure(&a, &z, None),
+            std::cmp::Ordering::Equal,
+            "P2 must preserve random sampling when observable pressure is equal"
         );
     }
 
@@ -815,19 +919,15 @@ mod tests {
                 },
             ),
         ]);
-        let proposal = SelectionProposal::with_backup(primary, backup).with_guard_hints(GuardHints {
-            matched_prefix_tokens: Some(32),
-            enable_cache_benefit: true,
-            ..Default::default()
-        });
+        let proposal =
+            SelectionProposal::with_backup(primary, backup).with_guard_hints(GuardHints {
+                matched_prefix_tokens: Some(32),
+                enable_cache_benefit: true,
+                ..Default::default()
+            });
 
-        let decision = resolve_prefill(
-            &CandidateRange::global(&workers),
-            &proposal,
-            80,
-            &snapshot,
-        )
-        .expect("both candidates fit capacity");
+        let decision = resolve_prefill(&CandidateRange::global(&workers), &proposal, 80, &snapshot)
+            .expect("both candidates fit capacity");
 
         assert_eq!(decision.reason, DecisionReason::BackupCacheBenefit);
     }
@@ -857,20 +957,16 @@ mod tests {
                 },
             ),
         ]);
-        let proposal = SelectionProposal::with_backup(primary, backup).with_guard_hints(GuardHints {
-            enable_pressure_guard: true,
-            pressure_abs_threshold_tokens: 100,
-            pressure_rel_threshold: 2.0,
-            ..Default::default()
-        });
+        let proposal =
+            SelectionProposal::with_backup(primary, backup).with_guard_hints(GuardHints {
+                enable_pressure_guard: true,
+                pressure_abs_threshold_tokens: 100,
+                pressure_rel_threshold: 2.0,
+                ..Default::default()
+            });
 
-        let decision = resolve_prefill(
-            &CandidateRange::global(&workers),
-            &proposal,
-            80,
-            &snapshot,
-        )
-        .expect("both candidates fit capacity");
+        let decision = resolve_prefill(&CandidateRange::global(&workers), &proposal, 80, &snapshot)
+            .expect("both candidates fit capacity");
 
         assert_eq!(decision.reason, DecisionReason::BackupPressureGuard);
     }
@@ -915,13 +1011,8 @@ mod tests {
         ]);
         let proposal = SelectionProposal::with_backup(primary, backup);
 
-        let decision = resolve_prefill(
-            &CandidateRange::global(&workers),
-            &proposal,
-            32,
-            &snapshot,
-        )
-        .expect("an admitted range fallback must be selected");
+        let decision = resolve_prefill(&CandidateRange::global(&workers), &proposal, 32, &snapshot)
+            .expect("an admitted range fallback must be selected");
 
         assert_eq!(decision.selected.id, fallback.id);
         assert_eq!(decision.reason, DecisionReason::RangeFallback);

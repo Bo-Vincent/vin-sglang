@@ -1,3 +1,4 @@
+use serde::Deserialize;
 use std::num::NonZeroU32;
 
 /// In-memory router configuration, built from CLI flags by
@@ -162,6 +163,81 @@ pub enum PolicyKind {
     Sticky,
 }
 
+/// PD 请求在 Final Prefill 之后选择 Decode worker 的策略。
+///
+/// 这是独立于 Prefill 顶层 policy 的 role-specific 配置：P 的 Session/Cache
+/// affinity 不会隐式变成 D affinity。默认 P2；旧 same-host 逻辑仅作为兼容选项
+/// 保留，后续 transfer-aware 将新增独立 variant，而不改 P policy。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum DecodePolicyKind {
+    #[default]
+    #[value(name = "power_of_two")]
+    PowerOfTwo,
+    #[value(name = "legacy_host_affinity")]
+    LegacyHostAffinity,
+}
+
+/// 静态能力 Bucket 的角色。Bucket 不替代 worker 的实时健康状态；它只定义哪些
+/// endpoint 可以作为某一阶段请求的候选域。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BucketStage {
+    Prefill,
+    Decode,
+}
+
+/// Bucket 的 SLO 选择语义。`rank` 仅在已兼容的候选 Bucket 内决定优先级。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SloBucketPolicy {
+    #[default]
+    Disabled,
+    BestEffort,
+    SloFirst,
+}
+
+/// 一份静态 Bucket 配置。它在 Router 启动时加载；请求热路径只读取内存中的
+/// 不可变数据，不查询 Orchestrator 或 LoadMonitor。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BucketConfig {
+    pub buckets: Vec<BucketSpec>,
+    #[serde(default)]
+    pub ttft_slo_policy: SloBucketPolicy,
+    #[serde(default)]
+    pub tps_slo_policy: SloBucketPolicy,
+}
+
+/// 一个角色化 Runtime 能力池。
+///
+/// profile 字段来自离线 benchmark；`rank` 是运营者给出的唯一候选优先级，
+/// 数字更小优先。动态 queue/running/KV 不存放于此，而由后续 Admission/Guard
+/// 在 Bucket 内处理。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BucketSpec {
+    pub id: String,
+    pub stage: BucketStage,
+    pub rank: u32,
+    pub worker_ids: Vec<String>,
+    #[serde(default)]
+    pub min_input_tokens: Option<u64>,
+    #[serde(default)]
+    pub max_input_tokens: Option<u64>,
+    #[serde(default)]
+    pub min_sequence_tokens: Option<u64>,
+    #[serde(default)]
+    pub max_sequence_tokens: Option<u64>,
+    #[serde(default)]
+    pub max_context_tokens: Option<u64>,
+    #[serde(default)]
+    pub ttft_p95_at_capacity_ms: Option<u64>,
+    #[serde(default)]
+    pub tps_p05_at_capacity: Option<f64>,
+    #[serde(default)]
+    pub max_pending_prefill_tokens: Option<u64>,
+}
+
 impl std::fmt::Display for PolicyKind {
     /// The `--policy` / `--fuse` spelling, read out of clap's own table so a
     /// diagnostic cannot name a variant differently from the flag that
@@ -221,6 +297,11 @@ pub struct ModelConfig {
     /// is omitted. Resolved by [`crate::tokenizer::adapter::load`].
     pub tokenizer_path: String,
     pub policy: PolicyKind,
+    /// Decode pool 的独立选择策略。只在 PD 部署中使用；plain deployment 不会
+    /// 解析 Decode domain。
+    pub decode_policy: DecodePolicyKind,
+    /// 可选静态 Bucket 配置。`None` 保持 GlobalDomain，不会人为拆分同构集群。
+    pub bucket_config: Option<BucketConfig>,
     pub circuit_breaker: Option<CircuitBreakerConfig>,
     /// 旧 ZMQ Cache-Aware 的阈值，以及新 Cache-Aware / 旧 ZMQ 共享的可选
     /// external Indexer endpoint。`None` 时 policy 使用自身默认值或退化到 P2。
@@ -377,6 +458,25 @@ pub enum AffinityMode {
     Soft,
 }
 
+/// Session/Cache affinity primary 的查找范围。它与 `AffinityMode` 独立：前者
+/// 决定是否先做跨 Bucket lookup，后者仅决定已准入 primary 是否可被压力 Guard
+/// 切到 backup。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum AffinityAwareRange {
+    /// 只在 target Bucket 内解析 affinity。
+    #[default]
+    #[value(name = "bucket")]
+    Bucket,
+    /// 先尝试全局 affinity primary；其自身 Bucket 不可用时回到 target Bucket
+    /// 重新解析 aware policy。
+    #[value(name = "global-first")]
+    GlobalFirst,
+    /// 先尝试全局 affinity primary；失败后直接按 target Bucket 的 P2 fallback，
+    /// 不在 target Bucket 重写/重建 affinity assignment。
+    #[value(name = "global")]
+    Global,
+}
+
 /// Session-Aware 与新 Cache-Aware 共用的 affinity / guard 配置。
 ///
 /// Bucket 不在此配置中：未来 Bucket 只能提供 CandidateRange，不能把范围规则
@@ -388,6 +488,7 @@ pub struct AffinityConfig {
     pub session_eviction_interval_secs: u64,
     pub stable_pair: bool,
     pub mode: AffinityMode,
+    pub aware_range: AffinityAwareRange,
     pub pressure_guard: bool,
     pub pressure_abs_threshold_tokens: u64,
     pub pressure_rel_threshold: f64,
@@ -402,6 +503,7 @@ impl Default for AffinityConfig {
             session_eviction_interval_secs: default_sticky_eviction_interval_secs(),
             stable_pair: false,
             mode: AffinityMode::Soft,
+            aware_range: AffinityAwareRange::Bucket,
             pressure_guard: true,
             pressure_abs_threshold_tokens: 1_024,
             pressure_rel_threshold: 1.5,

@@ -15,8 +15,8 @@ use crate::policies::{
         admission::Overloaded, prefix_cache, prefix_cache::PrefixCachePolicy, FusedScorePolicy,
         Pipeline, ScorePolicy,
     },
-    sticky::StickyPolicy,
     session_aware::SessionAwarePolicy,
+    sticky::StickyPolicy,
     Policy, PolicyRegistry,
 };
 use crate::tokenizer::TokenizerRegistry;
@@ -122,12 +122,12 @@ fn build_kind(
                 block_size_oracle,
             ))
         }
-        PolicyKind::SessionAware => {
-            Arc::new(SessionAwarePolicy::new(model.affinity.clone().unwrap_or_default()))
-        }
-        PolicyKind::CacheAware => {
-            Arc::new(CacheAwarePolicy::new(model.affinity.clone().unwrap_or_default()))
-        }
+        PolicyKind::SessionAware => Arc::new(SessionAwarePolicy::new(
+            model.affinity.clone().unwrap_or_default(),
+        )),
+        PolicyKind::CacheAware => Arc::new(CacheAwarePolicy::new(
+            model.affinity.clone().unwrap_or_default(),
+        )),
         PolicyKind::Sticky => build_sticky(model),
         PolicyKind::FusedScore => build_fused(model, &tree, &tokenizers, &block_size_oracle)?,
         PolicyKind::ScorePolicy => {
@@ -419,6 +419,8 @@ mod tests {
                 id: id.into(),
                 tokenizer_path: "/tmp/x".into(),
                 policy,
+                decode_policy: Default::default(),
+                bucket_config: None,
                 circuit_breaker: None,
                 cache_aware: None,
                 sticky: None,

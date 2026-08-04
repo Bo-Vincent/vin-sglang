@@ -7,14 +7,12 @@
 //! 临时 backup 选择不写回 map，因此压力抖动不会把 session 在两个 worker
 //! 之间来回迁移。
 
-use crate::config::{AffinityConfig, AffinityMode};
+use crate::config::{AffinityAwareRange, AffinityConfig, AffinityMode};
 use crate::discovery::WorkerId;
 use crate::policies::active_load::{spawn_sweeper, Clock, JanitorHandle, SystemTimeClock};
 use crate::policies::admission::compare_prefill_pressure;
 use crate::policies::power_of_two::PowerOfTwoChoicesPolicy;
-use crate::policies::{
-    GuardHints, Policy, ProposalKind, SelectionContext, SelectionProposal,
-};
+use crate::policies::{GuardHints, Policy, ProposalKind, SelectionContext, SelectionProposal};
 use crate::workers::Worker;
 use dashmap::DashMap;
 use rand::Rng;
@@ -107,8 +105,11 @@ impl SessionAwarePolicy {
         self.state.assignments.len()
     }
 
-    fn assignment_key(&self, session_id: &str, _ctx: &SelectionContext<'_>) -> String {
-        session_id.to_string()
+    fn assignment_key(&self, session_id: &str, ctx: &SelectionContext<'_>) -> String {
+        match self.config.aware_range {
+            AffinityAwareRange::Bucket => format!("{}\0{}", ctx.candidate_range_id(), session_id),
+            AffinityAwareRange::GlobalFirst | AffinityAwareRange::Global => session_id.to_string(),
+        }
     }
 
     fn initial_proposal(
@@ -118,7 +119,7 @@ impl SessionAwarePolicy {
         session_id: Option<&str>,
     ) -> Option<SelectionProposal> {
         let proposal = PowerOfTwoChoicesPolicy::new().propose(workers, ctx)?;
-        if let Some(session_id) = session_id {
+        if let Some(session_id) = session_id.filter(|_| ctx.affinity_assignment_enabled()) {
             self.state.assignments.insert(
                 self.assignment_key(session_id, ctx),
                 Assignment {
@@ -171,6 +172,9 @@ impl Policy for SessionAwarePolicy {
         workers: &[Arc<Worker>],
         ctx: &SelectionContext<'_>,
     ) -> Option<SelectionProposal> {
+        if !ctx.affinity_lookup_enabled() {
+            return PowerOfTwoChoicesPolicy::new().propose(workers, ctx);
+        }
         let Some(session_id) = ctx.session_id().filter(|id| !id.is_empty()) else {
             return self.initial_proposal(workers, ctx, None);
         };
@@ -196,6 +200,10 @@ impl Policy for SessionAwarePolicy {
     }
 
     fn uses_shared_prefill_admission(&self) -> bool {
+        true
+    }
+
+    fn is_bucket_affinity_policy(&self) -> bool {
         true
     }
 }

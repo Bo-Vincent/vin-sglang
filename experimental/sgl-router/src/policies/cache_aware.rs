@@ -76,6 +76,9 @@ impl Policy for CacheAwarePolicy {
         workers: &[Arc<Worker>],
         ctx: &SelectionContext<'_>,
     ) -> Option<SelectionProposal> {
+        if !ctx.affinity_lookup_enabled() {
+            return PowerOfTwoChoicesPolicy::new().propose(workers, ctx);
+        }
         let Some((primary, matched_prefix_blocks, signal)) = best_prefix_holder(workers, ctx)
         else {
             return PowerOfTwoChoicesPolicy::new().propose(workers, ctx);
@@ -88,6 +91,10 @@ impl Policy for CacheAwarePolicy {
     }
 
     fn uses_shared_prefill_admission(&self) -> bool {
+        true
+    }
+
+    fn is_bucket_affinity_policy(&self) -> bool {
         true
     }
 }
@@ -127,11 +134,7 @@ fn estimate_matched_prefix_tokens(
 ) -> Option<u64> {
     let input_tokens = input_tokens?;
     let query_blocks = u64::try_from(query_blocks).ok()?.max(1);
-    Some(
-        input_tokens
-            .saturating_mul(u64::from(matched_prefix_blocks))
-            / query_blocks,
-    )
+    Some(input_tokens.saturating_mul(u64::from(matched_prefix_blocks)) / query_blocks)
 }
 
 /// cache 命中的确切 token 前缀不可从当前 indexer block 协议直接得到。这里使用

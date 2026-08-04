@@ -311,6 +311,12 @@ impl Policy for Pipeline {
         self.inner.uses_shared_prefill_admission()
     }
 
+    /// Bucket-aware Session/Cache 仍可叠加通用 EligibilityFilter。Pipeline 只缩小
+    /// 已给定 CandidateDomain，不能吞掉 inner policy 的 affinity 范围语义。
+    fn is_bucket_affinity_policy(&self) -> bool {
+        self.inner.is_bucket_affinity_policy()
+    }
+
     /// An upper bound over BOTH layers: over-reporting costs one tokenization,
     /// under-reporting silently blinds a prompt-routed filter or term.
     fn needs_request_tokens(&self) -> bool {
@@ -399,11 +405,13 @@ pub(crate) fn refs(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::AffinityConfig;
     use crate::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
     use crate::load_monitor::{AggregateLoad, Freshness, LoadMonitorSnapshot, WorkerSnapshot};
     use crate::policies::admission::{resolve_prefill, CandidateRange};
     use crate::policies::power_of_two::PowerOfTwoChoicesPolicy;
     use crate::policies::round_robin::RoundRobinPolicy;
+    use crate::policies::session_aware::SessionAwarePolicy;
 
     fn worker(id: &str) -> Arc<Worker> {
         Arc::new(Worker::new(WorkerSpec {
@@ -641,8 +649,21 @@ mod tests {
             .propose(&ws, &ctx)
             .expect("eligible P2 must retain a pair");
 
-        assert!(proposal.backup.is_some(), "Pipeline must not collapse P2 to one primary");
+        assert!(
+            proposal.backup.is_some(),
+            "Pipeline must not collapse P2 to one primary"
+        );
         assert!(pipeline.uses_shared_prefill_admission());
+
+        let session_pipeline = Pipeline::new(
+            vec![Arc::new(Keep(vec!["a", "b", "c"], OnEmpty::Abstain))],
+            Arc::new(SessionAwarePolicy::new(AffinityConfig::default())),
+        )
+        .expect("valid filter and inner session policy");
+        assert!(
+            session_pipeline.is_bucket_affinity_policy(),
+            "Pipeline must forward the inner Session/Cache affinity range capability"
+        );
     }
 
     #[test]

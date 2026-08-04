@@ -1,8 +1,13 @@
 # SGLang Router Policy：Step 1 与 Step 2 方案设计
 
 日期：2026-08-04
-状态：设计冻结，按 Step 1 实现前的正式方案
+状态：实施中；Step 1 / Step 2 的目标语义与接口边界
 范围：`experimental/sgl-router`
+
+> 实现对应关系：当前代码用 `CandidateDomain { id: String, stage, workers }` 表示
+> Global 或 Bucket 域；为兼容既有 Prefill Admission，内部暂以借用的
+> `CandidateRange` 投影该 Domain。`FinalDecision` 已作为 P/D dispatch 前的结果，
+> `RoutePlan` 仍是未来 Reservation 的演进边界，并未额外引入一个持久化对象。
 
 ## 1. 目标与原则
 
@@ -310,11 +315,11 @@ num_running_reqs + 1 <= max_running_requests
 num_total_tokens + request_input_tokens <= max_total_num_tokens
 ```
 
-D Guard 必须在 dispatch 前执行。它只在 primary 与 backup 都通过 D Admission 后做
-受阈值控制的压力逃逸；可用输入是 running/request/KV 的当前利用率与 Router local
-decode active-load。`decode_retracted_queue_reqs` 作为后续 Decode Policy 的压力输入
-保留，但当前 LoadMonitor 未提供时不能伪造。D Guard 的具体阈值配置与 decision
-reason taxonomy 可在实现阶段单独冻结。
+D Guard 必须在 dispatch 前执行。当前 P2 proposal 与 Guard 都只使用 running/KV
+利用率及 Router local decode active-load：两个候选均通过 Admission 时保留较低压力者；
+没有额外的 queue-ms、TTFT 或 transfer 阈值。`decode_retracted_queue_reqs` 作为后续
+Decode Policy 的压力输入保留，但当前 LoadMonitor 未提供时不能伪造；其阈值配置与更细的
+decision reason taxonomy 在对应指标到位后单独冻结。
 
 Step 1 不实现 Transfer-Aware D Guard，因为当前尚无可信的：
 
@@ -368,6 +373,32 @@ BucketSpec {
 
 profile 来自绑定模型版本、Runtime Shape、并发限制与长度区间的离线 benchmark；它不由
 请求时 queue 预测临时生成。
+
+当前第一版通过 `--bucket-config <path>` 在启动时加载 JSON；热路径只读取内存配置。
+`worker_ids` 必须等于 discovery 产生的稳定 Worker ID（静态 URL discovery 时就是
+worker URL；K8s discovery 时是 pod UID 或 EndpointSlice 生成的 ID）。最小结构如下：
+
+```json
+{
+  "ttft_slo_policy": "slo_first",
+  "tps_slo_policy": "best_effort",
+  "buckets": [
+    {
+      "id": "p-fast",
+      "stage": "prefill",
+      "rank": 10,
+      "worker_ids": ["http://p-fast:30000"],
+      "max_input_tokens": 4096,
+      "max_context_tokens": 8192,
+      "ttft_p95_at_capacity_ms": 120
+    }
+  ]
+}
+```
+
+调用方可选地通过 `x-sgl-ttft-slo-ms` 传 P 的 TTFT SLO、通过 `x-sgl-tps-slo` 传 D
+的 TPS SLO。只有静态 Bucket 启用时 Router 才解析这两个 header；非法或非正值在
+入口返回 400，未提供时不伪造 SLO。
 
 ### 4.2 Prefill Bucket 与 TTFT policy
 

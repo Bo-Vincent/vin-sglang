@@ -1,7 +1,7 @@
 # Router v2 执行计划
 
 日期：2026-08-04
-状态：执行中
+状态：完成；Rust 验证和 8xL20 E2E PoC 结果见 `router-v2-e2e-poc-report.md`
 分支：`vin/router-v2`
 
 本计划执行 [Router Policy Step 1 与 Step 2 方案设计](../router-policy-step1-step2-design.md)。

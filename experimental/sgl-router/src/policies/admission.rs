@@ -33,6 +33,78 @@ impl<'a> CandidateRange<'a> {
     }
 }
 
+/// Policy 之前由 Router 解析出的角色化候选域。
+///
+/// `CandidateRange` 是既有 Prefill 共享层的借用视图；`CandidateDomain` 从
+/// Decode Step 1 起承担长期接口。Step 2 只会把 `id` 和 `workers` 替换为静态
+/// Bucket 的内容，policy/admission/guard 不需要知道 Bucket 的配置来源。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoutingStage {
+    Prefill,
+    Decode,
+}
+
+#[derive(Clone)]
+pub struct CandidateDomain {
+    pub id: String,
+    pub stage: RoutingStage,
+    pub workers: Vec<Arc<Worker>>,
+    pub max_pending_prefill_tokens: Option<u64>,
+}
+
+impl CandidateDomain {
+    pub fn global_prefill(workers: &[Arc<Worker>]) -> Self {
+        Self {
+            id: "global".to_string(),
+            stage: RoutingStage::Prefill,
+            workers: workers.to_vec(),
+            max_pending_prefill_tokens: None,
+        }
+    }
+
+    pub fn global_decode(workers: &[Arc<Worker>]) -> Self {
+        Self {
+            id: "global".to_string(),
+            stage: RoutingStage::Decode,
+            workers: workers.to_vec(),
+            max_pending_prefill_tokens: None,
+        }
+    }
+
+    pub fn bucket_prefill(
+        id: impl Into<String>,
+        workers: Vec<Arc<Worker>>,
+        max_pending_prefill_tokens: Option<u64>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            stage: RoutingStage::Prefill,
+            workers,
+            max_pending_prefill_tokens,
+        }
+    }
+
+    pub fn bucket_decode(id: impl Into<String>, workers: Vec<Arc<Worker>>) -> Self {
+        Self {
+            id: id.into(),
+            stage: RoutingStage::Decode,
+            workers,
+            max_pending_prefill_tokens: None,
+        }
+    }
+
+    /// 将统一 Domain 投影到既有 Prefill Admission 的借用视图。保留
+    /// `CandidateRange` 可避免 Step 1 共享 Admission 的无关重构；新入口和
+    /// Bucket selector 只创建 `CandidateDomain`。
+    pub fn prefill_range(&self) -> Option<CandidateRange<'_>> {
+        (self.stage == RoutingStage::Prefill).then(|| CandidateRange {
+            id: self.id.as_str(),
+            workers: &self.workers,
+            max_pending_prefill_tokens: self.max_pending_prefill_tokens,
+        })
+    }
+}
+
 /// 最终 worker 的来源，用于日志、指标和后续 Reservation 的输入。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DecisionReason {
@@ -108,8 +180,63 @@ pub fn resolve_prefill(
     })
 }
 
+/// Decode 共享 Admission / Guard。
+///
+/// 这里只采用 LoadMonitor 已有的 running/KV 计数和 Router local active-load。
+/// 缺失或过期 snapshot 时不做 hard reject，且不推测 transfer、queue 或 decode
+/// step time。与 Prefill 一样，只有 primary/backup 都 hard-admit 后才进入
+/// Guard；两者都失败时才扫描当前 Decode domain。
+pub fn resolve_decode(
+    domain: &CandidateDomain,
+    proposal: &SelectionProposal,
+    request_input_tokens: u64,
+    snapshot: &LoadMonitorSnapshot,
+) -> Option<FinalDecision> {
+    if domain.stage != RoutingStage::Decode || !contains_domain_worker(domain, &proposal.primary) {
+        return None;
+    }
+    let backup = proposal
+        .backup
+        .as_ref()
+        .filter(|worker| contains_domain_worker(domain, worker))
+        .cloned();
+    let primary_admitted = is_decode_admitted(&proposal.primary, request_input_tokens, snapshot);
+    let backup_admitted = backup
+        .as_ref()
+        .is_some_and(|worker| is_decode_admitted(worker, request_input_tokens, snapshot));
+
+    let (selected, reason) = match (primary_admitted, backup.as_ref(), backup_admitted) {
+        (true, Some(backup), true) => {
+            if compare_decode_pressure(&proposal.primary, backup, Some(snapshot)).is_gt() {
+                (Arc::clone(backup), DecisionReason::BackupPressureGuard)
+            } else {
+                (Arc::clone(&proposal.primary), DecisionReason::Primary)
+            }
+        }
+        (true, _, _) => (Arc::clone(&proposal.primary), DecisionReason::Primary),
+        (false, Some(backup), true) => (Arc::clone(backup), DecisionReason::BackupPrimaryAdmission),
+        _ => decode_domain_fallback(domain, request_input_tokens, snapshot)?,
+    };
+
+    Some(FinalDecision {
+        selected,
+        primary: Arc::clone(&proposal.primary),
+        backup,
+        reason,
+        candidate_range_id: domain.id.clone(),
+        load_snapshot_version: snapshot.version,
+    })
+}
+
 fn contains_worker(range: &CandidateRange<'_>, candidate: &Arc<Worker>) -> bool {
     range.workers.iter().any(|worker| worker.id == candidate.id)
+}
+
+fn contains_domain_worker(domain: &CandidateDomain, candidate: &Arc<Worker>) -> bool {
+    domain
+        .workers
+        .iter()
+        .any(|worker| worker.id == candidate.id)
 }
 
 /// 只把 fresh engine snapshot 作为 hard 容量依据。缺失或过期 report 退化为
@@ -125,13 +252,24 @@ fn is_admitted(
     };
 
     load.num_running_reqs.saturating_add(1) <= load.max_running_requests
-        && load.num_total_tokens.saturating_add(request_input_tokens)
-            <= load.max_total_num_tokens
+        && load.num_total_tokens.saturating_add(request_input_tokens) <= load.max_total_num_tokens
         && range.max_pending_prefill_tokens.map_or(true, |limit| {
             load.num_waiting_uncached_tokens
                 .saturating_add(request_input_tokens)
                 <= limit
         })
+}
+
+fn is_decode_admitted(
+    worker: &Arc<Worker>,
+    request_input_tokens: u64,
+    snapshot: &LoadMonitorSnapshot,
+) -> bool {
+    let Some(load) = snapshot.fresh_load(&worker.id) else {
+        return true;
+    };
+    load.num_running_reqs.saturating_add(1) <= load.max_running_requests
+        && load.num_total_tokens.saturating_add(request_input_tokens) <= load.max_total_num_tokens
 }
 
 fn cache_benefit_prefers_backup(hints: &GuardHints, request_input_tokens: u64) -> bool {
@@ -164,8 +302,7 @@ fn pressure_guard_prefers_backup(
     let primary_pressure = primary_load.num_waiting_uncached_tokens;
     let backup_pressure = backup_load.num_waiting_uncached_tokens;
     primary_pressure.saturating_sub(backup_pressure) > hints.pressure_abs_threshold_tokens
-        && (primary_pressure as f64)
-            > (backup_pressure as f64) * hints.pressure_rel_threshold
+        && (primary_pressure as f64) > (backup_pressure as f64) * hints.pressure_rel_threshold
 }
 
 fn range_fallback(
@@ -182,6 +319,20 @@ fn range_fallback(
         .filter(|worker| contains_worker(range, worker))
         .filter(|worker| is_admitted(range, worker, request_input_tokens, snapshot))
         .min_by(|left, right| compare_prefill_pressure(left, right, Some(snapshot)))
+        .cloned()
+        .map(|worker| (worker, DecisionReason::RangeFallback))
+}
+
+fn decode_domain_fallback(
+    domain: &CandidateDomain,
+    request_input_tokens: u64,
+    snapshot: &LoadMonitorSnapshot,
+) -> Option<(Arc<Worker>, DecisionReason)> {
+    domain
+        .workers
+        .iter()
+        .filter(|worker| is_decode_admitted(worker, request_input_tokens, snapshot))
+        .min_by(|left, right| compare_decode_pressure(left, right, Some(snapshot)))
         .cloned()
         .map(|worker| (worker, DecisionReason::RangeFallback))
 }
@@ -205,12 +356,8 @@ pub(crate) fn compare_prefill_pressure(
     }) {
         Some((left_load, right_load)) => load_pressure_key(&left_load)
             .cmp(&load_pressure_key(&right_load))
-            .then_with(|| left.active_load().cmp(&right.active_load()))
-            .then_with(|| left.id.0.cmp(&right.id.0)),
-        _ => left
-            .active_load()
-            .cmp(&right.active_load())
-            .then_with(|| left.id.0.cmp(&right.id.0)),
+            .then_with(|| left.active_load().cmp(&right.active_load())),
+        _ => left.active_load().cmp(&right.active_load()),
     }
 }
 
@@ -220,4 +367,37 @@ fn load_pressure_key(load: &AggregateLoad) -> (u64, u64, u64) {
         load.num_waiting_reqs,
         load.num_running_reqs,
     )
+}
+
+/// Decode 压力只使用当前可靠的 running/KV 与本地 in-flight。比较容量比例时用
+/// 交叉相乘而不是浮点，以免不同 worker 的并发/KV 上限让绝对计数失真。
+pub(crate) fn compare_decode_pressure(
+    left: &Arc<Worker>,
+    right: &Arc<Worker>,
+    snapshot: Option<&LoadMonitorSnapshot>,
+) -> Ordering {
+    match snapshot.and_then(|snapshot| {
+        Some((
+            snapshot.fresh_load(&left.id)?,
+            snapshot.fresh_load(&right.id)?,
+        ))
+    }) {
+        Some((left_load, right_load)) => {
+            let left_running = u128::from(left_load.num_running_reqs)
+                .saturating_mul(u128::from(right_load.max_running_requests));
+            let right_running = u128::from(right_load.num_running_reqs)
+                .saturating_mul(u128::from(left_load.max_running_requests));
+            let left_kv = u128::from(left_load.num_total_tokens)
+                .saturating_mul(u128::from(right_load.max_total_num_tokens));
+            let right_kv = u128::from(right_load.num_total_tokens)
+                .saturating_mul(u128::from(left_load.max_total_num_tokens));
+            left_running
+                .cmp(&right_running)
+                .then_with(|| left_kv.cmp(&right_kv))
+                .then_with(|| left_load.num_running_reqs.cmp(&right_load.num_running_reqs))
+                .then_with(|| left_load.num_total_tokens.cmp(&right_load.num_total_tokens))
+                .then_with(|| left.active_load().cmp(&right.active_load()))
+        }
+        None => left.active_load().cmp(&right.active_load()),
+    }
 }

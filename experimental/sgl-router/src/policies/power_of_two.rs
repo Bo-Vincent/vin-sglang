@@ -43,8 +43,9 @@ impl Policy for PowerOfTwoChoicesPolicy {
     ) -> Option<SelectionProposal> {
         match workers.len() {
             0 => None,
-            1 => Some(SelectionProposal::primary(workers[0].clone())
-                .with_kind(ProposalKind::PowerOfTwo)),
+            1 => Some(
+                SelectionProposal::primary(workers[0].clone()).with_kind(ProposalKind::PowerOfTwo),
+            ),
             len => {
                 let mut rng = rand::thread_rng();
                 let i = rng.gen_range(0..len);

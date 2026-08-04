@@ -70,6 +70,13 @@ performance regardless of worker count.
 TODO: Add a regression guard for the O(n) shape. Although `policy_select`
 measures the metric, nothing currently runs or gates on these results.
 
+## Router v2 policy / static Bucket E2E PoC
+
+功能与性能边界、实际硬件、命令口径及被 Git 忽略的原始结果位置见
+[Router v2 E2E PoC 报告](docs/router-v2-e2e-poc-report.md)。该 PoC 证明当前 Router 的
+候选域、P2 与 Session-Aware 功能链路可用；它同时表明同构集群将 8 卡静态切成 4+4
+Bucket 会损失单一 short workload 的容量，不可作为生产 Bucket 配置。
+
 ## Pre-deprecation calibration runbook
 
 Before deleting SMG, every routing-latency metric in the slim-design
