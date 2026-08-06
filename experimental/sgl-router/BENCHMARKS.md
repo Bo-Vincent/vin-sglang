@@ -78,6 +78,14 @@ Cache candidate 和单机 4P+4D Mooncake KV transfer 的环境、结果与边界
 Policy/Admission/Guard 数据流可用；静态 Bucket 仍是 Step 2 实验接口，不代表同构
 4+4 切分或异构生产 Bucket 已达到 production GO。
 
+## Step 3 LoadMonitor A/B
+
+Step 2 baseline 与 Step 3 多维 LoadMonitor candidate 的 48-case 正式主轮、12-case RSD
+确认轮、真实 4P+4D snapshot proof、性能结果和适用边界见
+[Step 3 LoadMonitor A/B 报告](docs/router-policy-step3-monitor-ab-report.md)。该结果证明新指标
+链路可用且多数场景中性或改善，但高压 Session workload 仍有高波动 TTFT 回退，不能外推为
+所有 workload 的稳定收益。
+
 ## Pre-deprecation calibration runbook
 
 Before deleting SMG, every routing-latency metric in the slim-design
