@@ -181,8 +181,9 @@ the protobuf or gRPC runtime-version checks emitted by the generator.
 
 ## Protocol constraints
 
-- **Wire contract:** fields 1 through 13 and all enum values in
-  `proto/load_monitor.proto` match the canonical Router IDL.
+- **Wire contract:** fields 1 through 21 and all enum values in
+  `proto/load_monitor.proto` match the canonical Router IDL. Step 3 pressure
+  fields 14 through 21 are optional so a new Router can accept older reporters.
 - **`Worker.worker_addr`:** normalize the registration HTTP request origin to
   `scheme://host:port`; never read `Forwarded` or `X-Forwarded-*`.
 - **`RankLoad.snapshot_time_unix_ms`:** prefer
@@ -191,6 +192,11 @@ the protobuf or gRPC runtime-version checks emitted by the generator.
 - **Latest-wins merging:** for repeated snapshots of the same DP rank, keep the
   newer timestamp. When timestamps are equal, use the complete raw metrics
   from the current sample.
+- **Pressure metrics:** the reporter forwards Scheduler gauges
+  (`num_active_tokens` and Decode queue counts) and cumulative counters
+  (Prefill work/busy time and Decode step/time). It does not estimate queue
+  time or throughput; the Router derives those values from consecutive reports
+  from the same source.
 - **Status logic:**
   - `HEALTHY`: every rank satisfies
     `report_time - snapshot_time <= snapshot_stale_after_ms`.
