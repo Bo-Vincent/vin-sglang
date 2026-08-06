@@ -3,6 +3,7 @@
 
 use crate::config::Config;
 
+use crate::load_monitor::LoadMonitor;
 use crate::policies::active_load::ActiveLoadRegistry;
 use crate::policies::kv_events::BlockSizeOracle;
 use crate::policies::PolicyRegistry;
@@ -28,6 +29,7 @@ pub struct AppContext {
     /// (active_load gauge + stale_requests_total), and PD resolver
     /// (decode_affinity_total).
     pub metrics: Arc<MetricsRegistry>,
+    pub load_monitor: Arc<LoadMonitor>,
     pub prefix_index: Option<Arc<sgl_kv_indexer::GrpcPrefixIndex>>,
     pub block_size_oracle: Arc<BlockSizeOracle>,
     ready: AtomicBool,
@@ -86,6 +88,7 @@ impl AppContext {
             policies,
             active_load,
             metrics,
+            load_monitor: Arc::new(LoadMonitor::disabled()),
             prefix_index: None,
             block_size_oracle: BlockSizeOracle::new(),
             ready: AtomicBool::new(false),
@@ -139,6 +142,7 @@ impl AppContext {
             policies: Arc::new(PolicyRegistry::default()),
             active_load: ActiveLoadRegistry::with_defaults(),
             metrics: MetricsRegistry::new(),
+            load_monitor: Arc::new(LoadMonitor::disabled()),
             prefix_index: None,
             block_size_oracle: BlockSizeOracle::new(),
             ready: AtomicBool::new(false),
