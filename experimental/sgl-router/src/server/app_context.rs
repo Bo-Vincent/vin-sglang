@@ -34,6 +34,8 @@ pub struct AppContext {
     pub prefix_index: Option<Arc<sgl_kv_indexer::GrpcPrefixIndex>>,
     pub block_size_oracle: Arc<BlockSizeOracle>,
     pub load_monitor: Arc<LoadMonitor>,
+    pub prefix_index: Option<Arc<dyn sgl_kv_indexer::PrefixIndex>>,
+    pub block_size_oracle: Arc<BlockSizeOracle>,
     ready: AtomicBool,
 }
 
@@ -89,6 +91,8 @@ impl AppContext {
             prefix_index: None,
             block_size_oracle: BlockSizeOracle::new(),
             load_monitor: Arc::new(LoadMonitor::disabled()),
+            prefix_index: None,
+            block_size_oracle: BlockSizeOracle::new(),
             ready: AtomicBool::new(false),
         }
     }
@@ -140,6 +144,8 @@ impl AppContext {
             prefix_index: None,
             block_size_oracle: BlockSizeOracle::new(),
             load_monitor: Arc::new(LoadMonitor::disabled()),
+            prefix_index: None,
+            block_size_oracle: BlockSizeOracle::new(),
             ready: AtomicBool::new(false),
         }
     }
