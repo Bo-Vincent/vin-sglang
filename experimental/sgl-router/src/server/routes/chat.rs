@@ -2,11 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::discovery::{ModelId, WorkerMode};
-use crate::policies::admission::{resolve_prefill, CandidateRange};
+use crate::policies::admission::{resolve_cache_candidates, resolve_prefill, CandidateRange};
 use crate::policies::kv_events::{compute_block_hashes, compute_block_hashes_bigram};
 use crate::policies::registry::{PdPoolResolver, PdResolveError};
 use crate::policies::{
-    request_tokens_for, ExternalPrefixSignal, PrefillProposal, RequestTokens, SelectionContext,
+    request_tokens_for, ExternalPrefixSignal, Policy, PrefillProposal, RequestTokens,
+    SelectionContext,
 };
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
@@ -182,22 +183,16 @@ pub async fn chat_completions(
                 compute_block_hashes_bigram(&tokens.ids, block_size as usize)
             } else {
                 compute_block_hashes(&tokens.ids, block_size as usize)
-            };
+            }
+            .into_iter()
+            .map(|hash| hash.to_string())
+            .collect::<Vec<_>>();
             let query_blocks = hashes.len();
-            let outcome = if hashes.is_empty() {
-                sgl_kv_indexer::PrefixOutcome::Empty
-            } else {
-                resolve_prefix_query(index.match_prefix(hashes).await, &model_str)?
-            };
             Some(ExternalPrefixSignal {
-                outcome,
+                outcome: index.match_prefix(hashes).await,
                 query_blocks,
             })
         }
-        (Some(_), _, _) => Some(ExternalPrefixSignal {
-            outcome: sgl_kv_indexer::PrefixOutcome::Empty,
-            query_blocks: 0,
-        }),
         _ => None,
     };
 
@@ -238,21 +233,44 @@ pub async fn chat_completions(
         selection_ctx = selection_ctx.with_load_snapshot(snapshot);
     }
     let worker = if let Some(snapshot) = load_snapshot.as_ref() {
-        let PrefillProposal::Pair(proposal) = policy
+        let proposal = policy
             .propose_prefill(&workers, &selection_ctx)
             .ok_or_else(|| ApiError::PolicySelectionFailed {
                 model: model_str.clone(),
             })?;
-        let proposal_kind = proposal.kind;
-        let decision = resolve_prefill(
-            &CandidateRange::global(&workers),
-            &proposal,
-            request_input_tokens,
-            snapshot,
-        )
-        .ok_or_else(|| ApiError::PolicySelectionFailed {
-            model: model_str.clone(),
-        })?;
+        let (proposal_kind, decision) = match proposal {
+            PrefillProposal::Pair(proposal) => {
+                let proposal_kind = proposal.kind;
+                let decision = resolve_prefill(
+                    &CandidateRange::global(&workers),
+                    &proposal,
+                    request_input_tokens,
+                    snapshot,
+                )
+                .ok_or_else(|| ApiError::PolicySelectionFailed {
+                    model: model_str.clone(),
+                })?;
+                (proposal_kind, decision)
+            }
+            PrefillProposal::CacheCandidates(proposal) => {
+                let decision = resolve_cache_candidates(&proposal, request_input_tokens, snapshot)
+                    .or_else(|| {
+                        let fallback =
+                            crate::policies::power_of_two::PowerOfTwoChoicesPolicy::new()
+                                .propose(&workers, &selection_ctx)?;
+                        resolve_prefill(
+                            &CandidateRange::global(&workers),
+                            &fallback,
+                            request_input_tokens,
+                            snapshot,
+                        )
+                    })
+                    .ok_or_else(|| ApiError::PolicySelectionFailed {
+                        model: model_str.clone(),
+                    })?;
+                (crate::policies::ProposalKind::CacheAffinity, decision)
+            }
+        };
         policy.commit_prefill_selection(&selection_ctx, proposal_kind, &decision.selected);
         decision.selected
     } else {

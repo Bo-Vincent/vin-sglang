@@ -205,6 +205,8 @@ async fn main() -> Result<()> {
     app_ctx.prefix_index = prefix_index;
     app_ctx.block_size_oracle = block_size_oracle;
     app_ctx.load_monitor = Arc::clone(&load_monitor);
+    app_ctx.prefix_index = prefix_index;
+    app_ctx.block_size_oracle = Arc::clone(&block_size_oracle);
     let ctx = Arc::new(app_ctx);
     ctx.mark_ready();
 
@@ -232,6 +234,7 @@ async fn main() -> Result<()> {
     server_result
 }
 
+/// Waits for either Unix termination signal and logs the selected cause.
 async fn shutdown_signal(mut sigterm: Signal, mut sigint: Signal) {
     tokio::select! {
         _ = sigterm.recv() => tracing::info!("got SIGTERM, shutting down"),
@@ -242,6 +245,7 @@ async fn shutdown_signal(mut sigterm: Signal, mut sigint: Signal) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
 
     #[tokio::test]
     async fn install_signal_handlers_returns_both() {

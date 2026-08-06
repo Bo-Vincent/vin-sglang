@@ -4,6 +4,7 @@
 use crate::config::{Config, ModelConfig, PolicyKind};
 use crate::discovery::ModelId;
 use crate::policies::{
+    cache_aware::CacheAwarePolicy,
     cache_aware_zmq::CacheAwareZmqPolicy,
     kv_events::{BlockSizeOracle, HashTree},
     load_based::LoadBasedPolicy,
@@ -33,7 +34,8 @@ fn build_sticky_fallback(kind: PolicyKind) -> Arc<dyn Policy> {
         PolicyKind::Random => Arc::new(RandomPolicy::new()),
         PolicyKind::PowerOfTwo => Arc::new(PowerOfTwoChoicesPolicy::new()),
         PolicyKind::LoadBased => Arc::new(LoadBasedPolicy::new()),
-        PolicyKind::CacheAwareZmq
+        PolicyKind::CacheAware
+        | PolicyKind::CacheAwareZmq
         | PolicyKind::SessionAware
         | PolicyKind::Overloaded
         | PolicyKind::Sticky
@@ -110,6 +112,9 @@ fn build_kind(
         PolicyKind::Random => Arc::new(RandomPolicy::new()),
         PolicyKind::PowerOfTwo => Arc::new(PowerOfTwoChoicesPolicy::new()),
         PolicyKind::SessionAware => Arc::new(SessionAwarePolicy::new(
+            model.affinity.clone().unwrap_or_default(),
+        )),
+        PolicyKind::CacheAware => Arc::new(CacheAwarePolicy::new(
             model.affinity.clone().unwrap_or_default(),
         )),
         PolicyKind::LoadBased => Arc::new(LoadBasedPolicy::new()),
@@ -196,6 +201,9 @@ pub fn build_policy_kind_only(kind: PolicyKind) -> Result<Arc<dyn Policy>> {
         PolicyKind::Random => Arc::new(RandomPolicy::new()),
         PolicyKind::PowerOfTwo => Arc::new(PowerOfTwoChoicesPolicy::new()),
         PolicyKind::SessionAware => Arc::new(SessionAwarePolicy::new(
+            crate::config::AffinityConfig::default(),
+        )),
+        PolicyKind::CacheAware => Arc::new(CacheAwarePolicy::new(
             crate::config::AffinityConfig::default(),
         )),
         PolicyKind::LoadBased => Arc::new(LoadBasedPolicy::new()),
@@ -401,6 +409,7 @@ mod tests {
             PolicyKind::LoadBased,
             PolicyKind::CacheAwareZmq,
             PolicyKind::SessionAware,
+            PolicyKind::CacheAware,
             PolicyKind::Sticky,
             // INVERTED (was asserted is_err): the `not_wired_yet` refusal it
             // pinned was a temporary state, not the contract. PLAN requires

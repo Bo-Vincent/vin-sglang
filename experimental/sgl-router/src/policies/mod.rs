@@ -3,6 +3,7 @@
 
 pub mod active_load;
 pub mod admission;
+pub mod cache_aware;
 pub mod cache_aware_zmq;
 pub mod factory;
 pub mod kv_events;
@@ -253,6 +254,9 @@ impl<'a> SelectionContext<'a> {
         external_prefix: Option<&'a ExternalPrefixSignal>,
     ) -> Self {
         self.external_prefix = external_prefix;
+        self
+    }
+
     pub fn with_session_id(mut self, session_id: Option<&'a str>) -> Self {
         self.session_id = session_id;
         self
@@ -303,6 +307,7 @@ impl<'a> SelectionContext<'a> {
 
     pub fn external_prefix(&self) -> Option<&ExternalPrefixSignal> {
         self.external_prefix
+    }
     pub fn session_id(&self) -> Option<&str> {
         self.session_id
     }
@@ -338,14 +343,40 @@ pub struct SelectionProposal {
 }
 
 #[derive(Clone)]
+pub struct CacheCandidate {
+    pub worker: Arc<Worker>,
+    pub matched_prefix_tokens: u64,
+    pub uncached_tokens: u64,
+    pub candidate_range_id: String,
+    pub max_pending_prefill_tokens: Option<u64>,
+}
+
+#[derive(Clone)]
+pub struct CacheCandidateProposal {
+    pub candidates: Vec<CacheCandidate>,
+    pub cache_switch_margin_tokens: u64,
+    pub pressure_abs_threshold_tokens: u64,
+    pub pressure_rel_threshold: f64,
+}
+
+#[derive(Clone)]
 pub enum PrefillProposal {
     Pair(SelectionProposal),
+    CacheCandidates(CacheCandidateProposal),
 }
 
 impl PrefillProposal {
     pub fn with_eligible_workers(self, workers: Vec<Arc<Worker>>) -> Self {
         match self {
             Self::Pair(proposal) => Self::Pair(proposal.with_eligible_workers(workers)),
+            Self::CacheCandidates(mut proposal) => {
+                proposal.candidates.retain(|candidate| {
+                    workers
+                        .iter()
+                        .any(|worker| worker.id == candidate.worker.id)
+                });
+                Self::CacheCandidates(proposal)
+            }
         }
     }
 }
@@ -392,6 +423,7 @@ pub enum ProposalKind {
     Generic,
     PowerOfTwo,
     SessionAffinity,
+    CacheAffinity,
     Score,
 }
 
@@ -524,7 +556,10 @@ mod tests {
     use crate::config::AffinityConfig;
     use crate::discovery::{WorkerId, WorkerMode, WorkerSpec};
     use crate::load_monitor::{AggregateLoad, Freshness, LoadMonitorSnapshot, WorkerSnapshot};
-    use crate::policies::admission::{resolve_prefill, CandidateRange, DecisionReason};
+    use crate::policies::admission::{
+        resolve_cache_candidates, resolve_prefill, CandidateRange, DecisionReason,
+    };
+    use crate::policies::cache_aware::CacheAwarePolicy;
     use crate::policies::power_of_two::PowerOfTwoChoicesPolicy;
     use crate::policies::session_aware::SessionAwarePolicy;
 
@@ -609,7 +644,9 @@ mod tests {
             .propose_prefill(&workers, &ctx)
             .expect("P2 must produce a prefill proposal");
 
-        let PrefillProposal::Pair(pair) = proposal;
+        let PrefillProposal::Pair(pair) = proposal else {
+            panic!("P2 must retain pair semantics");
+        };
         assert_eq!(pair.kind, ProposalKind::PowerOfTwo);
         assert!(pair.backup.is_some());
     }
@@ -762,6 +799,248 @@ mod tests {
             .expect("both candidates fit capacity");
 
         assert_eq!(decision.reason, DecisionReason::BackupPressureGuard);
+    }
+
+    #[test]
+    fn cache_candidates_keep_bounded_target_specific_uncached_work() {
+        let model = ModelId("model".into());
+        let hot = worker("hot");
+        let warm = worker("warm");
+        let workers = vec![Arc::clone(&hot), Arc::clone(&warm)];
+        let signal = ExternalPrefixSignal {
+            outcome: sgl_kv_indexer::PrefixOutcome::Matched {
+                matches: vec![
+                    sgl_kv_indexer::PrefixMatch {
+                        address: "http://gone:30000".into(),
+                        matched_prefix_blocks: 8,
+                        worker_id: "gone".into(),
+                    },
+                    sgl_kv_indexer::PrefixMatch {
+                        address: hot.url.clone(),
+                        matched_prefix_blocks: 6,
+                        worker_id: "hot".into(),
+                    },
+                    sgl_kv_indexer::PrefixMatch {
+                        address: warm.url.clone(),
+                        matched_prefix_blocks: 4,
+                        worker_id: "warm".into(),
+                    },
+                ],
+                best_prefix_blocks: 8,
+            },
+            query_blocks: 8,
+        };
+        let ctx = SelectionContext::new(&model, None)
+            .with_input_tokens(8_000)
+            .with_external_prefix(Some(&signal));
+        let policy = CacheAwarePolicy::new(AffinityConfig {
+            cache_candidate_min_workers: 2,
+            cache_candidate_ratio: 0.0,
+            cache_candidate_max_workers: 2,
+            ..Default::default()
+        });
+
+        let PrefillProposal::CacheCandidates(proposal) = policy
+            .propose_prefill(&workers, &ctx)
+            .expect("routable matches must produce cache candidates")
+        else {
+            panic!("cache hits must retain candidate-set semantics");
+        };
+
+        assert_eq!(proposal.candidates.len(), 2);
+        assert_eq!(proposal.candidates[0].worker.id, hot.id);
+        assert_eq!(proposal.candidates[0].matched_prefix_tokens, 6_000);
+        assert_eq!(proposal.candidates[0].uncached_tokens, 2_000);
+        assert_eq!(proposal.candidates[1].worker.id, warm.id);
+        assert_eq!(proposal.candidates[1].matched_prefix_tokens, 4_000);
+        assert_eq!(proposal.candidates[1].uncached_tokens, 4_000);
+    }
+
+    #[test]
+    fn cache_candidate_bound_keeps_the_best_k_from_a_large_match_set() {
+        let model = ModelId("model".into());
+        let workers: Vec<Arc<Worker>> = (0..64)
+            .map(|index| worker(&format!("w{index:02}")))
+            .collect();
+        let matches = workers
+            .iter()
+            .enumerate()
+            .map(|(index, worker)| sgl_kv_indexer::PrefixMatch {
+                address: worker.url.clone(),
+                matched_prefix_blocks: (index + 1) as u32,
+                worker_id: worker.id.0.clone(),
+            })
+            .collect();
+        let signal = ExternalPrefixSignal {
+            outcome: sgl_kv_indexer::PrefixOutcome::Matched {
+                matches,
+                best_prefix_blocks: 64,
+            },
+            query_blocks: 64,
+        };
+        let ctx = SelectionContext::new(&model, None)
+            .with_input_tokens(64_000)
+            .with_external_prefix(Some(&signal));
+        let policy = CacheAwarePolicy::new(AffinityConfig {
+            cache_affinity_min_matched_tokens: Some(0),
+            cache_candidate_min_workers: 4,
+            cache_candidate_ratio: 0.0,
+            cache_candidate_max_workers: 4,
+            ..Default::default()
+        });
+
+        let PrefillProposal::CacheCandidates(proposal) = policy
+            .propose_prefill(&workers, &ctx)
+            .expect("the bounded best candidates must survive")
+        else {
+            panic!("cache hits must retain candidate-set semantics");
+        };
+
+        assert_eq!(proposal.candidates.len(), 4);
+        assert_eq!(
+            proposal
+                .candidates
+                .iter()
+                .map(|candidate| candidate.matched_prefix_tokens)
+                .collect::<Vec<_>>(),
+            vec![64_000, 63_000, 62_000, 61_000]
+        );
+    }
+
+    fn cache_candidate(
+        worker: &Arc<Worker>,
+        matched_prefix_tokens: u64,
+        uncached_tokens: u64,
+        max_pending_prefill_tokens: Option<u64>,
+    ) -> CacheCandidate {
+        CacheCandidate {
+            worker: Arc::clone(worker),
+            matched_prefix_tokens,
+            uncached_tokens,
+            candidate_range_id: "global".into(),
+            max_pending_prefill_tokens,
+        }
+    }
+
+    #[test]
+    fn cache_tournament_skips_inadmissible_matches_and_returns_no_backup() {
+        let full = worker("full");
+        let winner = worker("winner");
+        let proposal = CacheCandidateProposal {
+            candidates: vec![
+                cache_candidate(&full, 90, 10, None),
+                cache_candidate(&winner, 70, 30, None),
+            ],
+            cache_switch_margin_tokens: 16,
+            pressure_abs_threshold_tokens: 1_024,
+            pressure_rel_threshold: 1.5,
+        };
+        let loads = snapshot(&[
+            (
+                &full,
+                AggregateLoad {
+                    num_running_reqs: 8,
+                    max_running_requests: 8,
+                    max_total_num_tokens: 10_000,
+                    ..AggregateLoad::default()
+                },
+            ),
+            (
+                &winner,
+                AggregateLoad {
+                    max_running_requests: 8,
+                    max_total_num_tokens: 10_000,
+                    ..AggregateLoad::default()
+                },
+            ),
+        ]);
+
+        let decision = resolve_cache_candidates(&proposal, 100, &loads)
+            .expect("a later admitted cache match must survive");
+
+        assert_eq!(decision.selected.id, winner.id);
+        assert_eq!(decision.primary.id, winner.id);
+        assert!(decision.backup.is_none());
+        assert_eq!(decision.reason, DecisionReason::CacheCandidate);
+    }
+
+    #[test]
+    fn cache_tournament_pressure_vetoes_a_small_cache_gain() {
+        let congested = worker("congested");
+        let idle = worker("idle");
+        let proposal = CacheCandidateProposal {
+            candidates: vec![
+                cache_candidate(&congested, 90, 10, None),
+                cache_candidate(&idle, 80, 20, None),
+            ],
+            cache_switch_margin_tokens: 32,
+            pressure_abs_threshold_tokens: 100,
+            pressure_rel_threshold: 1.5,
+        };
+        let loads = snapshot(&[
+            (
+                &congested,
+                AggregateLoad {
+                    num_waiting_uncached_tokens: 1_000,
+                    max_running_requests: 8,
+                    max_total_num_tokens: 10_000,
+                    ..AggregateLoad::default()
+                },
+            ),
+            (
+                &idle,
+                AggregateLoad {
+                    num_waiting_uncached_tokens: 10,
+                    max_running_requests: 8,
+                    max_total_num_tokens: 10_000,
+                    ..AggregateLoad::default()
+                },
+            ),
+        ]);
+
+        let decision = resolve_cache_candidates(&proposal, 100, &loads).unwrap();
+        assert_eq!(decision.selected.id, idle.id);
+    }
+
+    #[test]
+    fn cache_tournament_keeps_a_material_cache_gain_despite_pressure() {
+        let hot = worker("hot");
+        let idle = worker("idle");
+        let proposal = CacheCandidateProposal {
+            candidates: vec![
+                cache_candidate(&hot, 90, 10, None),
+                cache_candidate(&idle, 20, 80, None),
+            ],
+            cache_switch_margin_tokens: 32,
+            pressure_abs_threshold_tokens: 100,
+            pressure_rel_threshold: 1.5,
+        };
+        let loads = snapshot(&[
+            (
+                &hot,
+                AggregateLoad {
+                    num_waiting_uncached_tokens: 1_000,
+                    max_running_requests: 8,
+                    max_total_num_tokens: 10_000,
+                    ..AggregateLoad::default()
+                },
+            ),
+            (
+                &idle,
+                AggregateLoad {
+                    num_waiting_uncached_tokens: 10,
+                    max_running_requests: 8,
+                    max_total_num_tokens: 10_000,
+                    ..AggregateLoad::default()
+                },
+            ),
+        ]);
+
+        let decision = resolve_cache_candidates(&proposal, 100, &loads).unwrap();
+        assert_eq!(
+            decision.selected.id, hot.id,
+            "pressure may break a near tie, but must not erase a material cache-work gain"
+        );
     }
 
     #[test]

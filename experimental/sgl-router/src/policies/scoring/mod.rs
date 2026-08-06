@@ -312,21 +312,29 @@ impl Policy for Pipeline {
     /// `None` when an [`OnEmpty::Hold`] filter found nobody eligible -- the
     /// caller turns that into a refusal rather than routing anyway.
     fn select(&self, workers: &[Arc<Worker>], ctx: &SelectionContext<'_>) -> Option<Arc<Worker>> {
-        let PrefillProposal::Pair(proposal) = self.propose_prefill_filtered(workers, ctx)?;
-        let eligible = proposal.eligible_workers.as_deref().unwrap_or(workers);
-        let selected = if eligible
-            .iter()
-            .any(|worker| worker.id == proposal.primary.id)
-        {
-            proposal.primary
-        } else {
-            proposal
-                .backup
-                .filter(|backup| eligible.iter().any(|worker| worker.id == backup.id))
-                .or_else(|| eligible.first().cloned())?
+        let (proposal_kind, selected) = match self.propose_prefill_filtered(workers, ctx)? {
+            PrefillProposal::Pair(proposal) => {
+                let eligible = proposal.eligible_workers.as_deref().unwrap_or(workers);
+                let selected = if eligible
+                    .iter()
+                    .any(|worker| worker.id == proposal.primary.id)
+                {
+                    proposal.primary
+                } else {
+                    proposal
+                        .backup
+                        .filter(|backup| eligible.iter().any(|worker| worker.id == backup.id))
+                        .or_else(|| eligible.first().cloned())?
+                };
+                (proposal.kind, selected)
+            }
+            PrefillProposal::CacheCandidates(proposal) => {
+                let selected = proposal.candidates.into_iter().next()?.worker;
+                (crate::policies::ProposalKind::CacheAffinity, selected)
+            }
         };
         self.inner
-            .commit_prefill_selection(ctx, proposal.kind, &selected);
+            .commit_prefill_selection(ctx, proposal_kind, &selected);
         Some(selected)
     }
 
@@ -335,8 +343,16 @@ impl Policy for Pipeline {
         workers: &[Arc<Worker>],
         ctx: &SelectionContext<'_>,
     ) -> Option<SelectionProposal> {
-        let PrefillProposal::Pair(proposal) = self.propose_prefill_filtered(workers, ctx)?;
-        Some(proposal)
+        match self.propose_prefill_filtered(workers, ctx)? {
+            PrefillProposal::Pair(proposal) => Some(proposal),
+            PrefillProposal::CacheCandidates(proposal) => {
+                let candidate = proposal.candidates.into_iter().next()?;
+                Some(
+                    SelectionProposal::primary(candidate.worker)
+                        .with_kind(crate::policies::ProposalKind::CacheAffinity),
+                )
+            }
+        }
     }
 
     fn propose_prefill(
@@ -796,7 +812,10 @@ mod tests {
 
         let PrefillProposal::Pair(proposal) = pipeline
             .propose_prefill(&workers, &ctx)
-            .expect("filtered session proposal");
+            .expect("filtered session proposal")
+        else {
+            panic!("Session-Aware must retain pair semantics");
+        };
         assert_eq!(
             proposal.kind,
             crate::policies::ProposalKind::SessionAffinity
