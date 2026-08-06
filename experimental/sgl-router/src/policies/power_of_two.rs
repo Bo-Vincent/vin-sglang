@@ -28,11 +28,12 @@ impl Policy for PowerOfTwoChoicesPolicy {
                 if j >= i {
                     j += 1;
                 }
-                Some(ordered_pair(&workers[i], &workers[j], ctx).0)
+                Some(select_lower_pressure(&workers[i], &workers[j], ctx))
             }
         }
     }
 
+    /// 返回同一轮采样的 primary 和 backup。
     fn propose(
         &self,
         workers: &[Arc<Worker>],
@@ -59,6 +60,14 @@ impl Policy for PowerOfTwoChoicesPolicy {
     fn uses_shared_prefill_admission(&self) -> bool {
         true
     }
+}
+
+fn select_lower_pressure(
+    left: &Arc<Worker>,
+    right: &Arc<Worker>,
+    ctx: &SelectionContext<'_>,
+) -> Arc<Worker> {
+    ordered_pair(left, right, ctx).0
 }
 
 fn ordered_pair(

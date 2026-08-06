@@ -1,4 +1,5 @@
-use std::num::NonZeroU32;
+use serde::Deserialize;
+use std::num::{NonZeroU16, NonZeroU32};
 
 /// In-memory router configuration, built from CLI flags by
 /// [`crate::config::cli::Cli::into_config`] and validated by
@@ -71,7 +72,8 @@ impl Default for ActiveLoadConfig {
 ///
 /// Accepted on the CLI (`--policy`) as `round_robin` / `random` /
 /// `power_of_two` / `load_based` / `prefix_cache` / `fused_score` /
-/// `session_aware` / `cache_aware` / `cache_aware_zmq` / `sticky`.
+/// `score_policy` / `session_aware` / `cache_aware` / `cache_aware_zmq` /
+/// `sticky`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 pub enum PolicyKind {
     #[default]
@@ -81,12 +83,6 @@ pub enum PolicyKind {
     Random,
     #[value(name = "power_of_two")]
     PowerOfTwo,
-    /// Session affinity with shared admission and pressure guards.
-    #[value(name = "session_aware")]
-    SessionAware,
-    /// Prefix affinity from the external KV Indexer.
-    #[value(name = "cache_aware")]
-    CacheAware,
     /// Selects the currently least-loaded worker.
     #[value(name = "load_based")]
     LoadBased,
@@ -101,6 +97,15 @@ pub enum PolicyKind {
     /// contributes, so the terms trade off continuously.
     #[value(name = "fused_score")]
     FusedScore,
+    /// 使用通用 score 组合器的顶层 policy。
+    #[value(name = "score_policy")]
+    ScorePolicy,
+    /// 基于 Session-ID 的 affinity policy。
+    #[value(name = "session_aware")]
+    SessionAware,
+    /// 使用外部 Indexer 信号的 Cache affinity policy。
+    #[value(name = "cache_aware")]
+    CacheAware,
     /// Capacity as a hard constraint: reject any worker already carrying
     /// `--max-in-flight` requests. A `--filter` entry, not a `--policy`:
     /// standalone it can only fall back on the selector's load tiebreak.
@@ -118,6 +123,71 @@ pub enum PolicyKind {
     /// `ModelConfig::sticky`.
     #[value(name = "sticky")]
     Sticky,
+}
+
+/// PD 请求的 Decode worker 选择策略。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum DecodePolicyKind {
+    #[default]
+    #[value(name = "power_of_two")]
+    PowerOfTwo,
+    #[value(name = "legacy_host_affinity")]
+    LegacyHostAffinity,
+}
+
+/// 静态 Bucket 的角色。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BucketStage {
+    Prefill,
+    Decode,
+}
+
+/// Bucket 的 SLO 选择语义。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SloBucketPolicy {
+    #[default]
+    Disabled,
+    BestEffort,
+    SloFirst,
+}
+
+/// Router 启动时加载的静态 Bucket 配置。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BucketConfig {
+    pub buckets: Vec<BucketSpec>,
+    #[serde(default)]
+    pub ttft_slo_policy: SloBucketPolicy,
+    #[serde(default)]
+    pub tps_slo_policy: SloBucketPolicy,
+}
+
+/// 一个角色化 Runtime 能力池；`rank` 越小优先级越高。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BucketSpec {
+    pub id: String,
+    pub stage: BucketStage,
+    pub rank: u32,
+    pub worker_ids: Vec<String>,
+    #[serde(default)]
+    pub min_extend_tokens: Option<u64>,
+    #[serde(default)]
+    pub max_extend_tokens: Option<u64>,
+    #[serde(default)]
+    pub min_sequence_tokens: Option<u64>,
+    #[serde(default)]
+    pub max_sequence_tokens: Option<u64>,
+    #[serde(default)]
+    pub max_context_tokens: Option<u64>,
+    #[serde(default)]
+    pub ttft_p95_at_capacity_ms: Option<u64>,
+    #[serde(default)]
+    pub tps_p05_at_capacity: Option<f64>,
+    #[serde(default)]
+    pub max_pending_prefill_tokens: Option<u64>,
 }
 
 impl std::fmt::Display for PolicyKind {
@@ -179,20 +249,22 @@ pub struct ModelConfig {
     /// is omitted. Resolved by [`crate::tokenizer::adapter::load`].
     pub tokenizer_path: String,
     pub policy: PolicyKind,
+    /// Decode pool 的独立选择策略。
+    pub decode_policy: DecodePolicyKind,
+    /// 可选静态 Bucket 配置；`None` 使用全局 domain。
+    pub bucket_config: Option<BucketConfig>,
     pub circuit_breaker: Option<CircuitBreakerConfig>,
-    /// Tuning for cache-aware routing. Ignored unless
-    /// `policy = "cache_aware_zmq"`. `None` falls back to defaults at
-    /// policy construction time.
+    /// Cache-Aware ZMQ tuning and optional external Indexer endpoint.
     pub cache_aware: Option<CacheAwareConfig>,
-    /// Shared tuning for affinity policies.
-    pub affinity: Option<AffinityConfig>,
     /// Tuning for the sticky-session policy. `Some` exactly when
     /// `policy = "sticky"` (built by [`crate::config::cli::Cli::into_config`]).
     /// The chat handler reads `sticky.header_name` to populate
     /// [`crate::policies::SelectionContext::routing_key`].
     pub sticky: Option<StickyConfig>,
-    /// Terms the fused-score policy sums. `Some` exactly when
-    /// `policy = "fused_score"` (built by
+    /// Session-Aware / Cache-Aware 配置。
+    pub affinity: Option<AffinityConfig>,
+    /// Terms the score-composition policy sums. `Some` exactly when
+    /// `policy = "fused_score"` or `policy = "score_policy"` (built by
     /// [`crate::config::cli::Cli::into_config`]), defaulting to
     /// [`DEFAULT_FUSE`] when `--fuse` is omitted.
     pub fused: Option<Vec<FusedTerm>>,
@@ -328,20 +400,41 @@ fn default_balance_rel() -> f32 {
 /// (`x-sgl-decode-url`, `x-sgl-router-error-code`).
 pub const DEFAULT_STICKY_HEADER: &str = "x-sgl-routing-key";
 
-/// Default header for Session-Aware routing.
+/// Session-Aware 默认请求 header。
 pub const DEFAULT_SESSION_ID_HEADER: &str = "x-session-id";
+
+/// External Indexer 查询的默认 deadline。
 pub const DEFAULT_KV_INDEXER_QUERY_TIMEOUT_MS: u64 = 25;
 pub const DEFAULT_KV_INDEXER_QUERY_MAX_INFLIGHT: usize = 32;
 
+/// Session affinity 是否允许 Pressure Guard 选择 backup。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
 pub enum AffinityMode {
+    /// primary 通过 Admission 后保持 affinity。
     #[value(name = "strict")]
     Strict,
+    /// primary/backup 都准入时允许压力逃逸。
     #[default]
     #[value(name = "soft")]
     Soft,
 }
 
+/// Session affinity primary 的查找与 fallback 行为。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum SessionAffinityMode {
+    /// 只在 target Bucket 内查找。
+    #[default]
+    #[value(name = "bucket")]
+    Bucket,
+    /// 全局 primary 不可用时，用 target Bucket fallback 覆盖 Session assignment。
+    #[value(name = "global-rebind")]
+    GlobalRebind,
+    /// 全局 primary 不可用时，target Bucket fallback 不覆盖仍有效的 Session assignment。
+    #[value(name = "global-preserve")]
+    GlobalPreserve,
+}
+
+/// Session-Aware 与 Cache-Aware 的配置载体。
 #[derive(Debug, Clone)]
 pub struct AffinityConfig {
     pub session_id_header: String,
@@ -349,6 +442,7 @@ pub struct AffinityConfig {
     pub session_eviction_interval_secs: u64,
     pub stable_pair: bool,
     pub mode: AffinityMode,
+    pub session_affinity_mode: SessionAffinityMode,
     pub pressure_guard: bool,
     pub pressure_abs_threshold_tokens: u64,
     pub pressure_rel_threshold: f64,
@@ -368,9 +462,11 @@ impl Default for AffinityConfig {
             session_eviction_interval_secs: default_sticky_eviction_interval_secs(),
             stable_pair: false,
             mode: AffinityMode::Soft,
+            session_affinity_mode: SessionAffinityMode::Bucket,
             pressure_guard: true,
             pressure_abs_threshold_tokens: 1_024,
             pressure_rel_threshold: 1.5,
+            // Indexer 会截断 prefix scan，默认使用绝对 token 下限。
             cache_affinity_min_matched_tokens: Some(1_024),
             cache_affinity_min_match_ratio: None,
             cache_candidate_min_workers: 8,

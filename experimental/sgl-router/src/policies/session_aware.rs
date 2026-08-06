@@ -1,7 +1,9 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::config::{AffinityConfig, AffinityMode};
+//! Session-Aware Prefill policy。Guard 逃逸不会改写 session assignment。
+
+use crate::config::{AffinityConfig, AffinityMode, SessionAffinityMode};
 use crate::discovery::WorkerId;
 use crate::policies::active_load::{spawn_sweeper, Clock, JanitorHandle, SystemTimeClock};
 use crate::policies::admission::compare_prefill_pressure;
@@ -99,6 +101,17 @@ impl SessionAwarePolicy {
         self.state.assignments.len()
     }
 
+    fn assignment_key(&self, session_id: &str, ctx: &SelectionContext<'_>) -> String {
+        match self.config.session_affinity_mode {
+            SessionAffinityMode::Bucket => {
+                format!("{}\0{}", ctx.candidate_range_id(), session_id)
+            }
+            SessionAffinityMode::GlobalRebind | SessionAffinityMode::GlobalPreserve => {
+                session_id.to_string()
+            }
+        }
+    }
+
     fn initial_proposal(
         &self,
         workers: &[Arc<Worker>],
@@ -118,7 +131,7 @@ impl SessionAwarePolicy {
             workers,
             &primary,
             session_id,
-            "global",
+            ctx.candidate_range_id(),
             self.config.stable_pair,
             ctx,
         );
@@ -158,10 +171,11 @@ impl Policy for SessionAwarePolicy {
             return self.initial_proposal(workers, ctx);
         };
 
+        let assignment_key = self.assignment_key(session_id, ctx);
         let assigned = self
             .state
             .assignments
-            .get_mut(session_id)
+            .get_mut(&assignment_key)
             .map(|mut assignment| {
                 assignment.last_seen = self.state.clock.now();
                 assignment.worker_id.clone()
@@ -172,6 +186,7 @@ impl Policy for SessionAwarePolicy {
             }
         }
 
+        // 新 assignment 只在 Final P 产生后写入。
         self.initial_proposal(workers, ctx)
     }
 
@@ -188,7 +203,7 @@ impl Policy for SessionAwarePolicy {
             return;
         };
         self.state.assignments.insert(
-            session_id.to_string(),
+            self.assignment_key(session_id, ctx),
             Assignment {
                 worker_id: selected.id.clone(),
                 last_seen: self.state.clock.now(),
