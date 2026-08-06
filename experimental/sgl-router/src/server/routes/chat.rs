@@ -2,10 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::discovery::{ModelId, WorkerMode};
-use crate::policies::admission::{resolve_prefill, CandidateRange};
+use crate::policies::admission::{resolve_cache_candidates, resolve_prefill, CandidateRange};
+use crate::policies::kv_events::{compute_block_hashes, compute_block_hashes_bigram};
 use crate::policies::registry::{PdPoolResolver, PdResolveError};
 use crate::policies::{
-    request_tokens_for, PrefillProposal, RequestTokens, SelectionContext,
+    request_tokens_for, ExternalPrefixSignal, Policy, PrefillProposal, RequestTokens,
+    SelectionContext,
 };
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
@@ -170,6 +172,28 @@ pub async fn chat_completions(
     let request_tokens = request_value
         .as_ref()
         .and_then(|v| request_tokens_for(&ctx.tokenizers, &model_id, v));
+    let external_prefix = match (
+        ctx.prefix_index.as_ref(),
+        request_tokens.as_ref(),
+        ctx.block_size_oracle.get(),
+    ) {
+        (Some(index), Some(tokens), Some(block_size)) => {
+            let hashes = if ctx.block_size_oracle.is_bigram() {
+                compute_block_hashes_bigram(&tokens.ids, block_size as usize)
+            } else {
+                compute_block_hashes(&tokens.ids, block_size as usize)
+            }
+            .into_iter()
+            .map(|hash| hash.to_string())
+            .collect::<Vec<_>>();
+            let query_blocks = hashes.len();
+            Some(ExternalPrefixSignal {
+                outcome: index.match_prefix(hashes).await,
+                query_blocks,
+            })
+        }
+        _ => None,
+    };
 
     // Sticky-session routing key. When the sticky policy is configured,
     // read the routing key from the operator-chosen header into the
@@ -202,26 +226,50 @@ pub async fn chat_completions(
     let mut selection_ctx = SelectionContext::with_routing_key(&model_id, Some(&body), routing_key)
         .with_session_id(session_id)
         .with_input_tokens(request_input_tokens)
-        .with_request_tokens(request_tokens.as_ref().map(|t| t.ids.as_slice()));
+        .with_request_tokens(request_tokens.as_ref().map(|t| t.ids.as_slice()))
+        .with_external_prefix(external_prefix.as_ref());
     if let Some(snapshot) = load_snapshot.as_ref() {
         selection_ctx = selection_ctx.with_load_snapshot(snapshot);
     }
     let worker = if let Some(snapshot) = load_snapshot.as_ref() {
-        let PrefillProposal::Pair(proposal) = policy
+        let proposal = policy
             .propose_prefill(&workers, &selection_ctx)
             .ok_or_else(|| ApiError::PolicySelectionFailed {
                 model: model_str.clone(),
             })?;
-        let proposal_kind = proposal.kind;
-        let decision = resolve_prefill(
-            &CandidateRange::global(&workers),
-            &proposal,
-            request_input_tokens,
-            snapshot,
-        )
-        .ok_or_else(|| ApiError::PolicySelectionFailed {
-            model: model_str.clone(),
-        })?;
+        let (proposal_kind, decision) = match proposal {
+            PrefillProposal::Pair(proposal) => {
+                let proposal_kind = proposal.kind;
+                let decision = resolve_prefill(
+                    &CandidateRange::global(&workers),
+                    &proposal,
+                    request_input_tokens,
+                    snapshot,
+                )
+                .ok_or_else(|| ApiError::PolicySelectionFailed {
+                    model: model_str.clone(),
+                })?;
+                (proposal_kind, decision)
+            }
+            PrefillProposal::CacheCandidates(proposal) => {
+                let decision = resolve_cache_candidates(&proposal, request_input_tokens, snapshot)
+                    .or_else(|| {
+                        let fallback =
+                            crate::policies::power_of_two::PowerOfTwoChoicesPolicy::new()
+                                .propose(&workers, &selection_ctx)?;
+                        resolve_prefill(
+                            &CandidateRange::global(&workers),
+                            &fallback,
+                            request_input_tokens,
+                            snapshot,
+                        )
+                    })
+                    .ok_or_else(|| ApiError::PolicySelectionFailed {
+                        model: model_str.clone(),
+                    })?;
+                (crate::policies::ProposalKind::CacheAffinity, decision)
+            }
+        };
         policy.commit_prefill_selection(&selection_ctx, proposal_kind, &decision.selected);
         decision.selected
     } else {

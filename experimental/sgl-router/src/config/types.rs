@@ -92,7 +92,7 @@ impl Default for ActiveLoadConfig {
 ///
 /// Accepted on the CLI (`--policy`) as `round_robin` / `random` /
 /// `power_of_two` / `load_based` / `prefix_cache` / `fused_score` /
-/// `session_aware` / `cache_aware_zmq` / `sticky`.
+/// `session_aware` / `cache_aware` / `cache_aware_zmq` / `sticky`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 pub enum PolicyKind {
     #[default]
@@ -105,6 +105,9 @@ pub enum PolicyKind {
     /// Session affinity with shared admission and pressure guards.
     #[value(name = "session_aware")]
     SessionAware,
+    /// Prefix affinity from the external KV Indexer.
+    #[value(name = "cache_aware")]
+    CacheAware,
     /// Selects the currently least-loaded worker.
     #[value(name = "load_based")]
     LoadBased,
@@ -290,8 +293,16 @@ fn parse_fuse_weight(name: &str, raw: &str) -> Result<f32, String> {
     Ok(w)
 }
 
-/// Per-model cache-aware-ZMQ tuning.
-#[derive(Debug, Clone, Copy)]
+/// External KV Indexer query configuration.
+#[derive(Debug, Clone)]
+pub struct KvIndexerEndpointConfig {
+    pub url: String,
+    pub query_timeout_ms: u64,
+    pub query_max_inflight: usize,
+}
+
+/// Per-model cache-aware tuning.
+#[derive(Debug, Clone)]
 pub struct CacheAwareConfig {
     /// Lower bound on `matched_blocks / total_blocks` for the tree match
     /// to win the selection. Below this, the policy falls back to
@@ -307,6 +318,8 @@ pub struct CacheAwareConfig {
     /// that the absolute check is gated on. Default 1.1 — 10 % relative
     /// difference triggers re-balancing.
     pub balance_rel_threshold: f32,
+    /// Optional external Indexer used by the `cache_aware` policy.
+    pub kv_indexer_endpoint: Option<KvIndexerEndpointConfig>,
 }
 
 impl Default for CacheAwareConfig {
@@ -315,6 +328,7 @@ impl Default for CacheAwareConfig {
             cache_threshold: default_cache_threshold(),
             balance_abs_threshold: default_balance_abs(),
             balance_rel_threshold: default_balance_rel(),
+            kv_indexer_endpoint: None,
         }
     }
 }
@@ -336,6 +350,8 @@ pub const DEFAULT_STICKY_HEADER: &str = "x-sgl-routing-key";
 
 /// Default header for Session-Aware routing.
 pub const DEFAULT_SESSION_ID_HEADER: &str = "x-session-id";
+pub const DEFAULT_KV_INDEXER_QUERY_TIMEOUT_MS: u64 = 25;
+pub const DEFAULT_KV_INDEXER_QUERY_MAX_INFLIGHT: usize = 32;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
 pub enum AffinityMode {
@@ -356,6 +372,12 @@ pub struct AffinityConfig {
     pub pressure_guard: bool,
     pub pressure_abs_threshold_tokens: u64,
     pub pressure_rel_threshold: f64,
+    pub cache_affinity_min_matched_tokens: Option<u64>,
+    pub cache_affinity_min_match_ratio: Option<f64>,
+    pub cache_candidate_min_workers: usize,
+    pub cache_candidate_ratio: f64,
+    pub cache_candidate_max_workers: usize,
+    pub cache_switch_margin_tokens: u64,
 }
 
 impl Default for AffinityConfig {
@@ -369,6 +391,12 @@ impl Default for AffinityConfig {
             pressure_guard: true,
             pressure_abs_threshold_tokens: 1_024,
             pressure_rel_threshold: 1.5,
+            cache_affinity_min_matched_tokens: Some(1_024),
+            cache_affinity_min_match_ratio: None,
+            cache_candidate_min_workers: 8,
+            cache_candidate_ratio: 0.05,
+            cache_candidate_max_workers: 32,
+            cache_switch_margin_tokens: 1_024,
         }
     }
 }

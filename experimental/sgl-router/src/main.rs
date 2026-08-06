@@ -104,6 +104,20 @@ async fn main() -> Result<()> {
     );
 
     let registry = Arc::new(sgl_router::workers::WorkerRegistry::default());
+    let prefix_index = cfg
+        .model
+        .cache_aware
+        .as_ref()
+        .and_then(|cache| cache.kv_indexer_endpoint.as_ref())
+        .map(|indexer| {
+            Arc::new(sgl_kv_indexer::GrpcPrefixIndex::new(
+                sgl_kv_indexer::PrefixIndexConfig {
+                    endpoint: indexer.url.clone(),
+                    query_deadline: std::time::Duration::from_millis(indexer.query_timeout_ms),
+                    max_inflight: indexer.query_max_inflight,
+                },
+            ))
+        })
 
     // Build the KV-event index up front so the cache-aware-zmq policy can
     // share its `HashTree` handle + `BlockSizeOracle`. When no model uses
@@ -179,6 +193,8 @@ async fn main() -> Result<()> {
         active_load,
     );
     app_ctx.load_monitor = Arc::clone(&load_monitor);
+    app_ctx.prefix_index = prefix_index;
+    app_ctx.block_size_oracle = Arc::clone(&block_size_oracle);
     let ctx = Arc::new(app_ctx);
     ctx.mark_ready();
 
@@ -206,6 +222,7 @@ async fn main() -> Result<()> {
     server_result
 }
 
+/// Waits for either Unix termination signal and logs the selected cause.
 async fn shutdown_signal(mut sigterm: Signal, mut sigint: Signal) {
     tokio::select! {
         _ = sigterm.recv() => tracing::info!("got SIGTERM, shutting down"),
@@ -216,6 +233,7 @@ async fn shutdown_signal(mut sigterm: Signal, mut sigint: Signal) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
 
     #[tokio::test]
     async fn install_signal_handlers_returns_both() {

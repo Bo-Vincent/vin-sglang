@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::load_monitor::{AggregateLoad, Freshness, LoadMonitorSnapshot};
-use crate::policies::{GuardHints, SelectionProposal};
+use crate::policies::{CacheCandidate, CacheCandidateProposal, GuardHints, SelectionProposal};
 use crate::workers::Worker;
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -27,9 +27,53 @@ impl<'a> CandidateRange<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DecisionReason {
     Primary,
+    CacheCandidate,
     BackupPrimaryAdmission,
     BackupPressureGuard,
     RangeFallback,
+}
+
+pub fn resolve_cache_candidates(
+    proposal: &CacheCandidateProposal,
+    request_input_tokens: u64,
+    snapshot: &LoadMonitorSnapshot,
+) -> Option<FinalDecision> {
+    let loads = FreshLoadLookup::new(
+        Some(snapshot),
+        proposal
+            .candidates
+            .iter()
+            .map(|candidate| &candidate.worker),
+    );
+    let admitted: Vec<&CacheCandidate> = proposal
+        .candidates
+        .iter()
+        .filter(|candidate| is_cache_candidate_admitted(candidate, request_input_tokens, &loads))
+        .collect();
+    let work_floor = admitted
+        .iter()
+        .copied()
+        .min_by_key(|candidate| candidate.uncached_tokens)?;
+    let near_tie_ceiling = work_floor
+        .uncached_tokens
+        .saturating_add(proposal.cache_switch_margin_tokens);
+    let mut winner = work_floor;
+    for candidate in admitted {
+        if candidate.uncached_tokens > near_tie_ceiling {
+            continue;
+        }
+        if compare_cache_candidates(winner, candidate, proposal, &loads).is_gt() {
+            winner = candidate;
+        }
+    }
+    Some(FinalDecision {
+        selected: Arc::clone(&winner.worker),
+        primary: Arc::clone(&winner.worker),
+        backup: None,
+        reason: DecisionReason::CacheCandidate,
+        candidate_range_id: winner.candidate_range_id.clone(),
+        load_snapshot_version: snapshot.version,
+    })
 }
 
 #[derive(Clone)]
@@ -129,6 +173,82 @@ fn is_prefill_admitted_with_load(
         })
 }
 
+fn is_cache_candidate_admitted(
+    candidate: &CacheCandidate,
+    request_input_tokens: u64,
+    loads: &FreshLoadLookup<'_>,
+) -> bool {
+    let Some(load) = loads.get(&candidate.worker.id) else {
+        return true;
+    };
+    load.num_running_reqs.saturating_add(1) <= load.max_running_requests
+        && load.num_total_tokens.saturating_add(request_input_tokens) <= load.max_total_num_tokens
+        && candidate.max_pending_prefill_tokens.is_none_or(|limit| {
+            load.num_waiting_uncached_tokens
+                .saturating_add(candidate.uncached_tokens)
+                <= limit
+        })
+}
+
+fn compare_cache_candidates(
+    left: &CacheCandidate,
+    right: &CacheCandidate,
+    proposal: &CacheCandidateProposal,
+    loads: &FreshLoadLookup<'_>,
+) -> Ordering {
+    let work_delta = left.uncached_tokens.abs_diff(right.uncached_tokens);
+    if work_delta > proposal.cache_switch_margin_tokens {
+        return left
+            .uncached_tokens
+            .cmp(&right.uncached_tokens)
+            .then_with(|| loads.compare_prefill_pressure(&left.worker, &right.worker))
+            .then_with(|| left.worker.id.0.cmp(&right.worker.id.0));
+    }
+
+    if materially_more_pressured(
+        &left.worker,
+        &right.worker,
+        proposal.pressure_abs_threshold_tokens,
+        proposal.pressure_rel_threshold,
+        loads,
+    ) {
+        return Ordering::Greater;
+    }
+    if materially_more_pressured(
+        &right.worker,
+        &left.worker,
+        proposal.pressure_abs_threshold_tokens,
+        proposal.pressure_rel_threshold,
+        loads,
+    ) {
+        return Ordering::Less;
+    }
+
+    left.uncached_tokens
+        .cmp(&right.uncached_tokens)
+        .then_with(|| loads.compare_prefill_pressure(&left.worker, &right.worker))
+        .then_with(|| left.worker.id.0.cmp(&right.worker.id.0))
+}
+
+fn materially_more_pressured(
+    candidate: &Arc<Worker>,
+    other: &Arc<Worker>,
+    absolute_threshold: u64,
+    relative_threshold: f64,
+    loads: &FreshLoadLookup<'_>,
+) -> bool {
+    let (Some(candidate_load), Some(other_load)) = (
+        loads.comparable_get(&candidate.id),
+        loads.comparable_get(&other.id),
+    ) else {
+        return false;
+    };
+    let candidate_pressure = candidate_load.num_waiting_uncached_tokens;
+    let other_pressure = other_load.num_waiting_uncached_tokens;
+    candidate_pressure.saturating_sub(other_pressure) > absolute_threshold
+        && candidate_pressure as f64 > other_pressure as f64 * relative_threshold
+}
+
 pub(crate) struct FreshLoadLookup<'a> {
     by_worker_id: HashMap<&'a str, &'a AggregateLoad>,
     local_active_by_worker_id: HashMap<String, usize>,
@@ -171,7 +291,10 @@ impl<'a> FreshLoadLookup<'a> {
         self.by_worker_id.get(worker_id.0.as_str()).copied()
     }
 
-    fn comparable_get(&self, worker_id: &crate::discovery::WorkerId) -> Option<&AggregateLoad> {
+    pub(crate) fn comparable_get(
+        &self,
+        worker_id: &crate::discovery::WorkerId,
+    ) -> Option<&AggregateLoad> {
         if self.compare_aggregate {
             self.get(worker_id)
         } else {
