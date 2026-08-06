@@ -122,15 +122,20 @@ async fn main() -> Result<()> {
     );
 
     let registry = Arc::new(sgl_router::workers::WorkerRegistry::default());
-    let prefix_index = cfg
+    let kv_indexer_query_timeout_ms = cfg
+        .model
+        .affinity
+        .as_ref()
+        .map(|affinity| affinity.kv_indexer_query_timeout_ms);
+    let prefix_index: Option<Arc<dyn sgl_kv_indexer::PrefixIndex>> = cfg
         .model
         .cache_aware
         .as_ref()
         .and_then(|cache| cache.kv_indexer_endpoint.as_ref())
         .map(|endpoint| {
-            Arc::new(sgl_kv_indexer::GrpcPrefixIndex::new(
-                sgl_kv_indexer::PrefixIndexConfig::new(endpoint.clone()),
-            ))
+            let index_config = prefix_index_config(endpoint.clone(), kv_indexer_query_timeout_ms);
+            Arc::new(sgl_kv_indexer::GrpcPrefixIndex::new(index_config))
+                as Arc<dyn sgl_kv_indexer::PrefixIndex>
         });
 
     // Build the KV-event index up front so the cache-aware-zmq policy can
@@ -237,6 +242,17 @@ async fn main() -> Result<()> {
     server_result
 }
 
+fn prefix_index_config(
+    endpoint: String,
+    query_timeout_ms: Option<u64>,
+) -> sgl_kv_indexer::PrefixIndexConfig {
+    let mut config = sgl_kv_indexer::PrefixIndexConfig::new(endpoint);
+    if let Some(query_timeout_ms) = query_timeout_ms {
+        config.query_deadline = std::time::Duration::from_millis(query_timeout_ms);
+    }
+    config
+}
+
 /// Waits for either Unix termination signal and logs the selected cause.
 async fn shutdown_signal(mut sigterm: Signal, mut sigint: Signal) {
     tokio::select! {
@@ -248,6 +264,21 @@ async fn shutdown_signal(mut sigterm: Signal, mut sigint: Signal) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prefix_index_timeout_override_is_opt_in() {
+        let endpoint = "http://127.0.0.1:50051".to_string();
+        let dependency_default =
+            sgl_kv_indexer::PrefixIndexConfig::new(endpoint.clone()).query_deadline;
+        assert_eq!(
+            prefix_index_config(endpoint.clone(), None).query_deadline,
+            dependency_default,
+        );
+        assert_eq!(
+            prefix_index_config(endpoint, Some(25)).query_deadline,
+            std::time::Duration::from_millis(25),
+        );
+    }
 
     #[tokio::test]
     async fn install_signal_handlers_returns_both() {

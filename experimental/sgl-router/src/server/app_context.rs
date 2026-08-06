@@ -30,7 +30,7 @@ pub struct AppContext {
     /// (decode_affinity_total).
     pub metrics: Arc<MetricsRegistry>,
     pub load_monitor: Arc<LoadMonitor>,
-    pub prefix_index: Option<Arc<sgl_kv_indexer::GrpcPrefixIndex>>,
+    pub prefix_index: Option<Arc<dyn sgl_kv_indexer::PrefixIndex>>,
     pub block_size_oracle: Arc<BlockSizeOracle>,
     ready: AtomicBool,
 }
