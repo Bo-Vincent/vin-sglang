@@ -104,7 +104,7 @@ impl Default for ActiveLoadConfig {
 ///
 /// Accepted on the CLI (`--policy`) as `round_robin` / `random` /
 /// `power_of_two` / `load_based` / `prefix_cache` / `fused_score` /
-/// `cache_aware_zmq` / `sticky`.
+/// `session_aware` / `cache_aware_zmq` / `sticky`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 pub enum PolicyKind {
     #[default]
@@ -114,6 +114,9 @@ pub enum PolicyKind {
     Random,
     #[value(name = "power_of_two")]
     PowerOfTwo,
+    /// Session affinity with shared admission and pressure guards.
+    #[value(name = "session_aware")]
+    SessionAware,
     /// Selects the currently least-loaded worker.
     #[value(name = "load_based")]
     LoadBased,
@@ -211,6 +214,8 @@ pub struct ModelConfig {
     /// `policy = "cache_aware_zmq"`. `None` falls back to defaults at
     /// policy construction time.
     pub cache_aware: Option<CacheAwareConfig>,
+    /// Shared tuning for affinity policies.
+    pub affinity: Option<AffinityConfig>,
     /// Tuning for the sticky-session policy. `Some` exactly when
     /// `policy = "sticky"` (built by [`crate::config::cli::Cli::into_config`]).
     /// The chat handler reads `sticky.header_name` to populate
@@ -343,6 +348,45 @@ fn default_balance_rel() -> f32 {
 /// matches the router's other emitted/consumed metadata headers
 /// (`x-sgl-decode-url`, `x-sgl-router-error-code`).
 pub const DEFAULT_STICKY_HEADER: &str = "x-sgl-routing-key";
+
+/// Default header for Session-Aware routing.
+pub const DEFAULT_SESSION_ID_HEADER: &str = "x-session-id";
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum AffinityMode {
+    #[value(name = "strict")]
+    Strict,
+    #[default]
+    #[value(name = "soft")]
+    Soft,
+}
+
+#[derive(Debug, Clone)]
+pub struct AffinityConfig {
+    pub session_id_header: String,
+    pub session_idle_secs: u64,
+    pub session_eviction_interval_secs: u64,
+    pub stable_pair: bool,
+    pub mode: AffinityMode,
+    pub pressure_guard: bool,
+    pub pressure_abs_threshold_tokens: u64,
+    pub pressure_rel_threshold: f64,
+}
+
+impl Default for AffinityConfig {
+    fn default() -> Self {
+        Self {
+            session_id_header: DEFAULT_SESSION_ID_HEADER.to_string(),
+            session_idle_secs: default_sticky_idle_secs(),
+            session_eviction_interval_secs: default_sticky_eviction_interval_secs(),
+            stable_pair: false,
+            mode: AffinityMode::Soft,
+            pressure_guard: true,
+            pressure_abs_threshold_tokens: 1_024,
+            pressure_rel_threshold: 1.5,
+        }
+    }
+}
 
 /// Per-model sticky-session tuning. Built from the `--routing-key-header`
 /// / `--sticky-*` flags by [`crate::config::cli::Cli::into_config`], which
