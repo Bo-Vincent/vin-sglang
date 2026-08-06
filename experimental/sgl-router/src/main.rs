@@ -204,6 +204,7 @@ async fn main() -> Result<()> {
     );
     app_ctx.prefix_index = prefix_index;
     app_ctx.block_size_oracle = block_size_oracle;
+    app_ctx.load_monitor = Arc::clone(&load_monitor);
     let ctx = Arc::new(app_ctx);
     ctx.mark_ready();
 

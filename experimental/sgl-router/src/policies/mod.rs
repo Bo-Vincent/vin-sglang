@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 pub mod active_load;
+pub mod admission;
 pub mod cache_aware_zmq;
 pub mod factory;
 pub mod kv_events;
@@ -14,6 +15,7 @@ pub mod scoring;
 pub mod sticky;
 
 use crate::discovery::ModelId;
+use crate::load_monitor::LoadMonitorSnapshot;
 use crate::policies::scoring::{EligibilityFilter, ScoringPolicy};
 use crate::server::metrics::MetricsRegistry;
 use crate::tokenizer::{adapter, TokenizerRegistry};
@@ -191,6 +193,8 @@ pub struct SelectionContext<'a> {
     routing_key: Option<&'a str>,
     request_tokens: Option<&'a [u32]>,
     external_prefix: Option<&'a ExternalPrefixSignal>,
+    input_tokens: Option<u64>,
+    load_snapshot: Option<&'a LoadMonitorSnapshot>,
 }
 
 impl<'a> SelectionContext<'a> {
@@ -201,6 +205,8 @@ impl<'a> SelectionContext<'a> {
             routing_key: None,
             request_tokens: None,
             external_prefix: None,
+            input_tokens: None,
+            load_snapshot: None,
         }
     }
 
@@ -215,6 +221,8 @@ impl<'a> SelectionContext<'a> {
             routing_key,
             request_tokens: None,
             external_prefix: None,
+            input_tokens: None,
+            load_snapshot: None,
         }
     }
 
@@ -231,6 +239,13 @@ impl<'a> SelectionContext<'a> {
         external_prefix: Option<&'a ExternalPrefixSignal>,
     ) -> Self {
         self.external_prefix = external_prefix;
+    pub fn with_input_tokens(mut self, input_tokens: u64) -> Self {
+        self.input_tokens = Some(input_tokens);
+        self
+    }
+
+    pub fn with_load_snapshot(mut self, load_snapshot: &'a LoadMonitorSnapshot) -> Self {
+        self.load_snapshot = Some(load_snapshot);
         self
     }
 
@@ -254,6 +269,12 @@ impl<'a> SelectionContext<'a> {
 
     pub fn external_prefix(&self) -> Option<&ExternalPrefixSignal> {
         self.external_prefix
+    pub fn input_tokens(&self) -> Option<u64> {
+        self.input_tokens
+    }
+
+    pub fn load_snapshot(&self) -> Option<&LoadMonitorSnapshot> {
+        self.load_snapshot
     }
 }
 
@@ -352,6 +373,10 @@ pub trait Policy: Send + Sync + std::fmt::Debug {
         self.propose(workers, ctx).map(PrefillProposal::Pair)
     }
 
+    fn uses_shared_prefill_admission(&self) -> bool {
+        false
+    }
+
     /// Whether this policy's ROUTING decision needs the request tokens (i.e.
     /// it routes by prompt prefix). Ingress tokenization itself is no longer
     /// gated on this — that is a model property (`has_chat_encoder`) decided at
@@ -427,6 +452,8 @@ impl PolicyRegistry {
 mod tests {
     use super::*;
     use crate::discovery::{WorkerId, WorkerMode, WorkerSpec};
+    use crate::load_monitor::{AggregateLoad, Freshness, LoadMonitorSnapshot, WorkerSnapshot};
+    use crate::policies::admission::{resolve_prefill, CandidateRange, DecisionReason};
     use crate::policies::power_of_two::PowerOfTwoChoicesPolicy;
 
     fn worker(id: &str) -> Arc<Worker> {
@@ -437,6 +464,36 @@ mod tests {
             model_ids: vec![ModelId("model".into())],
             bootstrap_port: None,
         }))
+    }
+
+    fn snapshot(entries: &[(&Arc<Worker>, AggregateLoad)]) -> LoadMonitorSnapshot {
+        LoadMonitorSnapshot {
+            enabled: true,
+            version: 1,
+            captured_at: Some("2026-08-04T00:00:00Z".into()),
+            workers: entries
+                .iter()
+                .map(|(worker, aggregate)| WorkerSnapshot {
+                    worker_id: worker.id.0.clone(),
+                    url: worker.url.clone(),
+                    mode: worker.mode(),
+                    model_ids: worker
+                        .model_ids
+                        .iter()
+                        .map(|model| model.0.clone())
+                        .collect(),
+                    freshness: Freshness::Fresh,
+                    source_instance_id: None,
+                    sequence_id: None,
+                    report_time_unix_ms: None,
+                    last_error: None,
+                    received_at: None,
+                    expires_at: None,
+                    aggregate: Some(aggregate.clone()),
+                    ranks: Vec::new(),
+                })
+                .collect(),
+        }
     }
 
     #[test]
@@ -483,5 +540,155 @@ mod tests {
         let PrefillProposal::Pair(pair) = proposal;
         assert_eq!(pair.kind, ProposalKind::PowerOfTwo);
         assert!(pair.backup.is_some());
+    }
+
+    #[test]
+    fn power_of_two_orders_its_sample_with_fresh_load_monitor_snapshot() {
+        let model = ModelId("model".into());
+        let busy = worker("busy");
+        let idle = worker("idle");
+        let workers = vec![Arc::clone(&busy), Arc::clone(&idle)];
+        let load_snapshot = snapshot(&[
+            (
+                &busy,
+                AggregateLoad {
+                    num_waiting_uncached_tokens: 512,
+                    max_running_requests: 8,
+                    max_total_num_tokens: 4_096,
+                    ..Default::default()
+                },
+            ),
+            (
+                &idle,
+                AggregateLoad {
+                    num_waiting_uncached_tokens: 16,
+                    max_running_requests: 8,
+                    max_total_num_tokens: 4_096,
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let ctx = SelectionContext::new(&model, None).with_load_snapshot(&load_snapshot);
+
+        let proposal = PowerOfTwoChoicesPolicy::new()
+            .propose(&workers, &ctx)
+            .expect("two candidates must produce a proposal");
+
+        assert_eq!(proposal.primary.id, idle.id);
+        assert_eq!(
+            proposal.backup.expect("P2 keeps its other sample").id,
+            busy.id
+        );
+    }
+
+    #[test]
+    fn admission_uses_admitted_backup_before_scanning_candidate_range() {
+        let primary = worker("primary");
+        let backup = worker("backup");
+        let fallback = worker("fallback");
+        let workers = vec![
+            Arc::clone(&primary),
+            Arc::clone(&backup),
+            Arc::clone(&fallback),
+        ];
+        let snapshot = snapshot(&[
+            (
+                &primary,
+                AggregateLoad {
+                    num_running_reqs: 4,
+                    max_running_requests: 4,
+                    num_total_tokens: 10,
+                    max_total_num_tokens: 1_000,
+                    ..Default::default()
+                },
+            ),
+            (
+                &backup,
+                AggregateLoad {
+                    max_running_requests: 4,
+                    num_total_tokens: 10,
+                    max_total_num_tokens: 1_000,
+                    ..Default::default()
+                },
+            ),
+            (
+                &fallback,
+                AggregateLoad {
+                    max_running_requests: 4,
+                    num_total_tokens: 10,
+                    max_total_num_tokens: 1_000,
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let range = CandidateRange::global(&workers);
+        let proposal = SelectionProposal::with_backup(Arc::clone(&primary), Arc::clone(&backup));
+
+        let decision = resolve_prefill(&range, &proposal, 32, &snapshot)
+            .expect("an admitted backup must be selected");
+
+        assert_eq!(decision.selected.id, backup.id);
+        assert_eq!(decision.reason, DecisionReason::BackupPrimaryAdmission);
+    }
+
+    #[test]
+    fn disabled_monitor_does_not_hard_reject_a_registry_healthy_primary() {
+        let primary = worker("primary");
+        let workers = vec![Arc::clone(&primary)];
+        let snapshot = LoadMonitorSnapshot {
+            enabled: false,
+            version: 0,
+            captured_at: None,
+            workers: Vec::new(),
+        };
+
+        let decision = resolve_prefill(
+            &CandidateRange::global(&workers),
+            &SelectionProposal::primary(Arc::clone(&primary)),
+            1_000_000,
+            &snapshot,
+        )
+        .expect("disabled reporting must preserve the healthy registry candidate");
+
+        assert_eq!(decision.selected.id, primary.id);
+        assert_eq!(decision.reason, DecisionReason::Primary);
+    }
+
+    #[test]
+    fn pressure_guard_uses_fresh_waiting_uncached_tokens_not_local_load() {
+        let primary = worker("primary");
+        let backup = worker("backup");
+        let workers = vec![Arc::clone(&primary), Arc::clone(&backup)];
+        let snapshot = snapshot(&[
+            (
+                &primary,
+                AggregateLoad {
+                    num_waiting_uncached_tokens: 200,
+                    max_running_requests: 4,
+                    max_total_num_tokens: 1_000,
+                    ..Default::default()
+                },
+            ),
+            (
+                &backup,
+                AggregateLoad {
+                    num_waiting_uncached_tokens: 20,
+                    max_running_requests: 4,
+                    max_total_num_tokens: 1_000,
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let proposal =
+            SelectionProposal::with_backup(primary, backup).with_guard_hints(GuardHints {
+                enable_pressure_guard: true,
+                pressure_abs_threshold_tokens: 100,
+                pressure_rel_threshold: 2.0,
+            });
+
+        let decision = resolve_prefill(&CandidateRange::global(&workers), &proposal, 80, &snapshot)
+            .expect("both candidates fit capacity");
+
+        assert_eq!(decision.reason, DecisionReason::BackupPressureGuard);
     }
 }

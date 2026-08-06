@@ -3,6 +3,7 @@
 
 use crate::config::Config;
 
+use crate::load_monitor::LoadMonitor;
 use crate::policies::active_load::ActiveLoadRegistry;
 use crate::policies::kv_events::BlockSizeOracle;
 use crate::policies::PolicyRegistry;
@@ -32,6 +33,7 @@ pub struct AppContext {
     pub metrics: Arc<MetricsRegistry>,
     pub prefix_index: Option<Arc<sgl_kv_indexer::GrpcPrefixIndex>>,
     pub block_size_oracle: Arc<BlockSizeOracle>,
+    pub load_monitor: Arc<LoadMonitor>,
     ready: AtomicBool,
 }
 
@@ -86,6 +88,7 @@ impl AppContext {
             metrics,
             prefix_index: None,
             block_size_oracle: BlockSizeOracle::new(),
+            load_monitor: Arc::new(LoadMonitor::disabled()),
             ready: AtomicBool::new(false),
         }
     }
@@ -136,6 +139,7 @@ impl AppContext {
             metrics: MetricsRegistry::new(),
             prefix_index: None,
             block_size_oracle: BlockSizeOracle::new(),
+            load_monitor: Arc::new(LoadMonitor::disabled()),
             ready: AtomicBool::new(false),
         }
     }
