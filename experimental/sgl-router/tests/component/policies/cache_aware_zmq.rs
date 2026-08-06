@@ -71,6 +71,7 @@ async fn zmq_indexer_routes_to_publishing_worker_e2e() {
             policy: sgl_router::config::PolicyKind::CacheAwareZmq,
             circuit_breaker: None,
             cache_aware: None,
+            affinity: None,
             sticky: None,
             fused: None,
             eligibility: None,

@@ -31,6 +31,7 @@ use tower::ServiceExt;
 use crate::common::cache_aware_fixture::{config, MODEL};
 use crate::common::mock_worker::MockWorker;
 
+
 fn build_ctx(url: String) -> Arc<AppContext> {
     let cfg = config();
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
