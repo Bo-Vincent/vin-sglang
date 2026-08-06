@@ -12,6 +12,7 @@ pub mod random;
 pub mod registry;
 pub mod round_robin;
 pub mod scoring;
+pub mod session_aware;
 pub mod sticky;
 
 use crate::discovery::ModelId;
@@ -187,14 +188,19 @@ pub(crate) fn extract_prompt_text_from_value(v: &serde_json::Value) -> Option<St
 /// ingress-computed tokens are attached with [`Self::with_request_tokens`].
 /// Accessors expose immutable references so callers cannot mutate the model
 /// id or swap in a different body without going through the constructor.
+#[derive(Clone)]
 pub struct SelectionContext<'a> {
     model: &'a ModelId,
     request_body: Option<&'a [u8]>,
     routing_key: Option<&'a str>,
     request_tokens: Option<&'a [u32]>,
     external_prefix: Option<&'a ExternalPrefixSignal>,
+    session_id: Option<&'a str>,
+    candidate_range_id: &'a str,
     input_tokens: Option<u64>,
     load_snapshot: Option<&'a LoadMonitorSnapshot>,
+    affinity_lookup_enabled: bool,
+    affinity_assignment_enabled: bool,
 }
 
 impl<'a> SelectionContext<'a> {
@@ -205,8 +211,12 @@ impl<'a> SelectionContext<'a> {
             routing_key: None,
             request_tokens: None,
             external_prefix: None,
+            session_id: None,
+            candidate_range_id: "global",
             input_tokens: None,
             load_snapshot: None,
+            affinity_lookup_enabled: true,
+            affinity_assignment_enabled: true,
         }
     }
 
@@ -221,8 +231,12 @@ impl<'a> SelectionContext<'a> {
             routing_key,
             request_tokens: None,
             external_prefix: None,
+            session_id: None,
+            candidate_range_id: "global",
             input_tokens: None,
             load_snapshot: None,
+            affinity_lookup_enabled: true,
+            affinity_assignment_enabled: true,
         }
     }
 
@@ -242,6 +256,16 @@ impl<'a> SelectionContext<'a> {
         self
     }
 
+    pub fn with_session_id(mut self, session_id: Option<&'a str>) -> Self {
+        self.session_id = session_id;
+        self
+    }
+
+    pub fn with_candidate_range_id(mut self, candidate_range_id: &'a str) -> Self {
+        self.candidate_range_id = candidate_range_id;
+        self
+    }
+
     pub fn with_input_tokens(mut self, input_tokens: u64) -> Self {
         self.input_tokens = Some(input_tokens);
         self
@@ -249,6 +273,17 @@ impl<'a> SelectionContext<'a> {
 
     pub fn with_load_snapshot(mut self, load_snapshot: &'a LoadMonitorSnapshot) -> Self {
         self.load_snapshot = Some(load_snapshot);
+        self
+    }
+
+    pub fn without_affinity_lookup(mut self) -> Self {
+        self.affinity_lookup_enabled = false;
+        self.affinity_assignment_enabled = false;
+        self
+    }
+
+    pub fn without_affinity_assignment(mut self) -> Self {
+        self.affinity_assignment_enabled = false;
         self
     }
 
@@ -274,12 +309,28 @@ impl<'a> SelectionContext<'a> {
         self.external_prefix
     }
 
+    pub fn session_id(&self) -> Option<&str> {
+        self.session_id
+    }
+
+    pub fn candidate_range_id(&self) -> &str {
+        self.candidate_range_id
+    }
+
     pub fn input_tokens(&self) -> Option<u64> {
         self.input_tokens
     }
 
     pub fn load_snapshot(&self) -> Option<&LoadMonitorSnapshot> {
         self.load_snapshot
+    }
+
+    pub fn affinity_lookup_enabled(&self) -> bool {
+        self.affinity_lookup_enabled
+    }
+
+    pub fn affinity_assignment_enabled(&self) -> bool {
+        self.affinity_assignment_enabled
     }
 }
 
@@ -296,6 +347,14 @@ pub struct SelectionProposal {
 #[derive(Clone)]
 pub enum PrefillProposal {
     Pair(SelectionProposal),
+}
+
+impl PrefillProposal {
+    pub fn with_eligible_workers(self, workers: Vec<Arc<Worker>>) -> Self {
+        match self {
+            Self::Pair(proposal) => Self::Pair(proposal.with_eligible_workers(workers)),
+        }
+    }
 }
 
 impl SelectionProposal {
@@ -339,6 +398,7 @@ impl SelectionProposal {
 pub enum ProposalKind {
     Generic,
     PowerOfTwo,
+    SessionAffinity,
     Score,
 }
 
@@ -379,6 +439,18 @@ pub trait Policy: Send + Sync + std::fmt::Debug {
     }
 
     fn uses_shared_prefill_admission(&self) -> bool {
+        false
+    }
+
+    fn commit_prefill_selection(
+        &self,
+        _ctx: &SelectionContext<'_>,
+        _proposal_kind: ProposalKind,
+        _selected: &Arc<Worker>,
+    ) {
+    }
+
+    fn is_bucket_affinity_policy(&self) -> bool {
         false
     }
 
@@ -456,10 +528,12 @@ impl PolicyRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::AffinityConfig;
     use crate::discovery::{WorkerId, WorkerMode, WorkerSpec};
     use crate::load_monitor::{AggregateLoad, Freshness, LoadMonitorSnapshot, WorkerSnapshot};
     use crate::policies::admission::{resolve_prefill, CandidateRange, DecisionReason};
     use crate::policies::power_of_two::PowerOfTwoChoicesPolicy;
+    use crate::policies::session_aware::SessionAwarePolicy;
 
     fn worker(id: &str) -> Arc<Worker> {
         Arc::new(Worker::new(WorkerSpec {
@@ -695,5 +769,79 @@ mod tests {
             .expect("both candidates fit capacity");
 
         assert_eq!(decision.reason, DecisionReason::BackupPressureGuard);
+    }
+
+    #[test]
+    fn session_affinity_reuses_primary_and_stable_backup() {
+        let model = ModelId("model".into());
+        let workers = vec![worker("first"), worker("second"), worker("third")];
+        let policy = SessionAwarePolicy::new(AffinityConfig {
+            stable_pair: true,
+            ..Default::default()
+        });
+        let ctx = SelectionContext::new(&model, None).with_session_id(Some("session-a"));
+
+        let first = policy
+            .propose(&workers, &ctx)
+            .expect("a new session must get an initial P2 proposal");
+        policy.commit_prefill_selection(&ctx, first.kind, &first.primary);
+        let second = policy
+            .propose(&workers, &ctx)
+            .expect("a mapped session must produce an affinity proposal");
+        let third = policy
+            .propose(&workers, &ctx)
+            .expect("the session assignment must remain stable");
+
+        assert_eq!(second.kind, ProposalKind::SessionAffinity);
+        assert_eq!(second.primary.id, first.primary.id);
+        assert_eq!(third.primary.id, second.primary.id);
+        assert_eq!(
+            third.backup.expect("stable pair has backup").id,
+            second.backup.expect("stable pair has backup").id,
+        );
+    }
+
+    #[test]
+    fn new_session_commits_the_admitted_backup() {
+        let model = ModelId("model".into());
+        let workers = vec![worker("first"), worker("second")];
+        let policy = SessionAwarePolicy::new(AffinityConfig::default());
+        let ctx = SelectionContext::new(&model, None).with_session_id(Some("session-a"));
+        let proposal = policy
+            .propose(&workers, &ctx)
+            .expect("a new session produces a P2 proposal");
+        let backup = proposal
+            .backup
+            .clone()
+            .expect("two workers retain a backup");
+        let loads = snapshot(&[
+            (
+                &proposal.primary,
+                AggregateLoad {
+                    num_running_reqs: 1,
+                    max_running_requests: 1,
+                    max_total_num_tokens: 4_096,
+                    ..Default::default()
+                },
+            ),
+            (
+                &backup,
+                AggregateLoad {
+                    max_running_requests: 1,
+                    max_total_num_tokens: 4_096,
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let decision = resolve_prefill(&CandidateRange::global(&workers), &proposal, 32, &loads)
+            .expect("the admitted backup must become final P");
+        assert_eq!(decision.selected.id, backup.id);
+        policy.commit_prefill_selection(&ctx, proposal.kind, &decision.selected);
+
+        let mapped = policy
+            .propose(&workers, &ctx)
+            .expect("the next turn must reuse the actual first-turn worker");
+        assert_eq!(mapped.kind, ProposalKind::SessionAffinity);
+        assert_eq!(mapped.primary.id, backup.id);
     }
 }

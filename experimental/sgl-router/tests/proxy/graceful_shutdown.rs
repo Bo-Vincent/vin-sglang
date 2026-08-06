@@ -46,6 +46,7 @@ fn build_ctx_with_worker(worker_url: &str) -> Arc<AppContext> {
             policy: PolicyKind::RoundRobin,
             circuit_breaker: None,
             cache_aware: None,
+            affinity: None,
             sticky: None,
             fused: None,
             eligibility: None,
