@@ -53,6 +53,14 @@ fn test_report(worker_addr: &str, source: &str, sequence: u64, mode: WorkerMode)
             gen_throughput: 5.0,
             cache_hit_rate: 0.5,
             utilization: 0.7,
+            num_active_tokens: None,
+            total_prefill_uncached_tokens: None,
+            total_prefill_busy_us: None,
+            decode_prealloc_queue_reqs: None,
+            decode_transfer_queue_reqs: None,
+            decode_retracted_queue_reqs: None,
+            total_decode_steps: None,
+            total_decode_step_us: None,
         }],
     }
 }

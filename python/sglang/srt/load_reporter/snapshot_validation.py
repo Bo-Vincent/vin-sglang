@@ -27,8 +27,11 @@ _NON_NEGATIVE_INT64_FIELDS = (
     "num_waiting_uncached_tokens",
     "num_used_tokens",
     "num_total_tokens",
+    "num_active_tokens",
     "max_total_num_tokens",
     "max_running_requests",
+    "total_prefill_uncached_tokens",
+    "total_prefill_busy_us",
 )
 
 _FINITE_FLOAT_FIELDS = (
@@ -52,8 +55,16 @@ class RankSnapshot(msgspec.Struct, frozen=True):
     num_waiting_uncached_tokens: int
     num_used_tokens: int
     num_total_tokens: int
+    num_active_tokens: int
     max_total_num_tokens: int
     max_running_requests: int
+    total_prefill_uncached_tokens: int
+    total_prefill_busy_us: int
+    decode_prealloc_queue_reqs: int
+    decode_transfer_queue_reqs: int
+    decode_retracted_queue_reqs: int
+    total_decode_steps: int
+    total_decode_step_us: int
     token_usage: float
     gen_throughput: float
     cache_hit_rate: float
@@ -112,6 +123,34 @@ def _snapshot_time_unix_ms(load: LoadSnapshot, fallback_time_unix_ms: int) -> in
     return fallback_time_unix_ms
 
 
+def _require_non_negative_integral_float(field: str, value: object) -> int:
+    """Validate a cumulative counter represented in a decode-moment float."""
+    result = _require_finite_float(field, value)
+    if result < 0 or not result.is_integer() or result > _INT64_MAX:
+        raise SnapshotValidationError(
+            f"{field} must be an integral protobuf int64 value in [0, {_INT64_MAX}]"
+        )
+    return int(result)
+
+
+def _decode_counters(load: LoadSnapshot) -> tuple[int, int]:
+    """Extract cumulative decode work and step-time counters from one snapshot."""
+    moments = load.decode_moments
+    if moments is None:
+        return 0, 0
+    if not isinstance(moments, (list, tuple)) or len(moments) != 6:
+        raise SnapshotValidationError("decode_moments must contain exactly 6 values")
+    steps = _require_non_negative_integral_float("total_decode_steps", moments[0])
+    step_us = _require_non_negative_integral_float(
+        "total_decode_step_us", moments[2]
+    )
+    if steps == 0 and step_us != 0:
+        raise SnapshotValidationError(
+            "total_decode_step_us must be zero when total_decode_steps is zero"
+        )
+    return steps, step_us
+
+
 def _rank_snapshot_from_load(
     load: LoadSnapshot, *, fallback_time_unix_ms: int
 ) -> RankSnapshot:
@@ -134,6 +173,25 @@ def _rank_snapshot_from_load(
         raise SnapshotValidationError(
             "num_running_reqs must not exceed max_running_requests"
         )
+    if counts["num_active_tokens"] > counts["num_total_tokens"]:
+        raise SnapshotValidationError(
+            "num_active_tokens must not exceed num_total_tokens"
+        )
+
+    disaggregation = load.disaggregation
+    decode_prealloc_queue_reqs = _require_non_negative_int64(
+        "decode_prealloc_queue_reqs",
+        0 if disaggregation is None else disaggregation.decode_prealloc_queue_reqs,
+    )
+    decode_transfer_queue_reqs = _require_non_negative_int64(
+        "decode_transfer_queue_reqs",
+        0 if disaggregation is None else disaggregation.decode_transfer_queue_reqs,
+    )
+    decode_retracted_queue_reqs = _require_non_negative_int64(
+        "decode_retracted_queue_reqs",
+        0 if disaggregation is None else disaggregation.decode_retracted_queue_reqs,
+    )
+    total_decode_steps, total_decode_step_us = _decode_counters(load)
 
     floats = {
         field: _require_finite_float(field, getattr(load, field))
@@ -143,6 +201,11 @@ def _rank_snapshot_from_load(
         dp_rank=dp_rank,
         snapshot_time_unix_ms=_snapshot_time_unix_ms(load, fallback_time_unix_ms),
         **counts,
+        decode_prealloc_queue_reqs=decode_prealloc_queue_reqs,
+        decode_transfer_queue_reqs=decode_transfer_queue_reqs,
+        decode_retracted_queue_reqs=decode_retracted_queue_reqs,
+        total_decode_steps=total_decode_steps,
+        total_decode_step_us=total_decode_step_us,
         **floats,
     )
 

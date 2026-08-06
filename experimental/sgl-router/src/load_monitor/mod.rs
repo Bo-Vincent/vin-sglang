@@ -81,8 +81,16 @@ pub struct RankSnapshot {
     pub num_waiting_uncached_tokens: u64,
     pub num_used_tokens: u64,
     pub num_total_tokens: u64,
+    pub num_active_tokens: Option<u64>,
     pub max_total_num_tokens: u64,
     pub max_running_requests: u64,
+    pub total_prefill_uncached_tokens: Option<u64>,
+    pub total_prefill_busy_us: Option<u64>,
+    pub decode_prealloc_queue_reqs: Option<u64>,
+    pub decode_transfer_queue_reqs: Option<u64>,
+    pub decode_retracted_queue_reqs: Option<u64>,
+    pub total_decode_steps: Option<u64>,
+    pub total_decode_step_us: Option<u64>,
     pub token_usage: f64,
     pub gen_throughput: f64,
     pub cache_hit_rate: f64,
@@ -99,11 +107,17 @@ pub struct AggregateLoad {
     pub num_waiting_uncached_tokens: u64,
     pub num_used_tokens: u64,
     pub num_total_tokens: u64,
+    pub num_active_tokens: Option<u64>,
     pub max_total_num_tokens: u64,
     pub max_running_requests: u64,
+    pub decode_prealloc_queue_reqs: Option<u64>,
+    pub decode_transfer_queue_reqs: Option<u64>,
+    pub decode_retracted_queue_reqs: Option<u64>,
     pub free_tokens: u64,
     pub available_slots: u64,
-    pub queue_pressure: f64,
+    pub prefill_throughput_tokens_per_s: Option<f64>,
+    pub estimated_prefill_queue_ms: Option<f64>,
+    pub mean_decode_step_ms: Option<f64>,
     pub request_utilization: f64,
     pub weighted_token_usage: f64,
     pub max_rank_token_usage: f64,
@@ -211,6 +225,15 @@ struct AcceptedReport {
     locally_stale: bool,
     aggregate: AggregateLoad,
     ranks: Vec<RankSnapshot>,
+}
+
+impl AcceptedReport {
+    fn derive_from(&mut self, previous: Option<&AcceptedReport>) {
+        self.aggregate = aggregate_ranks_with_previous(
+            &self.ranks,
+            previous.map(|report| report.ranks.as_slice()),
+        );
+    }
 }
 
 #[derive(Debug)]
@@ -642,7 +665,7 @@ impl LoadMonitor {
         session: u64,
         report: LoadReport,
     ) -> IngestResult<()> {
-        let accepted = validate_report(&report, SystemTime::now())?;
+        let mut accepted = validate_report(&report, SystemTime::now())?;
         let mut store = self.inner.store.write();
         let state = store
             .workers
@@ -662,6 +685,9 @@ impl LoadMonitor {
                 .is_some_and(|current| accepted.sequence_id <= current.sequence_id)
         {
             return Ok(());
+        }
+        if same_source {
+            accepted.derive_from(state.report.as_ref());
         }
         state.active_source = Some(accepted.source_instance_id.clone());
         state.report = Some(accepted);
@@ -825,6 +851,35 @@ fn validate_rank(rank: &RankLoad) -> IngestResult<RankSnapshot> {
             ))));
         }
     }
+    let optional_counters = [
+        ("num_active_tokens", rank.num_active_tokens),
+        (
+            "total_prefill_uncached_tokens",
+            rank.total_prefill_uncached_tokens,
+        ),
+        ("total_prefill_busy_us", rank.total_prefill_busy_us),
+        (
+            "decode_prealloc_queue_reqs",
+            rank.decode_prealloc_queue_reqs,
+        ),
+        (
+            "decode_transfer_queue_reqs",
+            rank.decode_transfer_queue_reqs,
+        ),
+        (
+            "decode_retracted_queue_reqs",
+            rank.decode_retracted_queue_reqs,
+        ),
+        ("total_decode_steps", rank.total_decode_steps),
+        ("total_decode_step_us", rank.total_decode_step_us),
+    ];
+    for (name, value) in optional_counters {
+        if value.is_some_and(|value| value < 0) {
+            return Err(ingest_status(Status::invalid_argument(format!(
+                "{name} must be non-negative"
+            ))));
+        }
+    }
     if rank.num_used_tokens > rank.max_total_num_tokens {
         return Err(ingest_status(Status::invalid_argument(
             "num_used_tokens cannot exceed max_total_num_tokens",
@@ -833,6 +888,29 @@ fn validate_rank(rank: &RankLoad) -> IngestResult<RankSnapshot> {
     if rank.num_running_reqs > rank.max_running_requests {
         return Err(ingest_status(Status::invalid_argument(
             "num_running_reqs cannot exceed max_running_requests",
+        )));
+    }
+    if rank
+        .num_active_tokens
+        .is_some_and(|value| value > rank.num_total_tokens)
+    {
+        return Err(ingest_status(Status::invalid_argument(
+            "num_active_tokens cannot exceed num_total_tokens",
+        )));
+    }
+    if rank.total_prefill_uncached_tokens.is_some() != rank.total_prefill_busy_us.is_some() {
+        return Err(ingest_status(Status::invalid_argument(
+            "prefill cumulative counters must be reported together",
+        )));
+    }
+    if rank.total_decode_steps.is_some() != rank.total_decode_step_us.is_some() {
+        return Err(ingest_status(Status::invalid_argument(
+            "decode cumulative counters must be reported together",
+        )));
+    }
+    if rank.total_decode_steps == Some(0) && rank.total_decode_step_us != Some(0) {
+        return Err(ingest_status(Status::invalid_argument(
+            "total_decode_step_us must be zero when total_decode_steps is zero",
         )));
     }
     let finite_floats = [
@@ -862,8 +940,16 @@ fn validate_rank(rank: &RankLoad) -> IngestResult<RankSnapshot> {
         num_waiting_uncached_tokens: rank.num_waiting_uncached_tokens as u64,
         num_used_tokens: rank.num_used_tokens as u64,
         num_total_tokens: rank.num_total_tokens as u64,
+        num_active_tokens: rank.num_active_tokens.map(|value| value as u64),
         max_total_num_tokens: rank.max_total_num_tokens as u64,
         max_running_requests: rank.max_running_requests as u64,
+        total_prefill_uncached_tokens: rank.total_prefill_uncached_tokens.map(|value| value as u64),
+        total_prefill_busy_us: rank.total_prefill_busy_us.map(|value| value as u64),
+        decode_prealloc_queue_reqs: rank.decode_prealloc_queue_reqs.map(|value| value as u64),
+        decode_transfer_queue_reqs: rank.decode_transfer_queue_reqs.map(|value| value as u64),
+        decode_retracted_queue_reqs: rank.decode_retracted_queue_reqs.map(|value| value as u64),
+        total_decode_steps: rank.total_decode_steps.map(|value| value as u64),
+        total_decode_step_us: rank.total_decode_step_us.map(|value| value as u64),
         token_usage: rank.token_usage,
         gen_throughput: rank.gen_throughput,
         cache_hit_rate: rank.cache_hit_rate,
@@ -871,8 +957,26 @@ fn validate_rank(rank: &RankLoad) -> IngestResult<RankSnapshot> {
     })
 }
 
-/// Sums rank loads and derives scheduling and diagnostic utilization values.
+fn sum_optional_counter(
+    ranks: &[RankSnapshot],
+    field: impl Fn(&RankSnapshot) -> Option<u64>,
+) -> Option<u64> {
+    ranks
+        .iter()
+        .try_fold(0_u64, |sum, rank| Some(sum.saturating_add(field(rank)?)))
+}
+
+/// Sums rank loads without a prior sample.
 fn aggregate_ranks(ranks: &[RankSnapshot]) -> AggregateLoad {
+    aggregate_ranks_with_previous(ranks, None)
+}
+
+/// Sums rank loads and derives rate metrics only from consecutive reports of
+/// the same source. Missing, reset, or incomplete counters remain unavailable.
+fn aggregate_ranks_with_previous(
+    ranks: &[RankSnapshot],
+    previous_ranks: Option<&[RankSnapshot]>,
+) -> AggregateLoad {
     let mut aggregate = AggregateLoad {
         rank_count: ranks.len(),
         ..AggregateLoad::default()
@@ -890,6 +994,13 @@ fn aggregate_ranks(ranks: &[RankSnapshot]) -> AggregateLoad {
         weighted_token_usage += rank.token_usage * rank.max_total_num_tokens as f64;
         aggregate.max_rank_token_usage = aggregate.max_rank_token_usage.max(rank.token_usage);
     }
+    aggregate.num_active_tokens = sum_optional_counter(ranks, |rank| rank.num_active_tokens);
+    aggregate.decode_prealloc_queue_reqs =
+        sum_optional_counter(ranks, |rank| rank.decode_prealloc_queue_reqs);
+    aggregate.decode_transfer_queue_reqs =
+        sum_optional_counter(ranks, |rank| rank.decode_transfer_queue_reqs);
+    aggregate.decode_retracted_queue_reqs =
+        sum_optional_counter(ranks, |rank| rank.decode_retracted_queue_reqs);
     aggregate.total_requests = aggregate
         .num_running_reqs
         .saturating_add(aggregate.num_waiting_reqs);
@@ -899,10 +1010,6 @@ fn aggregate_ranks(ranks: &[RankSnapshot]) -> AggregateLoad {
     aggregate.available_slots = aggregate
         .max_running_requests
         .saturating_sub(aggregate.num_running_reqs);
-    if aggregate.gen_throughput > 0.0 {
-        aggregate.queue_pressure =
-            aggregate.num_waiting_uncached_tokens as f64 / aggregate.gen_throughput;
-    }
     if aggregate.max_running_requests > 0 {
         aggregate.request_utilization =
             aggregate.num_running_reqs as f64 / aggregate.max_running_requests as f64;
@@ -910,6 +1017,69 @@ fn aggregate_ranks(ranks: &[RankSnapshot]) -> AggregateLoad {
     if aggregate.max_total_num_tokens > 0 {
         aggregate.weighted_token_usage =
             weighted_token_usage / aggregate.max_total_num_tokens as f64;
+    }
+    if let Some(previous_ranks) = previous_ranks {
+        let same_rank_set = ranks.len() == previous_ranks.len()
+            && ranks
+                .iter()
+                .zip(previous_ranks)
+                .all(|(current, previous)| current.dp_rank == previous.dp_rank);
+        if same_rank_set {
+            let mut prefill_rate = 0.0;
+            let mut complete_prefill_sample = !ranks.is_empty();
+            let mut decode_steps = 0_u64;
+            let mut decode_step_us = 0_u64;
+            let mut complete_decode_sample = !ranks.is_empty();
+            for (current, previous) in ranks.iter().zip(previous_ranks) {
+                match (
+                    current.total_prefill_uncached_tokens,
+                    current.total_prefill_busy_us,
+                    previous.total_prefill_uncached_tokens,
+                    previous.total_prefill_busy_us,
+                ) {
+                    (Some(tokens), Some(busy_us), Some(old_tokens), Some(old_busy_us))
+                        if tokens > old_tokens && busy_us > old_busy_us =>
+                    {
+                        let rate = 1_000_000.0 * (tokens - old_tokens) as f64
+                            / (busy_us - old_busy_us) as f64;
+                        complete_prefill_sample &= rate.is_finite() && rate > 0.0;
+                        prefill_rate += rate;
+                    }
+                    _ => complete_prefill_sample = false,
+                }
+                match (
+                    current.total_decode_steps,
+                    current.total_decode_step_us,
+                    previous.total_decode_steps,
+                    previous.total_decode_step_us,
+                ) {
+                    (Some(steps), Some(step_us), Some(old_steps), Some(old_step_us))
+                        if steps >= old_steps && step_us >= old_step_us =>
+                    {
+                        let step_delta = steps - old_steps;
+                        let time_delta = step_us - old_step_us;
+                        if step_delta == 0 {
+                            complete_decode_sample &= time_delta == 0;
+                        } else {
+                            decode_steps = decode_steps.saturating_add(step_delta);
+                            decode_step_us = decode_step_us.saturating_add(time_delta);
+                        }
+                    }
+                    _ => complete_decode_sample = false,
+                }
+            }
+            if complete_prefill_sample && prefill_rate > 0.0 {
+                aggregate.prefill_throughput_tokens_per_s = Some(prefill_rate);
+                aggregate.estimated_prefill_queue_ms =
+                    Some(1_000.0 * aggregate.num_waiting_uncached_tokens as f64 / prefill_rate);
+            }
+            if complete_decode_sample && decode_steps > 0 {
+                let mean_ms = decode_step_us as f64 / decode_steps as f64 / 1_000.0;
+                if mean_ms.is_finite() {
+                    aggregate.mean_decode_step_ms = Some(mean_ms);
+                }
+            }
+        }
     }
     aggregate
 }
