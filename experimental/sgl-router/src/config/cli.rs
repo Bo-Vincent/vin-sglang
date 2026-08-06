@@ -51,9 +51,12 @@ pub struct Cli {
     /// Routing policy.
     #[arg(long, value_enum, default_value = "round_robin")]
     pub policy: PolicyKind,
-    /// PD 请求在 Final Prefill 后选择 Decode worker 的独立策略。非 PD 部署不使用。
+    /// PD 请求的 Decode worker 选择策略。
     #[arg(long, value_enum, default_value = "power_of_two")]
     pub decode_policy: DecodePolicyKind,
+    /// 静态 P/D Bucket JSON 配置；省略时使用全局候选域。
+    #[arg(long)]
+    pub bucket_config: Option<String>,
 
     // ---- circuit breaker (opt-in via --cb-threshold) ----
     /// Consecutive upstream failures before the circuit breaker opens.
@@ -98,8 +101,7 @@ pub struct Cli {
     /// 对同一个 affinity key 和候选域使用确定性 backup。
     #[arg(long)]
     pub stable_pair: bool,
-    /// Session affinity primary 在两个候选都通过 hard admission 后，是否可以
-    /// 按软策略逃逸到 backup。
+    /// Session affinity 的 Guard 模式。
     #[arg(long, value_enum)]
     pub affinity_mode: Option<AffinityMode>,
     /// Session affinity primary 的查找与 fallback 行为。
@@ -117,7 +119,7 @@ pub struct Cli {
     /// Cache-Aware 候选必须至少命中的 token 数；默认 1024。
     #[arg(long)]
     pub cache_affinity_min_matched_tokens: Option<u64>,
-    /// Cache-Aware 候选必须至少命中的输入比例；默认不启用，配置后与绝对下限取 AND。
+    /// Cache-Aware 候选最小命中比例；与绝对下限同时生效。
     #[arg(long)]
     pub cache_affinity_min_match_ratio: Option<f64>,
     /// Cache-Aware Top-K 的最小尝试数。
@@ -129,7 +131,7 @@ pub struct Cli {
     /// Cache-Aware Top-K 的最大尝试数。
     #[arg(long)]
     pub cache_candidate_max_workers: Option<usize>,
-    /// 两个候选的 uncached work 差不超过该值时，显著压力差可以否决微小缓存收益。
+    /// 允许压力覆盖缓存收益的 uncached work 差值上限。
     #[arg(long)]
     pub cache_switch_margin_tokens: Option<u64>,
 
@@ -242,6 +244,11 @@ impl Cli {
     /// (model id, static worker URLs).
     pub fn into_config(self) -> Result<Config> {
         let discovery = self.build_discovery()?;
+        let bucket_config = self
+            .bucket_config
+            .as_deref()
+            .map(load_bucket_config)
+            .transpose()?;
 
         // Reject knobs that only take effect alongside another flag, rather
         // than silently dropping them — mirrors the discovery mutual-exclusion
@@ -614,9 +621,7 @@ impl Cli {
                 id: self.model_id,
                 policy: self.policy,
                 decode_policy: self.decode_policy,
-                // Step 1 keeps the candidate-domain seam but does not expose
-                // static Bucket configuration. Step 2 activates this field.
-                bucket_config: None,
+                bucket_config,
                 circuit_breaker,
                 cache_aware,
                 sticky,
@@ -696,6 +701,13 @@ impl Cli {
         };
         Ok(backend)
     }
+}
+
+fn load_bucket_config(path: &str) -> Result<crate::config::BucketConfig> {
+    let raw = std::fs::read_to_string(path)
+        .map_err(|error| anyhow!("--bucket-config cannot read {path:?}: {error}"))?;
+    serde_json::from_str(&raw)
+        .map_err(|error| anyhow!("--bucket-config {path:?} is not valid JSON: {error}"))
 }
 
 /// Join space/repeated `key=value` selector terms into the single
@@ -1564,9 +1576,7 @@ mod tests {
         fused_of(argv).expect("fused_score builds a term list")
     }
 
-    /// `score_policy` 是 Step 1 的顶层 policy。它复用上游兼容入口
-    /// `fused_score` 的通用 score-composition 实现，但不把 Session/Cache
-    /// policy 折叠为 score term。
+    /// `score_policy` 使用独立的顶层 policy 名称。
     #[test]
     fn score_policy_is_a_top_level_policy_with_its_own_cli_spelling() {
         use PolicyKind::{LoadBased, PrefixCache, ScorePolicy};
@@ -1589,9 +1599,7 @@ mod tests {
         );
     }
 
-    /// `--policy fused_score` alone composes the useful pair, and `--fuse`
-    /// overrides it with names + optional per-term weights. 该 spelling 为
-    /// 上游兼容而保留；新的 Step 1 配置应使用 `score_policy`。
+    /// `fused_score` 保留兼容入口，`--fuse` 可覆盖默认 terms。
     #[test]
     fn fuse_defaults_to_the_useful_pair_and_parses_weights() {
         use PolicyKind::{LoadBased, PrefixCache, Random};
@@ -1862,6 +1870,53 @@ mod tests {
         assert_eq!(
             legacy_config.model.decode_policy,
             DecodePolicyKind::LegacyHostAffinity
+        );
+    }
+
+    #[test]
+    fn bucket_config_json_is_loaded_and_validated_at_startup() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            file.path(),
+            r#"{
+                "ttft_slo_policy": "slo_first",
+                "tps_slo_policy": "best_effort",
+                "buckets": [
+                    {
+                        "id": "p-fast",
+                        "stage": "prefill",
+                        "rank": 10,
+                        "worker_ids": ["http://worker:30000"],
+                        "max_extend_tokens": 4096,
+                        "max_context_tokens": 8192,
+                        "ttft_p95_at_capacity_ms": 120
+                    }
+                ]
+            }"#,
+        )
+        .unwrap();
+        let path = file.path().to_str().unwrap().to_string();
+        let config = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://worker:30000",
+            "--bucket-config",
+            &path,
+        ]))
+        .unwrap();
+
+        let buckets = config
+            .model
+            .bucket_config
+            .expect("Bucket config must be retained");
+        assert_eq!(buckets.buckets.len(), 1);
+        assert_eq!(buckets.buckets[0].id, "p-fast");
+        assert_eq!(
+            buckets.ttft_slo_policy,
+            crate::config::SloBucketPolicy::SloFirst
+        );
+        assert_eq!(
+            buckets.tps_slo_policy,
+            crate::config::SloBucketPolicy::BestEffort
         );
     }
 }
