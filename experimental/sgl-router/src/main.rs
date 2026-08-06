@@ -242,6 +242,7 @@ async fn main() -> Result<()> {
     server_result
 }
 
+/// Build the external Indexer client with an optional query deadline.
 fn prefix_index_config(
     endpoint: String,
     query_timeout_ms: Option<u64>,
@@ -273,6 +274,7 @@ mod tests {
         assert_eq!(
             prefix_index_config(endpoint.clone(), None).query_deadline,
             dependency_default,
+            "legacy cache_aware_zmq must retain the dependency client default"
         );
         assert_eq!(
             prefix_index_config(endpoint, Some(25)).query_deadline,

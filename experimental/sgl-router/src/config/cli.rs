@@ -12,9 +12,10 @@ use std::num::NonZeroU32;
 use crate::config::{
     default_cb_cool_down, default_proxy_request_timeout_secs, default_stale_request_timeout_secs,
     resolve_mode, ActiveLoadConfig, AffinityConfig, AffinityMode, CacheAwareConfig,
-    CircuitBreakerConfig, Config, DiscoveryBackend, EligibilityConfig, FusedTerm,
+    CircuitBreakerConfig, Config, DecodePolicyKind, DiscoveryBackend, EligibilityConfig, FusedTerm,
     K8sDiscoveryConfig, LoadMonitorConfig, LogFormat, ModelConfig, ObservabilityConfig, PolicyKind,
-    ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig, StickyConfig, DEFAULT_FUSE,
+    ProxyConfig, ServerConfig, SessionAffinityMode, StaticUrlsDiscoveryConfig, StickyConfig,
+    DEFAULT_FUSE,
 };
 
 /// `sgl-router` — slim KV-aware OpenAI-compatible router for SGLang workers.
@@ -49,6 +50,9 @@ pub struct Cli {
     /// Routing policy.
     #[arg(long, value_enum, default_value = "round_robin")]
     pub policy: PolicyKind,
+    /// PD 请求在 Final Prefill 后选择 Decode worker 的独立策略。非 PD 部署不使用。
+    #[arg(long, value_enum, default_value = "power_of_two")]
+    pub decode_policy: DecodePolicyKind,
 
     // ---- circuit breaker (opt-in via --cb-threshold) ----
     /// Consecutive upstream failures before the circuit breaker opens.
@@ -60,7 +64,7 @@ pub struct Cli {
     #[arg(long)]
     pub cb_cool_down_secs: Option<u64>,
 
-    // ---- cache-aware-zmq tuning (only used by that policy) ----
+    // ---- legacy cache-aware-zmq tuning ----
     /// Min `matched_blocks / total_blocks` for a cache match to win.
     #[arg(long)]
     pub cache_threshold: Option<f32>,
@@ -73,7 +77,8 @@ pub struct Cli {
     /// External KV indexer gRPC endpoint used as an additional cache-aware signal.
     #[arg(long)]
     pub kv_indexer_endpoint: Option<String>,
-    /// External KV Indexer query deadline in milliseconds.
+    /// 新 `cache_aware` 的 External KV Indexer 单次 prefix 查询硬 deadline（毫秒）。
+    /// 旧 `cache_aware_zmq` 保持 Indexer client 的既有默认值。
     #[arg(long)]
     pub kv_indexer_query_timeout_ms: Option<u64>,
 
@@ -87,46 +92,50 @@ pub struct Cli {
     /// Cadence of the Session-Aware idle-assignment sweep, in seconds.
     #[arg(long)]
     pub session_eviction_interval_secs: Option<u64>,
-    /// Use a deterministic backup for the same session.
+    /// 对同一个 affinity key 和候选域使用确定性 backup。
     #[arg(long)]
     pub stable_pair: bool,
-    /// Whether pressure may override an admitted session primary.
+    /// Session affinity primary 在两个候选都通过 hard admission 后，是否可以
+    /// 按软策略逃逸到 backup。
     #[arg(long, value_enum)]
     pub affinity_mode: Option<AffinityMode>,
-    /// Disable the optional pressure guard.
+    /// Session affinity primary 的查找与 fallback 行为。
+    #[arg(long, value_enum)]
+    pub session_affinity_mode: Option<SessionAffinityMode>,
+    /// 关闭 Session-Aware 可选的软 Pressure Guard。
     #[arg(long)]
     pub disable_pressure_guard: bool,
-    /// Waiting uncached-token difference required by the pressure guard.
+    /// Pressure Guard 所需的 waiting uncached token 绝对差。
     #[arg(long)]
     pub pressure_abs_threshold_tokens: Option<u64>,
-    /// Waiting uncached-token ratio required by the pressure guard.
+    /// Pressure Guard 所需的 waiting uncached token 相对倍率。
     #[arg(long)]
     pub pressure_rel_threshold: Option<f64>,
-    /// Minimum matched prefix tokens for a Cache-Aware candidate.
+    /// Cache-Aware 候选必须至少命中的 token 数；默认 1024。
     #[arg(long)]
     pub cache_affinity_min_matched_tokens: Option<u64>,
-    /// Minimum matched prefix ratio for a Cache-Aware candidate.
+    /// Cache-Aware 候选必须至少命中的输入比例；默认不启用，配置后与绝对下限取 AND。
     #[arg(long)]
     pub cache_affinity_min_match_ratio: Option<f64>,
-    /// Minimum number of Cache-Aware candidates to inspect.
+    /// Cache-Aware Top-K 的最小尝试数。
     #[arg(long)]
     pub cache_candidate_min_workers: Option<usize>,
-    /// Candidate count as a fraction of the healthy Prefill pool.
+    /// Cache-Aware Top-K 相对当前健康 P pool 的比例。
     #[arg(long)]
     pub cache_candidate_ratio: Option<f64>,
-    /// Maximum number of Cache-Aware candidates to inspect.
+    /// Cache-Aware Top-K 的最大尝试数。
     #[arg(long)]
     pub cache_candidate_max_workers: Option<usize>,
-    /// Uncached-work margin within which pressure may break a cache tie.
+    /// 两个候选的 uncached work 差不超过该值时，显著压力差可以否决微小缓存收益。
     #[arg(long)]
     pub cache_switch_margin_tokens: Option<u64>,
 
-    // ---- fused-score composition (only used by `--policy fused_score`) ----
+    // ---- score composition (only used by `--policy score_policy` / `fused_score`) ----
     /// Policies to sum, spelled exactly as `--policy` spells them and each
     /// optionally weighted: `--fuse prefix_cache=2.0,load_based=0.3`. An
     /// omitted weight keeps that policy's own default. Requires `--policy
-    /// fused_score`; when that policy is set and this flag is omitted, the
-    /// terms default to `prefix_cache,load_based`.
+    /// score_policy` or `fused_score`; when either policy is set and this flag
+    /// is omitted, the terms default to `prefix_cache,load_based`.
     #[arg(long, value_delimiter = ',')]
     pub fuse: Vec<FusedTerm>,
 
@@ -255,12 +264,13 @@ impl Cli {
             || self.balance_rel_threshold.is_some();
         if tuned_legacy_cache_aware && self.policy != PolicyKind::CacheAwareZmq {
             return Err(anyhow!(
-                "--cache-threshold / --balance-abs-threshold / --balance-rel-threshold require --policy cache_aware_zmq"
+                "--cache-threshold / --balance-abs-threshold / --balance-rel-threshold \
+                 require --policy cache_aware_zmq"
             ));
         }
         let uses_indexer = matches!(
             self.policy,
-            PolicyKind::CacheAware | PolicyKind::CacheAwareZmq
+            PolicyKind::CacheAwareZmq | PolicyKind::CacheAware
         );
         if self.kv_indexer_endpoint.is_some() && !uses_indexer {
             return Err(anyhow!(
@@ -272,7 +282,6 @@ impl Cli {
                 "--policy cache_aware requires --kv-indexer-endpoint"
             ));
         }
-        let tuned_cache_aware = tuned_legacy_cache_aware || self.kv_indexer_endpoint.is_some();
         let affinity_policy = matches!(
             self.policy,
             PolicyKind::SessionAware | PolicyKind::CacheAware
@@ -282,11 +291,13 @@ impl Cli {
             || self.session_eviction_interval_secs.is_some()
             || self.stable_pair
             || self.affinity_mode.is_some()
+            || self.session_affinity_mode.is_some()
             || self.disable_pressure_guard;
         if tuned_session_affinity && self.policy != PolicyKind::SessionAware {
             return Err(anyhow!(
                 "--session-id-header, --session-*-secs, --stable-pair, --affinity-mode, \
-                 and --disable-pressure-guard require --policy session_aware"
+                 --session-affinity-mode, and --disable-pressure-guard require \
+                 --policy session_aware"
             ));
         }
         let tuned_cache_candidates = self.cache_affinity_min_matched_tokens.is_some()
@@ -308,106 +319,34 @@ impl Cli {
                 "pressure thresholds require --policy session_aware or cache_aware"
             ));
         }
-        let affinity = if affinity_policy {
-            let defaults = AffinityConfig::default();
-            let session_id_header = self.session_id_header.unwrap_or(defaults.session_id_header);
-            axum::http::HeaderName::try_from(session_id_header.as_str()).map_err(|error| {
-                anyhow!(
-                    "--session-id-header {session_id_header:?} is not a valid HTTP header name: {error}"
-                )
-            })?;
-            let session_idle_secs = self.session_idle_secs.unwrap_or(defaults.session_idle_secs);
-            let session_eviction_interval_secs = self
-                .session_eviction_interval_secs
-                .unwrap_or(defaults.session_eviction_interval_secs);
-            if session_idle_secs == 0 || session_eviction_interval_secs == 0 {
-                return Err(anyhow!(
-                    "--session-idle-secs and --session-eviction-interval-secs must be greater than 0"
-                ));
-            }
-            let pressure_rel_threshold = self
-                .pressure_rel_threshold
-                .unwrap_or(defaults.pressure_rel_threshold);
-            if !pressure_rel_threshold.is_finite() || pressure_rel_threshold <= 1.0 {
-                return Err(anyhow!(
-                    "--pressure-rel-threshold must be finite and greater than 1"
-                ));
-            }
-            let cache_affinity_min_match_ratio = self
-                .cache_affinity_min_match_ratio
-                .or(defaults.cache_affinity_min_match_ratio);
-            if cache_affinity_min_match_ratio
-                .is_some_and(|ratio| !ratio.is_finite() || !(0.0..=1.0).contains(&ratio))
-            {
-                return Err(anyhow!(
-                    "--cache-affinity-min-match-ratio must be finite and in [0, 1]"
-                ));
-            }
-            let cache_candidate_ratio = self
-                .cache_candidate_ratio
-                .unwrap_or(defaults.cache_candidate_ratio);
-            if !cache_candidate_ratio.is_finite() || !(0.0..=1.0).contains(&cache_candidate_ratio) {
-                return Err(anyhow!(
-                    "--cache-candidate-ratio must be finite and in [0, 1]"
-                ));
-            }
-            let cache_candidate_min_workers = self
-                .cache_candidate_min_workers
-                .unwrap_or(defaults.cache_candidate_min_workers);
-            let cache_candidate_max_workers = self
-                .cache_candidate_max_workers
-                .unwrap_or(defaults.cache_candidate_max_workers);
-            if cache_candidate_min_workers == 0
-                || cache_candidate_max_workers == 0
-                || cache_candidate_min_workers > cache_candidate_max_workers
-            {
-                return Err(anyhow!(
-                    "--cache-candidate-min-workers and --cache-candidate-max-workers must be positive and min must not exceed max"
-                ));
-            }
-            let kv_indexer_query_timeout_ms = self
-                .kv_indexer_query_timeout_ms
-                .unwrap_or(defaults.kv_indexer_query_timeout_ms);
-            if kv_indexer_query_timeout_ms == 0 {
-                return Err(anyhow!(
-                    "--kv-indexer-query-timeout-ms must be greater than 0"
-                ));
-            }
-            Some(AffinityConfig {
-                session_id_header,
-                session_idle_secs,
-                session_eviction_interval_secs,
-                stable_pair: self.stable_pair,
-                mode: self.affinity_mode.unwrap_or(defaults.mode),
-                pressure_guard: !self.disable_pressure_guard,
-                pressure_abs_threshold_tokens: self
-                    .pressure_abs_threshold_tokens
-                    .unwrap_or(defaults.pressure_abs_threshold_tokens),
-                pressure_rel_threshold,
-                cache_affinity_min_matched_tokens: self
-                    .cache_affinity_min_matched_tokens
-                    .or(defaults.cache_affinity_min_matched_tokens),
-                cache_affinity_min_match_ratio,
-                cache_candidate_min_workers,
-                cache_candidate_ratio,
-                cache_candidate_max_workers,
-                cache_switch_margin_tokens: self
-                    .cache_switch_margin_tokens
-                    .unwrap_or(defaults.cache_switch_margin_tokens),
-                kv_indexer_query_timeout_ms,
-            })
-        } else {
-            None
-        };
-        if !self.fuse.is_empty() && self.policy != PolicyKind::FusedScore {
-            return Err(anyhow!("--fuse requires --policy fused_score"));
+        if self.session_id_header.is_some() && self.policy != PolicyKind::SessionAware {
+            return Err(anyhow!(
+                "--session-id-header requires --policy session_aware"
+            ));
+        }
+        if (self.session_idle_secs.is_some() || self.session_eviction_interval_secs.is_some())
+            && self.policy != PolicyKind::SessionAware
+        {
+            return Err(anyhow!(
+                "--session-idle-secs / --session-eviction-interval-secs require \
+                 --policy session_aware"
+            ));
+        }
+        let is_score_composition = matches!(
+            self.policy,
+            PolicyKind::FusedScore | PolicyKind::ScorePolicy
+        );
+        if !self.fuse.is_empty() && !is_score_composition {
+            return Err(anyhow!(
+                "--fuse requires --policy score_policy or fused_score"
+            ));
         }
         // Resolve the term list here so a malformed composition fails at
         // startup. Note what is deliberately NOT checked: whether a named
         // policy can actually be fused. That question is asked of the policy
         // itself (`Policy::can_fuse`) in the factory, never of a list of names
         // here — a name list drifts silently the moment a policy is added.
-        let fused = if self.policy == PolicyKind::FusedScore {
+        let fused = if is_score_composition {
             let terms = if self.fuse.is_empty() {
                 DEFAULT_FUSE
                     .iter()
@@ -419,8 +358,14 @@ impl Cli {
             for (i, t) in terms.iter().enumerate() {
                 // There is no CLI syntax for a nested group, so a self-
                 // reference is only ever unbounded recursion in the factory.
-                if t.kind == PolicyKind::FusedScore {
-                    return Err(anyhow!("--fuse: `fused_score` cannot fuse itself"));
+                if t.kind == self.policy {
+                    return Err(anyhow!("--fuse: `{}` cannot fuse itself", t.kind));
+                }
+                if matches!(t.kind, PolicyKind::FusedScore | PolicyKind::ScorePolicy) {
+                    return Err(anyhow!(
+                        "--fuse: `{}` cannot fuse a composed score policy",
+                        t.kind
+                    ));
                 }
                 // A repeat silently doubles that term's weight instead of
                 // doing nothing, which is the surprising reading.
@@ -534,6 +479,103 @@ impl Cli {
             None
         };
 
+        let affinity = if affinity_policy {
+            let d = AffinityConfig::default();
+            let session_id_header = self.session_id_header.unwrap_or(d.session_id_header);
+            axum::http::HeaderName::try_from(session_id_header.as_str()).map_err(|e| {
+                anyhow!("--session-id-header {session_id_header:?} is not a valid HTTP header name: {e}")
+            })?;
+            let pressure_rel_threshold = self
+                .pressure_rel_threshold
+                .unwrap_or(d.pressure_rel_threshold);
+            if !pressure_rel_threshold.is_finite() || pressure_rel_threshold <= 1.0 {
+                return Err(anyhow!(
+                    "--pressure-rel-threshold must be finite and greater than 1"
+                ));
+            }
+            let cache_affinity_min_match_ratio = self
+                .cache_affinity_min_match_ratio
+                .or(d.cache_affinity_min_match_ratio);
+            if cache_affinity_min_match_ratio
+                .is_some_and(|ratio| !ratio.is_finite() || !(0.0..=1.0).contains(&ratio))
+            {
+                return Err(anyhow!(
+                    "--cache-affinity-min-match-ratio must be finite and in [0, 1]"
+                ));
+            }
+            let cache_candidate_ratio = self
+                .cache_candidate_ratio
+                .unwrap_or(d.cache_candidate_ratio);
+            if !cache_candidate_ratio.is_finite() || !(0.0..=1.0).contains(&cache_candidate_ratio) {
+                return Err(anyhow!(
+                    "--cache-candidate-ratio must be finite and in [0, 1]"
+                ));
+            }
+            let cache_candidate_min_workers = self
+                .cache_candidate_min_workers
+                .unwrap_or(d.cache_candidate_min_workers);
+            let cache_candidate_max_workers = self
+                .cache_candidate_max_workers
+                .unwrap_or(d.cache_candidate_max_workers);
+            if cache_candidate_min_workers == 0
+                || cache_candidate_max_workers == 0
+                || cache_candidate_min_workers > cache_candidate_max_workers
+            {
+                return Err(anyhow!(
+                    "--cache-candidate-min-workers and --cache-candidate-max-workers must be \
+                     positive and min must not exceed max"
+                ));
+            }
+            let kv_indexer_query_timeout_ms = self
+                .kv_indexer_query_timeout_ms
+                .unwrap_or(d.kv_indexer_query_timeout_ms);
+            if kv_indexer_query_timeout_ms == 0 {
+                return Err(anyhow!(
+                    "--kv-indexer-query-timeout-ms must be greater than 0"
+                ));
+            }
+            let session_idle_secs = self.session_idle_secs.unwrap_or(d.session_idle_secs);
+            let session_eviction_interval_secs = self
+                .session_eviction_interval_secs
+                .unwrap_or(d.session_eviction_interval_secs);
+            if session_idle_secs == 0 {
+                return Err(anyhow!("--session-idle-secs must be greater than 0"));
+            }
+            if session_eviction_interval_secs == 0 {
+                return Err(anyhow!(
+                    "--session-eviction-interval-secs must be greater than 0"
+                ));
+            }
+            Some(AffinityConfig {
+                session_id_header,
+                session_idle_secs,
+                session_eviction_interval_secs,
+                stable_pair: self.stable_pair,
+                mode: self.affinity_mode.unwrap_or(d.mode),
+                session_affinity_mode: self
+                    .session_affinity_mode
+                    .unwrap_or(d.session_affinity_mode),
+                pressure_guard: !self.disable_pressure_guard,
+                pressure_abs_threshold_tokens: self
+                    .pressure_abs_threshold_tokens
+                    .unwrap_or(d.pressure_abs_threshold_tokens),
+                pressure_rel_threshold,
+                cache_affinity_min_matched_tokens: self
+                    .cache_affinity_min_matched_tokens
+                    .or(d.cache_affinity_min_matched_tokens),
+                cache_affinity_min_match_ratio,
+                cache_candidate_min_workers,
+                cache_candidate_ratio,
+                cache_candidate_max_workers,
+                cache_switch_margin_tokens: self
+                    .cache_switch_margin_tokens
+                    .unwrap_or(d.cache_switch_margin_tokens),
+                kv_indexer_query_timeout_ms,
+            })
+        } else {
+            None
+        };
+
         let circuit_breaker = self.cb_threshold.map(|threshold| CircuitBreakerConfig {
             threshold,
             cool_down_secs: self.cb_cool_down_secs.unwrap_or_else(default_cb_cool_down),
@@ -542,7 +584,7 @@ impl Cli {
         // Only build a CacheAwareConfig when the operator tuned at least
         // one knob; otherwise leave it None so the policy uses its own
         // defaults. Unset knobs fall back to the per-field defaults.
-        let cache_aware = if tuned_cache_aware {
+        let cache_aware = if tuned_legacy_cache_aware || self.kv_indexer_endpoint.is_some() {
             let d = CacheAwareConfig::default();
             Some(CacheAwareConfig {
                 cache_threshold: self.cache_threshold.unwrap_or(d.cache_threshold),
@@ -573,10 +615,14 @@ impl Cli {
                 tokenizer_path: self.tokenizer_path.unwrap_or_else(|| self.model_id.clone()),
                 id: self.model_id,
                 policy: self.policy,
+                decode_policy: self.decode_policy,
+                // Step 1 keeps the candidate-domain seam but does not expose
+                // static Bucket configuration. Step 2 activates this field.
+                bucket_config: None,
                 circuit_breaker,
                 cache_aware,
-                affinity,
                 sticky,
+                affinity,
                 fused,
                 eligibility,
             },
@@ -1455,8 +1501,34 @@ mod tests {
         fused_of(argv).expect("fused_score builds a term list")
     }
 
+    /// `score_policy` 是 Step 1 的顶层 policy。它复用上游兼容入口
+    /// `fused_score` 的通用 score-composition 实现，但不把 Session/Cache
+    /// policy 折叠为 score term。
+    #[test]
+    fn score_policy_is_a_top_level_policy_with_its_own_cli_spelling() {
+        use PolicyKind::{LoadBased, PrefixCache, ScorePolicy};
+        let pair = [(PrefixCache, None), (LoadBased, None)];
+        let config = cfg_of("--policy score_policy").unwrap();
+        assert_eq!(config.model.policy, ScorePolicy);
+        assert_eq!(
+            config
+                .model
+                .fused
+                .expect("score_policy must resolve its score terms")
+                .iter()
+                .map(|t| (t.kind, t.weight))
+                .collect::<Vec<_>>(),
+            pair,
+        );
+        assert_eq!(
+            fuse_ok("--policy score_policy --fuse prefix_cache=2.0,load_based=0.3"),
+            [(PrefixCache, Some(2.0)), (LoadBased, Some(0.3))],
+        );
+    }
+
     /// `--policy fused_score` alone composes the useful pair, and `--fuse`
-    /// overrides it with names + optional per-term weights.
+    /// overrides it with names + optional per-term weights. 该 spelling 为
+    /// 上游兼容而保留；新的 Step 1 配置应使用 `score_policy`。
     #[test]
     fn fuse_defaults_to_the_useful_pair_and_parses_weights() {
         use PolicyKind::{LoadBased, PrefixCache, Random};
@@ -1503,7 +1575,7 @@ mod tests {
     #[test]
     fn fuse_rejects_malformed_compositions() {
         // Every case must NAME the offending token, not just complain.
-        let cases: [(&str, &[&str]); 5] = [
+        let cases: [(&str, &[&str]); 6] = [
             ("--fuse load_based", &["--fuse requires", "fused_score"]),
             (
                 "--policy fused_score --fuse fused_score,load_based",
@@ -1512,6 +1584,10 @@ mod tests {
             (
                 "--policy fused_score --fuse load_based,load_based",
                 &["load_based", "listed more than once"],
+            ),
+            (
+                "--policy score_policy --fuse score_policy,load_based",
+                &["score_policy", "cannot fuse itself"],
             ),
             (
                 "--policy fused_score --fuse not_a_policy",
@@ -1531,10 +1607,10 @@ mod tests {
     }
 
     #[test]
-    fn session_aware_builds_affinity_config() {
+    fn session_aware_builds_affinity_config_from_its_cli_knobs() {
         let config = cfg_of(
             "--policy session_aware --session-id-header x-agent-session --stable-pair \
-             --affinity-mode strict --disable-pressure-guard \
+             --affinity-mode strict --session-affinity-mode global-rebind --disable-pressure-guard \
              --pressure-abs-threshold-tokens 2048 --pressure-rel-threshold 2.0",
         )
         .unwrap();
@@ -1547,17 +1623,51 @@ mod tests {
         assert_eq!(affinity.session_id_header, "x-agent-session");
         assert!(affinity.stable_pair);
         assert_eq!(affinity.mode, AffinityMode::Strict);
+        assert_eq!(
+            affinity.session_affinity_mode,
+            SessionAffinityMode::GlobalRebind
+        );
         assert!(!affinity.pressure_guard);
         assert_eq!(affinity.pressure_abs_threshold_tokens, 2_048);
         assert_eq!(affinity.pressure_rel_threshold, 2.0);
     }
 
     #[test]
-    fn session_aware_rejects_unbounded_assignment_lifetime() {
-        let error = cfg_of("--policy session_aware --session-idle-secs 0")
+    fn rejects_removed_affinity_aware_range_flag() {
+        let error = cfg_of("--policy session_aware --affinity-aware-range global-first")
             .unwrap_err()
             .to_string();
-        assert!(error.contains("must be greater than 0"), "{error}");
+        assert!(error.contains("unexpected argument '--affinity-aware-range'"));
+    }
+
+    #[test]
+    fn session_affinity_mode_accepts_all_new_values() {
+        for (value, expected) in [
+            ("bucket", SessionAffinityMode::Bucket),
+            ("global-rebind", SessionAffinityMode::GlobalRebind),
+            ("global-preserve", SessionAffinityMode::GlobalPreserve),
+        ] {
+            let config = cfg_of(&format!(
+                "--policy session_aware --session-affinity-mode {value}"
+            ))
+            .unwrap();
+            assert_eq!(
+                config.model.affinity.unwrap().session_affinity_mode,
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn session_aware_configures_bounded_assignment_lifetime() {
+        let config = cfg_of(
+            "--policy session_aware --session-idle-secs 120 \
+             --session-eviction-interval-secs 15",
+        )
+        .unwrap();
+        let affinity = config.model.affinity.expect("session affinity config");
+        assert_eq!(affinity.session_idle_secs, 120);
+        assert_eq!(affinity.session_eviction_interval_secs, 15);
     }
 
     #[test]
@@ -1657,6 +1767,21 @@ mod tests {
         assert!(
             missing_indexer.contains("--kv-indexer-endpoint"),
             "got: {missing_indexer}"
+        );
+    }
+
+    #[test]
+    fn decode_policy_defaults_to_p2_and_accepts_legacy_compatibility_mode() {
+        let default_config = cfg_of("--policy power_of_two").unwrap();
+        assert_eq!(
+            default_config.model.decode_policy,
+            DecodePolicyKind::PowerOfTwo
+        );
+
+        let legacy_config = cfg_of("--decode-policy legacy_host_affinity").unwrap();
+        assert_eq!(
+            legacy_config.model.decode_policy,
+            DecodePolicyKind::LegacyHostAffinity
         );
     }
 }

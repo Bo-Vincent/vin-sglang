@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
+//! 基于 ingress KV Indexer 结果生成有界 Cache-Aware 候选集。
+
 use crate::config::AffinityConfig;
 use crate::policies::admission::FreshLoadLookup;
 use crate::policies::power_of_two::PowerOfTwoChoicesPolicy;
@@ -62,7 +64,7 @@ impl CacheAwarePolicy {
                 worker: Arc::clone(worker),
                 matched_prefix_tokens,
                 uncached_tokens: input_tokens.saturating_sub(matched_prefix_tokens),
-                candidate_range_id: "global".to_string(),
+                candidate_range_id: ctx.candidate_range_id().to_string(),
                 max_pending_prefill_tokens: None,
             });
         }
