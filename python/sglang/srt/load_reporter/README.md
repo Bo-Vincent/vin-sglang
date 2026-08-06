@@ -237,6 +237,12 @@ only; its parameter name is chosen by the Router owner and is not defined here.
 | `report_builder.py` | Validated rank tuple → `pb.LoadReport` with status + sequence id. |
 | `config.py` | `LoadReporterConfig` / `WorkerMetadata` from `ServerArgs`; internal constants. |
 | `proto/` | Generated `sglang.router.loadmonitor.v1` bindings. |
+The canonical `RankLoad` fields 14 through 21 are optional. The reporter
+forwards Scheduler gauges
+  (`num_active_tokens` and Decode queue counts) and cumulative counters
+  (Prefill work/busy time and Decode step/time). It does not estimate queue
+  time or throughput; the Router derives those values from consecutive reports
+  from the same source.
 
 ## Threading and async model
 

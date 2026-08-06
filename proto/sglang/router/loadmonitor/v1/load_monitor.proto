@@ -53,6 +53,16 @@ message RankLoad {
   double gen_throughput = 11;
   double cache_hit_rate = 12;
   double utilization = 13;
+  // Optional pressure inputs. The Worker forwards raw gauges/counters; the
+  // Router derives rates only from consecutive reports of one source.
+  optional int64 num_active_tokens = 14;
+  optional int64 total_prefill_uncached_tokens = 15;
+  optional int64 total_prefill_busy_us = 16;
+  optional int64 decode_prealloc_queue_reqs = 17;
+  optional int64 decode_transfer_queue_reqs = 18;
+  optional int64 decode_retracted_queue_reqs = 19;
+  optional int64 total_decode_steps = 20;
+  optional int64 total_decode_step_us = 21;
 }
 
 message LoadReport {
