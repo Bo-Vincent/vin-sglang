@@ -170,16 +170,16 @@ async fn main() -> Result<()> {
         .context("build proxy client")?,
     );
 
-    let ctx = Arc::new(
-        sgl_router::server::app_context::AppContext::with_active_load(
-            cfg.clone(),
-            tokenizers,
-            proxy,
-            registry,
-            policies,
-            active_load,
-        ),
+    let mut app_ctx = sgl_router::server::app_context::AppContext::with_active_load(
+        cfg.clone(),
+        tokenizers,
+        proxy,
+        registry,
+        policies,
+        active_load,
     );
+    app_ctx.load_monitor = Arc::clone(&load_monitor);
+    let ctx = Arc::new(app_ctx);
     ctx.mark_ready();
 
     let app = sgl_router::server::app::build_router(ctx.clone());
