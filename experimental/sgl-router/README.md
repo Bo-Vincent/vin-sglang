@@ -50,7 +50,30 @@ Omit `--service-discovery-namespace` to watch all namespaces (requires
 cluster-wide RBAC). For prefill/decode disaggregation, replace `--selector`
 with `--prefill-selector` and `--decode-selector`.
 
-External KV indexer as the cache-aware signal source:
+## Engine 发布的负载快照
+
+Router 不再连接旧的 Load Reporter/LoadMonitor gRPC 服务。支持 #34608 的
+Worker 通过 `/server_info.kv_events` 广播 `load_endpoint_port_base` 和
+`load_topic`；Router 为每个 DP rank 建立 ZMQ SUB，并只接受三帧
+`[topic, sequence, msgpack LoadStat]` 消息。
+
+每个 `LoadStat` 的四个可信字段是运行请求数、等待请求数、已用 KV tokens
+和 KV 容量。Router 只有在同一 Worker 的所有已广播 rank 都有新鲜快照时才
+使用 `running + waiting`；缺失、过期或格式错误时会回退到 Router 本地的
+in-flight 计数。不会把请求数解释成 token、排队时延或旧协议的压力指标。
+
+## Session、Cache 与 Score 策略
+
+`power_of_two`、`session_aware`、`cache_aware` 和 `score_policy` 在健康的
+Prefill 候选范围中产生候选，再通过共享准入逻辑决定最终 Worker。`cache_aware`
+只读取入口阶段准备好的 Indexer 结果，不会在选择热路径发起同步 Indexer RPC。
+`fused_score` 保留为兼容名称；`load_based` 是 Router 本地 active-load 的软分，
+不是 Engine queue/token 的硬准入结论。
+
+## External KV indexer (cache_aware_zmq)
+
+External KV indexer as the cache-aware signal source for the legacy
+`cache_aware_zmq` policy:
 
 ```bash
 sgl-router \
