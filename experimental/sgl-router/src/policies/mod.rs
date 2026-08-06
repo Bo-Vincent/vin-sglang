@@ -235,8 +235,100 @@ impl<'a> SelectionContext<'a> {
     }
 }
 
+/// A policy's ordered candidates for the shared routing pipeline.
+#[derive(Clone)]
+pub struct SelectionProposal {
+    pub primary: Arc<Worker>,
+    pub backup: Option<Arc<Worker>>,
+    pub kind: ProposalKind,
+    pub guard_hints: GuardHints,
+    pub eligible_workers: Option<Vec<Arc<Worker>>>,
+}
+
+#[derive(Clone)]
+pub enum PrefillProposal {
+    Pair(SelectionProposal),
+}
+
+impl SelectionProposal {
+    pub fn primary(primary: Arc<Worker>) -> Self {
+        Self {
+            primary,
+            backup: None,
+            kind: ProposalKind::Generic,
+            guard_hints: GuardHints::default(),
+            eligible_workers: None,
+        }
+    }
+
+    pub fn with_backup(primary: Arc<Worker>, backup: Arc<Worker>) -> Self {
+        Self {
+            primary,
+            backup: Some(backup),
+            kind: ProposalKind::PowerOfTwo,
+            guard_hints: GuardHints::default(),
+            eligible_workers: None,
+        }
+    }
+
+    pub fn with_kind(mut self, kind: ProposalKind) -> Self {
+        self.kind = kind;
+        self
+    }
+
+    pub fn with_guard_hints(mut self, guard_hints: GuardHints) -> Self {
+        self.guard_hints = guard_hints;
+        self
+    }
+
+    pub fn with_eligible_workers(mut self, workers: Vec<Arc<Worker>>) -> Self {
+        self.eligible_workers = Some(workers);
+        self
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProposalKind {
+    Generic,
+    PowerOfTwo,
+    Score,
+}
+
+#[derive(Debug, Clone)]
+pub struct GuardHints {
+    pub enable_pressure_guard: bool,
+    pub pressure_abs_threshold_tokens: u64,
+    pub pressure_rel_threshold: f64,
+}
+
+impl Default for GuardHints {
+    fn default() -> Self {
+        Self {
+            enable_pressure_guard: false,
+            pressure_abs_threshold_tokens: 0,
+            pressure_rel_threshold: 1.0,
+        }
+    }
+}
+
 pub trait Policy: Send + Sync + std::fmt::Debug {
     fn select(&self, workers: &[Arc<Worker>], ctx: &SelectionContext<'_>) -> Option<Arc<Worker>>;
+
+    fn propose(
+        &self,
+        workers: &[Arc<Worker>],
+        ctx: &SelectionContext<'_>,
+    ) -> Option<SelectionProposal> {
+        self.select(workers, ctx).map(SelectionProposal::primary)
+    }
+
+    fn propose_prefill(
+        &self,
+        workers: &[Arc<Worker>],
+        ctx: &SelectionContext<'_>,
+    ) -> Option<PrefillProposal> {
+        self.propose(workers, ctx).map(PrefillProposal::Pair)
+    }
 
     /// Whether this policy's ROUTING decision needs the request tokens (i.e.
     /// it routes by prompt prefix). Ingress tokenization itself is no longer
@@ -306,5 +398,68 @@ impl PolicyRegistry {
         for entry in self.by_model.iter() {
             entry.value().attach_metrics(Arc::clone(&metrics));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::discovery::{WorkerId, WorkerMode, WorkerSpec};
+    use crate::policies::power_of_two::PowerOfTwoChoicesPolicy;
+
+    fn worker(id: &str) -> Arc<Worker> {
+        Arc::new(Worker::new(WorkerSpec {
+            id: WorkerId(id.into()),
+            url: format!("http://{id}:30000"),
+            mode: WorkerMode::Plain,
+            model_ids: vec![ModelId("model".into())],
+            bootstrap_port: None,
+        }))
+    }
+
+    #[test]
+    fn default_proposal_preserves_legacy_single_worker_selection() {
+        let model = ModelId("model".into());
+        let ctx = SelectionContext::new(&model, None);
+        let only = worker("only");
+        let policy = PowerOfTwoChoicesPolicy::new();
+
+        let proposal = policy
+            .propose(&[Arc::clone(&only)], &ctx)
+            .expect("one candidate must produce a proposal");
+        assert_eq!(proposal.primary.id, only.id);
+        assert!(proposal.backup.is_none());
+    }
+
+    #[test]
+    fn power_of_two_proposal_keeps_the_other_sample_as_backup() {
+        let model = ModelId("model".into());
+        let ctx = SelectionContext::new(&model, None);
+        let workers = vec![worker("first"), worker("second")];
+        let policy = PowerOfTwoChoicesPolicy::new();
+
+        let proposal = policy
+            .propose(&workers, &ctx)
+            .expect("two candidates must produce a proposal");
+        let backup = proposal.backup.expect("P2 must retain its second sample");
+
+        assert_ne!(proposal.primary.id, backup.id);
+        assert_eq!(proposal.kind, ProposalKind::PowerOfTwo);
+    }
+
+    #[test]
+    fn prefill_proposal_adapter_keeps_existing_pair_semantics() {
+        let model = ModelId("model".into());
+        let workers = vec![worker("first"), worker("second")];
+        let policy = PowerOfTwoChoicesPolicy::new();
+        let ctx = SelectionContext::new(&model, None);
+
+        let proposal = policy
+            .propose_prefill(&workers, &ctx)
+            .expect("P2 must produce a prefill proposal");
+
+        let PrefillProposal::Pair(pair) = proposal;
+        assert_eq!(pair.kind, ProposalKind::PowerOfTwo);
+        assert!(pair.backup.is_some());
     }
 }
