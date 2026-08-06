@@ -13,7 +13,7 @@ use crate::policies::{
     round_robin::RoundRobinPolicy,
     scoring::{
         admission::Overloaded, prefix_cache, prefix_cache::PrefixCachePolicy, FusedScorePolicy,
-        Pipeline,
+        Pipeline, ScorePolicy,
     },
     session_aware::SessionAwarePolicy,
     sticky::StickyPolicy,
@@ -34,13 +34,14 @@ fn build_sticky_fallback(kind: PolicyKind) -> Arc<dyn Policy> {
         PolicyKind::Random => Arc::new(RandomPolicy::new()),
         PolicyKind::PowerOfTwo => Arc::new(PowerOfTwoChoicesPolicy::new()),
         PolicyKind::LoadBased => Arc::new(LoadBasedPolicy::new()),
-        PolicyKind::CacheAware
-        | PolicyKind::CacheAwareZmq
+        PolicyKind::CacheAwareZmq
+        | PolicyKind::CacheAware
         | PolicyKind::SessionAware
         | PolicyKind::Overloaded
         | PolicyKind::Sticky
         | PolicyKind::PrefixCache
-        | PolicyKind::FusedScore => {
+        | PolicyKind::FusedScore
+        | PolicyKind::ScorePolicy => {
             unreachable!("sticky fallback is validated to be dependency-free in Cli::into_config")
         }
     }
@@ -66,8 +67,7 @@ fn build_sticky(model: &ModelConfig) -> Arc<dyn Policy> {
 /// all policies for the same process pass the same instances to every
 /// model.
 ///
-/// Fallible because `--policy fused_score` can name a term that turns out not
-/// to be fusable — a startup error rather than a request-time surprise.
+/// Returns an error for an invalid score composition.
 pub fn build_policy(
     model: &ModelConfig,
     tree: Arc<HashTree>,
@@ -111,12 +111,6 @@ fn build_kind(
         PolicyKind::RoundRobin => Arc::new(RoundRobinPolicy::new()),
         PolicyKind::Random => Arc::new(RandomPolicy::new()),
         PolicyKind::PowerOfTwo => Arc::new(PowerOfTwoChoicesPolicy::new()),
-        PolicyKind::SessionAware => Arc::new(SessionAwarePolicy::new(
-            model.affinity.clone().unwrap_or_default(),
-        )),
-        PolicyKind::CacheAware => Arc::new(CacheAwarePolicy::new(
-            model.affinity.clone().unwrap_or_default(),
-        )),
         PolicyKind::LoadBased => Arc::new(LoadBasedPolicy::new()),
         PolicyKind::CacheAwareZmq => {
             let cache_cfg = model.cache_aware.clone().unwrap_or_default();
@@ -127,8 +121,17 @@ fn build_kind(
                 block_size_oracle,
             ))
         }
+        PolicyKind::SessionAware => Arc::new(SessionAwarePolicy::new(
+            model.affinity.clone().unwrap_or_default(),
+        )),
+        PolicyKind::CacheAware => Arc::new(CacheAwarePolicy::new(
+            model.affinity.clone().unwrap_or_default(),
+        )),
         PolicyKind::Sticky => build_sticky(model),
         PolicyKind::FusedScore => build_fused(model, &tree, &tokenizers, &block_size_oracle)?,
+        PolicyKind::ScorePolicy => {
+            build_score_policy(model, &tree, &tokenizers, &block_size_oracle)?
+        }
         PolicyKind::PrefixCache => {
             let p = PrefixCachePolicy::new(tree, block_size_oracle, prefix_cache::DEFAULT_WEIGHT);
             // From the eligibility config even for a `--fuse` term, so the two
@@ -150,12 +153,35 @@ fn build_kind(
     })
 }
 
-/// Build the composer for `--policy fused_score`.
-///
-/// Each term is built by `build_policy` itself, so terms get the same
-/// dependencies real policies get and there is no second name table. A term
-/// naming `fused_score` recurses once into an empty spec and stops there.
+/// 构造上游兼容的 `fused_score` policy。
 fn build_fused(
+    model: &ModelConfig,
+    tree: &Arc<HashTree>,
+    tokenizers: &Arc<TokenizerRegistry>,
+    oracle: &Arc<BlockSizeOracle>,
+) -> Result<Arc<dyn Policy>> {
+    build_score_composition(PolicyKind::FusedScore, model, tree, tokenizers, oracle)
+}
+
+/// 构造顶层 `score_policy`。
+fn build_score_policy(
+    model: &ModelConfig,
+    tree: &Arc<HashTree>,
+    tokenizers: &Arc<TokenizerRegistry>,
+    oracle: &Arc<BlockSizeOracle>,
+) -> Result<Arc<dyn Policy>> {
+    Ok(Arc::new(ScorePolicy::new(build_score_composition(
+        PolicyKind::ScorePolicy,
+        model,
+        tree,
+        tokenizers,
+        oracle,
+    )?)))
+}
+
+/// 由配置中的 terms 构造 score composition。
+fn build_score_composition(
+    kind: PolicyKind,
     model: &ModelConfig,
     tree: &Arc<HashTree>,
     tokenizers: &Arc<TokenizerRegistry>,
@@ -163,20 +189,13 @@ fn build_fused(
 ) -> Result<Arc<dyn Policy>> {
     let spec = model.fused.as_deref().unwrap_or_default();
     if spec.is_empty() {
-        return Err(anyhow!(
-            "--policy fused_score needs at least one --fuse term"
-        ));
+        return Err(anyhow!("--policy {kind} needs at least one --fuse term"));
     }
     let mut terms: Vec<(Arc<dyn Policy>, Option<f32>)> = Vec::with_capacity(spec.len());
     for t in spec {
         let mut m = model.clone();
         (m.policy, m.fused) = (t.kind, None);
-        let inner = build_policy(
-            &m,
-            Arc::clone(tree),
-            Arc::clone(tokenizers),
-            Arc::clone(oracle),
-        )?;
+        let inner = build_kind(t.kind, &m, tree, tokenizers, oracle)?;
         // Fusability is asked of the BUILT policy via `can_fuse()`, never
         // matched on `kind`: a name list here would be a second source of
         // truth and would go stale the first time someone adds a policy.
@@ -200,12 +219,6 @@ pub fn build_policy_kind_only(kind: PolicyKind) -> Result<Arc<dyn Policy>> {
         PolicyKind::RoundRobin => Arc::new(RoundRobinPolicy::new()),
         PolicyKind::Random => Arc::new(RandomPolicy::new()),
         PolicyKind::PowerOfTwo => Arc::new(PowerOfTwoChoicesPolicy::new()),
-        PolicyKind::SessionAware => Arc::new(SessionAwarePolicy::new(
-            crate::config::AffinityConfig::default(),
-        )),
-        PolicyKind::CacheAware => Arc::new(CacheAwarePolicy::new(
-            crate::config::AffinityConfig::default(),
-        )),
         PolicyKind::LoadBased => Arc::new(LoadBasedPolicy::new()),
         PolicyKind::CacheAwareZmq => {
             // Provide an empty tree + empty tokenizer registry + fresh
@@ -219,6 +232,12 @@ pub fn build_policy_kind_only(kind: PolicyKind) -> Result<Arc<dyn Policy>> {
                 BlockSizeOracle::new(),
             ))
         }
+        PolicyKind::SessionAware => Arc::new(SessionAwarePolicy::new(
+            crate::config::AffinityConfig::default(),
+        )),
+        PolicyKind::CacheAware => Arc::new(CacheAwarePolicy::new(
+            crate::config::AffinityConfig::default(),
+        )),
         PolicyKind::Sticky => {
             let s = crate::config::StickyConfig::default();
             Arc::new(StickyPolicy::new(
@@ -233,9 +252,9 @@ pub fn build_policy_kind_only(kind: PolicyKind) -> Result<Arc<dyn Policy>> {
             BlockSizeOracle::new(),
             prefix_cache::DEFAULT_WEIGHT,
         )),
-        // The only genuinely dependency-BOUND kind: its terms live on
+        // The only genuinely dependency-BOUND kinds: their terms live on
         // `ModelConfig`, which this constructor by definition does not have.
-        PolicyKind::FusedScore => {
+        PolicyKind::FusedScore | PolicyKind::ScorePolicy => {
             return Err(anyhow!("--policy {kind} needs --fuse terms from the model"))
         }
     })
@@ -383,10 +402,12 @@ mod tests {
                 id: id.into(),
                 tokenizer_path: "/tmp/x".into(),
                 policy,
+                decode_policy: Default::default(),
+                bucket_config: None,
                 circuit_breaker: None,
                 cache_aware: None,
-                affinity: None,
                 sticky: None,
+                affinity: None,
                 fused: None,
                 eligibility: None,
             },
@@ -418,10 +439,9 @@ mod tests {
         ] {
             assert!(build_policy_kind_only(kind).is_ok(), "{kind:?}");
         }
-        // FusedScore stays refused here permanently, and for a different
-        // reason: its terms live on `ModelConfig`, which this constructor
-        // does not take. `build_policy` is the door for it.
+        // Composition policies require ModelConfig and use build_policy.
         assert!(build_policy_kind_only(PolicyKind::FusedScore).is_err());
+        assert!(build_policy_kind_only(PolicyKind::ScorePolicy).is_err());
     }
 
     /// The standalone path PLAN requires, exercised through `build_policy`
@@ -468,6 +488,50 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("at least one --fuse term"));
+    }
+
+    /// `score_policy` 使用独立的顶层 factory 分支。
+    #[test]
+    fn score_policy_builds_via_its_own_factory_branch() {
+        let mut cfg = cfg_with_model("modelA", PolicyKind::ScorePolicy);
+        cfg.model.fused = Some(vec![crate::config::FusedTerm {
+            kind: PolicyKind::PrefixCache,
+            weight: Some(2.0),
+        }]);
+
+        let registry = build_registry_with_defaults(&cfg).expect("score policy builds");
+        let policy = registry
+            .get(&ModelId("modelA".into()))
+            .expect("configured model has a policy");
+        assert!(
+            policy.can_fuse(),
+            "the score policy exposes score semantics"
+        );
+        assert!(
+            policy.uses_shared_prefill_admission(),
+            "top-level score_policy participates in the shared hard admission layer"
+        );
+    }
+
+    #[test]
+    fn score_policy_with_filter_builds_one_outer_pipeline() {
+        let mut cfg = cfg_with_model("modelA", PolicyKind::ScorePolicy);
+        cfg.model.fused = Some(vec![crate::config::FusedTerm {
+            kind: PolicyKind::LoadBased,
+            weight: Some(1.0),
+        }]);
+        cfg.model.eligibility = Some(EligibilityConfig {
+            filters: vec![PolicyKind::Overloaded],
+            max_in_flight: Some(2),
+            min_prefix_share: None,
+        });
+
+        let registry = build_registry_with_defaults(&cfg)
+            .expect("a score policy keeps eligibility outside its scoring terms");
+        let policy = registry
+            .get(&ModelId("modelA".into()))
+            .expect("configured model has a policy");
+        assert!(policy.uses_shared_prefill_admission());
     }
 
     #[test]
