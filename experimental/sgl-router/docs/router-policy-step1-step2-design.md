@@ -4,6 +4,9 @@
 状态：v2 集成分支实现设计；Step 1 是同构集群的 Policy / Admission / Guard 共设计，Step 2 在同一骨架上增加 work-aware Bucket 与 SLO。
 范围：`experimental/sgl-router`
 
+> LoadMonitor 原始指标、Router 派生指标及其在 Guard/Policy 中的精确消费属于独立的
+> [Step 3](router-policy-step3-load-monitor-design.md)，不改变本文 Step 1/Step 2 的调度层次。
+
 > 本文是 Router Policy 的唯一目标设计来源。它替换“先按完整 prompt 长度选择
 > Prefill Bucket、再把 Cache 当作跨 Bucket 例外”的旧顺序。新的 Cache-Aware
 > 语义是：**先用 Indexer 的真实 prefix match 构造少量全局 cache candidates；全部
@@ -508,6 +511,12 @@ num_waiting_reqs
 num_waiting_uncached_tokens
 num_total_tokens
 max_total_num_tokens
+num_active_tokens
+decode_prealloc_queue_reqs
+decode_transfer_queue_reqs
+decode_retracted_queue_reqs
+estimated_prefill_queue_ms（由同源连续 counter 派生）
+mean_decode_step_ms（由同源连续 counter 派生）
 ```
 
 Router 按实际消费者懒捕获 snapshot：共享 Prefill policy 一次捕获后贯穿 proposal、
@@ -529,9 +538,9 @@ num_waiting_uncached_tokens + L <= max_pending_prefill_tokens
 
 Indexer 的 prefix match 已足以把 `E_i` 用于 Prefill work 与 pending projection；硬 KV
 容量仍以 `L` 保守投影。只有 target-specific KV allocation / Reservation 反馈成熟后，硬
-KV guard 才能安全地按增量放宽。`estimated_prefill_queue_ms` 是后续比较器的首选输入，当前未采集时只使用所有候选
-共同具有且 fresh 的 waiting/running/local active-load 层级，不能用 decode throughput
-伪造 Prefill rate。
+KV guard 才能安全地按增量放宽。Step 3 使用真实 Prefill 累计 counter 派生
+`estimated_prefill_queue_ms`；不可派生时只使用所有候选共同具有且 fresh 的
+waiting/running/local active-load 层级，不使用 decode throughput 伪造 Prefill rate。
 
 ## 8. Decode、TPS 与 PD 边界
 
@@ -606,6 +615,19 @@ response.scan_capped（明确 prefix scan 是否被上限截断）
 聚合成本过高，再增加两段式查询或后端 Top-K/refine 优化。不要在 Router 热路径中
 改为逐 worker cache 查询。
 
+### Step 3：LoadMonitor 指标接入（当前增量）
+
+Step 3 不增加新 policy 或 Bucket mode，只补齐 Scheduler → Reporter → Router →
+Policy/Guard 的指标链路：
+
+```text
+Prefill cumulative counters → estimated_prefill_queue_ms
+Decode queues + cumulative step counters + active tokens → Decode pressure
+```
+
+字段、比较顺序和滚动升级降级规则见
+[Step 3 LoadMonitor 指标接入](router-policy-step3-load-monitor-design.md)。
+
 ### 后续：Reservation
 
 Reservation 需要单独定义 P/D 的预扣单位、取消/超时/发送失败归还和与 LoadSnapshot
@@ -656,4 +678,5 @@ snapshot freshness / load level
 - 不把 `score_policy` 变成 Bucket/SLO/PD 总控策略；
 - 不把 block match 近似当作精确 KV reservation；
 - 不在 Router 热路径扫描所有 worker 的 cache 或向每个 worker 同步查询；
-- 不在缺少真实指标时实现伪 prefill queue、伪 Transfer-Aware D 或投机 dispatch。
+- 不用 decode throughput 伪造 Prefill queue；不在缺少 transfer 成本指标时实现伪
+  Transfer-Aware D，也不实现投机 dispatch。

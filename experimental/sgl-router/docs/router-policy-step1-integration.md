@@ -5,6 +5,9 @@
 范围：同构、无静态 Bucket 的 Router Policy / Admission / Guard；Step 2 的增量见
 [Step 1 / Step 2 方案设计](router-policy-step1-step2-design.md)。
 
+LoadMonitor 指标精度的后续增量属于独立的
+[Step 3](router-policy-step3-load-monitor-design.md)，不改变本文件定义的 Step 1 边界。
+
 ## 1. 目标与边界
 
 Step 1 在不改变既有 dispatch、`sticky` 和 `cache_aware_zmq` 语义的前提下，提供：
