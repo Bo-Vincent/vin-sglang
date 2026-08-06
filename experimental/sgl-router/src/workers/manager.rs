@@ -480,6 +480,7 @@ mod tests {
                     cool_down_secs,
                 }),
                 cache_aware: None,
+                affinity: None,
                 sticky: None,
                 fused: None,
                 eligibility: None,

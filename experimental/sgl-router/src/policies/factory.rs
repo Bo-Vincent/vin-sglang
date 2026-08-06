@@ -15,6 +15,7 @@ use crate::policies::{
         admission::Overloaded, prefix_cache, prefix_cache::PrefixCachePolicy, FusedScorePolicy,
         Pipeline,
     },
+    session_aware::SessionAwarePolicy,
     sticky::StickyPolicy,
     Policy, PolicyRegistry,
 };
@@ -34,6 +35,7 @@ fn build_sticky_fallback(kind: PolicyKind) -> Arc<dyn Policy> {
         PolicyKind::PowerOfTwo => Arc::new(PowerOfTwoChoicesPolicy::new()),
         PolicyKind::LoadBased => Arc::new(LoadBasedPolicy::new()),
         PolicyKind::CacheAwareZmq
+        | PolicyKind::SessionAware
         | PolicyKind::Overloaded
         | PolicyKind::Sticky
         | PolicyKind::PrefixCache
@@ -124,6 +126,9 @@ fn build_kind(
         PolicyKind::RoundRobin => Arc::new(RoundRobinPolicy::new()),
         PolicyKind::Random => Arc::new(RandomPolicy::new()),
         PolicyKind::PowerOfTwo => Arc::new(PowerOfTwoChoicesPolicy::new()),
+        PolicyKind::SessionAware => Arc::new(SessionAwarePolicy::new(
+            model.affinity.clone().unwrap_or_default(),
+        )),
         PolicyKind::LoadBased => Arc::new(LoadBasedPolicy::new()),
         PolicyKind::CacheAwareZmq => {
             let cache_cfg = model.cache_aware.clone().unwrap_or_default();
@@ -212,6 +217,9 @@ pub fn build_policy_kind_only(kind: PolicyKind) -> Result<Arc<dyn Policy>> {
         PolicyKind::RoundRobin => Arc::new(RoundRobinPolicy::new()),
         PolicyKind::Random => Arc::new(RandomPolicy::new()),
         PolicyKind::PowerOfTwo => Arc::new(PowerOfTwoChoicesPolicy::new()),
+        PolicyKind::SessionAware => Arc::new(SessionAwarePolicy::new(
+            crate::config::AffinityConfig::default(),
+        )),
         PolicyKind::LoadBased => Arc::new(LoadBasedPolicy::new()),
         PolicyKind::CacheAwareZmq => {
             // Provide an empty tree + empty tokenizer registry + fresh
@@ -395,6 +403,7 @@ mod tests {
                 policy,
                 circuit_breaker: None,
                 cache_aware: None,
+                affinity: None,
                 sticky: None,
                 fused: None,
                 eligibility: None,
@@ -416,6 +425,7 @@ mod tests {
             PolicyKind::PowerOfTwo,
             PolicyKind::LoadBased,
             PolicyKind::CacheAwareZmq,
+            PolicyKind::SessionAware,
             PolicyKind::Sticky,
             // INVERTED (was asserted is_err): the `not_wired_yet` refusal it
             // pinned was a temporary state, not the contract. PLAN requires

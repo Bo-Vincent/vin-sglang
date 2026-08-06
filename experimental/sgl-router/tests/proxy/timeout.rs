@@ -40,6 +40,7 @@ fn config(_worker_url: &str) -> Config {
             policy: PolicyKind::RoundRobin,
             circuit_breaker: None,
             cache_aware: None,
+            affinity: None,
             sticky: None,
             fused: None,
             eligibility: None,
