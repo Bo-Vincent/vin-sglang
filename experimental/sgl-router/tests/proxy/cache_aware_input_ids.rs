@@ -53,6 +53,7 @@ fn config() -> Config {
             policy: PolicyKind::CacheAwareZmq,
             circuit_breaker: None,
             cache_aware: Some(CacheAwareConfig::default()),
+            affinity: None,
             sticky: None,
             fused: None,
             eligibility: None,

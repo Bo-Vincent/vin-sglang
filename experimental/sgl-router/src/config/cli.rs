@@ -11,10 +11,11 @@ use std::num::NonZeroU32;
 
 use crate::config::{
     default_cb_cool_down, default_proxy_request_timeout_secs, default_stale_request_timeout_secs,
-    resolve_mode, ActiveLoadConfig, CacheAwareConfig, CircuitBreakerConfig, Config,
-    DiscoveryBackend, EligibilityConfig, FusedTerm, K8sDiscoveryConfig, LogFormat, ModelConfig,
-    LoadMonitorConfig, ObservabilityConfig, PolicyKind, ProxyConfig, ServerConfig,
-    StaticUrlsDiscoveryConfig, StickyConfig, DEFAULT_FUSE,
+    resolve_mode, ActiveLoadConfig, AffinityConfig, AffinityMode, CacheAwareConfig,
+    CircuitBreakerConfig, Config, DiscoveryBackend, EligibilityConfig, FusedTerm,
+    K8sDiscoveryConfig, LoadMonitorConfig, LogFormat, ModelConfig,
+    ObservabilityConfig, PolicyKind, ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig,
+    StickyConfig, DEFAULT_FUSE,
 };
 
 /// `sgl-router` — slim KV-aware OpenAI-compatible router for SGLang workers.
@@ -70,6 +71,32 @@ pub struct Cli {
     /// Multiplicative load spread gating the absolute balance check.
     #[arg(long)]
     pub balance_rel_threshold: Option<f32>,
+
+    // ---- Session-Aware tuning ----
+    /// Header carrying the Session-ID for `--policy session_aware`.
+    #[arg(long)]
+    pub session_id_header: Option<String>,
+    /// Evict an idle Session-Aware assignment after this many seconds.
+    #[arg(long)]
+    pub session_idle_secs: Option<u64>,
+    /// Cadence of the Session-Aware idle-assignment sweep, in seconds.
+    #[arg(long)]
+    pub session_eviction_interval_secs: Option<u64>,
+    /// Use a deterministic backup for the same session.
+    #[arg(long)]
+    pub stable_pair: bool,
+    /// Whether pressure may override an admitted session primary.
+    #[arg(long, value_enum)]
+    pub affinity_mode: Option<AffinityMode>,
+    /// Disable the optional pressure guard.
+    #[arg(long)]
+    pub disable_pressure_guard: bool,
+    /// Waiting uncached-token difference required by the pressure guard.
+    #[arg(long)]
+    pub pressure_abs_threshold_tokens: Option<u64>,
+    /// Waiting uncached-token ratio required by the pressure guard.
+    #[arg(long)]
+    pub pressure_rel_threshold: Option<f64>,
 
     // ---- fused-score composition (only used by `--policy fused_score`) ----
     /// Policies to sum, spelled exactly as `--policy` spells them and each
@@ -200,7 +227,59 @@ impl Cli {
                  require --policy cache_aware_zmq"
             ));
         }
-
+        let tuned_affinity = self.session_id_header.is_some()
+            || self.session_idle_secs.is_some()
+            || self.session_eviction_interval_secs.is_some()
+            || self.stable_pair
+            || self.affinity_mode.is_some()
+            || self.disable_pressure_guard
+            || self.pressure_abs_threshold_tokens.is_some()
+            || self.pressure_rel_threshold.is_some();
+        if tuned_affinity && self.policy != PolicyKind::SessionAware {
+            return Err(anyhow!(
+                "session affinity tuning flags require --policy session_aware"
+            ));
+        }
+        let affinity = if self.policy == PolicyKind::SessionAware {
+            let defaults = AffinityConfig::default();
+            let session_id_header = self.session_id_header.unwrap_or(defaults.session_id_header);
+            axum::http::HeaderName::try_from(session_id_header.as_str()).map_err(|error| {
+                anyhow!(
+                    "--session-id-header {session_id_header:?} is not a valid HTTP header name: {error}"
+                )
+            })?;
+            let session_idle_secs = self.session_idle_secs.unwrap_or(defaults.session_idle_secs);
+            let session_eviction_interval_secs = self
+                .session_eviction_interval_secs
+                .unwrap_or(defaults.session_eviction_interval_secs);
+            if session_idle_secs == 0 || session_eviction_interval_secs == 0 {
+                return Err(anyhow!(
+                    "--session-idle-secs and --session-eviction-interval-secs must be greater than 0"
+                ));
+            }
+            let pressure_rel_threshold = self
+                .pressure_rel_threshold
+                .unwrap_or(defaults.pressure_rel_threshold);
+            if !pressure_rel_threshold.is_finite() || pressure_rel_threshold <= 1.0 {
+                return Err(anyhow!(
+                    "--pressure-rel-threshold must be finite and greater than 1"
+                ));
+            }
+            Some(AffinityConfig {
+                session_id_header,
+                session_idle_secs,
+                session_eviction_interval_secs,
+                stable_pair: self.stable_pair,
+                mode: self.affinity_mode.unwrap_or(defaults.mode),
+                pressure_guard: !self.disable_pressure_guard,
+                pressure_abs_threshold_tokens: self
+                    .pressure_abs_threshold_tokens
+                    .unwrap_or(defaults.pressure_abs_threshold_tokens),
+                pressure_rel_threshold,
+            })
+        } else {
+            None
+        };
         if !self.fuse.is_empty() && self.policy != PolicyKind::FusedScore {
             return Err(anyhow!("--fuse requires --policy fused_score"));
         }
@@ -378,6 +457,7 @@ impl Cli {
                 policy: self.policy,
                 circuit_breaker,
                 cache_aware,
+                affinity,
                 sticky,
                 fused,
                 eligibility,
@@ -1289,5 +1369,35 @@ mod tests {
                 assert!(err.contains(want), "{argv}: want {want:?}, got: {err}");
             }
         }
+    }
+
+    #[test]
+    fn session_aware_builds_affinity_config() {
+        let config = cfg_of(
+            "--policy session_aware --session-id-header x-agent-session --stable-pair \
+             --affinity-mode strict --disable-pressure-guard \
+             --pressure-abs-threshold-tokens 2048 --pressure-rel-threshold 2.0",
+        )
+        .unwrap();
+        let affinity = config
+            .model
+            .affinity
+            .expect("session policy needs affinity config");
+
+        assert_eq!(config.model.policy, PolicyKind::SessionAware);
+        assert_eq!(affinity.session_id_header, "x-agent-session");
+        assert!(affinity.stable_pair);
+        assert_eq!(affinity.mode, AffinityMode::Strict);
+        assert!(!affinity.pressure_guard);
+        assert_eq!(affinity.pressure_abs_threshold_tokens, 2_048);
+        assert_eq!(affinity.pressure_rel_threshold, 2.0);
+    }
+
+    #[test]
+    fn session_aware_rejects_unbounded_assignment_lifetime() {
+        let error = cfg_of("--policy session_aware --session-idle-secs 0")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("must be greater than 0"), "{error}");
     }
 }

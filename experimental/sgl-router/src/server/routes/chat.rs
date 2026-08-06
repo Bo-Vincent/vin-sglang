@@ -183,6 +183,14 @@ pub async fn chat_completions(
         .and_then(|s| headers.get(s.header_name.as_str()))
         .and_then(|v| v.to_str().ok())
         .filter(|s| !s.is_empty());
+    let session_id = ctx
+        .config
+        .model
+        .affinity
+        .as_ref()
+        .and_then(|config| headers.get(config.session_id_header.as_str()))
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty());
     let prefill_load = request_tokens
         .as_ref()
         .map(|tokens| tokens.ids.len().max(1))
@@ -192,6 +200,7 @@ pub async fn chat_completions(
         .uses_shared_prefill_admission()
         .then(|| ctx.load_monitor.snapshot());
     let mut selection_ctx = SelectionContext::with_routing_key(&model_id, Some(&body), routing_key)
+        .with_session_id(session_id)
         .with_input_tokens(request_input_tokens)
         .with_request_tokens(request_tokens.as_ref().map(|t| t.ids.as_slice()));
     if let Some(snapshot) = load_snapshot.as_ref() {
@@ -203,16 +212,18 @@ pub async fn chat_completions(
             .ok_or_else(|| ApiError::PolicySelectionFailed {
                 model: model_str.clone(),
             })?;
-        resolve_prefill(
+        let proposal_kind = proposal.kind;
+        let decision = resolve_prefill(
             &CandidateRange::global(&workers),
             &proposal,
             request_input_tokens,
             snapshot,
         )
-        .map(|decision| decision.selected)
         .ok_or_else(|| ApiError::PolicySelectionFailed {
             model: model_str.clone(),
-        })?
+        })?;
+        policy.commit_prefill_selection(&selection_ctx, proposal_kind, &decision.selected);
+        decision.selected
     } else {
         policy
             .select(&workers, &selection_ctx)

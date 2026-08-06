@@ -23,7 +23,7 @@ pub mod admission;
 pub mod argmax;
 pub mod prefix_cache;
 
-use crate::policies::{Policy, SelectionContext};
+use crate::policies::{Policy, PrefillProposal, SelectionContext, SelectionProposal};
 use crate::workers::Worker;
 use argmax::{Selector, ARGMAX};
 use std::sync::Arc;
@@ -283,14 +283,86 @@ impl Pipeline {
     fn views(&self) -> impl Iterator<Item = &dyn EligibilityFilter> {
         (self.filters.iter()).map(|p| p.as_filter().expect("checked by Pipeline::new"))
     }
+
+    fn propose_prefill_filtered(
+        &self,
+        workers: &[Arc<Worker>],
+        ctx: &SelectionContext<'_>,
+    ) -> Option<PrefillProposal> {
+        let eligible = admit(self.views(), workers, ctx)?;
+        if self.inner.is_bucket_affinity_policy() && ctx.affinity_lookup_enabled() {
+            let probe_ctx = ctx.clone().without_affinity_assignment();
+            if let Some(
+                proposal @ PrefillProposal::Pair(SelectionProposal {
+                    kind: crate::policies::ProposalKind::SessionAffinity,
+                    ..
+                }),
+            ) = self.inner.propose_prefill(workers, &probe_ctx)
+            {
+                return Some(proposal.with_eligible_workers(eligible));
+            }
+        }
+        self.inner
+            .propose_prefill(&eligible, ctx)
+            .map(|proposal| proposal.with_eligible_workers(eligible))
+    }
 }
 
 impl Policy for Pipeline {
     /// `None` when an [`OnEmpty::Hold`] filter found nobody eligible -- the
     /// caller turns that into a refusal rather than routing anyway.
     fn select(&self, workers: &[Arc<Worker>], ctx: &SelectionContext<'_>) -> Option<Arc<Worker>> {
-        let eligible = admit(self.views(), workers, ctx)?;
-        self.inner.select(&eligible, ctx)
+        let PrefillProposal::Pair(proposal) = self.propose_prefill_filtered(workers, ctx)?;
+        let eligible = proposal.eligible_workers.as_deref().unwrap_or(workers);
+        let selected = if eligible
+            .iter()
+            .any(|worker| worker.id == proposal.primary.id)
+        {
+            proposal.primary
+        } else {
+            proposal
+                .backup
+                .filter(|backup| eligible.iter().any(|worker| worker.id == backup.id))
+                .or_else(|| eligible.first().cloned())?
+        };
+        self.inner
+            .commit_prefill_selection(ctx, proposal.kind, &selected);
+        Some(selected)
+    }
+
+    fn propose(
+        &self,
+        workers: &[Arc<Worker>],
+        ctx: &SelectionContext<'_>,
+    ) -> Option<SelectionProposal> {
+        let PrefillProposal::Pair(proposal) = self.propose_prefill_filtered(workers, ctx)?;
+        Some(proposal)
+    }
+
+    fn propose_prefill(
+        &self,
+        workers: &[Arc<Worker>],
+        ctx: &SelectionContext<'_>,
+    ) -> Option<PrefillProposal> {
+        self.propose_prefill_filtered(workers, ctx)
+    }
+
+    fn uses_shared_prefill_admission(&self) -> bool {
+        self.inner.uses_shared_prefill_admission()
+    }
+
+    fn commit_prefill_selection(
+        &self,
+        ctx: &SelectionContext<'_>,
+        proposal_kind: crate::policies::ProposalKind,
+        selected: &Arc<Worker>,
+    ) {
+        self.inner
+            .commit_prefill_selection(ctx, proposal_kind, selected);
+    }
+
+    fn is_bucket_affinity_policy(&self) -> bool {
+        self.inner.is_bucket_affinity_policy()
     }
 
     /// An upper bound over BOTH layers: over-reporting costs one tokenization,
@@ -332,8 +404,10 @@ pub(crate) fn refs(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::AffinityConfig;
     use crate::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
     use crate::policies::round_robin::RoundRobinPolicy;
+    use crate::policies::session_aware::SessionAwarePolicy;
 
     fn worker(id: &str) -> Arc<Worker> {
         Arc::new(Worker::new(WorkerSpec {
@@ -701,5 +775,38 @@ mod tests {
             p.needs_request_tokens(),
             "hunger comes from the filter half"
         );
+    }
+
+    #[test]
+    fn eligibility_probe_does_not_rewrite_session_assignment() {
+        let workers = fleet();
+        let model = ModelId("tiny".into());
+        let ctx = SelectionContext::new(&model, None).with_session_id(Some("session-a"));
+        let session = Arc::new(SessionAwarePolicy::new(AffinityConfig::default()));
+        session.commit_prefill_selection(
+            &ctx,
+            crate::policies::ProposalKind::PowerOfTwo,
+            &workers[2],
+        );
+        let pipeline = Pipeline::new(
+            vec![Arc::new(Keep(vec!["a", "b"], OnEmpty::Abstain))],
+            session.clone(),
+        )
+        .expect("valid filter and session policy");
+
+        let PrefillProposal::Pair(proposal) = pipeline
+            .propose_prefill(&workers, &ctx)
+            .expect("filtered session proposal");
+        assert_eq!(
+            proposal.kind,
+            crate::policies::ProposalKind::SessionAffinity
+        );
+        assert_eq!(proposal.primary.id, workers[2].id);
+        assert_eq!(proposal.eligible_workers.as_ref().map(Vec::len), Some(2));
+
+        let mapped = session
+            .propose(&workers, &ctx)
+            .expect("probe must leave the existing assignment intact");
+        assert_eq!(mapped.primary.id, workers[2].id);
     }
 }
