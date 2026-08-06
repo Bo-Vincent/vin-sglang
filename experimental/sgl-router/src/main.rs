@@ -117,7 +117,7 @@ async fn main() -> Result<()> {
                     max_inflight: indexer.query_max_inflight,
                 },
             ))
-        })
+        });
 
     // Build the KV-event index up front so the cache-aware-zmq policy can
     // share its `HashTree` handle + `BlockSizeOracle`. When no model uses
