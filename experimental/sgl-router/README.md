@@ -71,9 +71,11 @@ sgl-router \
 
 `--load-monitor-report-ip` is required and must be reachable from the engine.
 The first version uses a fixed 1-second report interval, 3-second freshness
-window, 15-second lease, and 2-second registration timeout. This change keeps
-routing policies unchanged; the immutable snapshot is the read-only boundary
-for follow-up scheduling integrations.
+window, 15-second lease, and 2-second registration timeout. The immutable
+snapshot is the read-only boundary consumed by the shared Step 1
+Admission/Guard and pressure comparison. Missing, stale, or disabled reports
+degrade to registry health and Router-local active load instead of rejecting a
+request.
 
 The monitor maintains an internal immutable, versioned snapshot with worker
 freshness, source and sequence metadata, complete DP-rank values, and aggregate
@@ -108,11 +110,11 @@ fall through to the legacy policy.
 ## Session-Aware and Cache-Aware policies
 
 `power_of_two`, `session_aware`, `cache_aware`, and `score_policy` are the new
-Step 1 policies. They produce a primary plus an optional backup inside the
-current healthy Prefill candidate range. The Router then applies shared hard
-admission (fresh engine running/KV capacity when available); affinity policies
-may additionally apply Cache Benefit / Pressure Guard before the final worker
-is dispatched.
+Step 1 policies. Power-of-Two and Session-Aware produce a primary plus an
+optional backup; Session-Aware may use Pressure Guard after both pass shared
+hard admission. Cache-Aware instead reduces a bounded Indexer Top-K to one
+final worker using target-specific uncached work and pressure. It has no
+stable pair, range mode, or policy backup.
 
 ```bash
 sgl-router \
@@ -134,16 +136,31 @@ sgl-router \
   --worker-urls http://10.0.0.1:30000 http://10.0.0.2:30000 \
   --policy cache_aware \
   --kv-indexer-endpoint http://10.0.0.10:50051 \
-  --stable-pair
+  --cache-affinity-min-matched-tokens 512 \
+  --cache-affinity-min-match-ratio 0.25 \
+  --cache-candidate-min-workers 8 \
+  --cache-candidate-ratio 0.05 \
+  --cache-candidate-max-workers 32
 ```
 
-`cache_aware` only reads the indexer result prepared at ingress; it never
-issues a synchronous Indexer RPC from the selection path. Missing, stale, or
-disabled LoadMonitor data does not hard-reject registry-healthy workers.
-Bucket/SLO policy is not enabled by these flags yet: it will replace the
-candidate range before policy selection, not rewrite these policies. The
-legacy `sticky` and `cache_aware_zmq` policies keep their existing direct
-dispatch behavior; they do not silently opt into this new shared layer.
+`cache_aware` consumes one deadline-bounded Indexer result prepared at ingress;
+it never issues one RPC per worker or per Bucket. Each cache candidate is
+checked against its own Runtime/Bucket profile and Admission. If no candidate
+survives, routing restarts from the normal Bucket (or global) Power-of-Two
+fallback using the full input length. Missing, stale, or disabled LoadMonitor
+data does not hard-reject registry-healthy workers. Worker KV-event metadata
+must expose a consistent block size before the Router can hash an Indexer
+query; until then the request safely follows the same no-signal P2 fallback.
+The legacy
+`sticky` and `cache_aware_zmq` policies keep their existing direct-dispatch
+behavior; they do not silently opt into this new shared layer.
+
+In PD mode, Decode selection is independent of the Prefill policy. The default
+`--decode-policy power_of_two` samples two workers from the current Decode
+domain, then applies shared Decode Admission/Guard. Operators that need the
+previous same-host preference can select
+`--decode-policy legacy_host_affinity`. Transfer-aware Decode scoring is not
+implemented in this step.
 
 ## Score policy
 
@@ -152,7 +169,7 @@ dispatch behavior; they do not silently opt into this new shared layer.
 composition implementation internally; it does not turn Session or Cache
 affinity into a collection of flags. As a new top-level policy it participates
 in shared hard Prefill admission, but it has no affinity backup or soft
-Cache/Pressure Guard. The compatibility spelling `fused_score` retains its
+Pressure Guard. The compatibility spelling `fused_score` retains its
 existing behavior.
 
 ```bash

@@ -70,6 +70,14 @@ performance regardless of worker count.
 TODO: Add a regression guard for the O(n) shape. Although `policy_select`
 measures the metric, nothing currently runs or gates on these results.
 
+## Router v2 policy / PD E2E
+
+正式 108-case Policy 对照、RSD 确认轮、真实 LoadMonitor Pressure Guard、Indexer
+Cache candidate 和单机 4P+4D Mooncake KV transfer 的环境、结果与边界见
+[Router v2 Policy / PD E2E 报告](docs/router-v2-e2e-poc-report.md)。该验证证明 Step 1
+Policy/Admission/Guard 数据流可用；静态 Bucket 仍是 Step 2 实验接口，不代表同构
+4+4 切分或异构生产 Bucket 已达到 production GO。
+
 ## Pre-deprecation calibration runbook
 
 Before deleting SMG, every routing-latency metric in the slim-design
