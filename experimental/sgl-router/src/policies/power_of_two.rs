@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::policies::admission::compare_prefill_pressure;
 use crate::policies::{Policy, ProposalKind, SelectionContext, SelectionProposal};
 use crate::workers::Worker;
 use rand::Rng;
@@ -16,7 +17,7 @@ impl PowerOfTwoChoicesPolicy {
 }
 
 impl Policy for PowerOfTwoChoicesPolicy {
-    fn select(&self, workers: &[Arc<Worker>], _ctx: &SelectionContext<'_>) -> Option<Arc<Worker>> {
+    fn select(&self, workers: &[Arc<Worker>], ctx: &SelectionContext<'_>) -> Option<Arc<Worker>> {
         match workers.len() {
             0 => None,
             1 => Some(workers[0].clone()),
@@ -27,7 +28,7 @@ impl Policy for PowerOfTwoChoicesPolicy {
                 if j >= i {
                     j += 1;
                 }
-                Some(std::cmp::min_by_key(&workers[i], &workers[j], |w| w.active_load()).clone())
+                Some(ordered_pair(&workers[i], &workers[j], ctx).0)
             }
         }
     }
@@ -35,7 +36,7 @@ impl Policy for PowerOfTwoChoicesPolicy {
     fn propose(
         &self,
         workers: &[Arc<Worker>],
-        _ctx: &SelectionContext<'_>,
+        ctx: &SelectionContext<'_>,
     ) -> Option<SelectionProposal> {
         match workers.len() {
             0 => None,
@@ -49,13 +50,25 @@ impl Policy for PowerOfTwoChoicesPolicy {
                 if j >= i {
                     j += 1;
                 }
-                let (primary, backup) = if workers[i].active_load() <= workers[j].active_load() {
-                    (Arc::clone(&workers[i]), Arc::clone(&workers[j]))
-                } else {
-                    (Arc::clone(&workers[j]), Arc::clone(&workers[i]))
-                };
+                let (primary, backup) = ordered_pair(&workers[i], &workers[j], ctx);
                 Some(SelectionProposal::with_backup(primary, backup))
             }
         }
+    }
+
+    fn uses_shared_prefill_admission(&self) -> bool {
+        true
+    }
+}
+
+fn ordered_pair(
+    left: &Arc<Worker>,
+    right: &Arc<Worker>,
+    ctx: &SelectionContext<'_>,
+) -> (Arc<Worker>, Arc<Worker>) {
+    if compare_prefill_pressure(left, right, ctx.load_snapshot()).is_gt() {
+        (Arc::clone(right), Arc::clone(left))
+    } else {
+        (Arc::clone(left), Arc::clone(right))
     }
 }
