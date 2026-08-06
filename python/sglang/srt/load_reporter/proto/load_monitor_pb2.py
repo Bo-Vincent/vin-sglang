@@ -25,23 +25,23 @@ _sym_db = _symbol_database.Default()
 from google.protobuf import empty_pb2 as google_dot_protobuf_dot_empty__pb2
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x12load_monitor.proto\x12\x15router.loadmonitor.v1\x1a\x1bgoogle/protobuf/empty.proto\"\x8f\x01\n\x06Worker\x12\x13\n\x0bworker_addr\x18\x01 \x01(\t\x12\x36\n\x0bworker_type\x18\x02 \x01(\x0e\x32!.router.loadmonitor.v1.WorkerType\x12\x12\n\x05model\x18\x03 \x01(\tH\x00\x88\x01\x01\x12\x11\n\x04zone\x18\x04 \x01(\tH\x01\x88\x01\x01\x42\x08\n\x06_modelB\x07\n\x05_zone\"\xdc\x02\n\x08RankLoad\x12\x0f\n\x07\x64p_rank\x18\x01 \x01(\x05\x12\x1d\n\x15snapshot_time_unix_ms\x18\x02 \x01(\x03\x12\x18\n\x10num_running_reqs\x18\x03 \x01(\x03\x12\x18\n\x10num_waiting_reqs\x18\x04 \x01(\x03\x12#\n\x1bnum_waiting_uncached_tokens\x18\x05 \x01(\x03\x12\x17\n\x0fnum_used_tokens\x18\x06 \x01(\x03\x12\x18\n\x10num_total_tokens\x18\x07 \x01(\x03\x12\x1c\n\x14max_total_num_tokens\x18\x08 \x01(\x03\x12\x1c\n\x14max_running_requests\x18\t \x01(\x03\x12\x13\n\x0btoken_usage\x18\n \x01(\x01\x12\x16\n\x0egen_throughput\x18\x0b \x01(\x01\x12\x16\n\x0e\x63\x61\x63he_hit_rate\x18\x0c \x01(\x01\x12\x13\n\x0butilization\x18\r \x01(\x01\"\x96\x02\n\nLoadReport\x12\x1a\n\x12source_instance_id\x18\x01 \x01(\t\x12\x13\n\x0bsequence_id\x18\x02 \x01(\x04\x12\x1b\n\x13report_time_unix_ms\x18\x03 \x01(\x03\x12-\n\x06worker\x18\x04 \x01(\x0b\x32\x1d.router.loadmonitor.v1.Worker\x12\x33\n\x06status\x18\x05 \x01(\x0e\x32#.router.loadmonitor.v1.ReportStatus\x12\x17\n\nlast_error\x18\x06 \x01(\tH\x00\x88\x01\x01\x12.\n\x05ranks\x18\x07 \x03(\x0b\x32\x1f.router.loadmonitor.v1.RankLoadB\r\n\x0b_last_error*s\n\nWorkerType\x12\x1b\n\x17WORKER_TYPE_UNSPECIFIED\x10\x00\x12\x17\n\x13WORKER_TYPE_REGULAR\x10\x01\x12\x17\n\x13WORKER_TYPE_PREFILL\x10\x02\x12\x16\n\x12WORKER_TYPE_DECODE\x10\x03*\x80\x01\n\x0cReportStatus\x12\x1d\n\x19REPORT_STATUS_UNSPECIFIED\x10\x00\x12\x19\n\x15REPORT_STATUS_HEALTHY\x10\x01\x12\x17\n\x13REPORT_STATUS_STALE\x10\x02\x12\x1d\n\x19REPORT_STATUS_UNREACHABLE\x10\x03\x32[\n\x12LoadMonitorService\x12\x45\n\x06Report\x12!.router.loadmonitor.v1.LoadReport\x1a\x16.google.protobuf.Empty(\x01\x62\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x12load_monitor.proto\x12\x15router.loadmonitor.v1\x1a\x1bgoogle/protobuf/empty.proto\"\x8f\x01\n\x06Worker\x12\x13\n\x0bworker_addr\x18\x01 \x01(\t\x12\x36\n\x0bworker_type\x18\x02 \x01(\x0e\x32!.router.loadmonitor.v1.WorkerType\x12\x12\n\x05model\x18\x03 \x01(\tH\x00\x88\x01\x01\x12\x11\n\x04zone\x18\x04 \x01(\tH\x01\x88\x01\x01\x42\x08\n\x06_modelB\x07\n\x05_zone\"\xec\x06\n\x08RankLoad\x12\x0f\n\x07\x64p_rank\x18\x01 \x01(\x05\x12\x1d\n\x15snapshot_time_unix_ms\x18\x02 \x01(\x03\x12\x18\n\x10num_running_reqs\x18\x03 \x01(\x03\x12\x18\n\x10num_waiting_reqs\x18\x04 \x01(\x03\x12#\n\x1bnum_waiting_uncached_tokens\x18\x05 \x01(\x03\x12\x17\n\x0fnum_used_tokens\x18\x06 \x01(\x03\x12\x18\n\x10num_total_tokens\x18\x07 \x01(\x03\x12\x1c\n\x14max_total_num_tokens\x18\x08 \x01(\x03\x12\x1c\n\x14max_running_requests\x18\t \x01(\x03\x12\x13\n\x0btoken_usage\x18\n \x01(\x01\x12\x16\n\x0egen_throughput\x18\x0b \x01(\x01\x12\x16\n\x0e\x63\x61\x63he_hit_rate\x18\x0c \x01(\x01\x12\x13\n\x0butilization\x18\r \x01(\x01\x12\x1e\n\x11num_active_tokens\x18\x0e \x01(\x03H\x00\x88\x01\x01\x12*\n\x1dtotal_prefill_uncached_tokens\x18\x0f \x01(\x03H\x01\x88\x01\x01\x12\"\n\x15total_prefill_busy_us\x18\x10 \x01(\x03H\x02\x88\x01\x01\x12\'\n\x1a\x64\x65\x63ode_prealloc_queue_reqs\x18\x11 \x01(\x03H\x03\x88\x01\x01\x12\'\n\x1a\x64\x65\x63ode_transfer_queue_reqs\x18\x12 \x01(\x03H\x04\x88\x01\x01\x12(\n\x1b\x64\x65\x63ode_retracted_queue_reqs\x18\x13 \x01(\x03H\x05\x88\x01\x01\x12\x1f\n\x12total_decode_steps\x18\x14 \x01(\x03H\x06\x88\x01\x01\x12!\n\x14total_decode_step_us\x18\x15 \x01(\x03H\x07\x88\x01\x01\x42\x14\n\x12_num_active_tokensB \n\x1e_total_prefill_uncached_tokensB\x18\n\x16_total_prefill_busy_usB\x1d\n\x1b_decode_prealloc_queue_reqsB\x1d\n\x1b_decode_transfer_queue_reqsB\x1e\n\x1c_decode_retracted_queue_reqsB\x15\n\x13_total_decode_stepsB\x17\n\x15_total_decode_step_us\"\x96\x02\n\nLoadReport\x12\x1a\n\x12source_instance_id\x18\x01 \x01(\t\x12\x13\n\x0bsequence_id\x18\x02 \x01(\x04\x12\x1b\n\x13report_time_unix_ms\x18\x03 \x01(\x03\x12-\n\x06worker\x18\x04 \x01(\x0b\x32\x1d.router.loadmonitor.v1.Worker\x12\x33\n\x06status\x18\x05 \x01(\x0e\x32#.router.loadmonitor.v1.ReportStatus\x12\x17\n\nlast_error\x18\x06 \x01(\tH\x00\x88\x01\x01\x12.\n\x05ranks\x18\x07 \x03(\x0b\x32\x1f.router.loadmonitor.v1.RankLoadB\r\n\x0b_last_error*s\n\nWorkerType\x12\x1b\n\x17WORKER_TYPE_UNSPECIFIED\x10\x00\x12\x17\n\x13WORKER_TYPE_REGULAR\x10\x01\x12\x17\n\x13WORKER_TYPE_PREFILL\x10\x02\x12\x16\n\x12WORKER_TYPE_DECODE\x10\x03*\x80\x01\n\x0cReportStatus\x12\x1d\n\x19REPORT_STATUS_UNSPECIFIED\x10\x00\x12\x19\n\x15REPORT_STATUS_HEALTHY\x10\x01\x12\x17\n\x13REPORT_STATUS_STALE\x10\x02\x12\x1d\n\x19REPORT_STATUS_UNREACHABLE\x10\x03\x32[\n\x12LoadMonitorService\x12\x45\n\x06Report\x12!.router.loadmonitor.v1.LoadReport\x1a\x16.google.protobuf.Empty(\x01\x62\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
 _builder.BuildTopDescriptorsAndMessages(DESCRIPTOR, 'load_monitor_pb2', _globals)
 if not _descriptor._USE_C_DESCRIPTORS:
   DESCRIPTOR._loaded_options = None
-  _globals['_WORKERTYPE']._serialized_start=852
-  _globals['_WORKERTYPE']._serialized_end=967
-  _globals['_REPORTSTATUS']._serialized_start=970
-  _globals['_REPORTSTATUS']._serialized_end=1098
+  _globals['_WORKERTYPE']._serialized_start=1380
+  _globals['_WORKERTYPE']._serialized_end=1495
+  _globals['_REPORTSTATUS']._serialized_start=1498
+  _globals['_REPORTSTATUS']._serialized_end=1626
   _globals['_WORKER']._serialized_start=75
   _globals['_WORKER']._serialized_end=218
   _globals['_RANKLOAD']._serialized_start=221
-  _globals['_RANKLOAD']._serialized_end=569
-  _globals['_LOADREPORT']._serialized_start=572
-  _globals['_LOADREPORT']._serialized_end=850
-  _globals['_LOADMONITORSERVICE']._serialized_start=1100
-  _globals['_LOADMONITORSERVICE']._serialized_end=1191
+  _globals['_RANKLOAD']._serialized_end=1097
+  _globals['_LOADREPORT']._serialized_start=1100
+  _globals['_LOADREPORT']._serialized_end=1378
+  _globals['_LOADMONITORSERVICE']._serialized_start=1628
+  _globals['_LOADMONITORSERVICE']._serialized_end=1719
 # @@protoc_insertion_point(module_scope)
