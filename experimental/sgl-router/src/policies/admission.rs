@@ -5,8 +5,11 @@
 //!
 //! Pair proposal 先做容量检查再执行 Guard；Cache-Aware 候选走有界比较。
 
-use crate::load_monitor::{AggregateLoad, Freshness, LoadMonitorSnapshot};
-use crate::policies::{CacheCandidate, CacheCandidateProposal, GuardHints, SelectionProposal};
+use crate::discovery::WorkerId;
+use crate::load_monitor::{AggregateLoad, SchedulingSnapshot};
+use crate::policies::{
+    CacheCandidate, CacheCandidateProposal, CandidateMembership, GuardHints, SelectionProposal,
+};
 use crate::workers::Worker;
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -17,6 +20,7 @@ pub struct CandidateRange<'a> {
     pub id: &'a str,
     pub workers: &'a [Arc<Worker>],
     pub max_pending_prefill_tokens: Option<u64>,
+    membership: Option<&'a CandidateMembership>,
 }
 
 impl<'a> CandidateRange<'a> {
@@ -25,7 +29,12 @@ impl<'a> CandidateRange<'a> {
             id: "global",
             workers,
             max_pending_prefill_tokens: None,
+            membership: None,
         }
+    }
+
+    pub fn membership(&self) -> Option<&CandidateMembership> {
+        self.membership
     }
 }
 
@@ -42,25 +51,16 @@ pub struct CandidateDomain {
     pub stage: RoutingStage,
     pub workers: Vec<Arc<Worker>>,
     pub max_pending_prefill_tokens: Option<u64>,
+    membership: CandidateMembership,
 }
 
 impl CandidateDomain {
     pub fn global_prefill(workers: &[Arc<Worker>]) -> Self {
-        Self {
-            id: "global".to_string(),
-            stage: RoutingStage::Prefill,
-            workers: workers.to_vec(),
-            max_pending_prefill_tokens: None,
-        }
+        Self::new("global", RoutingStage::Prefill, workers.to_vec(), None)
     }
 
     pub fn global_decode(workers: &[Arc<Worker>]) -> Self {
-        Self {
-            id: "global".to_string(),
-            stage: RoutingStage::Decode,
-            workers: workers.to_vec(),
-            max_pending_prefill_tokens: None,
-        }
+        Self::new("global", RoutingStage::Decode, workers.to_vec(), None)
     }
 
     pub fn bucket_prefill(
@@ -68,20 +68,31 @@ impl CandidateDomain {
         workers: Vec<Arc<Worker>>,
         max_pending_prefill_tokens: Option<u64>,
     ) -> Self {
-        Self {
-            id: id.into(),
-            stage: RoutingStage::Prefill,
+        Self::new(
+            id,
+            RoutingStage::Prefill,
             workers,
             max_pending_prefill_tokens,
-        }
+        )
     }
 
     pub fn bucket_decode(id: impl Into<String>, workers: Vec<Arc<Worker>>) -> Self {
+        Self::new(id, RoutingStage::Decode, workers, None)
+    }
+
+    fn new(
+        id: impl Into<String>,
+        stage: RoutingStage,
+        workers: Vec<Arc<Worker>>,
+        max_pending_prefill_tokens: Option<u64>,
+    ) -> Self {
+        let membership = CandidateMembership::from_workers(&workers);
         Self {
             id: id.into(),
-            stage: RoutingStage::Decode,
+            stage,
             workers,
-            max_pending_prefill_tokens: None,
+            max_pending_prefill_tokens,
+            membership,
         }
     }
 
@@ -91,6 +102,7 @@ impl CandidateDomain {
             id: self.id.as_str(),
             workers: &self.workers,
             max_pending_prefill_tokens: self.max_pending_prefill_tokens,
+            membership: Some(&self.membership),
         })
     }
 }
@@ -110,7 +122,7 @@ pub enum DecisionReason {
 pub fn resolve_cache_candidates(
     proposal: &CacheCandidateProposal,
     request_input_tokens: u64,
-    snapshot: &LoadMonitorSnapshot,
+    snapshot: &SchedulingSnapshot,
 ) -> Option<FinalDecision> {
     let loads = FreshLoadLookup::new(
         Some(snapshot),
@@ -166,7 +178,7 @@ pub fn resolve_prefill(
     range: &CandidateRange<'_>,
     proposal: &SelectionProposal,
     request_input_tokens: u64,
-    snapshot: &LoadMonitorSnapshot,
+    snapshot: &SchedulingSnapshot,
 ) -> Option<FinalDecision> {
     if !contains_worker(range, &proposal.primary) {
         return None;
@@ -216,7 +228,7 @@ pub fn resolve_decode(
     domain: &CandidateDomain,
     proposal: &SelectionProposal,
     request_kv_tokens: u64,
-    snapshot: &LoadMonitorSnapshot,
+    snapshot: &SchedulingSnapshot,
 ) -> Option<FinalDecision> {
     if domain.stage != RoutingStage::Decode || !contains_domain_worker(domain, &proposal.primary) {
         return None;
@@ -255,14 +267,19 @@ pub fn resolve_decode(
 }
 
 fn contains_worker(range: &CandidateRange<'_>, candidate: &Arc<Worker>) -> bool {
-    range.workers.iter().any(|worker| worker.id == candidate.id)
+    // Policy 通常克隆 Domain 内的 Arc；ID 扫描仅兼容等价的独立 Worker 实例。
+    range
+        .membership
+        .is_some_and(|membership| membership.contains(candidate))
+        || range.workers.iter().any(|worker| worker.id == candidate.id)
 }
 
 fn contains_domain_worker(domain: &CandidateDomain, candidate: &Arc<Worker>) -> bool {
-    domain
-        .workers
-        .iter()
-        .any(|worker| worker.id == candidate.id)
+    domain.membership.contains(candidate)
+        || domain
+            .workers
+            .iter()
+            .any(|worker| worker.id == candidate.id)
 }
 
 fn is_proposal_worker_eligible(proposal: &SelectionProposal, candidate: &Arc<Worker>) -> bool {
@@ -277,10 +294,10 @@ fn is_admitted(
     range: &CandidateRange<'_>,
     worker: &Arc<Worker>,
     request_input_tokens: u64,
-    snapshot: &LoadMonitorSnapshot,
+    snapshot: &SchedulingSnapshot,
 ) -> bool {
     let load = snapshot.fresh_load(&worker.id);
-    is_prefill_admitted_with_load(range, request_input_tokens, load.as_ref())
+    is_prefill_admitted_with_load(range, request_input_tokens, load)
 }
 
 fn is_prefill_admitted_with_load(
@@ -303,10 +320,10 @@ fn is_prefill_admitted_with_load(
 fn is_decode_admitted(
     worker: &Arc<Worker>,
     request_kv_tokens: u64,
-    snapshot: &LoadMonitorSnapshot,
+    snapshot: &SchedulingSnapshot,
 ) -> bool {
     let load = snapshot.fresh_load(&worker.id);
-    is_decode_admitted_with_load(request_kv_tokens, load.as_ref())
+    is_decode_admitted_with_load(request_kv_tokens, load)
 }
 
 fn is_decode_admitted_with_load(request_kv_tokens: u64, load: Option<&AggregateLoad>) -> bool {
@@ -351,23 +368,27 @@ fn compare_cache_candidates(
     }
 
     // Pressure can overturn cache benefit only inside the near-tie margin.
-    if materially_more_pressured(
-        &left.worker,
-        &right.worker,
-        proposal.pressure_abs_threshold_tokens,
-        proposal.pressure_rel_threshold,
-        loads,
-    ) {
-        return Ordering::Greater;
-    }
-    if materially_more_pressured(
-        &right.worker,
-        &left.worker,
-        proposal.pressure_abs_threshold_tokens,
-        proposal.pressure_rel_threshold,
-        loads,
-    ) {
-        return Ordering::Less;
+    if proposal.enable_pressure_guard {
+        if materially_more_pressured(
+            &left.worker,
+            &right.worker,
+            proposal.pressure_abs_threshold_tokens,
+            proposal.pressure_abs_threshold_ms,
+            proposal.pressure_rel_threshold,
+            loads,
+        ) {
+            return Ordering::Greater;
+        }
+        if materially_more_pressured(
+            &right.worker,
+            &left.worker,
+            proposal.pressure_abs_threshold_tokens,
+            proposal.pressure_abs_threshold_ms,
+            proposal.pressure_rel_threshold,
+            loads,
+        ) {
+            return Ordering::Less;
+        }
     }
 
     left.uncached_tokens
@@ -380,6 +401,7 @@ fn materially_more_pressured(
     candidate: &Arc<Worker>,
     other: &Arc<Worker>,
     absolute_threshold: u64,
+    absolute_threshold_ms: Option<f64>,
     relative_threshold: f64,
     loads: &FreshLoadLookup<'_>,
 ) -> bool {
@@ -389,58 +411,82 @@ fn materially_more_pressured(
     ) else {
         return false;
     };
+    if let (Some(absolute_threshold_ms), true) =
+        (absolute_threshold_ms, loads.compare_prefill_queue_ms)
+    {
+        let candidate_pressure = candidate_load
+            .estimated_prefill_queue_ms
+            .expect("complete candidate set has queue estimates");
+        let other_pressure = other_load
+            .estimated_prefill_queue_ms
+            .expect("complete candidate set has queue estimates");
+        return candidate_pressure - other_pressure > absolute_threshold_ms
+            && candidate_pressure > other_pressure * relative_threshold;
+    }
     let candidate_pressure = candidate_load.num_waiting_uncached_tokens;
     let other_pressure = other_load.num_waiting_uncached_tokens;
     candidate_pressure.saturating_sub(other_pressure) > absolute_threshold
         && candidate_pressure as f64 > other_pressure as f64 * relative_threshold
 }
 
-/// Request-local O(1) lookup for fresh LoadMonitor and captured local load.
+/// Request-local lookup for fresh LoadMonitor data and captured local load.
 pub(crate) struct FreshLoadLookup<'a> {
-    by_worker_id: HashMap<&'a str, &'a AggregateLoad>,
+    snapshot: Option<&'a SchedulingSnapshot>,
     local_active_by_worker_id: HashMap<String, usize>,
     compare_aggregate: bool,
+    compare_prefill_queue_ms: bool,
+    compare_decode_queues: bool,
+    compare_decode_step_ms: bool,
+    compare_decode_active_tokens: bool,
 }
 
 impl<'a> FreshLoadLookup<'a> {
     pub(crate) fn new<'w>(
-        snapshot: Option<&'a LoadMonitorSnapshot>,
+        snapshot: Option<&'a SchedulingSnapshot>,
         workers: impl IntoIterator<Item = &'w Arc<Worker>>,
     ) -> Self {
-        // Snapshot atomics once so sort comparisons remain stable.
-        let local_active_by_worker_id: HashMap<String, usize> = workers
-            .into_iter()
-            .map(|worker| (worker.id.0.clone(), worker.active_load()))
-            .collect();
-        let by_worker_id: HashMap<&'a str, &'a AggregateLoad> = snapshot
-            .into_iter()
-            .flat_map(|snapshot| snapshot.workers.iter())
-            .filter(|worker| {
-                worker.freshness == Freshness::Fresh
-                    && local_active_by_worker_id.contains_key(worker.worker_id.as_str())
-            })
-            .filter_map(|worker| {
-                worker
-                    .aggregate
-                    .as_ref()
-                    .map(|aggregate| (worker.worker_id.as_str(), aggregate))
-            })
-            .collect();
-        // Mixed fresh/stale sets use local load only to preserve transitivity.
-        let compare_aggregate = !local_active_by_worker_id.is_empty()
-            && by_worker_id.len() == local_active_by_worker_id.len();
+        let mut local_active_by_worker_id = HashMap::new();
+        let mut compare_aggregate = snapshot.is_some();
+        let mut compare_prefill_queue_ms = true;
+        let mut compare_decode_queues = true;
+        let mut compare_decode_step_ms = true;
+        let mut compare_decode_active_tokens = true;
+        // Capture local load and snapshot capability in one pass. Mixed
+        // fresh/stale sets use local load only to preserve transitivity.
+        for worker in workers {
+            local_active_by_worker_id.insert(worker.id.0.clone(), worker.active_load());
+            let Some(load) = snapshot.and_then(|snapshot| snapshot.fresh_load(&worker.id)) else {
+                compare_aggregate = false;
+                continue;
+            };
+            compare_prefill_queue_ms &= load.estimated_prefill_queue_ms.is_some();
+            compare_decode_queues &= load.decode_prealloc_queue_reqs.is_some()
+                && load.decode_transfer_queue_reqs.is_some()
+                && load.decode_retracted_queue_reqs.is_some();
+            compare_decode_step_ms &= load.mean_decode_step_ms.is_some();
+            compare_decode_active_tokens &= load.num_active_tokens.is_some();
+        }
+        compare_aggregate &= !local_active_by_worker_id.is_empty();
+        compare_prefill_queue_ms &= compare_aggregate;
+        compare_decode_queues &= compare_aggregate;
+        compare_decode_step_ms &= compare_aggregate;
+        compare_decode_active_tokens &= compare_aggregate;
         Self {
-            by_worker_id,
+            snapshot,
             local_active_by_worker_id,
             compare_aggregate,
+            compare_prefill_queue_ms,
+            compare_decode_queues,
+            compare_decode_step_ms,
+            compare_decode_active_tokens,
         }
     }
 
-    pub(crate) fn get(&self, worker_id: &crate::discovery::WorkerId) -> Option<&AggregateLoad> {
-        self.by_worker_id.get(worker_id.0.as_str()).copied()
+    pub(crate) fn get(&self, worker_id: &WorkerId) -> Option<&AggregateLoad> {
+        self.snapshot?.fresh_load(worker_id)
     }
 
-    fn comparable_get(&self, worker_id: &crate::discovery::WorkerId) -> Option<&AggregateLoad> {
+    fn comparable_get(&self, worker_id: &WorkerId) -> Option<&AggregateLoad> {
         if self.compare_aggregate {
             self.get(worker_id)
         } else {
@@ -467,9 +513,10 @@ impl<'a> FreshLoadLookup<'a> {
             self.comparable_get(&left.id),
             self.comparable_get(&right.id),
         ) {
-            (Some(left_load), Some(right_load)) => load_pressure_key(left_load)
-                .cmp(&load_pressure_key(right_load))
-                .then_with(|| left_local.cmp(&right_local)),
+            (Some(left_load), Some(right_load)) => {
+                compare_prefill_aggregate(left_load, right_load, self.compare_prefill_queue_ms)
+                    .then_with(|| left_local.cmp(&right_local))
+            }
             _ => left_local.cmp(&right_local),
         }
     }
@@ -489,8 +536,14 @@ impl<'a> FreshLoadLookup<'a> {
             self.comparable_get(&left.id),
             self.comparable_get(&right.id),
         ) {
-            (Some(left_load), Some(right_load)) => compare_decode_aggregate(left_load, right_load)
-                .then_with(|| left_local.cmp(&right_local)),
+            (Some(left_load), Some(right_load)) => compare_decode_aggregate(
+                left_load,
+                right_load,
+                self.compare_decode_queues,
+                self.compare_decode_step_ms,
+                self.compare_decode_active_tokens,
+            )
+            .then_with(|| left_local.cmp(&right_local)),
             _ => left_local.cmp(&right_local),
         }
     }
@@ -501,7 +554,7 @@ fn pressure_guard_prefers_backup(
     primary: &Arc<Worker>,
     backup: &Arc<Worker>,
     hints: &GuardHints,
-    snapshot: &LoadMonitorSnapshot,
+    snapshot: &SchedulingSnapshot,
 ) -> bool {
     if !hints.enable_pressure_guard {
         return false;
@@ -512,6 +565,14 @@ fn pressure_guard_prefers_backup(
     ) else {
         return false;
     };
+    if let (Some(absolute_threshold_ms), Some(primary_queue_ms), Some(backup_queue_ms)) = (
+        hints.pressure_abs_threshold_ms,
+        primary_load.estimated_prefill_queue_ms,
+        backup_load.estimated_prefill_queue_ms,
+    ) {
+        return primary_queue_ms - backup_queue_ms > absolute_threshold_ms
+            && primary_queue_ms > backup_queue_ms * hints.pressure_rel_threshold;
+    }
     let primary_pressure = primary_load.num_waiting_uncached_tokens;
     let backup_pressure = backup_load.num_waiting_uncached_tokens;
     primary_pressure.saturating_sub(backup_pressure) > hints.pressure_abs_threshold_tokens
@@ -522,7 +583,7 @@ fn range_fallback(
     range: &CandidateRange<'_>,
     proposal: &SelectionProposal,
     request_input_tokens: u64,
-    snapshot: &LoadMonitorSnapshot,
+    snapshot: &SchedulingSnapshot,
 ) -> Option<(Arc<Worker>, DecisionReason)> {
     let candidates = proposal
         .eligible_workers
@@ -551,7 +612,7 @@ fn range_fallback(
 fn decode_domain_fallback(
     domain: &CandidateDomain,
     request_kv_tokens: u64,
-    snapshot: &LoadMonitorSnapshot,
+    snapshot: &SchedulingSnapshot,
 ) -> Option<(Arc<Worker>, DecisionReason)> {
     let admission_loads = FreshLoadLookup::new(Some(snapshot), domain.workers.iter());
     let admitted: Vec<Arc<Worker>> = domain
@@ -573,7 +634,7 @@ fn decode_domain_fallback(
 pub(crate) fn compare_prefill_pressure(
     left: &Arc<Worker>,
     right: &Arc<Worker>,
-    snapshot: Option<&LoadMonitorSnapshot>,
+    snapshot: Option<&SchedulingSnapshot>,
 ) -> Ordering {
     match snapshot.and_then(|snapshot| {
         Some((
@@ -581,14 +642,18 @@ pub(crate) fn compare_prefill_pressure(
             snapshot.fresh_load(&right.id)?,
         ))
     }) {
-        Some((left_load, right_load)) => load_pressure_key(&left_load)
-            .cmp(&load_pressure_key(&right_load))
-            .then_with(|| left.active_load().cmp(&right.active_load())),
+        Some((left_load, right_load)) => compare_prefill_aggregate(
+            left_load,
+            right_load,
+            left_load.estimated_prefill_queue_ms.is_some()
+                && right_load.estimated_prefill_queue_ms.is_some(),
+        )
+        .then_with(|| left.active_load().cmp(&right.active_load())),
         _ => left.active_load().cmp(&right.active_load()),
     }
 }
 
-fn load_pressure_key(load: &AggregateLoad) -> (u64, u64, u64) {
+fn fallback_prefill_pressure_key(load: &AggregateLoad) -> (u64, u64, u64) {
     (
         load.num_waiting_uncached_tokens,
         load.num_waiting_reqs,
@@ -596,11 +661,32 @@ fn load_pressure_key(load: &AggregateLoad) -> (u64, u64, u64) {
     )
 }
 
-/// 比较 Decode running/KV 占用比例，最后使用本地 active-load。
+fn compare_prefill_aggregate(
+    left: &AggregateLoad,
+    right: &AggregateLoad,
+    compare_queue_ms: bool,
+) -> Ordering {
+    if compare_queue_ms {
+        return left
+            .estimated_prefill_queue_ms
+            .expect("queue estimate availability was checked")
+            .total_cmp(
+                &right
+                    .estimated_prefill_queue_ms
+                    .expect("queue estimate availability was checked"),
+            )
+            .then_with(|| {
+                fallback_prefill_pressure_key(left).cmp(&fallback_prefill_pressure_key(right))
+            });
+    }
+    fallback_prefill_pressure_key(left).cmp(&fallback_prefill_pressure_key(right))
+}
+
+/// 比较 Decode 队列与执行压力，最后使用本地 active-load。
 pub(crate) fn compare_decode_pressure(
     left: &Arc<Worker>,
     right: &Arc<Worker>,
-    snapshot: Option<&LoadMonitorSnapshot>,
+    snapshot: Option<&SchedulingSnapshot>,
 ) -> Ordering {
     match snapshot.and_then(|snapshot| {
         Some((
@@ -608,24 +694,102 @@ pub(crate) fn compare_decode_pressure(
             snapshot.fresh_load(&right.id)?,
         ))
     }) {
-        Some((left_load, right_load)) => compare_decode_aggregate(&left_load, &right_load)
-            .then_with(|| left.active_load().cmp(&right.active_load())),
+        Some((left_load, right_load)) => compare_decode_aggregate(
+            left_load,
+            right_load,
+            left_load.decode_prealloc_queue_reqs.is_some()
+                && right_load.decode_prealloc_queue_reqs.is_some()
+                && left_load.decode_transfer_queue_reqs.is_some()
+                && right_load.decode_transfer_queue_reqs.is_some()
+                && left_load.decode_retracted_queue_reqs.is_some()
+                && right_load.decode_retracted_queue_reqs.is_some(),
+            left_load.mean_decode_step_ms.is_some() && right_load.mean_decode_step_ms.is_some(),
+            left_load.num_active_tokens.is_some() && right_load.num_active_tokens.is_some(),
+        )
+        .then_with(|| left.active_load().cmp(&right.active_load())),
         None => left.active_load().cmp(&right.active_load()),
     }
 }
 
-fn compare_decode_aggregate(left: &AggregateLoad, right: &AggregateLoad) -> Ordering {
+fn compare_decode_aggregate(
+    left: &AggregateLoad,
+    right: &AggregateLoad,
+    compare_queues: bool,
+    compare_step_ms: bool,
+    compare_active_tokens: bool,
+) -> Ordering {
+    let mut ordering = Ordering::Equal;
+    if compare_queues {
+        ordering = left
+            .decode_retracted_queue_reqs
+            .expect("decode queue availability was checked")
+            .cmp(
+                &right
+                    .decode_retracted_queue_reqs
+                    .expect("decode queue availability was checked"),
+            )
+            .then_with(|| {
+                let left_incoming = left
+                    .decode_prealloc_queue_reqs
+                    .expect("decode queue availability was checked")
+                    .saturating_add(
+                        left.decode_transfer_queue_reqs
+                            .expect("decode queue availability was checked"),
+                    );
+                let right_incoming = right
+                    .decode_prealloc_queue_reqs
+                    .expect("decode queue availability was checked")
+                    .saturating_add(
+                        right
+                            .decode_transfer_queue_reqs
+                            .expect("decode queue availability was checked"),
+                    );
+                left_incoming.cmp(&right_incoming)
+            });
+    }
     let left_running =
         u128::from(left.num_running_reqs).saturating_mul(u128::from(right.max_running_requests));
     let right_running =
         u128::from(right.num_running_reqs).saturating_mul(u128::from(left.max_running_requests));
-    let left_kv =
-        u128::from(left.num_total_tokens).saturating_mul(u128::from(right.max_total_num_tokens));
-    let right_kv =
-        u128::from(right.num_total_tokens).saturating_mul(u128::from(left.max_total_num_tokens));
-    left_running
-        .cmp(&right_running)
-        .then_with(|| left_kv.cmp(&right_kv))
+    ordering = ordering.then_with(|| left_running.cmp(&right_running));
+    if compare_step_ms {
+        ordering = ordering.then_with(|| {
+            left.mean_decode_step_ms
+                .expect("decode step availability was checked")
+                .total_cmp(
+                    &right
+                        .mean_decode_step_ms
+                        .expect("decode step availability was checked"),
+                )
+        });
+    }
+    if compare_active_tokens {
+        let left_active = u128::from(
+            left.num_active_tokens
+                .expect("active-token availability was checked"),
+        )
+        .saturating_mul(u128::from(right.max_total_num_tokens));
+        let right_active = u128::from(
+            right
+                .num_active_tokens
+                .expect("active-token availability was checked"),
+        )
+        .saturating_mul(u128::from(left.max_total_num_tokens));
+        ordering = ordering.then_with(|| left_active.cmp(&right_active));
+    } else {
+        let left_kv = u128::from(left.num_total_tokens)
+            .saturating_mul(u128::from(right.max_total_num_tokens));
+        let right_kv = u128::from(right.num_total_tokens)
+            .saturating_mul(u128::from(left.max_total_num_tokens));
+        ordering = ordering.then_with(|| left_kv.cmp(&right_kv));
+    }
+    ordering
         .then_with(|| left.num_running_reqs.cmp(&right.num_running_reqs))
-        .then_with(|| left.num_total_tokens.cmp(&right.num_total_tokens))
+        .then_with(|| {
+            if compare_active_tokens {
+                left.num_active_tokens.cmp(&right.num_active_tokens)
+            } else {
+                left.num_total_tokens.cmp(&right.num_total_tokens)
+            }
+        })
 }

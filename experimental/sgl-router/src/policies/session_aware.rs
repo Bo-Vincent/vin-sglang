@@ -14,12 +14,13 @@ use dashmap::DashMap;
 use rand::Rng;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 #[derive(Debug)]
 struct Assignment {
     worker_id: WorkerId,
+    worker: Weak<Worker>,
     last_seen: Instant,
 }
 
@@ -145,6 +146,7 @@ impl SessionAwarePolicy {
                 enable_pressure_guard: self.config.pressure_guard
                     && self.config.mode == AffinityMode::Soft,
                 pressure_abs_threshold_tokens: self.config.pressure_abs_threshold_tokens,
+                pressure_abs_threshold_ms: self.config.pressure_abs_threshold_ms,
                 pressure_rel_threshold: self.config.pressure_rel_threshold,
             })
     }
@@ -178,10 +180,18 @@ impl Policy for SessionAwarePolicy {
             .get_mut(&assignment_key)
             .map(|mut assignment| {
                 assignment.last_seen = self.state.clock.now();
-                assignment.worker_id.clone()
+                (assignment.worker_id.clone(), assignment.worker.upgrade())
             });
-        if let Some(assigned) = assigned {
-            if let Some(primary) = workers.iter().find(|worker| worker.id == assigned).cloned() {
+        if let Some((assigned_id, assigned_worker)) = assigned {
+            let primary = assigned_worker
+                .filter(|worker| ctx.candidate_contains(worker) == Some(true))
+                .or_else(|| {
+                    workers
+                        .iter()
+                        .find(|worker| worker.id == assigned_id)
+                        .cloned()
+                });
+            if let Some(primary) = primary {
                 return Some(self.affinity_proposal(primary, workers, ctx, session_id));
             }
         }
@@ -206,6 +216,7 @@ impl Policy for SessionAwarePolicy {
             self.assignment_key(session_id, ctx),
             Assignment {
                 worker_id: selected.id.clone(),
+                worker: Arc::downgrade(selected),
                 last_seen: self.state.clock.now(),
             },
         );

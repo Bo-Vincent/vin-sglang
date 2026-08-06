@@ -4,7 +4,7 @@
 //! Decode policy 的独立扩展点，不复用 Prefill affinity。
 
 use crate::config::DecodePolicyKind;
-use crate::load_monitor::LoadMonitorSnapshot;
+use crate::load_monitor::SchedulingSnapshot;
 use crate::policies::admission::{compare_decode_pressure, CandidateDomain};
 use crate::policies::registry::select_decode_with_affinity;
 use crate::policies::{ProposalKind, SelectionProposal};
@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 #[derive(Debug, Default)]
 pub struct DecodeSelectionContext<'a> {
-    load_snapshot: Option<&'a LoadMonitorSnapshot>,
+    load_snapshot: Option<&'a SchedulingSnapshot>,
     prefill_url: Option<&'a str>,
 }
 
@@ -26,12 +26,12 @@ impl<'a> DecodeSelectionContext<'a> {
     }
 
     /// 使用请求入口捕获的 LoadMonitor snapshot。
-    pub fn with_load_snapshot(mut self, load_snapshot: &'a LoadMonitorSnapshot) -> Self {
+    pub fn with_load_snapshot(mut self, load_snapshot: &'a SchedulingSnapshot) -> Self {
         self.load_snapshot = Some(load_snapshot);
         self
     }
 
-    pub fn load_snapshot(&self) -> Option<&LoadMonitorSnapshot> {
+    pub fn load_snapshot(&self) -> Option<&SchedulingSnapshot> {
         self.load_snapshot
     }
 

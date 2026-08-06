@@ -3,7 +3,7 @@
 
 use crate::config::{PolicyKind, SessionAffinityMode};
 use crate::discovery::{ModelId, WorkerMode};
-use crate::load_monitor::LoadMonitorSnapshot;
+use crate::load_monitor::SchedulingSnapshot;
 use crate::policies::admission::{
     resolve_cache_candidates, resolve_decode, resolve_prefill, CandidateDomain, DecisionReason,
 };
@@ -289,7 +289,7 @@ pub async fn chat_completions(
     // Shared Prefill Admission uses one immutable snapshot per request.
     let prefill_snapshot_captured = policy.uses_shared_prefill_admission();
     let load_snapshot = if prefill_snapshot_captured {
-        ctx.load_monitor.snapshot()
+        ctx.load_monitor.scheduling_snapshot()
     } else {
         empty_load_snapshot()
     };
@@ -353,6 +353,7 @@ pub async fn chat_completions(
         let selection_ctx = SelectionContext::with_routing_key(&model_id, Some(&body), routing_key)
             .with_session_id(session_id)
             .with_candidate_range_id(candidate_range.id)
+            .with_candidate_membership(candidate_range.membership())
             .with_input_tokens(request_input_tokens)
             .with_request_tokens(request_tokens.as_ref().map(|tokens| tokens.ids.as_slice()))
             .with_external_prefix(external_prefix.as_ref())
@@ -419,6 +420,7 @@ pub async fn chat_completions(
             let cache_ctx = SelectionContext::with_routing_key(&model_id, Some(&body), routing_key)
                 .with_session_id(session_id)
                 .with_candidate_range_id(global_range.id)
+                .with_candidate_membership(global_range.membership())
                 .with_input_tokens(request_input_tokens)
                 .with_request_tokens(request_tokens.as_ref().map(|tokens| tokens.ids.as_slice()))
                 .with_external_prefix(external_prefix.as_ref())
@@ -469,6 +471,7 @@ pub async fn chat_completions(
             let probe_ctx = SelectionContext::with_routing_key(&model_id, Some(&body), routing_key)
                 .with_session_id(session_id)
                 .with_candidate_range_id(global_range.id)
+                .with_candidate_membership(global_range.membership())
                 .with_input_tokens(request_input_tokens)
                 .with_request_tokens(request_tokens.as_ref().map(|tokens| tokens.ids.as_slice()))
                 .with_external_prefix(external_prefix.as_ref())
@@ -527,7 +530,7 @@ pub async fn chat_completions(
     // operators can alert on prefill-vs-decode pool imbalance.
     let decode_peer: Option<Arc<Worker>> = if worker.mode() == WorkerMode::Prefill {
         let decode_snapshot_storage =
-            (!prefill_snapshot_captured).then(|| ctx.load_monitor.snapshot());
+            (!prefill_snapshot_captured).then(|| ctx.load_monitor.scheduling_snapshot());
         let decode_load_snapshot = decode_snapshot_storage.as_ref().unwrap_or(&load_snapshot);
         let decode_workers = resolver.decode_candidates(&model_id).map_err(|e| match e {
             PdResolveError::NoHealthyWorkers => ApiError::NoHealthyWorkers {
@@ -1053,13 +1056,8 @@ fn should_tokenize_request(
     has_chat_encoder || policy_needs_request_tokens || bucket_enabled
 }
 
-fn empty_load_snapshot() -> LoadMonitorSnapshot {
-    LoadMonitorSnapshot {
-        enabled: false,
-        version: 0,
-        captured_at: None,
-        workers: Vec::new(),
-    }
+fn empty_load_snapshot() -> SchedulingSnapshot {
+    SchedulingSnapshot::default()
 }
 
 /// Estimate prefill-token count from the raw request body for use as

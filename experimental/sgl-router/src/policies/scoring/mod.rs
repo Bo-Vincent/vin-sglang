@@ -473,7 +473,7 @@ mod tests {
     use super::*;
     use crate::config::AffinityConfig;
     use crate::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
-    use crate::load_monitor::{AggregateLoad, Freshness, LoadMonitorSnapshot, WorkerSnapshot};
+    use crate::load_monitor::{AggregateLoad, SchedulingSnapshot};
     use crate::policies::admission::{resolve_prefill, CandidateRange};
     use crate::policies::power_of_two::PowerOfTwoChoicesPolicy;
     use crate::policies::round_robin::RoundRobinPolicy;
@@ -745,36 +745,22 @@ mod tests {
         let proposal = pipeline
             .propose(&ws, &ctx)
             .expect("the two eligible workers produce a P2 proposal");
-        let snapshot = LoadMonitorSnapshot {
+        let snapshot = SchedulingSnapshot {
             enabled: true,
             version: 1,
-            captured_at: None,
-            workers: ws
+            fresh_loads: ws
                 .iter()
                 .enumerate()
-                .map(|(index, worker)| WorkerSnapshot {
-                    worker_id: worker.id.0.clone(),
-                    url: worker.url.clone(),
-                    mode: worker.mode(),
-                    model_ids: worker
-                        .model_ids
-                        .iter()
-                        .map(|model| model.0.clone())
-                        .collect(),
-                    freshness: Freshness::Fresh,
-                    source_instance_id: None,
-                    sequence_id: None,
-                    report_time_unix_ms: None,
-                    last_error: None,
-                    received_at: None,
-                    expires_at: None,
-                    aggregate: Some(AggregateLoad {
-                        num_running_reqs: u64::from(index < 2) * 4,
-                        max_running_requests: 4,
-                        max_total_num_tokens: 4_096,
-                        ..Default::default()
-                    }),
-                    ranks: Vec::new(),
+                .map(|(index, worker)| {
+                    (
+                        worker.id.0.clone(),
+                        AggregateLoad {
+                            num_running_reqs: u64::from(index < 2) * 4,
+                            max_running_requests: 4,
+                            max_total_num_tokens: 4_096,
+                            ..Default::default()
+                        },
+                    )
                 })
                 .collect(),
         };
@@ -815,12 +801,7 @@ mod tests {
         );
         assert_eq!(proposal.primary.id, ws[2].id);
 
-        let snapshot = LoadMonitorSnapshot {
-            enabled: false,
-            version: 0,
-            captured_at: None,
-            workers: Vec::new(),
-        };
+        let snapshot = SchedulingSnapshot::default();
         let decision = resolve_prefill(&CandidateRange::global(&ws), &proposal, 32, &snapshot)
             .expect("an eligible escape worker exists");
         assert_ne!(decision.selected.id, ws[2].id);

@@ -19,12 +19,13 @@ pub mod session_aware;
 pub mod sticky;
 
 use crate::discovery::ModelId;
-use crate::load_monitor::LoadMonitorSnapshot;
+use crate::load_monitor::SchedulingSnapshot;
 use crate::policies::scoring::{EligibilityFilter, ScoringPolicy};
 use crate::server::metrics::MetricsRegistry;
 use crate::tokenizer::{adapter, TokenizerRegistry};
 use crate::workers::Worker;
 use dashmap::DashMap;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 /// Tokens produced once at ingress for a request. Consumed by the
@@ -47,6 +48,47 @@ pub struct RequestTokens {
 pub struct ExternalPrefixSignal {
     pub outcome: sgl_kv_indexer::PrefixOutcome,
     pub query_blocks: usize,
+}
+
+const LINEAR_MEMBERSHIP_LIMIT: usize = 16;
+
+#[derive(Clone)]
+enum CandidateMembershipIndex {
+    Linear(Vec<usize>),
+    Hashed(HashSet<usize>),
+}
+
+#[derive(Clone)]
+pub struct CandidateMembership {
+    index: CandidateMembershipIndex,
+}
+
+impl Default for CandidateMembership {
+    fn default() -> Self {
+        Self {
+            index: CandidateMembershipIndex::Linear(Vec::new()),
+        }
+    }
+}
+
+impl CandidateMembership {
+    pub(crate) fn from_workers(workers: &[Arc<Worker>]) -> Self {
+        let worker_ptrs = workers.iter().map(|worker| Arc::as_ptr(worker) as usize);
+        let index = if workers.len() <= LINEAR_MEMBERSHIP_LIMIT {
+            CandidateMembershipIndex::Linear(worker_ptrs.collect())
+        } else {
+            CandidateMembershipIndex::Hashed(worker_ptrs.collect())
+        };
+        Self { index }
+    }
+
+    fn contains(&self, worker: &Arc<Worker>) -> bool {
+        let worker_ptr = Arc::as_ptr(worker) as usize;
+        match &self.index {
+            CandidateMembershipIndex::Linear(worker_ptrs) => worker_ptrs.contains(&worker_ptr),
+            CandidateMembershipIndex::Hashed(worker_ptrs) => worker_ptrs.contains(&worker_ptr),
+        }
+    }
 }
 
 /// Produce the routing tokens — and whether they are engine-equivalent —
@@ -189,10 +231,11 @@ pub struct SelectionContext<'a> {
     routing_key: Option<&'a str>,
     session_id: Option<&'a str>,
     candidate_range_id: &'a str,
+    candidate_membership: Option<&'a CandidateMembership>,
     input_tokens: Option<u64>,
     request_tokens: Option<&'a [u32]>,
     external_prefix: Option<&'a ExternalPrefixSignal>,
-    load_snapshot: Option<&'a LoadMonitorSnapshot>,
+    load_snapshot: Option<&'a SchedulingSnapshot>,
     affinity_lookup_enabled: bool,
     affinity_assignment_enabled: bool,
 }
@@ -205,6 +248,7 @@ impl<'a> SelectionContext<'a> {
             routing_key: None,
             session_id: None,
             candidate_range_id: "global",
+            candidate_membership: None,
             input_tokens: None,
             request_tokens: None,
             external_prefix: None,
@@ -225,6 +269,7 @@ impl<'a> SelectionContext<'a> {
             routing_key,
             session_id: None,
             candidate_range_id: "global",
+            candidate_membership: None,
             input_tokens: None,
             request_tokens: None,
             external_prefix: None,
@@ -252,6 +297,14 @@ impl<'a> SelectionContext<'a> {
         self
     }
 
+    pub fn with_candidate_membership(
+        mut self,
+        candidate_membership: Option<&'a CandidateMembership>,
+    ) -> Self {
+        self.candidate_membership = candidate_membership;
+        self
+    }
+
     /// 附加请求 input token 数。
     pub fn with_input_tokens(mut self, input_tokens: u64) -> Self {
         self.input_tokens = Some(input_tokens);
@@ -267,7 +320,7 @@ impl<'a> SelectionContext<'a> {
     }
 
     /// 附加请求开始时捕获的 LoadMonitor snapshot。
-    pub fn with_load_snapshot(mut self, load_snapshot: &'a LoadMonitorSnapshot) -> Self {
+    pub fn with_load_snapshot(mut self, load_snapshot: &'a SchedulingSnapshot) -> Self {
         self.load_snapshot = Some(load_snapshot);
         self
     }
@@ -305,6 +358,11 @@ impl<'a> SelectionContext<'a> {
         self.candidate_range_id
     }
 
+    pub(crate) fn candidate_contains(&self, worker: &Arc<Worker>) -> Option<bool> {
+        self.candidate_membership
+            .map(|membership| membership.contains(worker))
+    }
+
     pub fn input_tokens(&self) -> Option<u64> {
         self.input_tokens
     }
@@ -318,7 +376,7 @@ impl<'a> SelectionContext<'a> {
         self.external_prefix
     }
 
-    pub fn load_snapshot(&self) -> Option<&LoadMonitorSnapshot> {
+    pub fn load_snapshot(&self) -> Option<&SchedulingSnapshot> {
         self.load_snapshot
     }
 
@@ -359,7 +417,9 @@ pub struct CacheCandidate {
 pub struct CacheCandidateProposal {
     pub candidates: Vec<CacheCandidate>,
     pub cache_switch_margin_tokens: u64,
+    pub enable_pressure_guard: bool,
     pub pressure_abs_threshold_tokens: u64,
+    pub pressure_abs_threshold_ms: Option<f64>,
     pub pressure_rel_threshold: f64,
 }
 
@@ -443,6 +503,8 @@ pub struct GuardHints {
     pub enable_pressure_guard: bool,
     /// 压力逃逸需要超过的未命中 prefill token 绝对差。
     pub pressure_abs_threshold_tokens: u64,
+    /// Queue-time 估计可比较时使用的毫秒绝对差；未配置时保持 token guard。
+    pub pressure_abs_threshold_ms: Option<f64>,
     /// 压力逃逸需要超过的相对倍率。
     pub pressure_rel_threshold: f64,
 }
@@ -452,6 +514,7 @@ impl Default for GuardHints {
         Self {
             enable_pressure_guard: false,
             pressure_abs_threshold_tokens: 0,
+            pressure_abs_threshold_ms: None,
             pressure_rel_threshold: 1.0,
         }
     }
@@ -573,9 +636,10 @@ mod tests {
     use super::*;
     use crate::config::{AffinityConfig, SessionAffinityMode};
     use crate::discovery::{WorkerId, WorkerMode, WorkerSpec};
-    use crate::load_monitor::{AggregateLoad, Freshness, LoadMonitorSnapshot, WorkerSnapshot};
+    use crate::load_monitor::{AggregateLoad, SchedulingSnapshot};
     use crate::policies::admission::{
-        resolve_cache_candidates, resolve_prefill, CandidateRange, DecisionReason, FreshLoadLookup,
+        resolve_cache_candidates, resolve_prefill, CandidateDomain, CandidateRange, DecisionReason,
+        FreshLoadLookup,
     };
     use crate::policies::cache_aware::CacheAwarePolicy;
     use crate::policies::power_of_two::PowerOfTwoChoicesPolicy;
@@ -604,6 +668,36 @@ mod tests {
             .expect("one candidate must produce a proposal");
         assert_eq!(proposal.primary.id, only.id);
         assert!(proposal.backup.is_none());
+    }
+
+    #[test]
+    fn prefill_domain_rejects_a_primary_outside_its_membership_index() {
+        let allowed = worker("allowed");
+        let foreign = worker("foreign");
+        let domain = CandidateDomain::global_prefill(&[allowed]);
+        let range = domain.prefill_range().expect("prefill domain");
+
+        assert!(resolve_prefill(
+            &range,
+            &SelectionProposal::primary(foreign),
+            32,
+            &SchedulingSnapshot::default(),
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn prefill_domain_accepts_an_equivalent_worker_instance() {
+        let domain = CandidateDomain::global_prefill(&[worker("same-id")]);
+        let range = domain.prefill_range().expect("prefill domain");
+
+        assert!(resolve_prefill(
+            &range,
+            &SelectionProposal::primary(worker("same-id")),
+            32,
+            &SchedulingSnapshot::default(),
+        )
+        .is_some());
     }
 
     #[test]
@@ -660,7 +754,9 @@ mod tests {
                 max_pending_prefill_tokens: None,
             }],
             cache_switch_margin_tokens: 8,
+            enable_pressure_guard: true,
             pressure_abs_threshold_tokens: 1_024,
+            pressure_abs_threshold_ms: None,
             pressure_rel_threshold: 1.5,
         };
 
@@ -1181,28 +1277,13 @@ mod tests {
         assert!(proposal.backup.is_some());
     }
 
-    fn snapshot(entries: &[(&Arc<Worker>, AggregateLoad)]) -> LoadMonitorSnapshot {
-        LoadMonitorSnapshot {
+    fn snapshot(entries: &[(&Arc<Worker>, AggregateLoad)]) -> SchedulingSnapshot {
+        SchedulingSnapshot {
             enabled: true,
             version: 1,
-            captured_at: Some("2026-08-04T00:00:00Z".into()),
-            workers: entries
+            fresh_loads: entries
                 .iter()
-                .map(|(worker, aggregate)| WorkerSnapshot {
-                    worker_id: worker.id.0.clone(),
-                    url: worker.url.clone(),
-                    mode: worker.mode(),
-                    model_ids: worker.model_ids.iter().map(|m| m.0.clone()).collect(),
-                    freshness: Freshness::Fresh,
-                    source_instance_id: None,
-                    sequence_id: None,
-                    report_time_unix_ms: None,
-                    last_error: None,
-                    received_at: None,
-                    expires_at: None,
-                    aggregate: Some(aggregate.clone()),
-                    ranks: Vec::new(),
-                })
+                .map(|(worker, aggregate)| (worker.id.0.clone(), aggregate.clone()))
                 .collect(),
         }
     }
@@ -1235,7 +1316,7 @@ mod tests {
             ),
             (&stale, AggregateLoad::default()),
         ]);
-        snapshot.workers[2].freshness = Freshness::Stale;
+        snapshot.fresh_loads.remove(stale.id.0.as_str());
 
         let lookup =
             FreshLoadLookup::new(Some(&snapshot), [&aggregate_idle, &aggregate_busy, &stale]);
@@ -1273,7 +1354,9 @@ mod tests {
                 cache_candidate(&winner, 70, 30, None),
             ],
             cache_switch_margin_tokens: 16,
+            enable_pressure_guard: true,
             pressure_abs_threshold_tokens: 1_024,
+            pressure_abs_threshold_ms: None,
             pressure_rel_threshold: 1.5,
         };
         let loads = snapshot(&[
@@ -1317,7 +1400,9 @@ mod tests {
                 cache_candidate(&final_winner, 80, 20, None),
             ],
             cache_switch_margin_tokens: 0,
+            enable_pressure_guard: true,
             pressure_abs_threshold_tokens: 1_024,
+            pressure_abs_threshold_ms: None,
             pressure_rel_threshold: 1.5,
         };
         let loads = snapshot(&[
@@ -1361,7 +1446,9 @@ mod tests {
         let proposal = CacheCandidateProposal {
             candidates: vec![cache_candidate(&candidate, 80, 20, Some(30))],
             cache_switch_margin_tokens: 16,
+            enable_pressure_guard: true,
             pressure_abs_threshold_tokens: 1_024,
+            pressure_abs_threshold_ms: None,
             pressure_rel_threshold: 1.5,
         };
         let pending_allows = snapshot(&[(
@@ -1404,7 +1491,9 @@ mod tests {
                 cache_candidate(&idle, 80, 20, None),
             ],
             cache_switch_margin_tokens: 32,
+            enable_pressure_guard: true,
             pressure_abs_threshold_tokens: 100,
+            pressure_abs_threshold_ms: None,
             pressure_rel_threshold: 1.5,
         };
         let loads = snapshot(&[
@@ -1433,6 +1522,89 @@ mod tests {
     }
 
     #[test]
+    fn cache_tournament_uses_queue_time_when_the_ms_guard_is_configured() {
+        let slow = worker("slow");
+        let fast = worker("fast");
+        let proposal = CacheCandidateProposal {
+            candidates: vec![
+                cache_candidate(&slow, 90, 10, None),
+                cache_candidate(&fast, 80, 20, None),
+            ],
+            cache_switch_margin_tokens: 32,
+            enable_pressure_guard: true,
+            pressure_abs_threshold_tokens: 1_024,
+            pressure_abs_threshold_ms: Some(100.0),
+            pressure_rel_threshold: 2.0,
+        };
+        let loads = snapshot(&[
+            (
+                &slow,
+                AggregateLoad {
+                    num_waiting_uncached_tokens: 10,
+                    estimated_prefill_queue_ms: Some(500.0),
+                    max_running_requests: 8,
+                    max_total_num_tokens: 10_000,
+                    ..AggregateLoad::default()
+                },
+            ),
+            (
+                &fast,
+                AggregateLoad {
+                    num_waiting_uncached_tokens: 200,
+                    estimated_prefill_queue_ms: Some(100.0),
+                    max_running_requests: 8,
+                    max_total_num_tokens: 10_000,
+                    ..AggregateLoad::default()
+                },
+            ),
+        ]);
+
+        let decision = resolve_cache_candidates(&proposal, 100, &loads).unwrap();
+        assert_eq!(decision.selected.id, fast.id);
+    }
+
+    #[test]
+    fn cache_tournament_ignores_pressure_when_guard_is_disabled() {
+        let cache_primary = worker("cache-primary");
+        let low_pressure = worker("low-pressure");
+        let proposal = CacheCandidateProposal {
+            candidates: vec![
+                cache_candidate(&cache_primary, 90, 10, None),
+                cache_candidate(&low_pressure, 80, 20, None),
+            ],
+            cache_switch_margin_tokens: 32,
+            enable_pressure_guard: false,
+            pressure_abs_threshold_tokens: 0,
+            pressure_abs_threshold_ms: Some(0.0),
+            pressure_rel_threshold: 1.01,
+        };
+        let loads = snapshot(&[
+            (
+                &cache_primary,
+                AggregateLoad {
+                    num_waiting_uncached_tokens: 1_000,
+                    estimated_prefill_queue_ms: Some(1_000.0),
+                    max_running_requests: 8,
+                    max_total_num_tokens: 10_000,
+                    ..AggregateLoad::default()
+                },
+            ),
+            (
+                &low_pressure,
+                AggregateLoad {
+                    estimated_prefill_queue_ms: Some(1.0),
+                    max_running_requests: 8,
+                    max_total_num_tokens: 10_000,
+                    ..AggregateLoad::default()
+                },
+            ),
+        ]);
+
+        let decision = resolve_cache_candidates(&proposal, 100, &loads).unwrap();
+        assert_eq!(decision.selected.id, cache_primary.id);
+    }
+
+    #[test]
     fn cache_tournament_keeps_a_material_cache_gain_despite_pressure() {
         let hot = worker("hot");
         let idle = worker("idle");
@@ -1442,7 +1614,9 @@ mod tests {
                 cache_candidate(&idle, 20, 80, None),
             ],
             cache_switch_margin_tokens: 32,
+            enable_pressure_guard: true,
             pressure_abs_threshold_tokens: 100,
+            pressure_abs_threshold_ms: None,
             pressure_rel_threshold: 1.5,
         };
         let loads = snapshot(&[
@@ -1488,7 +1662,9 @@ mod tests {
                 cache_candidate(&beyond_margin, 60, 40, None),
             ],
             cache_switch_margin_tokens: 32,
+            enable_pressure_guard: true,
             pressure_abs_threshold_tokens: 100,
+            pressure_abs_threshold_ms: None,
             pressure_rel_threshold: 1.5,
         };
         let loads = snapshot(&[
@@ -1582,12 +1758,7 @@ mod tests {
     fn disabled_monitor_does_not_hard_reject_a_registry_healthy_primary() {
         let primary = worker("primary");
         let workers = vec![Arc::clone(&primary)];
-        let snapshot = LoadMonitorSnapshot {
-            enabled: false,
-            version: 0,
-            captured_at: None,
-            workers: Vec::new(),
-        };
+        let snapshot = SchedulingSnapshot::default();
 
         let decision = resolve_prefill(
             &CandidateRange::global(&workers),
@@ -1630,6 +1801,7 @@ mod tests {
             SelectionProposal::with_backup(primary, backup).with_guard_hints(GuardHints {
                 enable_pressure_guard: true,
                 pressure_abs_threshold_tokens: 100,
+                pressure_abs_threshold_ms: None,
                 pressure_rel_threshold: 2.0,
             });
 
@@ -1637,6 +1809,187 @@ mod tests {
             .expect("both candidates fit capacity");
 
         assert_eq!(decision.reason, DecisionReason::BackupPressureGuard);
+    }
+
+    #[test]
+    fn pressure_guard_uses_estimated_prefill_queue_time_when_configured() {
+        let primary = worker("primary");
+        let backup = worker("backup");
+        let workers = vec![Arc::clone(&primary), Arc::clone(&backup)];
+        let snapshot = snapshot(&[
+            (
+                &primary,
+                AggregateLoad {
+                    num_waiting_uncached_tokens: 10,
+                    estimated_prefill_queue_ms: Some(500.0),
+                    max_running_requests: 4,
+                    max_total_num_tokens: 1_000,
+                    ..Default::default()
+                },
+            ),
+            (
+                &backup,
+                AggregateLoad {
+                    num_waiting_uncached_tokens: 200,
+                    estimated_prefill_queue_ms: Some(100.0),
+                    max_running_requests: 4,
+                    max_total_num_tokens: 1_000,
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let proposal =
+            SelectionProposal::with_backup(primary, backup).with_guard_hints(GuardHints {
+                enable_pressure_guard: true,
+                pressure_abs_threshold_tokens: 1_024,
+                pressure_abs_threshold_ms: Some(100.0),
+                pressure_rel_threshold: 2.0,
+            });
+
+        let decision = resolve_prefill(&CandidateRange::global(&workers), &proposal, 80, &snapshot)
+            .expect("both candidates fit capacity");
+
+        assert_eq!(decision.reason, DecisionReason::BackupPressureGuard);
+    }
+
+    #[test]
+    fn pressure_guard_falls_back_to_tokens_when_queue_time_is_incomplete() {
+        let primary = worker("primary");
+        let backup = worker("backup");
+        let workers = vec![Arc::clone(&primary), Arc::clone(&backup)];
+        let snapshot = snapshot(&[
+            (
+                &primary,
+                AggregateLoad {
+                    num_waiting_uncached_tokens: 500,
+                    estimated_prefill_queue_ms: Some(10.0),
+                    max_running_requests: 4,
+                    max_total_num_tokens: 1_000,
+                    ..Default::default()
+                },
+            ),
+            (
+                &backup,
+                AggregateLoad {
+                    num_waiting_uncached_tokens: 10,
+                    estimated_prefill_queue_ms: None,
+                    max_running_requests: 4,
+                    max_total_num_tokens: 1_000,
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let proposal =
+            SelectionProposal::with_backup(primary, backup).with_guard_hints(GuardHints {
+                enable_pressure_guard: true,
+                pressure_abs_threshold_tokens: 100,
+                pressure_abs_threshold_ms: Some(100.0),
+                pressure_rel_threshold: 2.0,
+            });
+
+        let decision = resolve_prefill(&CandidateRange::global(&workers), &proposal, 80, &snapshot)
+            .expect("both candidates fit capacity");
+
+        assert_eq!(decision.reason, DecisionReason::BackupPressureGuard);
+    }
+
+    #[test]
+    fn decode_pressure_prefers_no_retraction_then_shorter_steps() {
+        let retracted = worker("retracted");
+        let healthy = worker("healthy");
+        let retracted_snapshot = snapshot(&[
+            (
+                &retracted,
+                AggregateLoad {
+                    decode_prealloc_queue_reqs: Some(0),
+                    decode_transfer_queue_reqs: Some(0),
+                    decode_retracted_queue_reqs: Some(1),
+                    mean_decode_step_ms: Some(5.0),
+                    max_running_requests: 32,
+                    max_total_num_tokens: 10_000,
+                    ..Default::default()
+                },
+            ),
+            (
+                &healthy,
+                AggregateLoad {
+                    decode_prealloc_queue_reqs: Some(0),
+                    decode_transfer_queue_reqs: Some(0),
+                    decode_retracted_queue_reqs: Some(0),
+                    mean_decode_step_ms: Some(20.0),
+                    max_running_requests: 32,
+                    max_total_num_tokens: 10_000,
+                    ..Default::default()
+                },
+            ),
+        ]);
+        assert_eq!(
+            admission::compare_decode_pressure(&retracted, &healthy, Some(&retracted_snapshot)),
+            std::cmp::Ordering::Greater
+        );
+
+        let fast = worker("fast");
+        let slow = worker("slow");
+        let step_snapshot = snapshot(&[
+            (
+                &fast,
+                AggregateLoad {
+                    decode_prealloc_queue_reqs: Some(0),
+                    decode_transfer_queue_reqs: Some(0),
+                    decode_retracted_queue_reqs: Some(0),
+                    mean_decode_step_ms: Some(8.0),
+                    max_running_requests: 32,
+                    max_total_num_tokens: 10_000,
+                    ..Default::default()
+                },
+            ),
+            (
+                &slow,
+                AggregateLoad {
+                    decode_prealloc_queue_reqs: Some(0),
+                    decode_transfer_queue_reqs: Some(0),
+                    decode_retracted_queue_reqs: Some(0),
+                    mean_decode_step_ms: Some(16.0),
+                    max_running_requests: 32,
+                    max_total_num_tokens: 10_000,
+                    ..Default::default()
+                },
+            ),
+        ]);
+        assert_eq!(
+            admission::compare_decode_pressure(&fast, &slow, Some(&step_snapshot)),
+            std::cmp::Ordering::Less
+        );
+
+        let low_active = worker("low-active");
+        let high_active = worker("high-active");
+        let active_snapshot = snapshot(&[
+            (
+                &low_active,
+                AggregateLoad {
+                    num_total_tokens: 9_000,
+                    num_active_tokens: Some(1_000),
+                    max_running_requests: 32,
+                    max_total_num_tokens: 10_000,
+                    ..Default::default()
+                },
+            ),
+            (
+                &high_active,
+                AggregateLoad {
+                    num_total_tokens: 2_000,
+                    num_active_tokens: Some(1_500),
+                    max_running_requests: 32,
+                    max_total_num_tokens: 10_000,
+                    ..Default::default()
+                },
+            ),
+        ]);
+        assert_eq!(
+            admission::compare_decode_pressure(&low_active, &high_active, Some(&active_snapshot)),
+            std::cmp::Ordering::Less,
+            "reserved transfer KV stays in admission; execution pressure uses active tokens"
+        );
     }
 
     #[test]
