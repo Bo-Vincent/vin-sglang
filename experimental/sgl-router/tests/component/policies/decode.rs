@@ -3,11 +3,11 @@
 
 //! Decode policy 的最小可观察契约。
 //!
-//! 这些测试只覆盖 Router 已有的 running/KV/local active-load 输入；不把尚未
-//! 采集的 transfer、decode queue 或 retraction 指标伪造成可用数据。
+//! 这些测试覆盖 Decode proposal、Admission 和 Guard 的基础契约；Step 3 queue、
+//! retraction、step-time 与 active-token 排序由 policy 和 LoadMonitor 单元测试覆盖。
 
 use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
-use sgl_router::load_monitor::{AggregateLoad, Freshness, LoadMonitorSnapshot, WorkerSnapshot};
+use sgl_router::load_monitor::{AggregateLoad, SchedulingSnapshot};
 use sgl_router::policies::admission::{resolve_decode, CandidateDomain, DecisionReason};
 use sgl_router::policies::decode::{
     DecodePolicy, DecodePowerOfTwoPolicy, DecodeSelectionContext, LegacyHostAffinityDecodePolicy,
@@ -27,32 +27,13 @@ fn worker(id: &str) -> Arc<Worker> {
     }))
 }
 
-fn snapshot(entries: &[(&Arc<Worker>, AggregateLoad)]) -> LoadMonitorSnapshot {
-    LoadMonitorSnapshot {
+fn snapshot(entries: &[(&Arc<Worker>, AggregateLoad)]) -> SchedulingSnapshot {
+    SchedulingSnapshot {
         enabled: true,
         version: 7,
-        captured_at: Some("2026-08-04T00:00:00Z".into()),
-        workers: entries
+        fresh_loads: entries
             .iter()
-            .map(|(worker, aggregate)| WorkerSnapshot {
-                worker_id: worker.id.0.clone(),
-                url: worker.url.clone(),
-                mode: worker.mode(),
-                model_ids: worker
-                    .model_ids
-                    .iter()
-                    .map(|model| model.0.clone())
-                    .collect(),
-                freshness: Freshness::Fresh,
-                source_instance_id: None,
-                sequence_id: None,
-                report_time_unix_ms: None,
-                last_error: None,
-                received_at: None,
-                expires_at: None,
-                aggregate: Some(aggregate.clone()),
-                ranks: Vec::new(),
-            })
+            .map(|(worker, aggregate)| (worker.id.0.clone(), aggregate.clone()))
             .collect(),
     }
 }
@@ -93,6 +74,21 @@ fn legacy_host_affinity_remains_an_explicit_single_primary_compatibility_policy(
         proposal.backup.is_none(),
         "legacy semantics do not invent a backup"
     );
+}
+
+#[test]
+fn decode_domain_rejects_a_primary_outside_its_membership_index() {
+    let allowed = worker("allowed");
+    let foreign = worker("foreign");
+    let domain = CandidateDomain::global_decode(&[allowed]);
+
+    assert!(resolve_decode(
+        &domain,
+        &SelectionProposal::primary(foreign),
+        64,
+        &SchedulingSnapshot::default(),
+    )
+    .is_none());
 }
 
 #[test]

@@ -1,5 +1,9 @@
 use super::*;
 use crate::discovery::{ModelId, WorkerSpec};
+use crate::policies::admission::{
+    resolve_decode, resolve_prefill, CandidateDomain, CandidateRange, DecisionReason,
+};
+use crate::policies::{GuardHints, SelectionProposal};
 
 /// Builds one Router worker for store and snapshot tests.
 fn test_worker(id: &str, mode: WorkerMode) -> Arc<Worker> {
@@ -34,8 +38,16 @@ fn test_report(origin: &str, source: &str, sequence: u64, mode: WorkerMode) -> L
             num_waiting_uncached_tokens: 4,
             num_used_tokens: 20,
             num_total_tokens: 24,
+            num_active_tokens: Some(24),
             max_total_num_tokens: 100,
             max_running_requests: 10,
+            total_prefill_uncached_tokens: Some(0),
+            total_prefill_busy_us: Some(0),
+            decode_prealloc_queue_reqs: Some(0),
+            decode_transfer_queue_reqs: Some(0),
+            decode_retracted_queue_reqs: Some(0),
+            total_decode_steps: Some(0),
+            total_decode_step_us: Some(0),
             token_usage: 0.2,
             gen_throughput: 5.0,
             cache_hit_rate: 0.5,
@@ -66,6 +78,42 @@ fn disabled_snapshot_is_empty() {
     assert_eq!(snapshot.version, 0);
     assert!(snapshot.captured_at.is_none());
     assert!(snapshot.workers.is_empty());
+}
+
+/// Scheduling captures only fresh aggregate state and keeps diagnostic ranks
+/// on the existing snapshot API.
+#[tokio::test]
+async fn scheduling_snapshot_contains_only_fresh_aggregates() {
+    let monitor = test_monitor();
+    let fresh = test_worker("fresh", WorkerMode::Prefill);
+    let stale = test_worker("stale", WorkerMode::Prefill);
+    monitor
+        .reconcile(vec![Arc::clone(&fresh), Arc::clone(&stale)])
+        .await;
+
+    let fresh_binding = monitor
+        .begin_stream(test_report(
+            "fresh:30000",
+            "fresh-source",
+            1,
+            WorkerMode::Prefill,
+        ))
+        .unwrap();
+    let mut stale_report = test_report("stale:30000", "stale-source", 1, WorkerMode::Prefill);
+    stale_report.status = ReportStatus::Stale as i32;
+    let stale_binding = monitor.begin_stream(stale_report).unwrap();
+
+    let scheduling = monitor.scheduling_snapshot();
+
+    assert!(scheduling.enabled);
+    assert_eq!(scheduling.fresh_loads.len(), 1);
+    assert!(scheduling.fresh_load(&fresh.id).is_some());
+    assert!(scheduling.fresh_load(&stale.id).is_none());
+    assert_eq!(monitor.snapshot().workers.len(), 2);
+
+    monitor.end_stream(&fresh_binding);
+    monitor.end_stream(&stale_binding);
+    monitor.stop_registrations().await;
 }
 
 /// Rank aggregation sums counters and generation throughput.
@@ -309,6 +357,252 @@ async fn captured_snapshot_is_immutable_across_updates() {
     assert_eq!(second.workers[0].sequence_id, Some(2));
     assert!(second.version > first.version);
     monitor.stop_registrations().await;
+}
+
+/// Consecutive reports from one source derive prefill queue time and decode
+/// step time from monotonic engine counters.
+#[tokio::test]
+async fn derives_pressure_metrics_from_consecutive_reports() {
+    let monitor = test_monitor();
+    monitor
+        .reconcile(vec![test_worker("worker", WorkerMode::Plain)])
+        .await;
+
+    let mut first = test_report("worker:30000", "source", 1, WorkerMode::Plain);
+    first.ranks[0].total_prefill_uncached_tokens = Some(10_000);
+    first.ranks[0].total_prefill_busy_us = Some(5_000_000);
+    first.ranks[0].total_decode_steps = Some(100);
+    first.ranks[0].total_decode_step_us = Some(2_000_000);
+    let binding = monitor.begin_stream(first).unwrap();
+    assert!(monitor.snapshot().workers[0]
+        .aggregate
+        .as_ref()
+        .unwrap()
+        .estimated_prefill_queue_ms
+        .is_none());
+
+    let mut second = test_report("worker:30000", "source", 2, WorkerMode::Plain);
+    second.ranks[0].num_waiting_uncached_tokens = 800;
+    second.ranks[0].num_active_tokens = Some(18);
+    second.ranks[0].decode_prealloc_queue_reqs = Some(2);
+    second.ranks[0].decode_transfer_queue_reqs = Some(3);
+    second.ranks[0].decode_retracted_queue_reqs = Some(1);
+    second.ranks[0].total_prefill_uncached_tokens = Some(12_000);
+    second.ranks[0].total_prefill_busy_us = Some(5_500_000);
+    second.ranks[0].total_decode_steps = Some(120);
+    second.ranks[0].total_decode_step_us = Some(2_200_000);
+    monitor.apply_stream_report(&binding, second).unwrap();
+
+    let snapshot = monitor.snapshot();
+    let aggregate = snapshot.workers[0].aggregate.as_ref().unwrap();
+    assert_eq!(aggregate.num_active_tokens, Some(18));
+    assert_eq!(aggregate.decode_prealloc_queue_reqs, Some(2));
+    assert_eq!(aggregate.decode_transfer_queue_reqs, Some(3));
+    assert_eq!(aggregate.decode_retracted_queue_reqs, Some(1));
+    assert_eq!(aggregate.prefill_throughput_tokens_per_s, Some(4_000.0));
+    assert_eq!(aggregate.estimated_prefill_queue_ms, Some(200.0));
+    assert_eq!(aggregate.mean_decode_step_ms, Some(10.0));
+    monitor.stop_registrations().await;
+}
+
+/// Derived Prefill queue time is consumed by Pressure Guard, not merely
+/// published in the snapshot.
+#[tokio::test]
+async fn derived_prefill_queue_time_changes_guard_decision() {
+    let monitor = test_monitor();
+    let primary = test_worker("primary", WorkerMode::Prefill);
+    let backup = test_worker("backup", WorkerMode::Prefill);
+    monitor
+        .reconcile(vec![Arc::clone(&primary), Arc::clone(&backup)])
+        .await;
+
+    let mut primary_first = test_report("primary:30000", "p-source", 1, WorkerMode::Prefill);
+    primary_first.ranks[0].total_prefill_uncached_tokens = Some(1_000);
+    primary_first.ranks[0].total_prefill_busy_us = Some(1_000_000);
+    let primary_binding = monitor.begin_stream(primary_first).unwrap();
+
+    let mut backup_first = test_report("backup:30000", "b-source", 1, WorkerMode::Prefill);
+    backup_first.ranks[0].total_prefill_uncached_tokens = Some(1_000);
+    backup_first.ranks[0].total_prefill_busy_us = Some(1_000_000);
+    let backup_binding = monitor.begin_stream(backup_first).unwrap();
+
+    let mut primary_second = test_report("primary:30000", "p-source", 2, WorkerMode::Prefill);
+    primary_second.ranks[0].num_waiting_uncached_tokens = 100;
+    primary_second.ranks[0].total_prefill_uncached_tokens = Some(1_100);
+    primary_second.ranks[0].total_prefill_busy_us = Some(2_000_000);
+    monitor
+        .apply_stream_report(&primary_binding, primary_second)
+        .unwrap();
+
+    let mut backup_second = test_report("backup:30000", "b-source", 2, WorkerMode::Prefill);
+    backup_second.ranks[0].num_waiting_uncached_tokens = 500;
+    backup_second.ranks[0].total_prefill_uncached_tokens = Some(2_000);
+    backup_second.ranks[0].total_prefill_busy_us = Some(1_100_000);
+    monitor
+        .apply_stream_report(&backup_binding, backup_second)
+        .unwrap();
+
+    let snapshot = monitor.scheduling_snapshot();
+    let range_workers = vec![Arc::clone(&primary), Arc::clone(&backup)];
+    let range = CandidateRange::global(&range_workers);
+    let token_guard = SelectionProposal::with_backup(Arc::clone(&primary), Arc::clone(&backup))
+        .with_guard_hints(GuardHints {
+            enable_pressure_guard: true,
+            pressure_abs_threshold_tokens: 10,
+            pressure_abs_threshold_ms: None,
+            pressure_rel_threshold: 2.0,
+        });
+    let token_decision = resolve_prefill(&range, &token_guard, 1, &snapshot).unwrap();
+    assert_eq!(token_decision.selected.id, primary.id);
+
+    let queue_time_guard =
+        SelectionProposal::with_backup(Arc::clone(&primary), Arc::clone(&backup)).with_guard_hints(
+            GuardHints {
+                enable_pressure_guard: true,
+                pressure_abs_threshold_tokens: 10,
+                pressure_abs_threshold_ms: Some(100.0),
+                pressure_rel_threshold: 2.0,
+            },
+        );
+    let queue_time_decision = resolve_prefill(&range, &queue_time_guard, 1, &snapshot).unwrap();
+    assert_eq!(queue_time_decision.selected.id, backup.id);
+    assert_eq!(
+        queue_time_decision.reason,
+        DecisionReason::BackupPressureGuard
+    );
+
+    monitor.stop_registrations().await;
+}
+
+/// Decode queue gauges and step counters flow through LoadMonitor into the
+/// Decode pressure ordering.
+#[tokio::test]
+async fn decode_pressure_metrics_change_policy_decision() {
+    let monitor = test_monitor();
+    let primary = test_worker("primary", WorkerMode::Decode);
+    let backup = test_worker("backup", WorkerMode::Decode);
+    monitor
+        .reconcile(vec![Arc::clone(&primary), Arc::clone(&backup)])
+        .await;
+
+    let mut primary_first = test_report("primary:30000", "p-source", 1, WorkerMode::Decode);
+    primary_first.ranks[0].total_decode_steps = Some(100);
+    primary_first.ranks[0].total_decode_step_us = Some(1_000_000);
+    let primary_binding = monitor.begin_stream(primary_first).unwrap();
+
+    let mut backup_first = test_report("backup:30000", "b-source", 1, WorkerMode::Decode);
+    backup_first.ranks[0].total_decode_steps = Some(100);
+    backup_first.ranks[0].total_decode_step_us = Some(1_000_000);
+    let backup_binding = monitor.begin_stream(backup_first).unwrap();
+
+    let mut primary_second = test_report("primary:30000", "p-source", 2, WorkerMode::Decode);
+    primary_second.ranks[0].decode_retracted_queue_reqs = Some(1);
+    primary_second.ranks[0].total_decode_steps = Some(110);
+    primary_second.ranks[0].total_decode_step_us = Some(1_200_000);
+    monitor
+        .apply_stream_report(&primary_binding, primary_second)
+        .unwrap();
+
+    let mut backup_second = test_report("backup:30000", "b-source", 2, WorkerMode::Decode);
+    backup_second.ranks[0].decode_retracted_queue_reqs = Some(0);
+    backup_second.ranks[0].total_decode_steps = Some(110);
+    backup_second.ranks[0].total_decode_step_us = Some(1_100_000);
+    monitor
+        .apply_stream_report(&backup_binding, backup_second)
+        .unwrap();
+
+    let snapshot = monitor.scheduling_snapshot();
+    let domain = CandidateDomain::global_decode(&[Arc::clone(&primary), Arc::clone(&backup)]);
+    let proposal = SelectionProposal::with_backup(Arc::clone(&primary), Arc::clone(&backup));
+    let decision = resolve_decode(&domain, &proposal, 1, &snapshot).unwrap();
+    assert_eq!(decision.selected.id, backup.id);
+    assert_eq!(decision.reason, DecisionReason::BackupPressureGuard);
+
+    monitor.stop_registrations().await;
+}
+
+/// Counter resets and producer restarts invalidate only the derived sample;
+/// the fresh direct gauges remain available.
+#[tokio::test]
+async fn counter_reset_and_source_restart_drop_derived_metrics() {
+    let monitor = test_monitor();
+    monitor
+        .reconcile(vec![test_worker("worker", WorkerMode::Plain)])
+        .await;
+    let mut first = test_report("worker:30000", "source", 1, WorkerMode::Plain);
+    first.ranks[0].total_prefill_uncached_tokens = Some(1_000);
+    first.ranks[0].total_prefill_busy_us = Some(1_000);
+    first.ranks[0].total_decode_steps = Some(100);
+    first.ranks[0].total_decode_step_us = Some(100_000);
+    let binding = monitor.begin_stream(first).unwrap();
+
+    let mut reset = test_report("worker:30000", "source", 2, WorkerMode::Plain);
+    reset.ranks[0].num_active_tokens = Some(12);
+    reset.ranks[0].total_prefill_uncached_tokens = Some(10);
+    reset.ranks[0].total_prefill_busy_us = Some(10);
+    reset.ranks[0].total_decode_steps = Some(1);
+    reset.ranks[0].total_decode_step_us = Some(1_000);
+    monitor.apply_stream_report(&binding, reset).unwrap();
+    let reset_snapshot = monitor.snapshot();
+    let reset_load = reset_snapshot.workers[0].aggregate.as_ref().unwrap();
+    assert_eq!(reset_load.num_active_tokens, Some(12));
+    assert!(reset_load.estimated_prefill_queue_ms.is_none());
+    assert!(reset_load.mean_decode_step_ms.is_none());
+
+    monitor.end_stream(&binding);
+    let restarted = monitor
+        .begin_stream(test_report(
+            "worker:30000",
+            "new-source",
+            1,
+            WorkerMode::Plain,
+        ))
+        .unwrap();
+    let restarted_snapshot = monitor.snapshot();
+    let restarted_load = restarted_snapshot.workers[0].aggregate.as_ref().unwrap();
+    assert!(restarted_load.estimated_prefill_queue_ms.is_none());
+    assert!(restarted_load.mean_decode_step_ms.is_none());
+    monitor.end_stream(&restarted);
+    monitor.stop_registrations().await;
+}
+
+/// Optional fields keep a rolling upgrade from rejecting older reporters.
+#[test]
+fn accepts_legacy_rank_without_step3_metrics() {
+    let mut report = test_report("worker:30000", "source", 1, WorkerMode::Plain);
+    let rank = &mut report.ranks[0];
+    rank.num_active_tokens = None;
+    rank.total_prefill_uncached_tokens = None;
+    rank.total_prefill_busy_us = None;
+    rank.decode_prealloc_queue_reqs = None;
+    rank.decode_transfer_queue_reqs = None;
+    rank.decode_retracted_queue_reqs = None;
+    rank.total_decode_steps = None;
+    rank.total_decode_step_us = None;
+
+    let accepted = validate_report(&report, SystemTime::now()).unwrap();
+    assert_eq!(accepted.aggregate.num_active_tokens, None);
+    assert_eq!(accepted.aggregate.estimated_prefill_queue_ms, None);
+    assert_eq!(accepted.aggregate.mean_decode_step_ms, None);
+}
+
+#[test]
+fn rejects_incomplete_step3_counter_pairs() {
+    let mut prefill = test_report("worker:30000", "source", 1, WorkerMode::Plain);
+    prefill.ranks[0].total_prefill_busy_us = None;
+    let error = validate_report(&prefill, SystemTime::now()).unwrap_err();
+    assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    assert!(error
+        .message()
+        .contains("prefill cumulative counters must be reported together"));
+
+    let mut decode = test_report("worker:30000", "source", 1, WorkerMode::Plain);
+    decode.ranks[0].total_decode_step_us = None;
+    let error = validate_report(&decode, SystemTime::now()).unwrap_err();
+    assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    assert!(error
+        .message()
+        .contains("decode cumulative counters must be reported together"));
 }
 
 /// Exercises actual HTTP registration, an ephemeral gRPC listener, stream
