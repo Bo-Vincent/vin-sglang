@@ -250,6 +250,7 @@ struct WorkerState {
     report: Option<AcceptedReport>,
     active_source: Option<String>,
     active_session: Option<u64>,
+    active_cancel: Option<CancellationToken>,
     retired_sources: HashSet<String>,
 }
 
@@ -261,6 +262,7 @@ impl WorkerState {
             report: None,
             active_source: None,
             active_session: None,
+            active_cancel: None,
             retired_sources: HashSet::new(),
         }
     }
@@ -428,8 +430,13 @@ impl LoadMonitor {
         {
             let mut store = self.inner.store.write();
             let mut changed = false;
-            store.workers.retain(|id, _| {
+            store.workers.retain(|id, state| {
                 let keep = targets.contains_key(id);
+                if !keep {
+                    if let Some(cancel) = state.active_cancel.take() {
+                        cancel.cancel();
+                    }
+                }
                 changed |= !keep;
                 keep
             });
@@ -440,6 +447,9 @@ impl LoadMonitor {
                         state.target.model_ids.clone_from(&target.model_ids);
                     }
                     Some(state) => {
+                        if let Some(cancel) = state.active_cancel.take() {
+                            cancel.cancel();
+                        }
                         *state = WorkerState::new(target.clone());
                         changed = true;
                     }
@@ -678,7 +688,7 @@ impl LoadMonitor {
     /// # Errors
     ///
     /// Returns gRPC `invalid_argument` for unknown origins, role mismatches,
-    /// retired sources, duplicate streams, and invalid rank fields.
+    /// retired sources, and invalid rank fields.
     fn begin_stream(&self, report: LoadReport) -> IngestResult<StreamBinding> {
         if self.inner.shutting_down.load(Ordering::Acquire) {
             return Err(ingest_status(Status::unavailable(
@@ -727,12 +737,6 @@ impl LoadMonitor {
                 "source_instance_id has been retired",
             )));
         }
-        if state.active_source.as_deref() == Some(source.as_str()) && state.active_session.is_some()
-        {
-            return Err(ingest_status(Status::already_exists(
-                "duplicate stream for worker origin",
-            )));
-        }
         let same_source = state.active_source.as_deref() == Some(source.as_str());
         let duplicate_sequence = same_source
             && state
@@ -753,7 +757,22 @@ impl LoadMonitor {
                 state.retired_sources.insert(previous);
             }
         }
-        state.active_session = Some(session);
+        let cancel = CancellationToken::new();
+        let previous_session = state.active_session.replace(session);
+        if let Some(previous_cancel) = state.active_cancel.replace(cancel.clone()) {
+            previous_cancel.cancel();
+        }
+        if same_source {
+            if let Some(previous_session) = previous_session {
+                tracing::info!(
+                    worker_id = %id,
+                    %source,
+                    previous_session,
+                    session,
+                    "load monitor: same-source reconnect superseded old report stream",
+                );
+            }
+        }
         if let Some(accepted) = accepted {
             state.report = Some(accepted);
             store.version = store.version.wrapping_add(1);
@@ -764,13 +783,15 @@ impl LoadMonitor {
             role,
             source,
             session,
+            cancel,
         })
     }
 
     /// Applies a subsequent report after verifying immutable stream identity.
     ///
     /// Duplicate and out-of-order sequence numbers are ignored without closing
-    /// the stream. A superseded stream is closed on its next message.
+    /// the stream. Superseded sessions are fenced here as a second line of
+    /// defense in addition to their active cancellation token.
     fn apply_stream_report(&self, binding: &StreamBinding, report: LoadReport) -> IngestResult<()> {
         let worker = report.worker.as_ref().ok_or_else(|| {
             ingest_status(Status::invalid_argument(
@@ -797,7 +818,7 @@ impl LoadMonitor {
                 .ok_or_else(|| ingest_status(Status::not_found("worker was removed")))?;
             if state.active_session != Some(binding.session) {
                 return Err(ingest_status(Status::aborted(
-                    "stream source was superseded",
+                    "stream session was superseded",
                 )));
             }
             if state
@@ -821,7 +842,7 @@ impl LoadMonitor {
             .ok_or_else(|| ingest_status(Status::not_found("worker was removed")))?;
         if state.active_session != Some(binding.session) {
             return Err(ingest_status(Status::aborted(
-                "stream source was superseded",
+                "stream session was superseded",
             )));
         }
         if state
@@ -844,6 +865,7 @@ impl LoadMonitor {
         if let Some(state) = store.workers.get_mut(&binding.id) {
             if state.active_session == Some(binding.session) {
                 state.active_session = None;
+                state.active_cancel = None;
             }
         }
     }
@@ -871,6 +893,7 @@ struct StreamBinding {
     role: WorkerType,
     source: String,
     session: u64,
+    cancel: CancellationToken,
 }
 
 #[derive(Debug)]
@@ -913,7 +936,17 @@ impl LoadMonitorService for LoadMonitor {
             .ok_or_else(|| Status::invalid_argument("report stream is empty"))?;
         let binding = self.begin_stream(first).map_err(|status| *status)?;
         let result = async {
-            while let Some(report) = stream.message().await? {
+            loop {
+                let report = tokio::select! {
+                    biased;
+                    _ = binding.cancel.cancelled() => {
+                        return Err(Status::aborted("stream session was superseded"));
+                    }
+                    report = stream.message() => report?,
+                };
+                let Some(report) = report else {
+                    break;
+                };
                 self.apply_stream_report(&binding, report)
                     .map_err(|status| *status)?;
             }
