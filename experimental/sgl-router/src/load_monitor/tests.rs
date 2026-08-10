@@ -70,6 +70,20 @@ fn test_monitor() -> LoadMonitor {
     .unwrap()
 }
 
+/// Waits until the in-memory snapshot reaches an expected sequence number.
+async fn wait_for_sequence(monitor: &LoadMonitor, expected: u64) {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if monitor.snapshot().workers[0].sequence_id == Some(expected) {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("load snapshot did not reach sequence {expected}"));
+}
+
 /// Disabled snapshots preserve the documented empty state.
 #[test]
 fn disabled_snapshot_is_empty() {
@@ -284,6 +298,40 @@ async fn new_source_retires_old_source_until_worker_recreated() {
     assert!(monitor
         .begin_stream(test_report("worker:30000", "old", 3, WorkerMode::Plain))
         .is_err());
+    monitor.stop_registrations().await;
+}
+
+/// A reconnect from the same engine incarnation takes ownership without
+/// allowing the old stream or its cleanup path to disturb the new session.
+#[tokio::test]
+async fn same_source_reconnect_supersedes_old_session() {
+    let monitor = test_monitor();
+    monitor
+        .reconcile(vec![test_worker("worker", WorkerMode::Plain)])
+        .await;
+    let old = monitor
+        .begin_stream(test_report("worker:30000", "source", 1, WorkerMode::Plain))
+        .unwrap();
+    let new = monitor
+        .begin_stream(test_report("worker:30000", "source", 2, WorkerMode::Plain))
+        .unwrap();
+
+    let error = monitor
+        .apply_stream_report(
+            &old,
+            test_report("worker:30000", "source", 3, WorkerMode::Plain),
+        )
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::Aborted);
+
+    monitor.end_stream(&old);
+    monitor
+        .apply_stream_report(
+            &new,
+            test_report("worker:30000", "source", 3, WorkerMode::Plain),
+        )
+        .unwrap();
+    assert_eq!(monitor.snapshot().workers[0].sequence_id, Some(3));
     monitor.stop_registrations().await;
 }
 
@@ -700,6 +748,85 @@ async fn fake_engine_registration_and_grpc_report_form_complete_loop() {
 
     grpc.shutdown(&monitor).await;
     engine_server.abort();
+}
+
+/// Exercises the network service with two overlapping streams from the same
+/// engine incarnation, matching a reconnect while the old HTTP/2 stream is
+/// still half-open in the Router.
+#[tokio::test]
+async fn grpc_same_source_reconnect_aborts_old_stream_and_keeps_new_stream() {
+    use tokio::sync::mpsc;
+    use tokio_stream::wrappers::ReceiverStream;
+
+    let config = LoadMonitorConfig {
+        enabled: true,
+        bind_host: "127.0.0.1".to_string(),
+        bind_port: 0,
+        report_ip: Some("127.0.0.1".to_string()),
+    };
+    let (monitor, grpc) = bind_and_serve(config).await.unwrap();
+    monitor
+        .reconcile(vec![test_worker("worker", WorkerMode::Plain)])
+        .await;
+
+    let client = proto::load_monitor_service_client::LoadMonitorServiceClient::connect(format!(
+        "http://{}",
+        grpc.local_addr()
+    ))
+    .await
+    .unwrap();
+
+    let (old_tx, old_rx) = mpsc::channel(4);
+    let mut old_client = client.clone();
+    let old_rpc = tokio::spawn(async move { old_client.report(ReceiverStream::new(old_rx)).await });
+    old_tx
+        .send(test_report(
+            "worker:30000",
+            "same-engine",
+            1,
+            WorkerMode::Plain,
+        ))
+        .await
+        .unwrap();
+    wait_for_sequence(&monitor, 1).await;
+
+    let (new_tx, new_rx) = mpsc::channel(4);
+    let mut new_client = client;
+    let new_rpc = tokio::spawn(async move { new_client.report(ReceiverStream::new(new_rx)).await });
+    new_tx
+        .send(test_report(
+            "worker:30000",
+            "same-engine",
+            2,
+            WorkerMode::Plain,
+        ))
+        .await
+        .unwrap();
+    wait_for_sequence(&monitor, 2).await;
+
+    let old_error = tokio::time::timeout(Duration::from_secs(1), old_rpc)
+        .await
+        .expect("superseded stream must be closed promptly")
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(old_error.code(), tonic::Code::Aborted);
+
+    new_tx
+        .send(test_report(
+            "worker:30000",
+            "same-engine",
+            3,
+            WorkerMode::Plain,
+        ))
+        .await
+        .unwrap();
+    wait_for_sequence(&monitor, 3).await;
+
+    drop(old_tx);
+    drop(new_tx);
+    new_rpc.await.unwrap().unwrap();
+    monitor.stop_registrations().await;
+    grpc.shutdown(&monitor).await;
 }
 
 /// Retryable HTTP responses back off, terminal 4xx responses pause until

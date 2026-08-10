@@ -46,6 +46,11 @@ _RETRYABLE = {
     grpc.StatusCode.UNAVAILABLE,
     grpc.StatusCode.DEADLINE_EXCEEDED,
     grpc.StatusCode.RESOURCE_EXHAUSTED,
+    # A Router may briefly retain the old HTTP/2 stream after this task has
+    # already observed a transport failure and started reconnecting. Newer
+    # Routers supersede that stream; retry keeps mixed-version deployments
+    # from permanently removing this monitor task.
+    grpc.StatusCode.ALREADY_EXISTS,
 }
 # Permanent-for-this-registration codes: stop reconnecting and wait until the
 # Router renews the lease (a new revision) before trying again.

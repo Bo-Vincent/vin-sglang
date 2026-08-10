@@ -13,10 +13,12 @@ from ipaddress import IPv4Address
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import grpc
 from sglang.srt.load_reporter.ipc import (
     LoadReporterControlProxy,
     LoadReporterRefreshNotifier,
 )
+from sglang.srt.load_reporter.monitor import _classify_status, _StatusAction
 from sglang.srt.load_reporter.registration import (
     StartReportingRequest,
     start_reporting,
@@ -301,6 +303,17 @@ class TestLoadSampler(AsyncCustomTestCase):
         runtime._on_schedule_changed()
         runtime._sampler.deactivate.assert_called_once_with()
         self.assertEqual(runtime._active_changed.call_args_list[-1].args, (False,))
+
+
+class TestMonitorStatusClassification(AsyncCustomTestCase):
+    """Cover transport-status decisions that control monitor task lifetime."""
+
+    def test_duplicate_stream_status_retries_instead_of_terminating(self) -> None:
+        """A half-open old Router stream must not permanently stop reporting."""
+        self.assertIs(
+            _classify_status(grpc.StatusCode.ALREADY_EXISTS),
+            _StatusAction.RETRY,
+        )
 
 
 class TestLoadReporterControl(AsyncCustomTestCase):
