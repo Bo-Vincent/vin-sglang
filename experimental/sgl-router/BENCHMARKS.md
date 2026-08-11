@@ -78,6 +78,12 @@ Cache candidate 和单机 4P+4D Mooncake KV transfer 的环境、结果与边界
 Policy/Admission/Guard 数据流可用；静态 Bucket 仍是 Step 2 实验接口，不代表同构
 4+4 切分或异构生产 Bucket 已达到 production GO。
 
+## Router Policy 热路径 Microbenchmark
+
+8 / 64 / 256 endpoints 下 scheduling snapshot、P2、Session-Aware、Cache-Aware top-K
+和 Decode Policy 的三轮 Router-only latency、allocation、CPU、扩展性门槛与适用边界见
+[Router Policy 热路径 Microbenchmark 报告](docs/router-policy-pressure-microbenchmark-report.md)。
+该结果不替代高 Router RPS 和并发 Engine load 快照写入条件下的容量验证。
 ## Pre-deprecation calibration runbook
 
 Before deleting SMG, every routing-latency metric in the slim-design
