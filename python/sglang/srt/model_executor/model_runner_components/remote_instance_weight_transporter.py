@@ -83,7 +83,7 @@ class RemoteInstanceWeightTransporter:
             f"ep{self.ep_rank}-tp{self.tp_rank}"
         )
 
-    def validate_runtime_manifest_addresses(self, manifest: Any) -> None:
+    def validate_runtime_binding_inventory_addresses(self, inventory: Any) -> None:
         """Fail if model storage moved after TransferEngine registration."""
         if not self.weight_info:
             raise RuntimeError(
@@ -97,22 +97,22 @@ class RemoteInstanceWeightTransporter:
             for address, numel, itemsize in self.weight_info.values()
         )
         starts = [start for start, _ in ranges]
-        tensors = (
-            manifest.get("tensors", ())
-            if isinstance(manifest, dict)
-            else manifest.tensors
+        fragments = (
+            inventory.get("fragments", ())
+            if isinstance(inventory, dict)
+            else inventory.fragments
         )
-        for tensor in tensors:
+        for fragment in fragments:
             address = int(
-                tensor["address"] if isinstance(tensor, dict) else tensor.address
+                fragment["address"] if isinstance(fragment, dict) else fragment.address
             )
             nbytes = int(
-                tensor["nbytes"] if isinstance(tensor, dict) else tensor.nbytes
+                fragment["nbytes"] if isinstance(fragment, dict) else fragment.nbytes
             )
             index = bisect_right(starts, address) - 1
             if index < 0 or address + nbytes > ranges[index][1]:
                 raise RuntimeError(
-                    "runtime manifest references storage outside registered "
+                    "runtime binding inventory references storage outside registered "
                     "TransferEngine memory"
                 )
 

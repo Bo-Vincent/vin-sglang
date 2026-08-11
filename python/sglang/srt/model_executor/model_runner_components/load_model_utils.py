@@ -178,7 +178,7 @@ def build_load_config(
     tp_rank: int,
     remote_instance_weight_transporter_engine: Any,
     remote_instance_weight_transporter_session_id: str,
-    remote_instance_weight_runtime_manifest_builder: Any,
+    remote_instance_weight_inventory_builder: Any,
     draft_model_idx: Optional[int],
 ) -> LoadConfig:
     from sglang.srt.configs.modelopt_config import ModelOptConfig
@@ -202,7 +202,12 @@ def build_load_config(
         remote_instance_weight_loader_backend=server_args.remote_instance_weight_loader_backend,
         remote_instance_weight_loader_transfer_engine=remote_instance_weight_transporter_engine,
         remote_instance_weight_loader_transfer_engine_session_id=remote_instance_weight_transporter_session_id,
-        remote_instance_weight_runtime_manifest_builder=remote_instance_weight_runtime_manifest_builder,
+        remote_instance_weight_inventory_builder=remote_instance_weight_inventory_builder,
+        weight_reshard_resource_id=(
+            server_args.get_weight_reshard_resource_id()
+            if server_args.enable_weight_reshard
+            else None
+        ),
         modelexpress_url=server_args.modelexpress_url,
         modelexpress_transport=server_args.modelexpress_transport,
         modelopt_config=modelopt_config,

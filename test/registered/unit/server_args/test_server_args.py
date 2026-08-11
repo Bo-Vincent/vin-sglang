@@ -24,6 +24,9 @@ from sglang.srt.model_executor.cuda_graph_config import (
     Phase,
     PhaseConfig,
 )
+from sglang.srt.model_executor.model_runner_components.load_model_utils import (
+    build_load_config,
+)
 from sglang.srt.server_args import PortArgs, ServerArgs, prepare_server_args
 from sglang.srt.server_args_config_parser import ConfigArgumentMerger
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -1075,6 +1078,7 @@ class TestRemoteInstanceLoadFormat(CustomTestCase):
     def _args(**overrides):
         values = {
             "model_path": "dummy",
+            "revision": "immutable-revision",
             "load_format": "remote_instance",
             "remote_instance_weight_loader_backend": "transfer_engine",
             "remote_instance_weight_loader_seed_instance_ip": "127.0.0.1",
@@ -1082,6 +1086,52 @@ class TestRemoteInstanceLoadFormat(CustomTestCase):
         }
         values.update(overrides)
         return ServerArgs(**values)
+
+    def test_weight_reshard_requires_explicit_immutable_revision(self):
+        for revision in (None, "", "default"):
+            args = self._args(enable_weight_reshard=True, revision=revision)
+            with self.assertRaisesRegex(ValueError, "content-lineage revision"):
+                args._handle_load_format()
+
+    def test_weight_reshard_resource_id_is_independent_of_local_model_path(self):
+        args = self._args(
+            enable_weight_reshard=True,
+            served_model_name="canonical-model",
+            weight_reshard_resource_id="checkpoint-family-42",
+        )
+
+        self.assertEqual(
+            args.get_weight_reshard_resource_id(),
+            "checkpoint-family-42",
+        )
+
+    def test_weight_reshard_resource_id_defaults_to_served_model_identity(self):
+        args = self._args(
+            enable_weight_reshard=True,
+            served_model_name="canonical-model",
+        )
+
+        self.assertEqual(args.get_weight_reshard_resource_id(), "canonical-model")
+
+    def test_weight_reshard_resource_id_is_carried_into_load_config(self):
+        args = self._args(
+            enable_weight_reshard=True,
+            weight_reshard_resource_id="checkpoint-family-42",
+        )
+
+        load_config = build_load_config(
+            server_args=args,
+            tp_rank=0,
+            remote_instance_weight_transporter_engine=object(),
+            remote_instance_weight_transporter_session_id="target-session",
+            remote_instance_weight_inventory_builder=object(),
+            draft_model_idx=None,
+        )
+
+        self.assertEqual(
+            load_config.weight_reshard_resource_id,
+            "checkpoint-family-42",
+        )
 
     def test_missing_seed_settings_fail_closed(self):
         args = self._args(remote_instance_weight_loader_seed_instance_service_port=None)
@@ -1099,6 +1149,62 @@ class TestRemoteInstanceLoadFormat(CustomTestCase):
                 args._handle_load_format()
 
         self.assertEqual(args.load_format, "remote_instance")
+
+    def test_heterogeneous_transfer_engine_requires_reshard_capability(self):
+        args = self._args(enable_weight_reshard=True)
+
+        with patch.object(args, "validate_transfer_engine", return_value=True):
+            with patch.object(
+                args,
+                "validate_weight_reshard_backend",
+                return_value=False,
+            ):
+                with self.assertRaisesRegex(ValueError, "weight reshard"):
+                    args._handle_load_format()
+
+    def test_heterogeneous_target_rejects_non_transfer_engine_backend(self):
+        args = self._args(
+            enable_weight_reshard=True,
+            remote_instance_weight_loader_backend="nccl",
+            remote_instance_weight_loader_send_weights_group_ports=[31000],
+        )
+
+        with self.assertRaisesRegex(ValueError, "requires.*transfer_engine"):
+            args._handle_load_format()
+
+    def test_reshard_source_export_does_not_force_target_backend(self):
+        args = self._args(
+            load_format="auto",
+            enable_weight_reshard=True,
+            remote_instance_weight_loader_backend="nccl",
+        )
+
+        args._handle_load_format()
+
+        self.assertEqual(args.load_format, "auto")
+
+    def test_legacy_transfer_engine_does_not_require_reshard_capability(self):
+        args = self._args(enable_weight_reshard=False)
+
+        with patch.object(args, "validate_transfer_engine", return_value=True):
+            with patch.object(
+                args,
+                "validate_weight_reshard_backend",
+                side_effect=AssertionError("legacy loader must not require reshard"),
+            ):
+                args._handle_load_format()
+
+    def test_weight_reshard_validation_loads_the_real_backend_capability(self):
+        args = self._args(enable_weight_reshard=True)
+
+        with patch(
+            "sglang.srt.model_loader.weight_reshard_backend."
+            "create_weight_reshard_backend",
+            return_value=object(),
+        ) as create_backend:
+            self.assertTrue(args.validate_weight_reshard_backend())
+
+        create_backend.assert_called_once_with("transfer_engine")
 
     def test_memory_saver_conflict_fails_closed(self):
         args = self._args(enable_memory_saver=True)

@@ -238,26 +238,46 @@ class ModelRunnerOutput:
 
 
 @dataclass
-class _RemoteInstanceTargetWeightManifestSession:
+class _RemoteInstanceTargetWeightInventorySession:
     manager: Any
-    placement: Any
+    placement_inventory: Any
     instance_id: str
     worker_id: str
     endpoint: str
+    activation_coordinator: Any
+    activated: bool = False
+    active_binding_lease_id: str | None = None
 
     @contextlib.contextmanager
     def bind(self):
-        binding = self.manager.snapshot_binding(
-            placement=self.placement,
+        if self.active_binding_lease_id is not None:
+            raise RuntimeError("target weight binding is already active")
+        binding = self.manager.target_binding_inventory(
+            placement=self.placement_inventory,
             instance_id=self.instance_id,
             worker_id=self.worker_id,
             endpoint=self.endpoint,
         )
+        self.active_binding_lease_id = binding.lease_id
         try:
             yield binding
         finally:
             if self.manager.has_lease(binding.lease_id):
                 self.manager.release(binding.lease_id)
+            if self.active_binding_lease_id == binding.lease_id:
+                self.active_binding_lease_id = None
+
+    def activate(self) -> None:
+        if self.activated:
+            raise RuntimeError("target weight content was already activated")
+        lease_id = self.active_binding_lease_id
+        if lease_id is None:
+            raise RuntimeError("target weight binding is not active")
+        self.activation_coordinator.adopt_weight_generation_from_snapshot(
+            lease_id, self.placement_inventory.weight_generation
+        )
+        self.active_binding_lease_id = None
+        self.activated = True
 
 
 class ModelRunner:
@@ -395,6 +415,10 @@ class ModelRunner:
         # For hisparse (must be set before initialize() so CUDA graph capture can see it)
         self.hisparse_coordinator = None
 
+        # Target reshard loading binds storage before initialize() returns. The
+        # same coordinator must fence that binding, later updates, and activation.
+        self.init_weight_snapshot_coordinator()
+
         # Load model weights and configure
         self.initialize()
         self.check_quantized_moe_compatibility()
@@ -504,18 +528,21 @@ class ModelRunner:
     def init_msprobe(self):
         self.msprobe_debugger = misc_utils.create_msprobe_debugger(self.server_args)
 
-    def init_weight_updater(self):
+    def init_weight_snapshot_coordinator(self):
         self.weight_snapshot_coordinator = None
-        self.weight_runtime_manifest_manager = None
-        coordination_kwargs = {}
-        if self.server_args.enable_weight_runtime_manifest:
-            from sglang.srt.model_executor.weight_runtime_manifest import (
+        self.weight_inventory_manager = None
+        if self.server_args.enable_weight_reshard:
+            from sglang.srt.model_executor.weight_snapshot import (
                 WeightSnapshotCoordinator,
             )
 
             self.weight_snapshot_coordinator = WeightSnapshotCoordinator(
                 completion_fence=current_platform.synchronize
             )
+
+    def init_weight_updater(self):
+        coordination_kwargs = {}
+        if self.weight_snapshot_coordinator is not None:
             coordination_kwargs = {
                 "begin_weight_update": self.weight_snapshot_coordinator.begin_update,
                 "finish_weight_update": self.weight_snapshot_coordinator.finish_update,
@@ -758,27 +785,23 @@ class ModelRunner:
         if self.server_args.enable_lora:
             self.init_lora_manager()
 
-    def init_weight_runtime_manifest_manager(self):
-        if not self.server_args.enable_weight_runtime_manifest:
-            raise RuntimeError(
-                "weight runtime manifests require --enable-weight-runtime-manifest"
-            )
-        if self.weight_runtime_manifest_manager is not None:
+    def init_weight_inventory_manager(self):
+        if not self.server_args.enable_weight_reshard:
+            raise RuntimeError("weight inventories require --enable-weight-reshard")
+        if self.weight_inventory_manager is not None:
             return
         assert self.weight_snapshot_coordinator is not None
-        self.weight_runtime_manifest_manager = (
-            self._create_weight_runtime_manifest_manager(
-                model=self.model,
-                coordinator=self.weight_snapshot_coordinator,
-            )
+        self.weight_inventory_manager = self._create_weight_inventory_manager(
+            model=self.model,
+            coordinator=self.weight_snapshot_coordinator,
         )
 
-    def _create_weight_runtime_manifest_manager(self, *, model, coordinator):
-        from sglang.srt.model_executor.weight_runtime_manifest import (
-            create_sglang_weight_runtime_manifest_manager,
+    def _create_weight_inventory_manager(self, *, model, coordinator):
+        from sglang.srt.model_executor.weight_inventory_factory import (
+            create_sglang_weight_inventory_manager,
         )
 
-        return create_sglang_weight_runtime_manifest_manager(
+        return create_sglang_weight_inventory_manager(
             model=model,
             config=self.model_config.hf_config,
             parallel_state=self.ps,
@@ -787,6 +810,7 @@ class ModelRunner:
             quantization=self.model_config.quantization,
             lora_enabled=self.server_args.enable_lora,
             is_multimodal=self.is_multimodal,
+            vision_data_parallel=self.server_args.mm_enable_dp_encoder,
             dynamic_expert_placement=(
                 self.server_args.enable_eplb
                 or self.server_args.elastic_ep_backend is not None
@@ -799,80 +823,52 @@ class ModelRunner:
             coordinator=coordinator,
         )
 
-    def _select_remote_instance_target_weight_manifest_builder(self):
-        if not self.server_args.enable_weight_runtime_manifest or self.is_draft_worker:
+    def _select_remote_instance_target_weight_inventory_builder(self):
+        if not self.server_args.enable_weight_reshard or self.is_draft_worker:
             return None
-
-        from sglang.srt.model_executor.weight_runtime_manifest import (
-            local_mooncake_supports_placement_binding,
-        )
-
-        if local_mooncake_supports_placement_binding():
-            return self.build_remote_instance_target_weight_manifest_session
-        logger.info(
-            "Local Mooncake lacks placement/binding manifest APIs; "
-            "using the runtime-v1 target builder."
-        )
-        return self.build_remote_instance_target_weight_runtime_manifest
+        return self.build_remote_instance_target_weight_inventory_session
 
     @contextlib.contextmanager
-    def build_remote_instance_target_weight_manifest_session(
+    def build_remote_instance_target_weight_inventory_session(
         self,
         *,
         model,
         model_id: str,
         revision: str,
+        weight_generation: int,
         instance_id: str,
         endpoint: str,
     ):
-        from sglang.srt.model_executor.weight_runtime_manifest import (
-            WeightSnapshotCoordinator,
+        from sglang.srt.model_executor.weight_inventory_contracts import (
+            WeightInventoryError,
         )
 
-        manager = self._create_weight_runtime_manifest_manager(
+        if callable(getattr(model, "post_load_weights", None)):
+            raise WeightInventoryError(
+                "heterogeneous target binding requires post-load-idempotent "
+                "runtime storage"
+            )
+        # The inventory adapter is the authority for byte-compatible runtime
+        # layouts, including the supported serialized block-FP8 layout.
+        manager = self._create_weight_inventory_manager(
             model=model,
-            coordinator=WeightSnapshotCoordinator(),
+            coordinator=self.weight_snapshot_coordinator,
         )
-        placement = manager.placement(model_id=model_id, revision=revision)
-        yield _RemoteInstanceTargetWeightManifestSession(
+        placement_inventory = manager.target_layout_inventory(
+            model_id=model_id,
+            revision=revision,
+            desired_weight_generation=weight_generation,
+        )
+        yield _RemoteInstanceTargetWeightInventorySession(
             manager=manager,
-            placement=placement,
+            placement_inventory=placement_inventory,
             instance_id=instance_id,
             worker_id=self.remote_instance_weight_transporter.worker_id,
             endpoint=endpoint,
+            activation_coordinator=self.weight_snapshot_coordinator,
         )
 
-    @contextlib.contextmanager
-    def build_remote_instance_target_weight_runtime_manifest(
-        self,
-        *,
-        model,
-        model_id: str,
-        revision: str,
-        instance_id: str,
-        endpoint: str,
-    ):
-        from sglang.srt.model_executor.weight_runtime_manifest import (
-            WeightSnapshotCoordinator,
-        )
-
-        manager = self._create_weight_runtime_manifest_manager(
-            model=model,
-            coordinator=WeightSnapshotCoordinator(),
-        )
-        manifest = manager.snapshot(
-            model_id=model_id,
-            revision=revision,
-            instance_id=instance_id,
-            worker_id=self.remote_instance_weight_transporter.worker_id,
-            endpoint=endpoint,
-        )
-        try:
-            yield manifest
-        finally:
-            manager.release(manifest.lease_id)
-
-    def get_weight_runtime_manifest(
+    def get_weight_inventories(
         self,
         *,
         model_id: str,
@@ -882,8 +878,8 @@ class ModelRunner:
         endpoint: str,
         lease_timeout_sec: int | None = None,
     ):
-        self.init_weight_runtime_manifest_manager()
-        return self.weight_runtime_manifest_manager.snapshot(
+        self.init_weight_inventory_manager()
+        return self.weight_inventory_manager.snapshot_inventories(
             model_id=model_id,
             revision=revision,
             instance_id=instance_id,
@@ -892,46 +888,24 @@ class ModelRunner:
             lease_timeout_sec=lease_timeout_sec,
         )
 
-    def get_weight_runtime_manifest_parts(
-        self,
-        *,
-        model_id: str,
-        revision: str,
-        instance_id: str,
-        worker_id: str,
-        endpoint: str,
-        lease_timeout_sec: int | None = None,
-    ):
-        self.init_weight_runtime_manifest_manager()
-        return self.weight_runtime_manifest_manager.snapshot_parts(
-            model_id=model_id,
-            revision=revision,
-            instance_id=instance_id,
-            worker_id=worker_id,
-            endpoint=endpoint,
-            lease_timeout_sec=lease_timeout_sec,
-        )
+    def release_weight_inventory(self, lease_id: str) -> None:
+        if self.weight_inventory_manager is None:
+            raise RuntimeError("weight inventory manager is not initialized")
+        self.weight_inventory_manager.release(lease_id)
 
-    def release_weight_runtime_manifest(self, lease_id: str) -> None:
-        if self.weight_runtime_manifest_manager is None:
-            raise RuntimeError("weight runtime manifest manager is not initialized")
-        self.weight_runtime_manifest_manager.release(lease_id)
-
-    def renew_weight_runtime_manifest(
-        self, lease_id: str, *, lease_timeout_sec: int
-    ) -> None:
-        if self.weight_runtime_manifest_manager is None:
-            raise RuntimeError("weight runtime manifest manager is not initialized")
-        self.weight_runtime_manifest_manager.renew(
+    def renew_weight_inventory(self, lease_id: str, *, lease_timeout_sec: int) -> None:
+        if self.weight_inventory_manager is None:
+            raise RuntimeError("weight inventory manager is not initialized")
+        self.weight_inventory_manager.renew(
             lease_id, lease_timeout_sec=lease_timeout_sec
         )
 
-    def has_weight_runtime_manifest_lease(self, lease_id: str) -> bool:
-        if self.weight_runtime_manifest_manager is None:
+    def has_weight_inventory_lease(self, lease_id: str) -> bool:
+        if self.weight_inventory_manager is None:
             return False
-        return self.weight_runtime_manifest_manager.has_lease(lease_id)
+        return self.weight_inventory_manager.has_lease(lease_id)
 
-    def get_remote_instance_weight_runtime_manifest(
+    def get_remote_instance_weight_inventories(
         self,
         *,
         model_id: str,
@@ -939,8 +913,18 @@ class ModelRunner:
         transfer_id: str,
         lease_timeout_sec: int,
     ):
+        from sglang.srt.model_executor.weight_inventory_contracts import (
+            validate_remote_weight_source_identity,
+        )
+
+        validate_remote_weight_source_identity(
+            requested_model_id=model_id,
+            requested_revision=revision,
+            loaded_model_id=self.server_args.get_weight_reshard_resource_id(),
+            loaded_revision=self.model_config.revision,
+        )
         transporter = self.remote_instance_weight_transporter
-        manifest = self.get_weight_runtime_manifest(
+        inventories = self.get_weight_inventories(
             model_id=model_id,
             revision=revision,
             instance_id=f"sglang:{transporter.session_id}:{transfer_id}",
@@ -949,67 +933,23 @@ class ModelRunner:
             lease_timeout_sec=lease_timeout_sec,
         )
         try:
-            transporter.validate_runtime_manifest_addresses(manifest)
-        except BaseException:
-            self.release_weight_runtime_manifest(manifest.lease_id)
-            raise
-        return manifest
-
-    def get_remote_instance_weight_runtime_manifest_parts(
-        self,
-        *,
-        model_id: str,
-        revision: str,
-        transfer_id: str,
-        lease_timeout_sec: int,
-    ):
-        from sglang.srt.model_executor.weight_runtime_manifest import (
-            compose_weight_runtime_manifest,
-        )
-
-        transporter = self.remote_instance_weight_transporter
-        parts = self.get_weight_runtime_manifest_parts(
-            model_id=model_id,
-            revision=revision,
-            instance_id=f"sglang:{transporter.session_id}:{transfer_id}",
-            worker_id=transporter.worker_id,
-            endpoint=transporter.session_id,
-            lease_timeout_sec=lease_timeout_sec,
-        )
-        try:
-            transporter.validate_runtime_manifest_addresses(
-                compose_weight_runtime_manifest(parts.placement, parts.binding)
+            transporter.validate_runtime_binding_inventory_addresses(
+                inventories.binding
+            )
+            self.renew_weight_inventory(
+                inventories.binding.lease_id,
+                lease_timeout_sec=lease_timeout_sec,
             )
         except BaseException:
-            self.release_weight_runtime_manifest(parts.binding.lease_id)
+            self.release_weight_inventory(inventories.binding.lease_id)
             raise
-        return parts
+        return inventories
 
-    def pending_weight_runtime_generation(self) -> int | None:
-        if self.weight_snapshot_coordinator is None:
-            raise RuntimeError(
-                "weight runtime manifests require --enable-weight-runtime-manifest"
-            )
-        return self.weight_snapshot_coordinator.pending_revision_generation()
-
-    def commit_weight_runtime_revision(
-        self, expected_generation: int | None = None
-    ) -> int:
-        if self.weight_snapshot_coordinator is None:
-            raise RuntimeError(
-                "weight runtime manifests require --enable-weight-runtime-manifest"
-            )
-        return self.weight_snapshot_coordinator.commit_revision(
-            expected_generation=expected_generation
-        )
-
-    def poison_weight_runtime_after_global_failure(
+    def poison_weight_inventory_after_global_failure(
         self, expected_generation: int
     ) -> None:
         if self.weight_snapshot_coordinator is None:
-            raise RuntimeError(
-                "weight runtime manifests require --enable-weight-runtime-manifest"
-            )
+            raise RuntimeError("weight inventories require --enable-weight-reshard")
         self.weight_snapshot_coordinator.poison_global_update_failure(
             expected_generation=expected_generation
         )
@@ -1245,8 +1185,8 @@ class ModelRunner:
             tp_rank=self.ps.tp_rank,
             remote_instance_weight_transporter_engine=self.remote_instance_weight_transporter.engine,
             remote_instance_weight_transporter_session_id=self.remote_instance_weight_transporter.session_id,
-            remote_instance_weight_runtime_manifest_builder=(
-                self._select_remote_instance_target_weight_manifest_builder()
+            remote_instance_weight_inventory_builder=(
+                self._select_remote_instance_target_weight_inventory_builder()
             ),
             draft_model_idx=self.draft_model_idx,
         )
@@ -2144,6 +2084,7 @@ class ModelRunner:
         new_model: torch.nn.Module,
         *,
         model_path: str,
+        revision: str | None,
         load_format: str,
         load_config: LoadConfig,
     ) -> None:
@@ -2151,6 +2092,7 @@ class ModelRunner:
         self.server_args.override(
             "model_runner.update_model_fields",
             model_path=model_path,
+            revision=revision,
             load_format=load_format,
         )
         self.load_config = load_config

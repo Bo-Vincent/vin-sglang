@@ -13,8 +13,8 @@ from typing import Any, List
 
 import requests
 
-from sglang.srt.model_executor.weight_runtime_manifest import (
-    local_mooncake_supports_placement_binding,
+from sglang.srt.model_executor.weight_inventory_contracts import (
+    validate_remote_instance_weight_transfer_lease_timeout,
 )
 
 logger = logging.getLogger(__name__)
@@ -29,15 +29,25 @@ class RemoteInstanceWeightLoaderBackend(str, enum.Enum):
 @dataclass(frozen=True, slots=True)
 class RemoteInstanceWeightTransferSession:
     transfer_id: str
-    manifests: list[dict]
+    placement_inventories: list[dict]
+    binding_inventories: list[dict]
     lease_timeout_sec: int
-    source_placements: list[dict] | None = None
-    source_bindings: list[dict] | None = None
-    manifest_format: str = "runtime_v1"
 
-
-def supports_mooncake_placement_binding_v1() -> bool:
-    return local_mooncake_supports_placement_binding()
+    def __post_init__(self) -> None:
+        if type(self.transfer_id) is not str or not self.transfer_id:
+            raise ValueError("transfer_id must be a non-empty string")
+        if (
+            type(self.placement_inventories) is not list
+            or type(self.binding_inventories) is not list
+            or not self.placement_inventories
+            or len(self.placement_inventories) != len(self.binding_inventories)
+            or not all(type(item) is dict for item in self.placement_inventories)
+            or not all(type(item) is dict for item in self.binding_inventories)
+        ):
+            raise ValueError(
+                "placement and binding inventories must be paired non-empty dict lists"
+            )
+        validate_remote_instance_weight_transfer_lease_timeout(self.lease_timeout_sec)
 
 
 class RemoteInstanceWeightTransferHeartbeat:
@@ -131,12 +141,32 @@ class RemoteInstanceWeightTransferHeartbeat:
             raise RuntimeError("remote weight transfer heartbeat did not stop")
 
 
+def validate_remote_instance_weight_transfer_world_group(world_group: Any) -> int:
+    world_size = getattr(world_group, "world_size", None)
+    rank_in_group = getattr(world_group, "rank_in_group", None)
+    if type(world_size) is not int or world_size <= 0:
+        raise ValueError("target world_group must expose a positive integer world_size")
+    if (
+        type(rank_in_group) is not int
+        or rank_in_group < 0
+        or rank_in_group >= world_size
+    ):
+        raise ValueError("target world_group must expose a valid integer rank_in_group")
+    for method_name in ("all_gather_object", "broadcast_object"):
+        if not callable(getattr(world_group, method_name, None)):
+            raise ValueError(f"target world_group must expose {method_name}()")
+    return world_size
+
+
 class RemoteInstanceWeightTransferWorldCoordinator:
     """Share one source snapshot lease across the target model world."""
 
     def __init__(self, seed_url: str, world_group: Any) -> None:
         self.seed_url = seed_url
         self.world_group = world_group
+        self.world_size = validate_remote_instance_weight_transfer_world_group(
+            world_group
+        )
         self.is_owner = world_group.rank_in_group == 0
         self.session: RemoteInstanceWeightTransferSession | None = None
         self.heartbeat: RemoteInstanceWeightTransferHeartbeat | None = None
@@ -176,6 +206,12 @@ class RemoteInstanceWeightTransferWorldCoordinator:
 
         try:
             self.session = self.world_group.broadcast_object(local_session, src=0)
+            if self.session is not None and not isinstance(
+                self.session, RemoteInstanceWeightTransferSession
+            ):
+                raise ValueError(
+                    "target world broadcast an invalid weight transfer session"
+                )
         except Exception:
             self._stop_heartbeat()
             if self.is_owner and local_session is not None:
@@ -194,6 +230,8 @@ class RemoteInstanceWeightTransferWorldCoordinator:
 
     def ready_for_transfer(self, local_ready: bool) -> bool:
         """Run the single target-world gate before any rank starts DMA."""
+        if type(local_ready) is not bool:
+            raise TypeError("local_ready must be a bool")
         if not self._acquired:
             raise RuntimeError("remote weight transfer world session was not acquired")
         if self._finished:
@@ -204,7 +242,7 @@ class RemoteInstanceWeightTransferWorldCoordinator:
         if self.session is None:
             return False
 
-        ready = bool(local_ready)
+        ready = local_ready
         if self.heartbeat is not None:
             try:
                 self.heartbeat.raise_if_failed()
@@ -225,9 +263,7 @@ class RemoteInstanceWeightTransferWorldCoordinator:
             )
             return False
 
-        readiness_valid = len(
-            gathered_readiness
-        ) == self.world_group.world_size and all(
+        readiness_valid = len(gathered_readiness) == self.world_size and all(
             isinstance(value, bool) for value in gathered_readiness
         )
         if not readiness_valid:
@@ -245,6 +281,8 @@ class RemoteInstanceWeightTransferWorldCoordinator:
         local_success: bool,
         local_release_safe: bool = True,
     ) -> tuple[bool, bool]:
+        if type(local_success) is not bool or type(local_release_safe) is not bool:
+            raise TypeError("local_success and local_release_safe must be bools")
         if not self._acquired:
             raise RuntimeError("remote weight transfer world session was not acquired")
         if self._finished:
@@ -253,7 +291,7 @@ class RemoteInstanceWeightTransferWorldCoordinator:
         if self.session is None:
             return False, True
 
-        local_release_safe = bool(local_release_safe) and self._release_safe
+        local_release_safe = local_release_safe and self._release_safe
 
         if self.heartbeat is not None:
             try:
@@ -266,7 +304,7 @@ class RemoteInstanceWeightTransferWorldCoordinator:
 
         try:
             gathered_outcomes = self.world_group.all_gather_object(
-                (bool(local_success), bool(local_release_safe))
+                (local_success, local_release_safe)
             )
         except Exception:
             self._stop_heartbeat()
@@ -276,7 +314,7 @@ class RemoteInstanceWeightTransferWorldCoordinator:
             )
             return False, False
 
-        outcomes_valid = len(gathered_outcomes) == self.world_group.world_size and all(
+        outcomes_valid = len(gathered_outcomes) == self.world_size and all(
             isinstance(outcome, tuple)
             and len(outcome) == 2
             and isinstance(outcome[0], bool)
@@ -446,32 +484,6 @@ def get_remote_instance_transfer_engine_info_per_rank(seed_url: str, rank: int):
         return None, None
 
 
-def _unsupported_manifest_format_response(response) -> bool:
-    if response.status_code not in (400, 409, 422):
-        return False
-    details = str(getattr(response, "text", ""))
-    try:
-        details = f"{details} {response.json()}"
-    except Exception:
-        pass
-    details = details.lower()
-    names_format = "manifest_format" in details or "placement_binding_v1" in details
-    rejects_format = any(
-        marker in details
-        for marker in (
-            "unsupported",
-            "not supported",
-            "unexpected",
-            "unknown",
-            "extra_forbidden",
-            "literal_error",
-            "input should be",
-            "invalid",
-        )
-    )
-    return names_format and rejects_format
-
-
 def _best_effort_release_invalid_transfer(
     seed_url: str,
     transfer_id: str,
@@ -505,12 +517,6 @@ def begin_remote_instance_weight_transfer(
         transfer_id = uuid.uuid4().hex
     if not isinstance(transfer_id, str) or not transfer_id:
         raise ValueError("transfer_id must be a non-empty string")
-    manifest_format = (
-        "placement_binding_v1"
-        if supports_mooncake_placement_binding_v1()
-        else "runtime_v1"
-    )
-    allow_runtime_fallback = manifest_format == "placement_binding_v1"
 
     for attempt in range(3):
         try:
@@ -518,7 +524,6 @@ def begin_remote_instance_weight_transfer(
                 f"{seed_url}/remote_instance_weight_transfer",
                 params={
                     "lease_timeout_sec": lease_timeout_sec,
-                    "manifest_format": manifest_format,
                     "transfer_id": transfer_id,
                 },
                 timeout=30,
@@ -540,14 +545,6 @@ def begin_remote_instance_weight_transfer(
                         response_transfer_id,
                         attempts=3,
                     )
-                if (
-                    allow_runtime_fallback
-                    and response_transfer_id is None
-                    and _unsupported_manifest_format_response(response)
-                ):
-                    manifest_format = "runtime_v1"
-                    allow_runtime_fallback = False
-                    continue
                 logger.error(
                     "Failed to begin remote weight transfer: %s: %s",
                     response.status_code,
@@ -574,50 +571,55 @@ def begin_remote_instance_weight_transfer(
                     transfer_id,
                 )
                 return None
-            manifests = payload.get("weight_runtime_manifests") or []
-            source_placements = payload.get("source_weight_placements")
-            source_bindings = payload.get("source_weight_runtime_bindings")
+
+            allowed_payload_fields = {
+                "transfer_id",
+                "success",
+                "message",
+                "session_state",
+                "placement_inventories",
+                "binding_inventories",
+                "lease_timeout_sec",
+            }
+            placements = payload.get("placement_inventories")
+            bindings = payload.get("binding_inventories")
             server_lease_timeout_sec = payload.get(
                 "lease_timeout_sec", lease_timeout_sec
             )
-            lease_timeout_valid = (
-                not isinstance(server_lease_timeout_sec, bool)
-                and isinstance(server_lease_timeout_sec, int)
-                and server_lease_timeout_sec > 0
-            )
-
-            actual_manifest_format = manifest_format
-            split_manifest_valid = (
-                bool(source_placements)
-                and bool(source_bindings)
-                and len(source_placements) == len(source_bindings)
-            )
-            if manifest_format == "placement_binding_v1" and manifests:
-                actual_manifest_format = "runtime_v1"
-                source_placements = None
-                source_bindings = None
-            payload_valid = lease_timeout_valid and (
-                bool(manifests)
-                if actual_manifest_format == "runtime_v1"
-                else split_manifest_valid
+            try:
+                validate_remote_instance_weight_transfer_lease_timeout(
+                    server_lease_timeout_sec
+                )
+                lease_timeout_valid = True
+            except ValueError:
+                lease_timeout_valid = False
+            payload_valid = (
+                set(payload) == allowed_payload_fields
+                and payload.get("success") is True
+                and type(payload.get("message")) is str
+                and payload.get("session_state") in {"created", "reused"}
+                and isinstance(placements, list)
+                and isinstance(bindings, list)
+                and bool(placements)
+                and len(placements) == len(bindings)
+                and all(type(item) is dict for item in placements)
+                and all(type(item) is dict for item in bindings)
+                and lease_timeout_valid
             )
             if not payload_valid:
-                if transfer_id:
-                    _best_effort_release_invalid_transfer(
-                        seed_url,
-                        transfer_id,
-                        attempts=3,
-                    )
-                logger.error("Remote instance returned an incomplete transfer session.")
+                _best_effort_release_invalid_transfer(
+                    seed_url,
+                    transfer_id,
+                    attempts=3,
+                )
+                logger.error("Remote instance returned an invalid inventory session.")
                 return None
 
             return RemoteInstanceWeightTransferSession(
                 transfer_id=transfer_id,
-                manifests=manifests,
+                placement_inventories=placements,
+                binding_inventories=bindings,
                 lease_timeout_sec=server_lease_timeout_sec,
-                source_placements=source_placements,
-                source_bindings=source_bindings,
-                manifest_format=actual_manifest_format,
             )
         except Exception as error:
             logger.error("Failed to begin remote weight transfer: %s", error)

@@ -3,9 +3,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from sglang.srt.model_executor.weight_runtime_manifest import (
+from sglang.srt.model_executor.weight_inventory_contracts import (
     LogicalTensorView,
-    WeightManifestError,
+    WeightInventoryError,
     WeightParallelTopology,
     WeightSemanticsAdapter,
 )
@@ -58,7 +58,7 @@ def _unravel_index(index: int, shape: tuple[int, ...]) -> tuple[int, ...]:
         coordinates[axis] = index % shape[axis]
         index //= shape[axis]
     if index:
-        raise WeightManifestError("FP8 logical view offset exceeds weight storage")
+        raise WeightInventoryError("FP8 logical view offset exceeds weight storage")
     return tuple(coordinates)
 
 
@@ -66,7 +66,7 @@ def _ravel_index(coordinates: tuple[int, ...], shape: tuple[int, ...]) -> int:
     index = 0
     for coordinate, extent in zip(coordinates, shape):
         if coordinate < 0 or coordinate >= extent:
-            raise WeightManifestError("FP8 scale offset exceeds scale storage")
+            raise WeightInventoryError("FP8 scale offset exceeds scale storage")
         index = index * extent + coordinate
     return index
 
@@ -81,7 +81,6 @@ def _retag_weight_view(view: LogicalTensorView) -> LogicalTensorView:
         global_shape=view.global_shape,
         global_offset=view.global_offset,
         local_shape=view.local_shape,
-        partition_dim=view.partition_dim,
         byte_offset=view.byte_offset,
         layer_id=view.layer_id,
         expert_id=view.expert_id,
@@ -89,12 +88,14 @@ def _retag_weight_view(view: LogicalTensorView) -> LogicalTensorView:
             f"{view.layout_fingerprint}|serialized-block-fp8:e4m3fn:128x128:weight:v1"
         ),
         shard_dims=view.shard_dims,
+        parallel_axes=view.parallel_axes,
+        aliases=view.aliases,
     )
 
 
 def _scale_tensor_id(weight_tensor_id: str) -> str:
     if not weight_tensor_id.endswith(".weight"):
-        raise WeightManifestError(
+        raise WeightInventoryError(
             f"FP8 logical weight has no canonical scale name: {weight_tensor_id}"
         )
     return f"{weight_tensor_id}_scale_inv"
@@ -108,12 +109,14 @@ def _scale_view(
     weight_shape = _shape(pair.weight)
     scale_shape = _shape(pair.scale)
     if len(weight_shape) < 2:
-        raise WeightManifestError("block FP8 weights must have at least two axes")
+        raise WeightInventoryError("block FP8 weights must have at least two axes")
 
     physical_block_axes = (len(weight_shape) - 2, len(weight_shape) - 1)
     logical_rank = len(weight_view.global_shape)
     if logical_rank < 2:
-        raise WeightManifestError("block FP8 logical views must have at least two axes")
+        raise WeightInventoryError(
+            "block FP8 logical views must have at least two axes"
+        )
     logical_block_axes = (logical_rank - 2, logical_rank - 1)
     expected_scale_shape = (
         *weight_shape[:-2],
@@ -121,14 +124,14 @@ def _scale_view(
         _ceil_div(weight_shape[-1], _BLOCK_SHAPE[1]),
     )
     if scale_shape != expected_scale_shape:
-        raise WeightManifestError(
+        raise WeightInventoryError(
             "block FP8 inverse scale shape does not match its runtime weight: "
             f"{scale_shape}, expected {expected_scale_shape}"
         )
 
     weight_itemsize = int(pair.weight.element_size())
     if weight_view.byte_offset % weight_itemsize:
-        raise WeightManifestError("FP8 logical view is not element aligned")
+        raise WeightInventoryError("FP8 logical view is not element aligned")
     physical_weight_offset = _unravel_index(
         weight_view.byte_offset // weight_itemsize,
         weight_shape,
@@ -138,7 +141,7 @@ def _scale_view(
     for block_index, axis in enumerate(physical_block_axes):
         block = _BLOCK_SHAPE[block_index]
         if physical_weight_offset[axis] % block:
-            raise WeightManifestError(
+            raise WeightInventoryError(
                 "FP8 packed component boundary is not aligned to a 128x128 block"
             )
         physical_scale_offset[axis] //= block
@@ -152,11 +155,11 @@ def _scale_view(
         extent = weight_view.local_shape[axis]
         total = weight_view.global_shape[axis]
         if offset % block:
-            raise WeightManifestError(
+            raise WeightInventoryError(
                 "FP8 logical shard offset is not aligned to a 128x128 block"
             )
         if offset + extent < total and extent % block:
-            raise WeightManifestError(
+            raise WeightInventoryError(
                 "FP8 logical shard extent is not aligned to a 128x128 block"
             )
         global_shape[axis] = _ceil_div(total, block)
@@ -168,7 +171,6 @@ def _scale_view(
         global_shape=tuple(global_shape),
         global_offset=tuple(global_offset),
         local_shape=tuple(local_shape),
-        partition_dim=weight_view.partition_dim,
         byte_offset=(
             _ravel_index(tuple(physical_scale_offset), scale_shape)
             * int(pair.scale.element_size())
@@ -180,6 +182,8 @@ def _scale_view(
             "fp32-inverse-scale:128x128:v1"
         ),
         shard_dims=weight_view.shard_dims,
+        parallel_axes=weight_view.parallel_axes,
+        aliases=tuple(_scale_tensor_id(alias) for alias in weight_view.aliases),
     )
 
 
@@ -224,7 +228,7 @@ class SerializedBlockFp8WeightSemanticsAdapter:
             )
 
         if _dtype_name(parameter).startswith("float8_"):
-            raise WeightManifestError(
+            raise WeightInventoryError(
                 f"FP8 runtime parameter has no inverse block scale: {names[0]}"
             )
         return self._delegate.describe_parameter(
@@ -242,7 +246,7 @@ def create_serialized_block_fp8_adapter(
     moe_runner_backend: str | None,
 ) -> SerializedBlockFp8WeightSemanticsAdapter:
     if fp8_gemm_backend != "triton":
-        raise WeightManifestError(
+        raise WeightInventoryError(
             "block FP8 weight manifests require the canonical triton GEMM "
             f"backend; got {fp8_gemm_backend!r}"
         )
@@ -261,7 +265,7 @@ def create_serialized_block_fp8_adapter(
             quant_config = getattr(quant_method, "quant_config", None)
             for derived_name in _DERIVED_PARAMETER_NAMES:
                 if getattr(module, derived_name, None) is not None:
-                    raise WeightManifestError(
+                    raise WeightInventoryError(
                         f"derived or swizzled FP8 layout is unsupported: {derived_name}"
                     )
 
@@ -272,7 +276,7 @@ def create_serialized_block_fp8_adapter(
                 if id(weight) in pairs:
                     continue
                 if _dtype_name(weight) != "float8_e4m3fn":
-                    raise WeightManifestError(
+                    raise WeightInventoryError(
                         "block FP8 weight manifests require float8_e4m3fn weights"
                     )
                 if bool(
@@ -283,7 +287,7 @@ def create_serialized_block_fp8_adapter(
                         default=False,
                     )
                 ):
-                    raise WeightManifestError("MXFP8 weight manifests are unsupported")
+                    raise WeightInventoryError("MXFP8 weight manifests are unsupported")
                 if not bool(
                     _getattr_chain(
                         quant_method,
@@ -292,7 +296,7 @@ def create_serialized_block_fp8_adapter(
                         default=False,
                     )
                 ):
-                    raise WeightManifestError(
+                    raise WeightInventoryError(
                         "per-channel or per-tensor FP8 scales are unsupported; "
                         "block quantization is required"
                     )
@@ -304,7 +308,7 @@ def create_serialized_block_fp8_adapter(
                         default=False,
                     )
                 ):
-                    raise WeightManifestError(
+                    raise WeightInventoryError(
                         "online FP8 quantization is unsupported; a serialized FP8 "
                         "checkpoint is required"
                     )
@@ -314,7 +318,7 @@ def create_serialized_block_fp8_adapter(
                     default="dynamic",
                 )
                 if activation_scheme != "dynamic":
-                    raise WeightManifestError(
+                    raise WeightInventoryError(
                         "block FP8 weight manifests require dynamic activation"
                     )
                 block_shape = _getattr_chain(
@@ -324,20 +328,20 @@ def create_serialized_block_fp8_adapter(
                     name="weight_block_size",
                 )
                 if tuple(block_shape or ()) != _BLOCK_SHAPE:
-                    raise WeightManifestError(
+                    raise WeightInventoryError(
                         "block FP8 weight manifests require 128x128 blocks"
                     )
                 if bool(getattr(quant_method, "use_marlin", False)):
-                    raise WeightManifestError(
+                    raise WeightInventoryError(
                         "Marlin-derived FP8 weight layouts are unsupported"
                     )
                 if bool(getattr(weight, "is_shuffled", False)):
-                    raise WeightManifestError("shuffled FP8 weights are unsupported")
+                    raise WeightInventoryError("shuffled FP8 weights are unsupported")
                 if (
                     weight_role in ("w13_weight", "w2_weight")
                     and moe_runner_backend != "triton"
                 ):
-                    raise WeightManifestError(
+                    raise WeightInventoryError(
                         "block FP8 MoE weight manifests require the canonical "
                         f"triton runner backend; got {moe_runner_backend!r}"
                     )
@@ -350,20 +354,20 @@ def create_serialized_block_fp8_adapter(
                         None,
                     )
                     qualifier = "per-channel " if alternate_scale is not None else ""
-                    raise WeightManifestError(
+                    raise WeightInventoryError(
                         f"{qualifier}FP8 weight is missing {scale_role}"
                     )
                 if _dtype_name(scale) != "float32" or bool(
                     getattr(scale, "format_ue8m0", False)
                 ):
-                    raise WeightManifestError(
+                    raise WeightInventoryError(
                         "block FP8 inverse scales must use canonical float32 storage"
                     )
                 if (
                     id(weight) not in parameter_names
                     or id(scale) not in parameter_names
                 ):
-                    raise WeightManifestError(
+                    raise WeightInventoryError(
                         "FP8 weight and inverse scale must be runtime parameters"
                     )
                 pairs[id(weight)] = _BlockFp8Pair(
@@ -380,17 +384,17 @@ def create_serialized_block_fp8_adapter(
         and parameter_id not in pairs
     ]
     if unpaired:
-        raise WeightManifestError(
+        raise WeightInventoryError(
             f"FP8 runtime parameter has no inverse block scale: {unpaired[0]}"
         )
     if not pairs:
-        raise WeightManifestError(
+        raise WeightInventoryError(
             "FP8 quantization is enabled but no serialized block FP8 weights were found"
         )
 
     scale_ids = [id(pair.scale) for pair in pairs.values()]
     if len(scale_ids) != len(set(scale_ids)):
-        raise WeightManifestError(
+        raise WeightInventoryError(
             "multiple FP8 weights unexpectedly share one inverse scale allocation"
         )
 

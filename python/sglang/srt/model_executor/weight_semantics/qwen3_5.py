@@ -4,9 +4,12 @@ import re
 from math import prod
 from typing import Any, Sequence
 
-from sglang.srt.model_executor.weight_runtime_manifest import (
+import msgspec
+
+from sglang.srt.model_executor.weight_inventory_contracts import (
+    LogicalParallelAxis,
     LogicalTensorView,
-    WeightManifestError,
+    WeightInventoryError,
     WeightParallelTopology,
 )
 
@@ -41,8 +44,121 @@ def _layer_id(name: str) -> int | None:
 
 def _replace_suffix(name: str, old: str, new: str) -> str:
     if not name.endswith(old):
-        raise WeightManifestError(f"invalid Qwen3.5 parameter name: {name}")
+        raise WeightInventoryError(f"invalid Qwen3.5 parameter name: {name}")
     return name[: -len(old)] + new
+
+
+def _parallel_axes(
+    shard_dims: tuple[int, ...],
+    *,
+    expert_id: int | None,
+) -> tuple[LogicalParallelAxis, ...]:
+    axes = [
+        LogicalParallelAxis(kind="dp", mode="replicated"),
+        LogicalParallelAxis(kind="pp", mode="ownership"),
+    ]
+    tp_dims = shard_dims
+    if len(shard_dims) == 2 and shard_dims[0] == 0:
+        axes.append(LogicalParallelAxis(kind="ep", mode="split", dim=0))
+        tp_dims = shard_dims[1:]
+    elif expert_id is not None:
+        axes.append(LogicalParallelAxis(kind="ep", mode="ownership"))
+    else:
+        axes.append(LogicalParallelAxis(kind="ep", mode="replicated"))
+    if len(tp_dims) > 1:
+        raise WeightInventoryError("Qwen3.5 view has ambiguous TP shard dimensions")
+    axes.append(
+        LogicalParallelAxis(
+            kind="tp",
+            mode="split" if tp_dims else "replicated",
+            dim=tp_dims[0] if tp_dims else None,
+        )
+    )
+    return tuple(axes)
+
+
+def _moe_parallel_semantics(
+    topology: WeightParallelTopology,
+    *,
+    tp_dim: int,
+) -> tuple[tuple[int, ...], tuple[LogicalParallelAxis, ...]]:
+    shard_dims = []
+    axes = [
+        LogicalParallelAxis(kind="dp", mode="replicated"),
+        LogicalParallelAxis(kind="pp", mode="ownership"),
+    ]
+    if topology.ep_size > 1:
+        shard_dims.append(0)
+        axes.append(LogicalParallelAxis(kind="ep", mode="split", dim=0))
+    else:
+        axes.append(LogicalParallelAxis(kind="ep", mode="replicated"))
+    if topology.moe_tp_size > 1:
+        shard_dims.append(tp_dim)
+        axes.append(LogicalParallelAxis(kind="tp", mode="split", dim=tp_dim))
+    else:
+        axes.append(LogicalParallelAxis(kind="tp", mode="replicated"))
+    return tuple(sorted(shard_dims)), tuple(axes)
+
+
+def _shared_moe_parallel_semantics(
+    topology: WeightParallelTopology,
+    *,
+    tp_dim: int,
+) -> tuple[tuple[int, ...], tuple[LogicalParallelAxis, ...]]:
+    axes = [
+        LogicalParallelAxis(kind="dp", mode="replicated"),
+        LogicalParallelAxis(kind="pp", mode="ownership"),
+    ]
+    axes.append(LogicalParallelAxis(kind="ep", mode="replicated"))
+    if topology.moe_tp_size > 1:
+        axes.append(LogicalParallelAxis(kind="tp", mode="split", dim=tp_dim))
+        return (tp_dim,), tuple(axes)
+    axes.append(LogicalParallelAxis(kind="tp", mode="replicated"))
+    return (), tuple(axes)
+
+
+def _apply_qwen_coupled_parallel_semantics(
+    views: tuple[LogicalTensorView, ...],
+    topology: WeightParallelTopology,
+) -> tuple[LogicalTensorView, ...]:
+    """Describe the TP/EP rank co-map without claiming independent replicas."""
+
+    if topology.ep_size == 1:
+        return views
+    if (
+        topology.moe_tp_size != 1
+        or topology.tp_size != topology.ep_size
+        or topology.tp_rank != topology.ep_rank
+    ):
+        raise WeightInventoryError(
+            "Qwen TP/EP coupled semantics require equal co-mapped TP and EP ranks"
+        )
+
+    result = []
+    for view in views:
+        axes = {axis.kind: axis for axis in view.parallel_axes}
+        if set(axes) != {"dp", "tp", "pp", "ep"}:
+            raise WeightInventoryError(
+                f"Qwen logical view does not explicitly describe four axes: "
+                f"{view.tensor_id}"
+            )
+        coupled_kind, primary_kind = (
+            ("tp", "ep") if axes["ep"].mode in {"split", "ownership"} else ("ep", "tp")
+        )
+        parallel_axes = tuple(
+            (
+                LogicalParallelAxis(
+                    kind=axis.kind,
+                    mode="coupled",
+                    coupled_to=primary_kind,
+                )
+                if axis.kind == coupled_kind
+                else axis
+            )
+            for axis in view.parallel_axes
+        )
+        result.append(msgspec.structs.replace(view, parallel_axes=parallel_axes))
+    return tuple(result)
 
 
 def _view(
@@ -51,28 +167,30 @@ def _view(
     global_shape: tuple[int, ...],
     global_offset: tuple[int, ...],
     local_shape: tuple[int, ...],
-    partition_dim: int | None,
+    shard_dims: tuple[int, ...],
     byte_offset: int,
     layer_id: int | None,
     expert_id: int | None = None,
     layout: str,
-    shard_dims: tuple[int, ...] | None = None,
+    parallel_axes: tuple[LogicalParallelAxis, ...] | None = None,
+    aliases: tuple[str, ...] = (),
 ) -> LogicalTensorView:
     return LogicalTensorView(
         tensor_id=tensor_id,
         global_shape=global_shape,
         global_offset=global_offset,
         local_shape=local_shape,
-        partition_dim=partition_dim,
         byte_offset=byte_offset,
         layer_id=layer_id,
         expert_id=expert_id,
         layout_fingerprint=f"sglang:qwen3.5:{layout}:v1",
-        shard_dims=(
-            shard_dims
-            if shard_dims is not None
-            else (() if partition_dim is None else (partition_dim,))
+        shard_dims=shard_dims,
+        parallel_axes=(
+            _parallel_axes(shard_dims, expert_id=expert_id)
+            if parallel_axes is None
+            else parallel_axes
         ),
+        aliases=aliases,
     )
 
 
@@ -85,26 +203,35 @@ def _split_dim_zero(
     sizes: Sequence[int],
     layer_id: int | None,
     layout: str,
+    replicated: Sequence[bool] | None = None,
+    aliases: tuple[str, ...] = (),
 ) -> tuple[LogicalTensorView, ...]:
     if not (len(tensor_ids) == len(global_extents) == len(ranks) == len(sizes)):
-        raise WeightManifestError("invalid packed Qwen3.5 tensor description")
+        raise WeightInventoryError("invalid packed Qwen3.5 tensor description")
+    replicated = tuple(replicated or (False,) * len(tensor_ids))
+    if len(replicated) != len(tensor_ids):
+        raise WeightInventoryError("invalid packed Qwen3.5 replication description")
     shape = _shape(parameter)
     tail = shape[1:]
     local_extents = []
     for extent, rank, size in zip(global_extents, ranks, sizes):
         if size <= 0 or rank < 0 or rank >= size or extent % size != 0:
-            raise WeightManifestError("Qwen3.5 tensor is not evenly partitionable")
+            raise WeightInventoryError("Qwen3.5 tensor is not evenly partitionable")
         local_extents.append(extent // size)
     if not shape or shape[0] != sum(local_extents):
-        raise WeightManifestError(
+        raise WeightInventoryError(
             f"Qwen3.5 packed tensor shape mismatch: {shape}, {local_extents}"
         )
 
     byte_offset = 0
     result = []
-    for tensor_id, extent, local_extent, rank, size in zip(
-        tensor_ids, global_extents, local_extents, ranks, sizes
+    for tensor_id, extent, local_extent, rank, size, is_replicated in zip(
+        tensor_ids, global_extents, local_extents, ranks, sizes, replicated
     ):
+        if is_replicated and (rank != 0 or size != 1):
+            raise WeightInventoryError(
+                "a replicated Qwen3.5 packed view must contain the full tensor"
+            )
         local_shape = (local_extent, *tail)
         result.append(
             _view(
@@ -112,10 +239,11 @@ def _split_dim_zero(
                 global_shape=(extent, *tail),
                 global_offset=(rank * local_extent, *((0,) * len(tail))),
                 local_shape=local_shape,
-                partition_dim=0,
+                shard_dims=() if is_replicated else (0,),
                 byte_offset=byte_offset,
                 layer_id=layer_id,
                 layout=layout,
+                aliases=aliases,
             )
         )
         byte_offset += prod(local_shape) * _itemsize(parameter)
@@ -134,9 +262,9 @@ def _split_dim_zero_or_full(
     layout: str,
 ) -> tuple[LogicalTensorView, ...]:
     if len(tensor_ids) != len(global_extents) or size <= 0 or not 0 <= rank < size:
-        raise WeightManifestError("invalid Qwen3.5 VL tensor description")
+        raise WeightInventoryError("invalid Qwen3.5 VL tensor description")
     if any(extent <= 0 or extent % size != 0 for extent in global_extents):
-        raise WeightManifestError("Qwen3.5 VL tensor is not evenly partitionable")
+        raise WeightInventoryError("Qwen3.5 VL tensor is not evenly partitionable")
 
     shape = _shape(parameter)
     local_extents = tuple(extent // size for extent in global_extents)
@@ -149,7 +277,7 @@ def _split_dim_zero_or_full(
         extents = tuple(global_extents)
         offsets = (0,) * len(global_extents)
     else:
-        raise WeightManifestError(
+        raise WeightInventoryError(
             f"Qwen3.5 VL packed tensor shape mismatch: {shape}, "
             f"expected {sharded_shape} or {full_shape}"
         )
@@ -166,7 +294,7 @@ def _split_dim_zero_or_full(
                 global_shape=(global_extent, *global_tail),
                 global_offset=(offset, *((0,) * len(global_tail))),
                 local_shape=local_shape,
-                partition_dim=0,
+                shard_dims=(0,),
                 byte_offset=byte_offset,
                 layer_id=layer_id,
                 layout=layout,
@@ -187,7 +315,9 @@ def _row_parallel_or_full_view(
     layout: str,
 ) -> tuple[LogicalTensorView, ...]:
     if size <= 0 or not 0 <= rank < size or global_shape[1] % size != 0:
-        raise WeightManifestError(f"Qwen3.5 VL tensor is not TP divisible: {tensor_id}")
+        raise WeightInventoryError(
+            f"Qwen3.5 VL tensor is not TP divisible: {tensor_id}"
+        )
     shape = _shape(parameter)
     sharded_shape = (global_shape[0], global_shape[1] // size)
     if shape == sharded_shape:
@@ -195,7 +325,7 @@ def _row_parallel_or_full_view(
     elif shape == global_shape:
         offset = 0
     else:
-        raise WeightManifestError(
+        raise WeightInventoryError(
             f"Qwen3.5 VL row tensor shape mismatch: {tensor_id}: {shape}, "
             f"expected {sharded_shape} or {global_shape}"
         )
@@ -205,7 +335,7 @@ def _row_parallel_or_full_view(
             global_shape=global_shape,
             global_offset=(0, offset),
             local_shape=shape,
-            partition_dim=1,
+            shard_dims=(1,),
             byte_offset=0,
             layer_id=layer_id,
             layout=layout,
@@ -223,7 +353,7 @@ def _replicated_view(
 ) -> tuple[LogicalTensorView, ...]:
     shape = _shape(parameter)
     if expected_shape is not None and shape != expected_shape:
-        raise WeightManifestError(
+        raise WeightInventoryError(
             f"Qwen3.5 replicated tensor shape mismatch: {tensor_id}: {shape}, "
             f"expected {expected_shape}"
         )
@@ -233,7 +363,7 @@ def _replicated_view(
             global_shape=shape,
             global_offset=(0,) * len(shape),
             local_shape=shape,
-            partition_dim=None,
+            shard_dims=(),
             byte_offset=0,
             layer_id=layer_id,
             layout=layout,
@@ -252,10 +382,10 @@ def _row_parallel_view(
     layout: str,
 ) -> tuple[LogicalTensorView, ...]:
     if global_shape[1] % size != 0:
-        raise WeightManifestError(f"Qwen3.5 tensor is not TP divisible: {tensor_id}")
+        raise WeightInventoryError(f"Qwen3.5 tensor is not TP divisible: {tensor_id}")
     local_shape = (global_shape[0], global_shape[1] // size)
     if _shape(parameter) != local_shape:
-        raise WeightManifestError(
+        raise WeightInventoryError(
             f"Qwen3.5 row tensor shape mismatch: {tensor_id}: {_shape(parameter)}"
         )
     return (
@@ -264,7 +394,7 @@ def _row_parallel_view(
             global_shape=global_shape,
             global_offset=(0, rank * local_shape[1]),
             local_shape=local_shape,
-            partition_dim=1,
+            shard_dims=(1,),
             byte_offset=0,
             layer_id=layer_id,
             layout=layout,
@@ -279,12 +409,34 @@ class Qwen35WeightSemanticsAdapter:
         config: Any,
         dynamic_expert_placement: bool = False,
         up_first_w13_parameter_ids: Sequence[int] = (),
+        num_fused_shared_experts: int = 0,
     ) -> None:
         self._config = config
         self._dynamic_expert_placement = dynamic_expert_placement
         self._up_first_w13_parameter_ids = frozenset(up_first_w13_parameter_ids)
+        if num_fused_shared_experts not in (0, 1):
+            raise WeightInventoryError(
+                "Qwen3.5 weight inventories support at most one fused shared expert"
+            )
+        self._num_fused_shared_experts = num_fused_shared_experts
 
     def describe_parameter(
+        self,
+        *,
+        names: tuple[str, ...],
+        parameter: Any,
+        topology: WeightParallelTopology,
+    ) -> tuple[LogicalTensorView, ...]:
+        return _apply_qwen_coupled_parallel_semantics(
+            self._describe_parameter_uncoupled(
+                names=names,
+                parameter=parameter,
+                topology=topology,
+            ),
+            topology,
+        )
+
+    def _describe_parameter_uncoupled(
         self,
         *,
         names: tuple[str, ...],
@@ -294,6 +446,11 @@ class Qwen35WeightSemanticsAdapter:
         canonical_names = tuple(dict.fromkeys(_canonical_name(name) for name in names))
         name = canonical_names[0]
         layer_id = _layer_id(name)
+        aliases = tuple(sorted(canonical_names)) if len(canonical_names) > 1 else ()
+        if aliases and set(aliases) != {"embed_tokens.weight", "lm_head.weight"}:
+            raise WeightInventoryError(
+                f"Qwen3.5 has an unsupported logical parameter alias group: {aliases}"
+            )
 
         if name.endswith("experts.w13_weight"):
             return self._moe_w13(
@@ -404,6 +561,7 @@ class Qwen35WeightSemanticsAdapter:
                     sizes=(topology.tp_size,),
                     layer_id=None,
                     layout="vocab-parallel",
+                    aliases=aliases,
                 )
             )
         if name.endswith(("A_log", "dt_bias")):
@@ -435,13 +593,13 @@ class Qwen35WeightSemanticsAdapter:
                     global_shape=shape,
                     global_offset=(0,) * len(shape),
                     local_shape=shape,
-                    partition_dim=None,
+                    shard_dims=(),
                     byte_offset=0,
                     layer_id=layer_id,
                     layout="replicated",
                 ),
             )
-        raise WeightManifestError(f"unsupported Qwen3.5 parameter: {names[0]}")
+        raise WeightInventoryError(f"unsupported Qwen3.5 parameter: {names[0]}")
 
     def _head_dim(self) -> int:
         configured = getattr(self._config, "head_dim", None)
@@ -470,6 +628,11 @@ class Qwen35WeightSemanticsAdapter:
         kv_extent = kv_heads * head_dim
         kv_partitions = min(topology.attention_tp_size, kv_heads)
         kv_replicas = topology.attention_tp_size // kv_partitions
+        if kv_replicas > 1 and kv_partitions > 1:
+            raise WeightInventoryError(
+                "partially replicated Qwen3.5 KV shards are not represented by "
+                "the current weight inventory contract"
+            )
         kv_rank = topology.attention_tp_rank // kv_replicas
         return _split_dim_zero(
             parameter=parameter,
@@ -487,6 +650,7 @@ class Qwen35WeightSemanticsAdapter:
             sizes=(topology.attention_tp_size, kv_partitions, kv_partitions),
             layer_id=layer_id,
             layout="qkv",
+            replicated=(False, kv_partitions == 1, kv_partitions == 1),
         )
 
     def _gdn_qkvz(
@@ -556,19 +720,34 @@ class Qwen35WeightSemanticsAdapter:
         self, *, parameter: Any, topology: WeightParallelTopology
     ) -> tuple[int, ...]:
         if self._dynamic_expert_placement:
-            raise WeightManifestError(
+            raise WeightInventoryError(
                 "dynamic Qwen3.5 expert placement requires an explicit expert map"
             )
         num_experts = int(self._config.num_experts)
         if num_experts % topology.ep_size != 0:
-            raise WeightManifestError("Qwen3.5 experts are not evenly EP partitionable")
+            raise WeightInventoryError(
+                "Qwen3.5 experts are not evenly EP partitionable"
+            )
         local_experts = num_experts // topology.ep_size
-        if not _shape(parameter) or _shape(parameter)[0] != local_experts:
-            raise WeightManifestError(
-                f"Qwen3.5 local expert count mismatch: {_shape(parameter)}"
+        expected_slots = local_experts + self._num_fused_shared_experts
+        if not _shape(parameter) or _shape(parameter)[0] != expected_slots:
+            raise WeightInventoryError(
+                f"Qwen3.5 local expert count mismatch: {_shape(parameter)}, "
+                f"expected {expected_slots} slots"
             )
         start = topology.ep_rank * local_experts
         return tuple(range(start, start + local_experts))
+
+    def _shared_intermediate_size(self) -> int:
+        shared_intermediate = int(
+            getattr(self._config, "shared_expert_intermediate_size", 0)
+        )
+        intermediate = int(self._config.moe_intermediate_size)
+        if self._num_fused_shared_experts and shared_intermediate != intermediate:
+            raise WeightInventoryError(
+                "Qwen3.5 fused shared expert must match routed intermediate size"
+            )
+        return shared_intermediate
 
     def _moe_w13(
         self, *, name, parameter, topology, layer_id
@@ -577,15 +756,15 @@ class Qwen35WeightSemanticsAdapter:
         shape = _shape(parameter)
         intermediate = int(self._config.moe_intermediate_size)
         if intermediate % topology.moe_tp_size != 0:
-            raise WeightManifestError("Qwen3.5 expert tensor is not TP divisible")
+            raise WeightInventoryError("Qwen3.5 expert tensor is not TP divisible")
         local_intermediate = intermediate // topology.moe_tp_size
         expected = (
-            len(expert_ids),
+            len(expert_ids) + self._num_fused_shared_experts,
             local_intermediate * 2,
             int(self._config.hidden_size),
         )
         if shape != expected:
-            raise WeightManifestError(
+            raise WeightInventoryError(
                 f"Qwen3.5 w13 tensor shape mismatch: {shape}, expected {expected}"
             )
         prefix = name[: -len("experts.w13_weight")]
@@ -598,6 +777,7 @@ class Qwen35WeightSemanticsAdapter:
         )
         result = []
         num_experts = int(self._config.num_experts)
+        shard_dims, parallel_axes = _moe_parallel_semantics(topology, tp_dim=1)
         for local_index, expert_id in enumerate(expert_ids):
             base = local_index * expert_bytes
             for component_index, component in enumerate(components):
@@ -611,12 +791,36 @@ class Qwen35WeightSemanticsAdapter:
                             0,
                         ),
                         local_shape=(1, local_intermediate, shape[2]),
-                        partition_dim=None,
                         byte_offset=base + component_index * component_bytes,
                         layer_id=layer_id,
                         expert_id=None,
                         layout="moe-w13",
-                        shard_dims=(0, 1),
+                        shard_dims=shard_dims,
+                        parallel_axes=parallel_axes,
+                    )
+                )
+        if self._num_fused_shared_experts:
+            shared_intermediate = self._shared_intermediate_size()
+            shared_base = len(expert_ids) * expert_bytes
+            shared_shard_dims, shared_axes = _shared_moe_parallel_semantics(
+                topology, tp_dim=0
+            )
+            for component_index, component in enumerate(components):
+                result.append(
+                    _view(
+                        tensor_id=f"{prefix}shared_expert.{component}.weight",
+                        global_shape=(shared_intermediate, shape[2]),
+                        global_offset=(
+                            topology.moe_tp_rank * local_intermediate,
+                            0,
+                        ),
+                        local_shape=(local_intermediate, shape[2]),
+                        shard_dims=shared_shard_dims,
+                        byte_offset=(shared_base + component_index * component_bytes),
+                        layer_id=layer_id,
+                        expert_id=None,
+                        layout="gate-up",
+                        parallel_axes=shared_axes,
                     )
                 )
         return tuple(result)
@@ -628,17 +832,22 @@ class Qwen35WeightSemanticsAdapter:
         shape = _shape(parameter)
         intermediate = int(self._config.moe_intermediate_size)
         if intermediate % topology.moe_tp_size != 0:
-            raise WeightManifestError("Qwen3.5 expert tensor is not TP divisible")
+            raise WeightInventoryError("Qwen3.5 expert tensor is not TP divisible")
         local_intermediate = intermediate // topology.moe_tp_size
-        expected = (len(expert_ids), int(self._config.hidden_size), local_intermediate)
+        expected = (
+            len(expert_ids) + self._num_fused_shared_experts,
+            int(self._config.hidden_size),
+            local_intermediate,
+        )
         if shape != expected:
-            raise WeightManifestError(
+            raise WeightInventoryError(
                 f"Qwen3.5 w2 tensor shape mismatch: {shape}, expected {expected}"
             )
         prefix = name[: -len("experts.w2_weight")]
         expert_bytes = prod(shape[1:]) * _itemsize(parameter)
         num_experts = int(self._config.num_experts)
-        return tuple(
+        shard_dims, parallel_axes = _moe_parallel_semantics(topology, tp_dim=2)
+        result = [
             _view(
                 tensor_id=f"{prefix}experts.down_proj.weight",
                 global_shape=(num_experts, shape[1], intermediate),
@@ -648,22 +857,86 @@ class Qwen35WeightSemanticsAdapter:
                     topology.moe_tp_rank * local_intermediate,
                 ),
                 local_shape=(1, shape[1], local_intermediate),
-                partition_dim=None,
                 byte_offset=local_index * expert_bytes,
                 layer_id=layer_id,
                 expert_id=None,
                 layout="moe-w2",
-                shard_dims=(0, 2),
+                shard_dims=shard_dims,
+                parallel_axes=parallel_axes,
             )
             for local_index, expert_id in enumerate(expert_ids)
-        )
+        ]
+        if self._num_fused_shared_experts:
+            shared_intermediate = self._shared_intermediate_size()
+            shared_shard_dims, shared_axes = _shared_moe_parallel_semantics(
+                topology, tp_dim=1
+            )
+            result.append(
+                _view(
+                    tensor_id=f"{prefix}shared_expert.down_proj.weight",
+                    global_shape=(shape[1], shared_intermediate),
+                    global_offset=(
+                        0,
+                        topology.moe_tp_rank * local_intermediate,
+                    ),
+                    local_shape=(shape[1], local_intermediate),
+                    shard_dims=shared_shard_dims,
+                    byte_offset=len(expert_ids) * expert_bytes,
+                    layer_id=layer_id,
+                    expert_id=None,
+                    layout="row-parallel",
+                    parallel_axes=shared_axes,
+                )
+            )
+        return tuple(result)
 
 
 class Qwen35VisionWeightSemanticsAdapter:
-    def __init__(self, *, config: Any) -> None:
+    def __init__(self, *, config: Any, data_parallel: bool = False) -> None:
         self._config = config
+        self._data_parallel = data_parallel
 
     def describe_parameter(
+        self,
+        *,
+        names: tuple[str, ...],
+        parameter: Any,
+        topology: WeightParallelTopology,
+    ) -> tuple[LogicalTensorView, ...]:
+        views = self._describe_parameter(
+            names=names,
+            parameter=parameter,
+            topology=topology,
+        )
+        if self._data_parallel:
+            result = []
+            for view in views:
+                if view.global_offset != (0,) * len(view.global_shape) or (
+                    view.local_shape != view.global_shape
+                ):
+                    raise WeightInventoryError(
+                        "Qwen3.5 MM-DP vision requires a complete tensor replica: "
+                        f"{view.tensor_id}"
+                    )
+                result.append(
+                    msgspec.structs.replace(
+                        view,
+                        shard_dims=(),
+                        parallel_axes=_parallel_axes((), expert_id=None),
+                    )
+                )
+            return tuple(result)
+
+        if topology.attention_tp_size > 1:
+            for view in views:
+                if view.shard_dims and view.local_shape == view.global_shape:
+                    raise WeightInventoryError(
+                        "Qwen3.5 explicit vision TP received a full tensor instead "
+                        f"of a shard: {view.tensor_id}"
+                    )
+        return views
+
+    def _describe_parameter(
         self,
         *,
         names: tuple[str, ...],
@@ -673,10 +946,15 @@ class Qwen35VisionWeightSemanticsAdapter:
         canonical_names = tuple(
             dict.fromkeys(self._canonical_name(name) for name in names)
         )
+        if len(canonical_names) > 1:
+            raise WeightInventoryError(
+                "Qwen3.5 vision has an unsupported logical parameter alias group: "
+                f"{tuple(sorted(canonical_names))}"
+            )
         name = canonical_names[0]
         hidden = int(self._config.hidden_size)
-        rank = topology.attention_tp_rank
-        size = topology.attention_tp_size
+        rank = 0 if self._data_parallel else topology.attention_tp_rank
+        size = 1 if self._data_parallel else topology.attention_tp_size
 
         if name == "visual.patch_embed.proj.weight":
             return _replicated_view(
@@ -811,7 +1089,7 @@ class Qwen35VisionWeightSemanticsAdapter:
                 layer_id=None,
                 layout="vision-norm",
             )
-        raise WeightManifestError(f"unsupported Qwen3.5 vision parameter: {names[0]}")
+        raise WeightInventoryError(f"unsupported Qwen3.5 vision parameter: {names[0]}")
 
     @staticmethod
     def _canonical_name(name: str) -> str:
@@ -835,15 +1113,21 @@ class Qwen35MultimodalWeightSemanticsAdapter:
         *,
         text_config: Any,
         vision_config: Any,
+        vision_data_parallel: bool = False,
         dynamic_expert_placement: bool = False,
         up_first_w13_parameter_ids: Sequence[int] = (),
+        num_fused_shared_experts: int = 0,
     ) -> None:
         self._text = Qwen35WeightSemanticsAdapter(
             config=text_config,
             dynamic_expert_placement=dynamic_expert_placement,
             up_first_w13_parameter_ids=up_first_w13_parameter_ids,
+            num_fused_shared_experts=num_fused_shared_experts,
         )
-        self._vision = Qwen35VisionWeightSemanticsAdapter(config=vision_config)
+        self._vision = Qwen35VisionWeightSemanticsAdapter(
+            config=vision_config,
+            data_parallel=vision_data_parallel,
+        )
 
     def describe_parameter(
         self,
@@ -853,13 +1137,16 @@ class Qwen35MultimodalWeightSemanticsAdapter:
         topology: WeightParallelTopology,
     ) -> tuple[LogicalTensorView, ...]:
         if all(name.startswith(("visual.", "model.visual.")) for name in names):
-            return self._vision.describe_parameter(
-                names=names,
-                parameter=parameter,
-                topology=topology,
+            return _apply_qwen_coupled_parallel_semantics(
+                self._vision.describe_parameter(
+                    names=names,
+                    parameter=parameter,
+                    topology=topology,
+                ),
+                topology,
             )
         if any(name.startswith(("visual.", "model.visual.")) for name in names):
-            raise WeightManifestError("Qwen3.5 aliases mix vision and text parameters")
+            raise WeightInventoryError("Qwen3.5 aliases mix vision and text parameters")
         return self._text.describe_parameter(
             names=names,
             parameter=parameter,

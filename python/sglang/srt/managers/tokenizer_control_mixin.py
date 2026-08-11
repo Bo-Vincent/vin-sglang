@@ -83,9 +83,10 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqOutput,
 )
 from sglang.srt.managers.load_snapshot import LoadSnapshot
-from sglang.srt.model_executor.weight_runtime_manifest import (
+from sglang.srt.model_executor.weight_inventory_contracts import (
     DEFAULT_REMOTE_INSTANCE_WEIGHT_TRANSFER_LEASE_TIMEOUT_SEC,
     validate_remote_instance_weight_transfer_lease_timeout,
+    validate_remote_weight_lineage,
 )
 from sglang.srt.server_args import LoRARef, ServerArgs
 from sglang.srt.utils import (
@@ -143,12 +144,11 @@ def _remote_weight_transfer_lease_identity(payloads) -> Tuple[List[str], int | N
     return lease_ids, generation
 
 
-def _remote_weight_transfer_result_payloads(results, manifest_format: str) -> List:
-    field = "bindings" if manifest_format == "placement_binding_v1" else "manifests"
+def _remote_weight_transfer_result_payloads(results) -> List:
     return [
         payload
         for result in results
-        for payload in (getattr(result, field, None) or ())
+        for payload in (getattr(result, "binding_inventories", None) or ())
     ]
 
 
@@ -175,7 +175,6 @@ def _remember_remote_weight_transfer_session(
     manager,
     *,
     transfer_id: str,
-    manifest_format: str,
     deadline_unix_sec: float | None,
     payloads,
     session_state: str,
@@ -191,7 +190,6 @@ def _remember_remote_weight_transfer_session(
         "generation": (
             generation if generation is not None else existing.get("generation")
         ),
-        "manifest_format": manifest_format,
         "deadline_unix_sec": deadline_unix_sec,
         "expired": session_state == "expired",
         "session_state": session_state,
@@ -251,7 +249,6 @@ def _record_remote_weight_transfer_release(
             "lease_id": None,
             "lease_ids": [],
             "generation": None,
-            "manifest_format": None,
             "deadline_unix_sec": None,
             "expired": False,
             "session_state": "release_failed",
@@ -278,7 +275,6 @@ def _record_remote_weight_transfer_renewal(
             "lease_id": None,
             "lease_ids": [],
             "generation": None,
-            "manifest_format": None,
             "last_release_attempt_unix_sec": None,
             "last_release_success": None,
             "last_release_message": None,
@@ -298,189 +294,18 @@ async def _finish_control_task(task: asyncio.Task):
     return task.result()
 
 
-_RUNTIME_TENSOR_SEMANTIC_FIELDS = (
-    "tensor_id",
-    "aliases",
-    "global_shape",
-    "global_offset",
-    "local_shape",
-    "dtype",
-    "itemsize",
-    "partition_dim",
-    "shard_dims",
-    "layer_id",
-    "expert_id",
-    "layout_fingerprint",
-    "nbytes",
-    "byte_offset",
-    "stride",
-    "storage_offset",
-    "device",
-    "is_contiguous",
-)
-
-
-def _freeze_runtime_manifest_value(value):
-    if isinstance(value, dict):
-        return tuple(
-            sorted(
-                (key, _freeze_runtime_manifest_value(item))
-                for key, item in value.items()
-            )
-        )
-    if isinstance(value, (list, tuple)):
-        return tuple(_freeze_runtime_manifest_value(item) for item in value)
-    return value
-
-
-def _runtime_manifest_group_signature(manifests) -> tuple:
-    signatures = []
-    for manifest in manifests:
-        tensors = manifest.get("tensors") or ()
-        tensor_signatures = []
-        for tensor in tensors:
-            rank = tensor.get("rank") or {}
-            tensor_signatures.append(
-                (
-                    tuple(
-                        _freeze_runtime_manifest_value(tensor.get(field))
-                        for field in _RUNTIME_TENSOR_SEMANTIC_FIELDS
-                    ),
-                    tuple(rank.get(axis) for axis in ("tp", "pp", "ep")),
-                )
-            )
-        signatures.append(
-            (
-                manifest.get("model_id"),
-                manifest.get("revision"),
-                manifest.get("generation"),
-                manifest.get("format_version"),
-                tuple(sorted(tensor_signatures)),
-            )
-        )
-    return tuple(sorted(signatures))
-
-
-def _merge_runtime_manifest_groups(groups) -> list:
-    if not groups or any(not group for group in groups):
-        raise RuntimeError("source workers returned no runtime manifests")
-    expected_signature = _runtime_manifest_group_signature(groups[0])
-    if any(
-        _runtime_manifest_group_signature(group) != expected_signature
-        for group in groups[1:]
-    ):
+def _merge_inventory_result_groups(results) -> tuple[list, list]:
+    if len(results) != 1:
         raise RuntimeError(
-            "source DP replicas returned semantically inconsistent runtime manifests"
+            "remote heterogeneous weight reuse does not support DP source groups"
         )
-
-    manifests = [manifest for group in groups for manifest in group]
-    worker_ids = []
-    for manifest in manifests:
-        manifest_worker_ids = {
-            tensor.get("worker_id") for tensor in manifest.get("tensors") or ()
-        }
-        if None in manifest_worker_ids or len(manifest_worker_ids) != 1:
-            raise RuntimeError(
-                "each source runtime manifest must describe exactly one worker"
-            )
-        worker_ids.append(next(iter(manifest_worker_ids)))
-    if len(set(worker_ids)) != len(worker_ids):
-        raise RuntimeError("source runtime manifest worker IDs are not unique")
-    return manifests
-
-
-def _merge_placement_binding_groups(
-    placement_groups, binding_groups
-) -> tuple[list, list]:
-    if (
-        not placement_groups
-        or not binding_groups
-        or len(placement_groups) != len(binding_groups)
-        or any(not group for group in placement_groups)
-        or any(not group for group in binding_groups)
-    ):
-        raise RuntimeError("source workers returned no placement/binding manifests")
-    if any(
-        len(placements) != len(bindings)
-        for placements, bindings in zip(placement_groups, binding_groups)
-    ):
-        raise RuntimeError("source placement and binding counts do not match")
-
-    expected_signature = _runtime_manifest_group_signature(placement_groups[0])
-    if any(
-        _runtime_manifest_group_signature(group) != expected_signature
-        for group in placement_groups[1:]
-    ):
+    placements = results[0].placement_inventories
+    bindings = results[0].binding_inventories
+    if not placements or not bindings or len(placements) != len(bindings):
         raise RuntimeError(
-            "source DP replicas returned semantically inconsistent placements"
+            "source workers returned invalid placement/binding inventories"
         )
-
-    placements = [placement for group in placement_groups for placement in group]
-    bindings = [binding for group in binding_groups for binding in group]
-    worker_ids = []
-    generations = set()
-    for placement, binding in zip(placements, bindings):
-        placement_identity = (
-            placement.get("model_id"),
-            placement.get("revision"),
-            placement.get("placement_id"),
-        )
-        binding_identity = (
-            binding.get("model_id"),
-            binding.get("revision"),
-            binding.get("placement_id"),
-        )
-        if placement_identity != binding_identity:
-            raise RuntimeError("source runtime binding does not match its placement")
-
-        placement_records = placement.get("tensors") or ()
-        binding_records = binding.get("fragments") or ()
-        placement_fragment_ids = [
-            tensor.get("placement_fragment_id") for tensor in placement_records
-        ]
-        binding_fragment_ids = [
-            fragment.get("placement_fragment_id") for fragment in binding_records
-        ]
-        if len(placement_fragment_ids) != len(set(placement_fragment_ids)):
-            raise RuntimeError("source placement has duplicate placement fragment IDs")
-        if len(binding_fragment_ids) != len(set(binding_fragment_ids)):
-            raise RuntimeError(
-                "source runtime binding has duplicate placement fragment IDs"
-            )
-        placement_fragments = {
-            tensor.get("placement_fragment_id"): tensor.get("nbytes")
-            for tensor in placement_records
-        }
-        binding_fragments = {
-            fragment.get("placement_fragment_id"): fragment.get("nbytes")
-            for fragment in binding_records
-        }
-        if (
-            None in placement_fragments
-            or None in binding_fragments
-            or placement_fragments != binding_fragments
-        ):
-            raise RuntimeError(
-                "source runtime binding fragments do not match placement"
-            )
-
-        fragment_worker_ids = {
-            fragment.get("worker_id") for fragment in binding.get("fragments") or ()
-        }
-        if None in fragment_worker_ids or len(fragment_worker_ids) != 1:
-            raise RuntimeError(
-                "each source runtime binding must describe exactly one worker"
-            )
-        worker_ids.append(next(iter(fragment_worker_ids)))
-        generations.add(binding.get("generation"))
-
-    if len(set(worker_ids)) != len(worker_ids):
-        raise RuntimeError("source runtime binding worker IDs are not unique")
-    if None in generations or len(generations) != 1:
-        raise RuntimeError(
-            "source placement and bindings do not describe one model generation"
-        )
-    return placements, bindings
+    return list(placements), list(bindings)
 
 
 # Declarative spec: (attr_name_prefix, response_type[, mode, correlation_attr])
@@ -910,18 +735,14 @@ class TokenizerControlMixin:
         lease_timeout_sec: int = (
             DEFAULT_REMOTE_INSTANCE_WEIGHT_TRANSFER_LEASE_TIMEOUT_SEC
         ),
-        manifest_format: str = "runtime_v1",
         transfer_id: str | None = None,
     ) -> dict:
-        """Pause for snapshot capture, then serve while the lease is held."""
-        if not self.server_args.enable_weight_runtime_manifest:
+        """Pause for inventory capture, then serve while the lease is held."""
+        if not self.server_args.enable_weight_reshard:
             raise RuntimeError(
-                "remote heterogeneous weight reuse requires "
-                "--enable-weight-runtime-manifest"
+                "remote heterogeneous weight reuse requires --enable-weight-reshard"
             )
         validate_remote_instance_weight_transfer_lease_timeout(lease_timeout_sec)
-        if manifest_format not in ("runtime_v1", "placement_binding_v1"):
-            raise ValueError(f"unsupported source manifest format: {manifest_format}")
         if transfer_id is not None and (
             type(transfer_id) is not str or not transfer_id
         ):
@@ -933,7 +754,6 @@ class TokenizerControlMixin:
             return await TokenizerControlMixin._begin_remote_instance_weight_transfer(
                 self,
                 lease_timeout_sec=lease_timeout_sec,
-                manifest_format=manifest_format,
                 transfer_id=transfer_id,
             )
 
@@ -941,30 +761,33 @@ class TokenizerControlMixin:
         self: TokenizerManager,
         *,
         lease_timeout_sec: int,
-        manifest_format: str,
         transfer_id: str,
     ) -> dict:
-        deadline_unix_sec = time.time() + lease_timeout_sec
+        model_id, revision = validate_remote_weight_lineage(
+            model_id=self.server_args.get_weight_reshard_resource_id(),
+            revision=getattr(self.server_args, "revision", None),
+        )
         request = BeginRemoteInstanceWeightTransferReqInput(
             transfer_id=transfer_id,
-            model_id=self.server_args.model_path,
-            revision=getattr(self.server_args, "revision", None) or "default",
+            model_id=model_id,
+            revision=revision,
             lease_timeout_sec=lease_timeout_sec,
-            manifest_format=manifest_format,
         )
         results = None
+        deadline_unix_sec = None
 
-        async def capture_snapshot():
-            nonlocal results
+        async def capture_inventories():
+            nonlocal deadline_unix_sec, results
             async with TokenizerControlMixin._remote_instance_weight_transfer_pause(
                 self
             ):
                 results = await self.begin_remote_instance_weight_transfer_communicator(
                     request
                 )
+                deadline_unix_sec = time.time() + lease_timeout_sec
             return results
 
-        capture_task = asyncio.create_task(capture_snapshot())
+        capture_task = asyncio.create_task(capture_inventories())
         try:
             results = await asyncio.shield(capture_task)
         except asyncio.CancelledError:
@@ -981,11 +804,12 @@ class TokenizerControlMixin:
                 _remember_remote_weight_transfer_session(
                     self,
                     transfer_id=transfer_id,
-                    manifest_format=manifest_format,
-                    deadline_unix_sec=deadline_unix_sec,
-                    payloads=_remote_weight_transfer_result_payloads(
-                        results or (), manifest_format
+                    deadline_unix_sec=(
+                        deadline_unix_sec
+                        if deadline_unix_sec is not None
+                        else time.time() + lease_timeout_sec
                     ),
+                    payloads=_remote_weight_transfer_result_payloads(results or ()),
                     session_state="cleanup_pending",
                 )
             if cleanup_candidate:
@@ -1019,7 +843,7 @@ class TokenizerControlMixin:
                 else:
                     session_state = "failed"
                 raise RemoteInstanceWeightTransferBeginError(
-                    f"Failed to resume source generation after snapshot capture: "
+                    "Failed to resume source generation after inventory capture: "
                     f"{error}",
                     transfer_id=transfer_id,
                     session_state=session_state,
@@ -1027,35 +851,24 @@ class TokenizerControlMixin:
             _remember_remote_weight_transfer_session(
                 self,
                 transfer_id=transfer_id,
-                manifest_format=manifest_format,
                 deadline_unix_sec=deadline_unix_sec,
-                payloads=_remote_weight_transfer_result_payloads(
-                    results, manifest_format
-                ),
+                payloads=_remote_weight_transfer_result_payloads(results),
                 session_state="cleanup_pending",
             )
             raise RemoteInstanceWeightTransferBeginError(
-                f"Failed to resume source generation after snapshot capture: {error}",
+                f"Failed to resume source generation after inventory capture: {error}",
                 transfer_id=transfer_id,
                 session_state="cleanup_pending",
             ) from error
+
         failures = [result.message for result in results if not result.success]
-        manifests = None
         placements = None
         bindings = None
         if not results:
             failures.append("source workers returned no transfer responses")
         elif not failures:
             try:
-                if manifest_format == "placement_binding_v1":
-                    placements, bindings = _merge_placement_binding_groups(
-                        [result.placements for result in results],
-                        [result.bindings for result in results],
-                    )
-                else:
-                    manifests = _merge_runtime_manifest_groups(
-                        [result.manifests for result in results]
-                    )
+                placements, bindings = _merge_inventory_result_groups(results)
             except RuntimeError as error:
                 failures.append(str(error))
         if failures:
@@ -1074,10 +887,7 @@ class TokenizerControlMixin:
                         )
                     )
                     try:
-                        (
-                            cleanup_succeeded,
-                            _,
-                        ) = await asyncio.shield(cleanup_task)
+                        cleanup_succeeded, _ = await asyncio.shield(cleanup_task)
                     except asyncio.CancelledError as error:
                         cleanup_cancellation = cleanup_cancellation or error
                         try:
@@ -1110,11 +920,8 @@ class TokenizerControlMixin:
                 _remember_remote_weight_transfer_session(
                     self,
                     transfer_id=transfer_id,
-                    manifest_format=manifest_format,
                     deadline_unix_sec=deadline_unix_sec,
-                    payloads=_remote_weight_transfer_result_payloads(
-                        results, manifest_format
-                    ),
+                    payloads=_remote_weight_transfer_result_payloads(results),
                     session_state=session_state,
                 )
             if cleanup_cancellation is not None:
@@ -1124,24 +931,9 @@ class TokenizerControlMixin:
                 transfer_id=transfer_id,
                 session_state=session_state,
             )
-        if manifest_format == "placement_binding_v1":
-            assert placements is not None and bindings is not None
-            session_payloads = bindings
-            response = {
-                "transfer_id": transfer_id,
-                "source_weight_placements": placements,
-                "source_weight_runtime_bindings": bindings,
-                "lease_timeout_sec": lease_timeout_sec,
-            }
-        else:
-            assert manifests is not None
-            session_payloads = manifests
-            response = {
-                "transfer_id": transfer_id,
-                "weight_runtime_manifests": manifests,
-                "lease_timeout_sec": lease_timeout_sec,
-            }
-        reused = bool(results) and all(
+
+        assert placements is not None and bindings is not None
+        reused = all(
             getattr(result, "session_state", "created") == "reused"
             for result in results
         )
@@ -1149,16 +941,23 @@ class TokenizerControlMixin:
         _remember_remote_weight_transfer_session(
             self,
             transfer_id=transfer_id,
-            manifest_format=manifest_format,
             deadline_unix_sec=(
                 existing.get("deadline_unix_sec")
                 if reused and existing is not None
                 else (None if reused else deadline_unix_sec)
             ),
-            payloads=session_payloads,
+            payloads=bindings,
             session_state="reused" if reused and existing is None else "active",
         )
-        return response
+        return {
+            "transfer_id": transfer_id,
+            "success": True,
+            "message": "Success.",
+            "session_state": "reused" if reused else "created",
+            "placement_inventories": placements,
+            "binding_inventories": bindings,
+            "lease_timeout_sec": lease_timeout_sec,
+        }
 
     async def release_remote_instance_weight_transfer(
         self: TokenizerManager, transfer_id: str
@@ -1205,7 +1004,7 @@ class TokenizerControlMixin:
     ) -> Tuple[bool, str]:
         validate_remote_instance_weight_transfer_lease_timeout(lease_timeout_sec)
         self.auto_create_handle_loop()
-        deadline_unix_sec = time.time() + lease_timeout_sec
+        deadline_unix_sec = None
         try:
             async with TokenizerControlMixin._remote_instance_weight_transfer_pause(
                 self
@@ -1216,10 +1015,12 @@ class TokenizerControlMixin:
                         lease_timeout_sec=lease_timeout_sec,
                     )
                 )
+                deadline_unix_sec = time.time() + lease_timeout_sec
             success, message = FanOutCommunicator.merge_results(results)
         except Exception as error:
             success, message = False, str(error)
         if success:
+            assert deadline_unix_sec is not None
             _record_remote_weight_transfer_renewal(
                 self,
                 transfer_id=transfer_id,

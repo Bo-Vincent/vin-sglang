@@ -497,17 +497,25 @@ class RuntimeHandle:
         self._submit_json_unary("stop_profile", _payload, chunk_callback)
 
     def update_weights_from_disk(
-        self, model_path: str, load_format: Optional[str], chunk_callback
+        self,
+        model_path: str,
+        load_format: Optional[str],
+        chunk_callback,
+        revision: Optional[str] = None,
     ) -> None:
         async def _payload():
             from sglang.srt.managers.io_struct import UpdateWeightFromDiskReqInput
 
             obj = UpdateWeightFromDiskReqInput(
-                model_path=model_path, load_format=load_format
+                model_path=model_path,
+                load_format=load_format,
+                revision=revision,
             )
-            success, message, num_paused = (
-                await self.tokenizer_manager.update_weights_from_disk(obj, request=None)
-            )
+            (
+                success,
+                message,
+                num_paused,
+            ) = await self.tokenizer_manager.update_weights_from_disk(obj, request=None)
             return {
                 "success": success,
                 "message": message,

@@ -3236,11 +3236,34 @@ class ServerArgs:
         "Save model weights (both main model and draft model, if any) to CPU memory during release_weights_occupation and resume_weights_occupation",
         NS("exec.features"),
     ] = False
-    enable_weight_runtime_manifest: A[
+    enable_weight_reshard: A[
         bool,
-        "Enable the experimental runtime weight manifest exporter.",
+        "Enable copy-only remote instance weight resharding with "
+        "placement/binding inventories. Requires the Mooncake "
+        "mooncake.reshard.weight capability on TransferEngine targets; "
+        "the backend-neutral SGLang loader interface has no second reshard "
+        "backend implementation yet. Source and target must both set the "
+        "same explicit caller-attested immutable --revision; None and default "
+        "are rejected, but SGLang cannot prove that an arbitrary label is "
+        "immutable. "
+        "A live G2G source must also enable "
+        "--remote-instance-weight-loader-start-seed-via-transfer-engine so "
+        "its resident weight ranges are registered and published. "
+        "Use --weight-reshard-resource-id when source and target load the "
+        "same content through different model paths. "
+        "The caller must change the attested revision when the underlying "
+        "content lineage changes; SGLang cannot infer that from model bytes. "
+        "After mutation starts, an update failure stops the model process "
+        "instead of resuming inference with unverified content.",
         NS("exec.features"),
     ] = False
+    weight_reshard_resource_id: A[
+        Optional[str],
+        "Stable canonical resource ID shared by heterogeneous weight source "
+        "and target runtimes. Defaults to --served-model-name (which itself "
+        "defaults to the model argument before local path resolution).",
+        NS("exec.features"),
+    ] = None
     enable_draft_weights_cpu_backup: A[
         bool,
         "Save draft model weights to CPU memory during release_weights_occupation and resume_weights_occupation",
@@ -4126,8 +4149,10 @@ class ServerArgs:
             ),
             (
                 "OOT platform without piecewise support",
-                lambda: current_platform.is_out_of_tree()
-                and not current_platform.support_piecewise_cuda_graph(),
+                lambda: (
+                    current_platform.is_out_of_tree()
+                    and not current_platform.support_piecewise_cuda_graph()
+                ),
             ),
             (
                 "MoE A2A backend",
@@ -4136,14 +4161,18 @@ class ServerArgs:
             ("LoRA", lambda: bool(self.lora_paths) or self.enable_lora),
             (
                 "multimodal model",
-                lambda: self.get_model_config().is_multimodal
-                and not self.get_model_config().is_multimodal_piecewise_cuda_graph_supported,
+                lambda: (
+                    self.get_model_config().is_multimodal
+                    and not self.get_model_config().is_multimodal_piecewise_cuda_graph_supported
+                ),
             ),
             (
                 "GGUF quantization",
-                lambda: self.load_format == "gguf"
-                or _resolved_view(self).quantization == "gguf"
-                or check_gguf_file(self.model_path),
+                lambda: (
+                    self.load_format == "gguf"
+                    or _resolved_view(self).quantization == "gguf"
+                    or check_gguf_file(self.model_path)
+                ),
             ),
             ("DLLM (diffusion LLM)", lambda: self.dllm_algorithm is not None),
             (
@@ -4158,8 +4187,10 @@ class ServerArgs:
             ("symmetric memory", lambda: self.enable_symm_mem),
             (
                 "expert distribution recorder",
-                lambda: self.enable_eplb
-                or self.expert_distribution_recorder_mode is not None,
+                lambda: (
+                    self.enable_eplb
+                    or self.expert_distribution_recorder_mode is not None
+                ),
             ),
             (
                 "context parallel (attn_cp_size > 1)",
@@ -4218,8 +4249,10 @@ class ServerArgs:
             # Multimodal prefill replay faults under BCG; allowlisted archs opt back in.
             (
                 "multimodal model",
-                lambda: self.get_model_config().is_multimodal
-                and not self.get_model_config().is_multimodal_breakable_cuda_graph_supported,
+                lambda: (
+                    self.get_model_config().is_multimodal
+                    and not self.get_model_config().is_multimodal_breakable_cuda_graph_supported
+                ),
             ),
         ]
         for name, predicate in rules:
@@ -6811,6 +6844,16 @@ class ServerArgs:
         if self.custom_weight_loader is None:
             self.custom_weight_loader = []
 
+        if self.enable_weight_reshard:
+            from sglang.srt.model_executor.weight_inventory_contracts import (
+                validate_remote_weight_lineage,
+            )
+
+            validate_remote_weight_lineage(
+                model_id=self.get_weight_reshard_resource_id(),
+                revision=self.revision,
+            )
+
         speculative_algorithm = str(self.speculative_algorithm or "").upper()
         draft_load_format = self.speculative_draft_load_format or self.load_format
         if (
@@ -6824,6 +6867,14 @@ class ServerArgs:
             )
 
         if self.load_format == "remote_instance":
+            if (
+                self.enable_weight_reshard
+                and self.remote_instance_weight_loader_backend != "transfer_engine"
+            ):
+                raise ValueError(
+                    "--enable-weight-reshard on a remote_instance target requires "
+                    "--remote-instance-weight-loader-backend transfer_engine"
+                )
             if self.remote_instance_weight_loader_backend != "modelexpress" and (
                 self.remote_instance_weight_loader_seed_instance_ip is None
                 or self.remote_instance_weight_loader_seed_instance_service_port is None
@@ -6850,6 +6901,15 @@ class ServerArgs:
                     raise ValueError(
                         "--load-format remote_instance requires an available "
                         "TransferEngine"
+                    )
+                if (
+                    self.enable_weight_reshard
+                    and not self.validate_weight_reshard_backend()
+                ):
+                    raise ValueError(
+                        "--enable-weight-reshard with TransferEngine requires "
+                        "the Mooncake weight reshard capability "
+                        "(mooncake.reshard.weight)"
                     )
 
         if self.remote_instance_weight_loader_start_seed_via_transfer_engine:
@@ -7334,13 +7394,12 @@ class ServerArgs:
     def _handle_unified_memory_pool(self):
         if not self.enable_unified_memory:
             return
-        assert self.disaggregation_mode == "null", (
-            "--enable-unified-memory is not yet compatible with PD " "disaggregation."
-        )
-        assert self.speculative_algorithm is None, (
-            "--enable-unified-memory is not yet compatible with speculative "
-            "decoding."
-        )
+        assert (
+            self.disaggregation_mode == "null"
+        ), "--enable-unified-memory is not yet compatible with PD disaggregation."
+        assert (
+            self.speculative_algorithm is None
+        ), "--enable-unified-memory is not yet compatible with speculative decoding."
         assert not (self.enable_hierarchical_cache or self.enable_lmcache), (
             "--enable-unified-memory is not yet compatible with hierarchical / "
             "host-tiered KV cache (--enable-hierarchical-cache / --enable-lmcache): "
@@ -8522,6 +8581,33 @@ class ServerArgs:
             return False
         else:
             return True
+
+    def validate_weight_reshard_backend(self):
+        try:
+            from sglang.srt.model_loader.weight_reshard_backend import (
+                WeightReshardBackendError,
+                create_weight_reshard_backend,
+            )
+
+            create_weight_reshard_backend("transfer_engine")
+        except (ImportError, WeightReshardBackendError):
+            logger.warning(
+                "Failed to load the Mooncake weight reshard backend. "
+                "The installed Mooncake package must export "
+                "mooncake.reshard.weight."
+            )
+            return False
+        return True
+
+    def get_weight_reshard_resource_id(self) -> str:
+        """Return the stable logical ID without using a resolved local path."""
+
+        value = self.weight_reshard_resource_id
+        if value is None:
+            value = self.served_model_name or self.model_path
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("--weight-reshard-resource-id must be a non-empty string")
+        return value
 
     @property
     def _parsed_modelexpress_config(self) -> dict:

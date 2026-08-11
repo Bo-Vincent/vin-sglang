@@ -1098,6 +1098,7 @@ class Engine(EngineScoreMixin, EngineBase):
         self,
         model_path: str,
         load_format: Optional[str] = None,
+        revision: Optional[str] = None,
     ):
         """Update the weights from disk inplace without re-launching the engine.
 
@@ -1108,6 +1109,7 @@ class Engine(EngineScoreMixin, EngineBase):
         obj = UpdateWeightFromDiskReqInput(
             model_path=model_path,
             load_format=load_format,
+            revision=revision,
         )
 
         return self.loop.run_until_complete(

@@ -309,7 +309,11 @@ def _make_updater(module, model, **overrides):
         "tp_rank": 0,
         "device": "cpu",
         "gpu_id": 0,
-        "model_config": SimpleNamespace(dtype=None, model_path="original"),
+        "model_config": SimpleNamespace(
+            dtype=None,
+            model_path="original",
+            revision="original-revision",
+        ),
         "custom_weight_loaders": {"custom_loader": object()},
         "get_model": lambda: model,
         "update_model_fields": lambda *args, **kwargs: None,
@@ -465,40 +469,110 @@ def test_disk_update_refreshes_runtime_state_after_success(
 ):
     module = runtime_modules.weight_updater
     model = _Model()
+    loader_configs = []
+    callback_observations = []
 
     class Loader(_DefaultModelLoader):
         def _get_weights_iterator(self, source):
-            del source
+            config, _ = source
+            assert config.model_path == "new-model"
+            assert config.revision == "new-checkpoint-sha"
             return iter(())
 
         def load_weights_and_postprocess(self, loaded_model, weights, device):
             del loaded_model, weights, device
 
-    monkeypatch.setattr(module, "get_model_loader", lambda *args, **kwargs: Loader())
-    updater = _make_updater(module, model)
+    updater = _make_updater(
+        module,
+        model,
+        update_model_fields=lambda *args, **kwargs: callback_observations.append(
+            (
+                updater.model_config.model_path,
+                updater.model_config.revision,
+                kwargs["model_path"],
+                kwargs["revision"],
+            )
+        ),
+    )
 
-    success, _ = updater.update_weights_from_disk("new-model", "auto")
+    def get_model_loader(_load_config, config):
+        loader_configs.append((config.model_path, config.revision))
+        assert updater.model_config.model_path == "original"
+        assert updater.model_config.revision == "original-revision"
+        return Loader()
+
+    monkeypatch.setattr(module, "get_model_loader", get_model_loader)
+
+    success, _ = updater.update_weights_from_disk(
+        "new-model",
+        "auto",
+        revision="new-checkpoint-sha",
+    )
 
     assert success is True
+    assert loader_configs == [("new-model", "new-checkpoint-sha")]
+    assert callback_observations == [
+        (
+            "original",
+            "original-revision",
+            "new-model",
+            "new-checkpoint-sha",
+        )
+    ]
+    assert updater.model_config.model_path == "new-model"
+    assert updater.model_config.revision == "new-checkpoint-sha"
     _assert_refreshed(model)
 
 
 def test_disk_update_does_not_refresh_after_failure(runtime_modules, monkeypatch):
     module = runtime_modules.weight_updater
     model = _Model()
+    seen_sources = []
 
     class Loader(_DefaultModelLoader):
-        load_calls = 0
+        def __init__(self, *, fail_load):
+            self.fail_load = fail_load
 
         def _get_weights_iterator(self, source):
-            del source
+            config, _ = source
+            seen_sources.append((config.model_path, config.revision))
             return iter(())
 
         def load_weights_and_postprocess(self, loaded_model, weights, device):
             del loaded_model, weights, device
-            self.load_calls += 1
-            if self.load_calls == 1:
+            if self.fail_load:
                 raise RuntimeError("load failed")
+
+    loaders = iter((Loader(fail_load=True), Loader(fail_load=False)))
+    monkeypatch.setattr(
+        module,
+        "get_model_loader",
+        lambda *args, **kwargs: next(loaders),
+    )
+    updater = _make_updater(module, model)
+
+    success, _ = updater.update_weights_from_disk("new-model", "auto")
+
+    assert success is False
+    assert seen_sources == [
+        ("new-model", "original-revision"),
+        ("original", "original-revision"),
+    ]
+    assert updater.model_config.model_path == "original"
+    assert updater.model_config.revision == "original-revision"
+    _assert_refreshed(model)
+
+
+def test_disk_update_restores_identity_when_inventory_fails_before_load(
+    runtime_modules, monkeypatch
+):
+    module = runtime_modules.weight_updater
+    model = _Model()
+
+    class Loader(_DefaultModelLoader):
+        def _get_weights_iterator(self, source):
+            del source
+            raise RuntimeError("inventory failed")
 
     monkeypatch.setattr(module, "get_model_loader", lambda *args, **kwargs: Loader())
     updater = _make_updater(module, model)
@@ -506,6 +580,8 @@ def test_disk_update_does_not_refresh_after_failure(runtime_modules, monkeypatch
     success, _ = updater.update_weights_from_disk("new-model", "auto")
 
     assert success is False
+    assert updater.model_config.model_path == "original"
+    assert updater.model_config.revision == "original-revision"
     _assert_not_refreshed(model)
 
 

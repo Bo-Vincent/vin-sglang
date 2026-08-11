@@ -5,17 +5,21 @@ from typing import Any, Sequence
 
 import msgspec
 
-from sglang.srt.model_executor.weight_runtime_manifest import (
+from sglang.srt.model_executor.weight_inventory_contracts import (
     LogicalTensorView,
-    WeightManifestError,
+    WeightInventoryError,
     WeightParallelTopology,
 )
 from sglang.srt.model_executor.weight_semantics.qwen3_5 import (
     Qwen35WeightSemanticsAdapter,
+    _apply_qwen_coupled_parallel_semantics,
     _canonical_name,
     _itemsize,
     _layer_id,
+    _moe_parallel_semantics,
+    _parallel_axes,
     _shape,
+    _shared_moe_parallel_semantics,
     _view,
 )
 
@@ -37,8 +41,8 @@ class Qwen3NextWeightSemanticsAdapter(Qwen35WeightSemanticsAdapter):
             up_first_w13_parameter_ids=up_first_w13_parameter_ids,
         )
         if num_fused_shared_experts not in (0, 1):
-            raise WeightManifestError(
-                "Qwen3-Next weight manifests support at most one fused shared expert"
+            raise WeightInventoryError(
+                "Qwen3-Next weight inventories support at most one fused shared expert"
             )
         self._num_fused_shared_experts = num_fused_shared_experts
 
@@ -52,37 +56,57 @@ class Qwen3NextWeightSemanticsAdapter(Qwen35WeightSemanticsAdapter):
         canonical_names = tuple(dict.fromkeys(_canonical_name(name) for name in names))
         name = canonical_names[0]
         layer_id = _layer_id(name)
+        if len(canonical_names) > 1 and set(canonical_names) != {
+            "embed_tokens.weight",
+            "lm_head.weight",
+        }:
+            raise WeightInventoryError(
+                "Qwen3-Next has an unsupported logical parameter alias group: "
+                f"{tuple(sorted(canonical_names))}"
+            )
         if self._num_fused_shared_experts and name.endswith("experts.w13_weight"):
-            return self._fused_moe_w13(
-                name=name,
-                parameter=parameter,
-                topology=topology,
-                layer_id=layer_id,
+            return _apply_qwen_coupled_parallel_semantics(
+                self._fused_moe_w13(
+                    name=name,
+                    parameter=parameter,
+                    topology=topology,
+                    layer_id=layer_id,
+                ),
+                topology,
             )
         if self._num_fused_shared_experts and name.endswith("experts.w2_weight"):
-            return self._fused_moe_w2(
-                name=name,
-                parameter=parameter,
-                topology=topology,
-                layer_id=layer_id,
+            return _apply_qwen_coupled_parallel_semantics(
+                self._fused_moe_w2(
+                    name=name,
+                    parameter=parameter,
+                    topology=topology,
+                    layer_id=layer_id,
+                ),
+                topology,
             )
         if name.endswith("in_proj_qkvz.weight"):
             self._require_grouped_gdn_layout(parameter, name)
-            return self._grouped_gdn_view(
-                name=name,
-                parameter=parameter,
-                topology=topology,
-                group_width=self._qkvz_group_width(),
-                layout="gdn-qkvz-grouped",
+            return _apply_qwen_coupled_parallel_semantics(
+                self._grouped_gdn_view(
+                    name=name,
+                    parameter=parameter,
+                    topology=topology,
+                    group_width=self._qkvz_group_width(),
+                    layout="gdn-qkvz-grouped",
+                ),
+                topology,
             )
         if name.endswith("in_proj_ba.weight"):
             self._require_grouped_gdn_layout(parameter, name)
-            return self._grouped_gdn_view(
-                name=name,
-                parameter=parameter,
-                topology=topology,
-                group_width=self._ba_group_width(),
-                layout="gdn-ba-grouped",
+            return _apply_qwen_coupled_parallel_semantics(
+                self._grouped_gdn_view(
+                    name=name,
+                    parameter=parameter,
+                    topology=topology,
+                    group_width=self._ba_group_width(),
+                    layout="gdn-ba-grouped",
+                ),
+                topology,
             )
 
         views = super().describe_parameter(
@@ -96,7 +120,7 @@ class Qwen3NextWeightSemanticsAdapter(Qwen35WeightSemanticsAdapter):
     def _require_grouped_gdn_layout(parameter: Any, name: str) -> None:
         layout = getattr(parameter, "_sglang_qwen3_next_gdn_layout", None)
         if layout != "grouped":
-            raise WeightManifestError(
+            raise WeightInventoryError(
                 "Qwen3-Next GDN runtime layout marker must explicitly be "
                 f"'grouped': {name}: {layout!r}"
             )
@@ -105,18 +129,18 @@ class Qwen3NextWeightSemanticsAdapter(Qwen35WeightSemanticsAdapter):
         self, *, parameter: Any, topology: WeightParallelTopology
     ) -> tuple[int, ...]:
         if self._dynamic_expert_placement:
-            raise WeightManifestError(
+            raise WeightInventoryError(
                 "dynamic Qwen3-Next expert placement requires an explicit expert map"
             )
         num_experts = int(self._config.num_experts)
         if num_experts % topology.ep_size != 0:
-            raise WeightManifestError(
+            raise WeightInventoryError(
                 "Qwen3-Next experts are not evenly EP partitionable"
             )
         local_experts = num_experts // topology.ep_size
         expected_slots = local_experts + self._num_fused_shared_experts
         if not _shape(parameter) or _shape(parameter)[0] != expected_slots:
-            raise WeightManifestError(
+            raise WeightInventoryError(
                 f"Qwen3-Next local expert count mismatch: {_shape(parameter)}, "
                 f"expected {expected_slots} slots"
             )
@@ -133,11 +157,11 @@ class Qwen3NextWeightSemanticsAdapter(Qwen35WeightSemanticsAdapter):
             getattr(self._config, "shared_expert_intermediate_size", 0)
         )
         if shared_intermediate != intermediate:
-            raise WeightManifestError(
+            raise WeightInventoryError(
                 "Qwen3-Next fused shared expert must match routed intermediate size"
             )
         if intermediate % topology.moe_tp_size != 0:
-            raise WeightManifestError("Qwen3-Next expert tensor is not TP divisible")
+            raise WeightInventoryError("Qwen3-Next expert tensor is not TP divisible")
         local_intermediate = intermediate // topology.moe_tp_size
         expected = (
             len(expert_ids) + 1,
@@ -145,7 +169,7 @@ class Qwen3NextWeightSemanticsAdapter(Qwen35WeightSemanticsAdapter):
             int(self._config.hidden_size),
         )
         if shape != expected:
-            raise WeightManifestError(
+            raise WeightInventoryError(
                 f"Qwen3-Next w13 tensor shape mismatch: {shape}, expected {expected}"
             )
         prefix = name[: -len("experts.w13_weight")]
@@ -158,6 +182,7 @@ class Qwen3NextWeightSemanticsAdapter(Qwen35WeightSemanticsAdapter):
         )
         views = []
         num_experts = int(self._config.num_experts)
+        routed_shard_dims, routed_axes = _moe_parallel_semantics(topology, tp_dim=1)
         for local_index, expert_id in enumerate(expert_ids):
             base = local_index * expert_bytes
             for component_index, component in enumerate(components):
@@ -171,15 +196,18 @@ class Qwen3NextWeightSemanticsAdapter(Qwen35WeightSemanticsAdapter):
                             0,
                         ),
                         local_shape=(1, local_intermediate, shape[2]),
-                        partition_dim=None,
                         byte_offset=base + component_index * component_bytes,
                         layer_id=layer_id,
                         expert_id=None,
                         layout="moe-w13",
-                        shard_dims=(0, 1),
+                        shard_dims=routed_shard_dims,
+                        parallel_axes=routed_axes,
                     )
                 )
         shared_base = len(expert_ids) * expert_bytes
+        shared_shard_dims, shared_axes = _shared_moe_parallel_semantics(
+            topology, tp_dim=0
+        )
         for component_index, component in enumerate(components):
             views.append(
                 _view(
@@ -190,11 +218,12 @@ class Qwen3NextWeightSemanticsAdapter(Qwen35WeightSemanticsAdapter):
                         0,
                     ),
                     local_shape=(local_intermediate, shape[2]),
-                    partition_dim=0,
+                    shard_dims=shared_shard_dims,
                     byte_offset=shared_base + component_index * component_bytes,
                     layer_id=layer_id,
                     expert_id=None,
                     layout="gate-up",
+                    parallel_axes=shared_axes,
                 )
             )
         return tuple(self._retag(view) for view in views)
@@ -209,11 +238,11 @@ class Qwen3NextWeightSemanticsAdapter(Qwen35WeightSemanticsAdapter):
             getattr(self._config, "shared_expert_intermediate_size", 0)
         )
         if shared_intermediate != intermediate:
-            raise WeightManifestError(
+            raise WeightInventoryError(
                 "Qwen3-Next fused shared expert must match routed intermediate size"
             )
         if intermediate % topology.moe_tp_size != 0:
-            raise WeightManifestError("Qwen3-Next expert tensor is not TP divisible")
+            raise WeightInventoryError("Qwen3-Next expert tensor is not TP divisible")
         local_intermediate = intermediate // topology.moe_tp_size
         expected = (
             len(expert_ids) + 1,
@@ -221,12 +250,13 @@ class Qwen3NextWeightSemanticsAdapter(Qwen35WeightSemanticsAdapter):
             local_intermediate,
         )
         if shape != expected:
-            raise WeightManifestError(
+            raise WeightInventoryError(
                 f"Qwen3-Next w2 tensor shape mismatch: {shape}, expected {expected}"
             )
         prefix = name[: -len("experts.w2_weight")]
         expert_bytes = prod(shape[1:]) * _itemsize(parameter)
         num_experts = int(self._config.num_experts)
+        routed_shard_dims, routed_axes = _moe_parallel_semantics(topology, tp_dim=2)
         views = [
             _view(
                 tensor_id=f"{prefix}experts.down_proj.weight",
@@ -237,15 +267,18 @@ class Qwen3NextWeightSemanticsAdapter(Qwen35WeightSemanticsAdapter):
                     topology.moe_tp_rank * local_intermediate,
                 ),
                 local_shape=(1, shape[1], local_intermediate),
-                partition_dim=None,
                 byte_offset=local_index * expert_bytes,
                 layer_id=layer_id,
                 expert_id=None,
                 layout="moe-w2",
-                shard_dims=(0, 2),
+                shard_dims=routed_shard_dims,
+                parallel_axes=routed_axes,
             )
             for local_index, expert_id in enumerate(expert_ids)
         ]
+        shared_shard_dims, shared_axes = _shared_moe_parallel_semantics(
+            topology, tp_dim=1
+        )
         views.append(
             _view(
                 tensor_id=f"{prefix}shared_expert.down_proj.weight",
@@ -255,11 +288,12 @@ class Qwen3NextWeightSemanticsAdapter(Qwen35WeightSemanticsAdapter):
                     topology.moe_tp_rank * local_intermediate,
                 ),
                 local_shape=(shape[1], local_intermediate),
-                partition_dim=1,
+                shard_dims=shared_shard_dims,
                 byte_offset=len(expert_ids) * expert_bytes,
                 layer_id=layer_id,
                 expert_id=None,
                 layout="row-parallel",
+                parallel_axes=shared_axes,
             )
         )
         return tuple(self._retag(view) for view in views)
@@ -277,7 +311,7 @@ class Qwen3NextWeightSemanticsAdapter(Qwen35WeightSemanticsAdapter):
         tp_size = topology.attention_tp_size
         tp_rank = topology.attention_tp_rank
         if key_heads % tp_size != 0:
-            raise WeightManifestError(
+            raise WeightInventoryError(
                 f"Qwen3-Next GDN key heads are not TP divisible: {key_heads}"
             )
         local_key_heads = key_heads // tp_size
@@ -289,7 +323,7 @@ class Qwen3NextWeightSemanticsAdapter(Qwen35WeightSemanticsAdapter):
             (local_key_heads * group_width, hidden_size),
         )
         if physical_shape not in valid_shapes:
-            raise WeightManifestError(
+            raise WeightInventoryError(
                 f"Qwen3-Next grouped GDN tensor shape mismatch: {name}: "
                 f"{physical_shape}, expected one of {valid_shapes}"
             )
@@ -299,12 +333,12 @@ class Qwen3NextWeightSemanticsAdapter(Qwen35WeightSemanticsAdapter):
                 global_shape=(key_heads, group_width, hidden_size),
                 global_offset=(tp_rank * local_key_heads, 0, 0),
                 local_shape=local_shape,
-                partition_dim=0,
                 byte_offset=0,
                 layer_id=_layer_id(name),
                 expert_id=None,
                 layout_fingerprint=f"sglang:qwen3-next:{layout}:v1",
                 shard_dims=(0,),
+                parallel_axes=_parallel_axes((0,), expert_id=None),
             ),
         )
 
@@ -312,7 +346,7 @@ class Qwen3NextWeightSemanticsAdapter(Qwen35WeightSemanticsAdapter):
         key_heads = int(self._config.linear_num_key_heads)
         value_heads = int(self._config.linear_num_value_heads)
         if value_heads % key_heads != 0:
-            raise WeightManifestError(
+            raise WeightInventoryError(
                 "Qwen3-Next GDN value heads are not divisible by key heads"
             )
         values_per_key = value_heads // key_heads
@@ -324,7 +358,7 @@ class Qwen3NextWeightSemanticsAdapter(Qwen35WeightSemanticsAdapter):
         key_heads = int(self._config.linear_num_key_heads)
         value_heads = int(self._config.linear_num_value_heads)
         if value_heads % key_heads != 0:
-            raise WeightManifestError(
+            raise WeightInventoryError(
                 "Qwen3-Next GDN value heads are not divisible by key heads"
             )
         return 2 * value_heads // key_heads
@@ -333,7 +367,7 @@ class Qwen3NextWeightSemanticsAdapter(Qwen35WeightSemanticsAdapter):
     def _retag(view: LogicalTensorView) -> LogicalTensorView:
         prefix = "sglang:qwen3.5:"
         if not view.layout_fingerprint.startswith(prefix):
-            raise WeightManifestError(
+            raise WeightInventoryError(
                 f"unexpected inherited Qwen layout: {view.layout_fingerprint}"
             )
         return msgspec.structs.replace(

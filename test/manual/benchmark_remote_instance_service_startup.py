@@ -5,7 +5,7 @@ in one of three modes:
 
 * ``cold``: load the target from checkpoint files after dropping page cache.
 * ``legacy``: use the homogeneous remote-instance TransferEngine path.
-* ``manifest``: use the runtime-manifest path, including heterogeneous TP.
+* ``reshard``: use placement/binding inventories for heterogeneous resharding.
 
 Every deterministic source and target response is appended to
 ``responses.jsonl``. Source responses must equal the source baseline; reuse
@@ -19,9 +19,10 @@ Homogeneous example (runs all three modes by default):
 
 PYTHONPATH=python python test/manual/benchmark_remote_instance_service_startup.py \
   --model /models/Qwen3.5-0.8B --source-gpus 0,1 --target-gpus 2,3 \
+  --content-revision checkpoint-sha-42 \
   --source-tp-size 2 --target-tp-size 2 --drop-page-cache --iterations 4
 
-Large-model legacy example (runtime-manifest semantics may be model-specific):
+Large-model legacy example (reshard semantics may be model-specific):
 
 PYTHONPATH=python python test/manual/benchmark_remote_instance_service_startup.py \
   --model /models/Qwen2-72B --source-gpus 0,1 --target-gpus 2,3 \
@@ -32,6 +33,7 @@ Heterogeneous example (legacy is reported as ineligible when TPs differ):
 
 PYTHONPATH=python python test/manual/benchmark_remote_instance_service_startup.py \
   --model /models/Qwen3.5-0.8B --source-gpus 0,1 --target-gpus 2,3,4,5 \
+  --content-revision checkpoint-sha-42 \
   --source-tp-size 2 --target-tp-size 4 --drop-page-cache --iterations 3
 """
 
@@ -54,26 +56,23 @@ from typing import Any
 import psutil
 import requests
 
-ALL_MODES = ("cold", "legacy", "manifest")
-REUSE_MODES = ("legacy", "manifest")
+ALL_MODES = ("cold", "legacy", "reshard")
+REUSE_MODES = ("legacy", "reshard")
 MIN_PERCENTILE_SAMPLES = 5
 REUSE_REQUIRED_LOG_MARKERS = {
     "legacy": (
         "Loading weights from remote instance ...",
         "TransferEngine memory regions have been successfully registered.",
     ),
-    "manifest": (
-        "TransferEngine memory regions have been successfully registered.",
+    "reshard": (
         "Loaded heterogeneous remote-instance weights:",
-        "manifest_format=placement_binding_v1",
         "transfer_id=",
         "release_success=true",
     ),
 }
 REUSE_FORBIDDEN_LOG_MARKERS = (
     "Fallback load_format to 'auto'",
-    "using the runtime-v1 target builder",
-    "manifest_format=runtime_v1",
+    "using a retired target inventory builder",
     "Cannot acquire remote weight transfer session",
     "Heterogeneous remote-instance weight loading failed",
     "Failed to load weights from remote instance via transfer engine",
@@ -317,7 +316,10 @@ def _server_command(
         "--mem-fraction-static",
         str(args.mem_fraction_static),
         "--disable-cuda-graph",
+        "--enable-deterministic-inference",
     ]
+    if args.content_revision:
+        command.extend(["--revision", args.content_revision])
     if args.attention_backend:
         command.extend(["--attention-backend", args.attention_backend])
     if args.mm_attention_backend:
@@ -338,8 +340,8 @@ def _server_command(
                 str(args.bootstrap_port),
             ]
         )
-        if "manifest" in args.modes:
-            command.append("--enable-weight-runtime-manifest")
+        if "reshard" in args.modes:
+            command.append("--enable-weight-reshard")
     elif load_mode in REUSE_MODES:
         command.extend(
             [
@@ -353,8 +355,8 @@ def _server_command(
                 str(args.source_port),
             ]
         )
-        if load_mode == "manifest":
-            command.append("--enable-weight-runtime-manifest")
+        if load_mode == "reshard":
+            command.append("--enable-weight-reshard")
     elif load_mode != "cold":
         raise ValueError(f"unknown load mode: {load_mode}")
     return command
@@ -964,7 +966,19 @@ def _eligible_modes(args: argparse.Namespace) -> tuple[list[str], list[dict[str,
     executed = []
     skipped = []
     for mode in args.modes:
-        if mode == "legacy" and (
+        if mode == "reshard" and (args.source_dp_size != 1 or args.target_dp_size != 1):
+            skipped.append(
+                {
+                    "mode": "reshard",
+                    "reason": (
+                        "SGLang weight inventories do not yet represent DP or "
+                        "MoE-DP participants; "
+                        f"source_dp_size={args.source_dp_size}, "
+                        f"target_dp_size={args.target_dp_size}"
+                    ),
+                }
+            )
+        elif mode == "legacy" and (
             args.source_dp_size != 1
             or args.target_dp_size != 1
             or args.source_tp_size != args.target_tp_size
@@ -1115,6 +1129,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "disable_custom_all_reduce": args.disable_custom_all_reduce,
             "measurement_boundary": "target process spawn to health_generate ready",
             "deterministic_inference": {
+                "server_flag_enabled": True,
                 "request": _inference_request(args),
                 "comparison": (
                     "source responses are compared with the source baseline; "
@@ -1186,10 +1201,15 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Compare cold checkpoint startup, homogeneous remote reuse, and "
-            "runtime-manifest heterogeneous reuse."
+            "placement/binding inventory heterogeneous resharding."
         )
     )
     parser.add_argument("--model", required=True)
+    parser.add_argument(
+        "--content-revision",
+        default="",
+        help="Immutable checkpoint revision asserted by heterogeneous reshard mode.",
+    )
     parser.add_argument("--python", default=os.environ.get("PYTHON", "python"))
     parser.add_argument("--source-gpus", type=_parse_gpus, required=True)
     parser.add_argument("--target-gpus", type=_parse_gpus, required=True)
@@ -1248,6 +1268,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", default="remote-instance-service-benchmark")
     args = parser.parse_args()
 
+    if "reshard" in args.modes and not args.content_revision:
+        parser.error("reshard mode requires --content-revision")
     if args.iterations <= 0:
         parser.error("iterations must be positive")
     if (

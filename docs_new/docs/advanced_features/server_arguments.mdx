@@ -2646,6 +2646,18 @@ Please consult the documentation below and [server_args.py](https://github.com/s
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>bool flag (set to enable)</td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--enable-weight-reshard`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Enable copy-only resharding for a `remote_instance` target using the `transfer_engine` backend. The SGLang loader has a backend-neutral interface, but Mooncake is the only reshard backend implemented today; the existing NCCL and ModelExpress loaders do not implement this heterogeneous planner contract. Source and target must both set the same explicit caller-attested immutable `--revision`; `None` and `default` are rejected, but SGLang cannot prove that an arbitrary label is immutable. A live G2G source must also enable `--remote-instance-weight-loader-start-seed-via-transfer-engine` so its resident weight ranges are registered and published. Use `--weight-reshard-resource-id` when source and target load the same content through different model paths. Current SGLang adapters cover Qwen3, Qwen3.5 text/multimodal, and Qwen3-Next; DP/MoE-DP, DP attention subgroups, dynamic expert placement, and hybrid EP plus MoE-TP are rejected. Source and target must expose the same dtype and canonical runtime layout. FP8 is limited to serialized e4m3fn, dynamic activation, 128x128 block scales, and Triton weight/MoE runners; online, MXFP8, Marlin, shuffled, or derived layouts are rejected. Mooncake must provide `placement_binding`, `nd_logical_box`, `dependent_axis_projection`, and `te_execution`. Disk weight updates on an enabled source must include an explicit caller-attested immutable `revision`; callers must change it when the underlying content lineage changes. Once mutation starts, any unverified failure stops the model process rather than resuming inference.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`False`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>bool flag (set to enable)</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--weight-reshard-resource-id`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Stable canonical resource ID shared by heterogeneous weight source and target runtimes. Defaults to `--served-model-name`, which itself defaults to the model argument before local path resolution.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>str</td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--enable-draft-weights-cpu-backup`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Save draft model weights to CPU memory during release_weights_occupation and resume_weights_occupation</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`False`</td>
@@ -3137,7 +3149,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--remote-instance-weight-loader-backend`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>The backend for loading weights from remote instance. Can be 'transfer_engine', 'nccl', or 'modelexpress'. Default is 'nccl'.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>The backend for loading weights from a remote instance. Can be 'transfer_engine', 'nccl', or 'modelexpress'. With `--enable-weight-reshard`, the TransferEngine backend validates the Mooncake reshard capability at startup.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`nccl`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>transfer_engine</code>, <code>nccl</code>, <code>modelexpress</code></td>
     </tr>

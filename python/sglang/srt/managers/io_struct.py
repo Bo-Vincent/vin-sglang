@@ -53,7 +53,7 @@ from sglang.srt.environ import envs
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.managers.schedule_batch import Modality
-from sglang.srt.model_executor.weight_runtime_manifest import (
+from sglang.srt.model_executor.weight_inventory_contracts import (
     DEFAULT_REMOTE_INSTANCE_WEIGHT_TRANSFER_LEASE_TIMEOUT_SEC,
 )
 from sglang.srt.multimodal.mm_utils import has_valid_data
@@ -1536,6 +1536,9 @@ class PauseContinueBroadcastReq(BaseReq, kw_only=True):
 class UpdateWeightFromDiskReqInput(BaseReq, kw_only=True):
     # The model path with the new weights
     model_path: str
+    # Caller-attested immutable lineage for the new weight content. Required
+    # when runtime weight reshard export is enabled.
+    revision: Optional[str] = None
     # The format to load the weights
     load_format: Optional[str] = None
     # Whether to abort all requests before updating weights
@@ -1673,7 +1676,6 @@ class BeginRemoteInstanceWeightTransferReqInput(BaseReq, kw_only=True):
     model_id: str
     revision: str
     lease_timeout_sec: int = DEFAULT_REMOTE_INSTANCE_WEIGHT_TRANSFER_LEASE_TIMEOUT_SEC
-    manifest_format: str = "runtime_v1"
 
 
 class BeginRemoteInstanceWeightTransferReqOutput(BaseReq, kw_only=True):
@@ -1681,9 +1683,8 @@ class BeginRemoteInstanceWeightTransferReqOutput(BaseReq, kw_only=True):
     success: bool
     message: str
     session_state: str = "unknown"
-    manifests: Optional[List[Dict[str, Any]]] = None
-    placements: Optional[List[Dict[str, Any]]] = None
-    bindings: Optional[List[Dict[str, Any]]] = None
+    placement_inventories: Optional[List[Dict[str, Any]]] = None
+    binding_inventories: Optional[List[Dict[str, Any]]] = None
 
 
 class ReleaseRemoteInstanceWeightTransferReqInput(BaseReq, kw_only=True):

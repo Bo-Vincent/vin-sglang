@@ -80,7 +80,8 @@ class LoadConfig:
     remote_instance_weight_loader_backend: Optional[str] = None
     remote_instance_weight_loader_transfer_engine: Optional[Any] = None
     remote_instance_weight_loader_transfer_engine_session_id: Optional[str] = None
-    remote_instance_weight_runtime_manifest_builder: Optional[Any] = None
+    remote_instance_weight_inventory_builder: Optional[Any] = None
+    weight_reshard_resource_id: Optional[str] = None
     modelexpress_url: Optional[str] = None
     modelexpress_transport: str = "nixl"
 

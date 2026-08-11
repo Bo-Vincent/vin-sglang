@@ -1771,9 +1771,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             self.model_update_lock.writer_lock if not is_paused else nullcontext()
         )
         async with lock_context:
-            success, message, num_paused_requests = (
-                await self._wait_for_model_update_from_disk(obj)
-            )
+            (
+                success,
+                message,
+                num_paused_requests,
+            ) = await self._wait_for_model_update_from_disk(obj)
 
         if success and obj.weight_version is not None:
             self._update_weight_version_if_provided(obj.weight_version)
@@ -1781,11 +1783,17 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         return success, message, num_paused_requests
 
-    def _update_model_path_info(self, model_path: str, load_format: str):
+    def _update_model_path_info(
+        self,
+        model_path: str,
+        load_format: str,
+        revision: str | None,
+    ):
         self.served_model_name = model_path
-        self.server_args.override(
-            "tokenizer.update_weights", model_path=model_path, load_format=load_format
-        )
+        updates = {"model_path": model_path, "load_format": load_format}
+        if revision is not None:
+            updates["revision"] = revision
+        self.server_args.override("tokenizer.update_weights", **updates)
         self.model_path = model_path
 
     async def _wait_for_model_update_from_disk(
@@ -1799,14 +1807,22 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if expected_workers == 1:
             result = await self.model_update_result
             if result.success:
-                self._update_model_path_info(obj.model_path, obj.load_format)
+                self._update_model_path_info(
+                    obj.model_path,
+                    obj.load_format,
+                    obj.revision,
+                )
             return result.success, result.message, result.num_paused_requests
         else:
             result = await self.model_update_result
 
             all_success = all([r.success for r in result])
             if all_success is True:
-                self._update_model_path_info(obj.model_path, obj.load_format)
+                self._update_model_path_info(
+                    obj.model_path,
+                    obj.load_format,
+                    obj.revision,
+                )
             all_message = [r.message for r in result]
             all_message = " | ".join(all_message)
             all_paused_requests = [r.num_paused_requests for r in result]
@@ -2665,7 +2681,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 filename = os.path.join(
                     self.crash_dump_folder,
                     hostname,
-                    f'crash_dump_{datetime.now().strftime("%Y-%m-%d_%H-%M-%S")}.pkl',
+                    f"crash_dump_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.pkl",
                 )
                 os.makedirs(os.path.dirname(filename), exist_ok=True)
 

@@ -39,11 +39,21 @@ import numpy as np
 import torch
 
 from sglang.srt.constants import GIB_BYTES
+from sglang.srt.model_executor.weight_inventory_contracts import (
+    validate_remote_weight_lineage,
+)
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     RemoteInstanceWeightLoaderBackend,
     RemoteInstanceWeightTransferWorldCoordinator,
     get_remote_instance_transfer_engine_info_per_rank,
     register_memory_region,
+    validate_remote_instance_weight_transfer_world_group,
+)
+from sglang.srt.model_loader.weight_reshard_backend import (
+    WeightReshardBackendError,
+    WeightReshardCompletionUnknownError,
+    create_weight_reshard_backend,
+    validate_weight_reshard_execution_result,
 )
 from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils import get_available_gpu_memory
@@ -76,6 +86,7 @@ from sglang.srt.distributed import (
     model_parallel_is_initialized,
 )
 from sglang.srt.distributed.parallel_state import get_world_group
+from sglang.srt.environ import envs
 from sglang.srt.layers.modelopt_utils import QUANT_CFG_CHOICES
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
@@ -85,9 +96,6 @@ from sglang.srt.model_loader.utils import (
     get_model_architecture,
     set_default_torch_dtype,
 )
-from sglang.srt.utils.common import is_cuda_alike
-
-from sglang.srt.environ import envs
 from sglang.srt.model_loader.weight_utils import (
     buffered_multi_thread_safetensors_weights_iterator,
     download_safetensors_index_file_from_hf,
@@ -116,7 +124,7 @@ from sglang.srt.utils import (
     rank0_log,
     set_weight_attrs,
 )
-from sglang.srt.utils.common import temp_set_env
+from sglang.srt.utils.common import is_cuda_alike, temp_set_env
 
 # Constants for memory management
 DEFAULT_GPU_MEMORY_FRACTION_FOR_CALIBRATION = (
@@ -149,6 +157,51 @@ class _HeterogeneousUnknownTransferQuarantine:
 _HETEROGENEOUS_UNKNOWN_TRANSFER_QUARANTINE: list[
     _HeterogeneousUnknownTransferQuarantine
 ] = []
+
+
+def _require_target_world_activation_success(
+    world_group: Any,
+    local_error: Exception | None,
+) -> None:
+    try:
+        world_size = validate_remote_instance_weight_transfer_world_group(world_group)
+    except ValueError as error:
+        raise WeightReshardBackendError(str(error)) from error
+    local_outcome = {
+        "success": local_error is None,
+        "message": (
+            ""
+            if local_error is None
+            else f"{type(local_error).__name__}: {local_error}"
+        ),
+    }
+    try:
+        gathered = world_group.all_gather_object(local_outcome)
+    except Exception as error:
+        raise WeightReshardBackendError(
+            f"failed to coordinate target-world activation: {error}"
+        ) from error
+
+    if not isinstance(gathered, list) or len(gathered) != world_size:
+        raise WeightReshardBackendError(
+            "target world returned an invalid activation outcome set"
+        )
+    failures = []
+    for rank, outcome in enumerate(gathered):
+        if (
+            not isinstance(outcome, dict)
+            or type(outcome.get("success")) is not bool
+            or type(outcome.get("message")) is not str
+        ):
+            raise WeightReshardBackendError(
+                f"target rank {rank} returned an invalid activation outcome"
+            )
+        if not outcome["success"]:
+            failures.append(f"rank {rank}: {outcome['message']}")
+    if failures:
+        raise WeightReshardBackendError(
+            "target-world content activation failed: " + " | ".join(failures)
+        )
 
 
 def _transfer_completion_status_name(status: Any) -> str:
@@ -2280,6 +2333,8 @@ class RemoteInstanceModelLoader(BaseModelLoader):
         logger.info("Loading weights from remote instance ...")
         load_config = self.load_config
 
+        self._validate_reshard_backend_selection()
+
         assert load_config.load_format == LoadFormat.REMOTE_INSTANCE, (
             f"Model loader {self.load_config.load_format} is not supported for "
             f"load format {load_config.load_format}"
@@ -2315,30 +2370,35 @@ class RemoteInstanceModelLoader(BaseModelLoader):
                     "Transfer engine is not initialized for remote instance "
                     "model loader with `transfer_engine` backend. "
                 )
-            logger.info(
-                "TransferEngine registering memory regions (this may take a few seconds)..."
-            )
-            # register memory region
-            self.remote_instance_transfer_engine_weight_info = register_memory_region(
-                model, load_config.remote_instance_weight_loader_transfer_engine
-            )
-            logger.info(
-                "TransferEngine memory regions have been successfully registered."
-            )
-
             # transfer weights
             seed_url = f"http://{load_config.remote_instance_weight_loader_seed_instance_ip}:{load_config.remote_instance_weight_loader_seed_instance_service_port}"
-            if load_config.remote_instance_weight_runtime_manifest_builder is not None:
+            if load_config.remote_instance_weight_inventory_builder is not None:
                 success = self.load_model_from_remote_instance_by_transfer_engine_heterogeneous(
                     model,
                     load_config.remote_instance_weight_loader_transfer_engine,
                     seed_url,
                     load_config.remote_instance_weight_loader_transfer_engine_session_id,
-                    load_config.remote_instance_weight_runtime_manifest_builder,
-                    target_model_id=model_config.model_path,
-                    target_revision=model_config.revision or "default",
+                    load_config.remote_instance_weight_inventory_builder,
+                    target_model_id=(
+                        load_config.weight_reshard_resource_id
+                        or model_config.model_path
+                    ),
+                    target_revision=model_config.revision,
                 )
             else:
+                logger.info(
+                    "TransferEngine registering memory regions "
+                    "(this may take a few seconds)..."
+                )
+                self.remote_instance_transfer_engine_weight_info = (
+                    register_memory_region(
+                        model,
+                        load_config.remote_instance_weight_loader_transfer_engine,
+                    )
+                )
+                logger.info(
+                    "TransferEngine memory regions have been successfully registered."
+                )
                 success = self.load_model_from_remote_instance_by_transfer_engine(
                     model,
                     load_config.remote_instance_weight_loader_transfer_engine,
@@ -2370,6 +2430,19 @@ class RemoteInstanceModelLoader(BaseModelLoader):
             raise ValueError("Invalid remote instance weight loader backend.")
 
         return model.eval()
+
+    def _validate_reshard_backend_selection(self) -> None:
+        """Keep canonical reshard targets out of legacy loader branches."""
+
+        if (
+            self.load_config.remote_instance_weight_inventory_builder is not None
+            and self.load_config.remote_instance_weight_loader_backend
+            != RemoteInstanceWeightLoaderBackend.TRANSFER_ENGINE
+        ):
+            raise ValueError(
+                "A remote_instance target with a weight inventory builder requires "
+                "the transfer_engine backend"
+            )
 
     def load_model_from_remote_instance_by_nccl(
         self, model, client, model_config: ModelConfig, device_config: DeviceConfig
@@ -2527,49 +2600,37 @@ class RemoteInstanceModelLoader(BaseModelLoader):
 
         return True
 
-    @staticmethod
-    def _runtime_v1_target_manifest_builder(target_manifest_builder):
-        owner = getattr(target_manifest_builder, "__self__", None)
-        legacy_builder = getattr(
-            owner,
-            "build_remote_instance_target_weight_runtime_manifest",
-            None,
-        )
-        return legacy_builder if callable(legacy_builder) else target_manifest_builder
-
-    @staticmethod
-    def _require_manifest_identity(
-        manifests,
-        *,
-        model_id: str,
-        revision: str,
-        role: str,
-    ) -> None:
-        mismatches = {
-            (manifest.model_id, manifest.revision)
-            for manifest in manifests
-            if (manifest.model_id, manifest.revision) != (model_id, revision)
-        }
-        if mismatches:
-            raise ValueError(
-                f"{role} manifest identity does not match target model "
-                f"{model_id}@{revision}: {sorted(mismatches)}"
-            )
-
     def load_model_from_remote_instance_by_transfer_engine_heterogeneous(
         self,
         model,
         transfer_engine,
         seed_url,
         local_session_id,
-        target_manifest_builder,
+        target_inventory_builder,
         *,
         target_model_id: str,
-        target_revision: str,
+        target_revision: str | None,
     ) -> bool:
+        try:
+            target_model_id, target_revision = validate_remote_weight_lineage(
+                model_id=target_model_id,
+                revision=target_revision,
+            )
+        except ValueError:
+            logger.exception(
+                "Heterogeneous remote-instance loading requires an explicit "
+                "content-lineage revision; a default label is not restart-safe"
+            )
+            return False
         world_group = get_world_group()
+        try:
+            world_size = validate_remote_instance_weight_transfer_world_group(
+                world_group
+            )
+        except ValueError:
+            logger.exception("Invalid target-world reshard coordination group")
+            return False
         local_quarantined = bool(_HETEROGENEOUS_UNKNOWN_TRANSFER_QUARANTINE)
-        world_size = getattr(world_group, "world_size", 1)
         if world_size > 1:
             try:
                 quarantine_flags = world_group.all_gather_object(local_quarantined)
@@ -2590,6 +2651,7 @@ class RemoteInstanceModelLoader(BaseModelLoader):
                 "restart the target process before another remote weight load"
             )
             return False
+
         server_args = get_server_args()
         if server_args is not None and getattr(server_args, "torchao_config", None):
             logger.error(
@@ -2598,27 +2660,21 @@ class RemoteInstanceModelLoader(BaseModelLoader):
             )
             return False
         try:
-            from mooncake.weight_transfer import (
-                MemoryRegistrationLease,
-                MooncakeTransferEngineReader,
-                RuntimeManifest,
-                TransferCompletionUnknownError,
-                TransferEngineError,
-                plan_runtime_transfer_to_local_target,
+            backend = create_weight_reshard_backend(
+                self.load_config.remote_instance_weight_loader_backend
             )
-        except Exception:
-            logger.exception("Cannot import Mooncake heterogeneous weight transfer")
+        except WeightReshardBackendError:
+            logger.exception("Cannot initialize the weight reshard backend")
             return False
 
         started = time.perf_counter()
         phase_seconds = {
             "acquire": 0.0,
-            "source_manifest": 0.0,
-            "target_manifest": 0.0,
-            "plan": 0.0,
+            "prepare": 0.0,
             "transfer": 0.0,
             "synchronize": 0.0,
             "post_load": 0.0,
+            "activation": 0.0,
             "release": 0.0,
         }
         coordinator = RemoteInstanceWeightTransferWorldCoordinator(
@@ -2634,218 +2690,73 @@ class RemoteInstanceModelLoader(BaseModelLoader):
         if transfer_session is None:
             logger.error("Cannot acquire remote weight transfer session.")
             return False
-        inventories = transfer_session.manifests
-        source_placement_inventories = getattr(
-            transfer_session, "source_placements", None
-        )
-        source_binding_inventories = getattr(transfer_session, "source_bindings", None)
-        manifest_format = getattr(transfer_session, "manifest_format", "runtime_v1")
+
         transfer_success = False
         release_safe = True
         release_success = False
-        receipts = ()
-        plan = None
+        finish_attempted = False
+        execution_result = None
+        operation_count = 0
         try:
             with ExitStack() as transfer_resources:
                 planning_error = None
+                prepared = None
+                prepare_started = time.perf_counter()
                 try:
-                    source_manifest_started = time.perf_counter()
-                    source_placements = ()
-                    source_bindings = ()
-                    if manifest_format == "placement_binding_v1":
-                        if (
-                            not source_placement_inventories
-                            or not source_binding_inventories
-                            or len(source_placement_inventories)
-                            != len(source_binding_inventories)
-                        ):
-                            raise ValueError(
-                                "source placement and runtime binding inventories "
-                                "must be paired"
-                            )
-                        from mooncake.weight_transfer import (
-                            RuntimeBindingManifest,
-                            SourcePlacementManifest,
-                            bind_runtime_manifest,
-                        )
-
-                        source_placements = tuple(
-                            SourcePlacementManifest.from_runtime_inventory(inventory)
-                            for inventory in source_placement_inventories
-                        )
-                        source_bindings = tuple(
-                            RuntimeBindingManifest.from_runtime_inventory(inventory)
-                            for inventory in source_binding_inventories
-                        )
-                        source_manifests = tuple(
-                            bind_runtime_manifest(placement, binding)
-                            for placement, binding in zip(
-                                source_placements, source_bindings
-                            )
-                        )
-                    elif manifest_format == "runtime_v1":
-                        if not inventories:
-                            raise ValueError(
-                                "source runtime manifest inventories must not be empty"
-                            )
-                        source_manifests = tuple(
-                            RuntimeManifest.from_runtime_inventory(inventory)
-                            for inventory in inventories
-                        )
-                    else:
-                        raise ValueError(
-                            f"unsupported source manifest format: {manifest_format}"
-                        )
-                    phase_seconds["source_manifest"] = (
-                        time.perf_counter() - source_manifest_started
-                    )
-                    source_identity_manifests = (
-                        source_placements if source_placements else source_manifests
-                    )
-                    self._require_manifest_identity(
-                        source_identity_manifests,
-                        model_id=target_model_id,
-                        revision=target_revision,
-                        role="source",
-                    )
-                    target_manifest_started = time.perf_counter()
-                    selected_target_builder = target_manifest_builder
-                    if manifest_format == "runtime_v1":
-                        selected_target_builder = (
-                            self._runtime_v1_target_manifest_builder(
-                                target_manifest_builder
-                            )
-                        )
-                    target_resource = transfer_resources.enter_context(
-                        selected_target_builder(
+                    prepared = transfer_resources.enter_context(
+                        backend.prepare(
                             model=model,
-                            model_id=target_model_id,
-                            revision=target_revision,
-                            instance_id=f"sglang:{local_session_id}",
-                            endpoint=local_session_id,
+                            source_placement_inventories=tuple(
+                                transfer_session.placement_inventories
+                            ),
+                            source_binding_inventories=tuple(
+                                transfer_session.binding_inventories
+                            ),
+                            target_inventory_builder=target_inventory_builder,
+                            target_model_id=target_model_id,
+                            target_revision=target_revision,
+                            target_instance_id=f"sglang:{local_session_id}",
+                            target_endpoint=local_session_id,
+                            world_group=world_group,
                         )
                     )
-                    if manifest_format == "placement_binding_v1":
-                        if not hasattr(target_resource, "placement") or not callable(
-                            getattr(target_resource, "bind", None)
-                        ):
-                            raise ValueError(
-                                "placement_binding_v1 requires a target manifest "
-                                "session with placement and bind()"
-                            )
-                        from mooncake.weight_transfer import (
-                            RuntimeBindingManifest,
-                            TargetPlacementManifest,
-                            bind_logical_transfer_plan,
-                            bind_runtime_manifest,
-                            plan_placement_transfer_to_local_target,
-                        )
-
-                        target_placement = (
-                            TargetPlacementManifest.from_runtime_inventory(
-                                target_resource.placement
-                            )
-                        )
-                        self._require_manifest_identity(
-                            (target_placement,),
-                            model_id=target_model_id,
-                            revision=target_revision,
-                            role="target",
-                        )
-                        phase_seconds["target_manifest"] = (
-                            time.perf_counter() - target_manifest_started
-                        )
-                        plan_started = time.perf_counter()
-                        logical_plan = plan_placement_transfer_to_local_target(
-                            source_placements, target_placement
-                        )
-                        target_binding_inventory = transfer_resources.enter_context(
-                            target_resource.bind()
-                        )
-                        target_binding = RuntimeBindingManifest.from_runtime_inventory(
-                            target_binding_inventory
-                        )
-                        target_manifest = bind_runtime_manifest(
-                            target_placement, target_binding
-                        )
-                        plan = bind_logical_transfer_plan(
-                            logical_plan,
-                            (target_binding,),
-                            source_bindings=source_bindings,
-                        )
-                        phase_seconds["plan"] = time.perf_counter() - plan_started
-                    else:
-                        target_manifest = RuntimeManifest.from_runtime_inventory(
-                            target_resource
-                        )
-                        self._require_manifest_identity(
-                            (target_manifest,),
-                            model_id=target_model_id,
-                            revision=target_revision,
-                            role="target",
-                        )
-                        phase_seconds["target_manifest"] = (
-                            time.perf_counter() - target_manifest_started
-                        )
-                        plan_started = time.perf_counter()
-                        plan = plan_runtime_transfer_to_local_target(
-                            source_manifests, target_manifest
-                        )
-                        phase_seconds["plan"] = time.perf_counter() - plan_started
-                    source_registrations = tuple(
-                        MemoryRegistrationLease.from_fragment(
-                            fragment,
-                            runtime_lease_id=manifest.lease_id,
-                        )
-                        for manifest in source_manifests
-                        for fragment in manifest.fragments
-                    )
-                    target_registrations = tuple(
-                        MemoryRegistrationLease.from_fragment(
-                            fragment,
-                            runtime_lease_id=target_manifest.lease_id,
-                        )
-                        for fragment in target_manifest.fragments
-                    )
+                    operation_count = prepared.operation_count
                 except Exception as error:
                     planning_error = error
+                phase_seconds["prepare"] = time.perf_counter() - prepare_started
 
                 world_ready = coordinator.ready_for_transfer(planning_error is None)
                 if planning_error is not None:
                     raise planning_error
-                if not world_ready:
-                    raise RuntimeError(
+                if not world_ready or prepared is None:
+                    raise WeightReshardBackendError(
                         "target world is not ready for heterogeneous weight transfer"
                     )
 
                 transfer_started = time.perf_counter()
-                reader = MooncakeTransferEngineReader(
-                    transfer_engine,
-                    max_batch_operations=8192,
-                )
                 release_safe = False
                 try:
-                    receipts = reader.execute(
-                        plan,
-                        source_manifests,
-                        target_manifest,
-                        source_pre_registered=True,
-                        source_registrations=source_registrations,
-                        target_pre_registered=True,
-                        target_registrations=target_registrations,
+                    execution_result = backend.execute(
+                        prepared,
+                        transfer_engine=transfer_engine,
                     )
-                except TransferCompletionUnknownError as error:
+                    execution_result = validate_weight_reshard_execution_result(
+                        prepared,
+                        execution_result,
+                    )
+                except WeightReshardCompletionUnknownError as error:
+                    backend.retain_completion_unknown(prepared)
                     logger.error(
-                        "Transfer completion is unknown; retaining the target model, "
-                        "runtime binding, registrations, and source lease while "
-                        "draining %s",
+                        "Transfer completion is unknown; retaining backend-owned "
+                        "target bindings and registrations while draining %s",
                         error.pending_transfer_id,
                     )
                     pending_interrupt = None
                     for _ in range(_HETEROGENEOUS_UNKNOWN_DRAIN_MAX_ATTEMPTS):
                         try:
-                            terminal_status = reader.drain_pending_transfer(
-                                error.pending_transfer_id,
+                            terminal_status = backend.drain_pending_transfer(
+                                prepared,
+                                pending_transfer_id=error.pending_transfer_id,
                                 timeout_ms=_HETEROGENEOUS_UNKNOWN_DRAIN_TIMEOUT_MS,
                             )
                         except BaseException as drain_error:
@@ -2867,13 +2778,15 @@ class RemoteInstanceModelLoader(BaseModelLoader):
                             continue
                         if terminal_status == "COMPLETION_UNKNOWN":
                             continue
+                        backend.close_after_terminal(prepared)
                         release_safe = True
                         if pending_interrupt is not None:
                             raise pending_interrupt
-                        raise TransferEngineError(
+                        raise WeightReshardBackendError(
                             "heterogeneous transfer became terminal after an "
                             f"unknown completion state: {terminal_status}"
                         ) from error
+
                     quarantine_resources = transfer_resources.pop_all()
                     _HETEROGENEOUS_UNKNOWN_TRANSFER_QUARANTINE.append(
                         _HeterogeneousUnknownTransferQuarantine(
@@ -2882,19 +2795,15 @@ class RemoteInstanceModelLoader(BaseModelLoader):
                             owners=(
                                 model,
                                 transfer_engine,
-                                reader,
-                                tuple(source_manifests),
-                                target_manifest,
-                                source_registrations,
-                                target_registrations,
+                                backend,
+                                prepared,
                                 transfer_session,
-                                plan,
                             ),
                         )
                     )
                     logger.critical(
                         "Pending transfer %s did not reach a terminal state after "
-                        "%d drain attempts; target resources are retained for "
+                        "%d drain attempts; backend resources are retained for "
                         "process lifetime and source release remains blocked",
                         error.pending_transfer_id,
                         _HETEROGENEOUS_UNKNOWN_DRAIN_MAX_ATTEMPTS,
@@ -2902,42 +2811,120 @@ class RemoteInstanceModelLoader(BaseModelLoader):
                     if pending_interrupt is not None:
                         raise pending_interrupt
                     raise
+                except WeightReshardBackendError:
+                    # The backend explicitly attests that execution reached a
+                    # terminal state, so normal context cleanup is safe.
+                    raise
+                except BaseException as error:
+                    # Once execute() starts, an untyped exception cannot prove
+                    # whether DMA was submitted. Keep every backend-owned
+                    # resource alive and block source mutation just as for an
+                    # explicit completion-unknown result.
+                    pending_transfer_id = (
+                        f"untracked-execution:{transfer_session.transfer_id}"
+                    )
+                    try:
+                        backend.retain_completion_unknown(prepared)
+                    except BaseException:
+                        logger.exception(
+                            "Backend failed to mark an untracked transfer as "
+                            "completion-unknown; retaining its full context anyway"
+                        )
+                    quarantine_resources = transfer_resources.pop_all()
+                    _HETEROGENEOUS_UNKNOWN_TRANSFER_QUARANTINE.append(
+                        _HeterogeneousUnknownTransferQuarantine(
+                            pending_transfer_id=pending_transfer_id,
+                            resources=quarantine_resources,
+                            owners=(
+                                model,
+                                transfer_engine,
+                                backend,
+                                prepared,
+                                transfer_session,
+                            ),
+                        )
+                    )
+                    release_safe = False
+                    logger.critical(
+                        "Backend execute() raised without a terminal completion "
+                        "attestation; target resources are retained for process "
+                        "lifetime and source release remains blocked"
+                    )
+                    if isinstance(error, Exception):
+                        raise WeightReshardCompletionUnknownError(
+                            "backend execution ended without a terminal "
+                            "completion attestation",
+                            pending_transfer_id=pending_transfer_id,
+                        ) from error
+                    raise
                 release_safe = True
                 phase_seconds["transfer"] = time.perf_counter() - transfer_started
-            synchronize_started = time.perf_counter()
-            current_platform.synchronize()
-            phase_seconds["synchronize"] = time.perf_counter() - synchronize_started
-            post_load_started = time.perf_counter()
-            _post_load_weights(model)
-            phase_seconds["post_load"] = time.perf_counter() - post_load_started
-            transfer_success = True
-        except TransferCompletionUnknownError:
+
+                synchronize_started = time.perf_counter()
+                current_platform.synchronize()
+                phase_seconds["synchronize"] = time.perf_counter() - synchronize_started
+                post_load_started = time.perf_counter()
+                _post_load_weights(model)
+                phase_seconds["post_load"] = time.perf_counter() - post_load_started
+
+                release_started = time.perf_counter()
+                finish_attempted = True
+                world_transfer_success, release_success = coordinator.finish(
+                    local_success=True,
+                    local_release_safe=release_safe,
+                )
+                phase_seconds["release"] = time.perf_counter() - release_started
+                if not world_transfer_success or not release_success:
+                    raise WeightReshardBackendError(
+                        "target-world transfer or source lease release failed before "
+                        "content activation"
+                    )
+
+                activation_started = time.perf_counter()
+                local_activation_error = None
+                try:
+                    backend.activate(prepared)
+                except Exception as error:
+                    local_activation_error = error
+                try:
+                    _require_target_world_activation_success(
+                        world_group,
+                        local_activation_error,
+                    )
+                except WeightReshardBackendError as error:
+                    if local_activation_error is not None:
+                        raise error from local_activation_error
+                    raise
+                phase_seconds["activation"] = time.perf_counter() - activation_started
+                transfer_success = True
+        except WeightReshardCompletionUnknownError:
             release_safe = False
             logger.exception(
                 "Heterogeneous remote-instance transfer completion remains unknown; "
-                "target resources and source lease must remain quarantined"
+                "backend resources and source lease remain quarantined"
             )
-        except TransferEngineError:
+        except WeightReshardBackendError:
             release_safe = True
             logger.exception(
-                "Heterogeneous remote-instance Transfer Engine loading failed with "
-                "a known terminal completion state"
+                "Heterogeneous remote-instance backend failed with a known "
+                "terminal state"
             )
         except Exception:
             release_safe = True
             logger.exception("Heterogeneous remote-instance weight loading failed")
         finally:
-            release_started = time.perf_counter()
-            try:
-                transfer_success, release_success = coordinator.finish(
-                    local_success=transfer_success,
-                    local_release_safe=release_safe,
-                )
-            except Exception:
-                transfer_success = False
-                release_success = False
-                logger.exception("Failed to finish remote weight transfer session")
-            phase_seconds["release"] = time.perf_counter() - release_started
+            if not finish_attempted:
+                release_started = time.perf_counter()
+                finish_attempted = True
+                try:
+                    _, release_success = coordinator.finish(
+                        local_success=transfer_success,
+                        local_release_safe=release_safe,
+                    )
+                except Exception:
+                    release_success = False
+                    logger.exception("Failed to finish remote weight transfer session")
+                phase_seconds["release"] = time.perf_counter() - release_started
 
         if not transfer_success:
             logger.error(
@@ -2955,17 +2942,18 @@ class RemoteInstanceModelLoader(BaseModelLoader):
                 transfer_session.transfer_id,
             )
             return False
+        if execution_result is None:
+            logger.error("Weight reshard backend returned no execution result")
+            return False
 
         logger.info(
             "Loaded heterogeneous remote-instance weights: "
-            "manifest_format=%s, transfer_id=%s, release_success=true, bytes=%d, "
-            "compact_operations=%d, segments=%d, elapsed=%.4fs; "
-            "phases: %s",
-            manifest_format,
+            "transfer_id=%s, release_success=true, bytes=%d, "
+            "compact_operations=%d, segments=%d, elapsed=%.4fs; phases: %s",
             transfer_session.transfer_id,
-            sum(receipt.nbytes for receipt in receipts),
-            len(plan.operations),
-            sum(receipt.operation_count for receipt in receipts),
+            execution_result.nbytes,
+            operation_count,
+            execution_result.segment_count,
             time.perf_counter() - started,
             ", ".join(
                 f"{name}={seconds:.4f}s" for name, seconds in phase_seconds.items()

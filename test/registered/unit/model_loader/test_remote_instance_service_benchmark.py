@@ -26,6 +26,7 @@ def _args(**overrides):
     values = dict(
         python="python",
         model="model",
+        content_revision="checkpoint-sha-42",
         source_tp_size=4,
         target_tp_size=2,
         source_pp_size=1,
@@ -41,7 +42,7 @@ def _args(**overrides):
         disable_custom_all_reduce=False,
         disable_shared_experts_fusion=True,
         moe_runner_backend="triton",
-        modes=("cold", "legacy", "manifest"),
+        modes=("cold", "legacy", "reshard"),
         bootstrap_port=31999,
         source_port=31000,
         protocol="tcp",
@@ -189,7 +190,10 @@ def test_server_command_describes_dp_and_ep_topology() -> None:
     args = _args(source_dp_size=2, target_dp_size=3)
 
     source = benchmark._server_command(args, port=31000, load_mode="source")
-    target = benchmark._server_command(args, port=32000, load_mode="manifest")
+    target = benchmark._server_command(args, port=32000, load_mode="reshard")
+
+    assert source[source.index("--revision") + 1] == "checkpoint-sha-42"
+    assert target[target.index("--revision") + 1] == "checkpoint-sha-42"
 
     assert source[source.index("--dp-size") + 1] == "2"
     assert source[source.index("--ep-size") + 1] == "4"
@@ -197,6 +201,8 @@ def test_server_command_describes_dp_and_ep_topology() -> None:
     assert target[target.index("--ep-size") + 1] == "2"
     assert "--disable-shared-experts-fusion" in source
     assert "--disable-shared-experts-fusion" in target
+    assert "--enable-deterministic-inference" in source
+    assert "--enable-deterministic-inference" in target
 
 
 def test_legacy_mode_is_skipped_for_heterogeneous_dp_or_ep() -> None:
@@ -204,13 +210,13 @@ def test_legacy_mode_is_skipped_for_heterogeneous_dp_or_ep() -> None:
         _args(source_tp_size=2, target_tp_size=2)
     )
 
-    assert executed == ["cold", "manifest"]
+    assert executed == ["cold", "reshard"]
     assert [item["mode"] for item in skipped] == ["legacy"]
     assert "source_ep_size=4" in skipped[0]["reason"]
     assert "target_ep_size=2" in skipped[0]["reason"]
 
 
-def test_legacy_mode_is_skipped_when_both_sides_use_dp_two() -> None:
+def test_reuse_modes_are_skipped_when_both_sides_use_dp_two() -> None:
     executed, skipped = benchmark._eligible_modes(
         _args(
             source_tp_size=2,
@@ -222,19 +228,19 @@ def test_legacy_mode_is_skipped_when_both_sides_use_dp_two() -> None:
         )
     )
 
-    assert executed == ["cold", "manifest"]
-    assert [item["mode"] for item in skipped] == ["legacy"]
-    assert "source_dp_size=2" in skipped[0]["reason"]
+    assert executed == ["cold"]
+    assert [item["mode"] for item in skipped] == ["legacy", "reshard"]
+    assert all("source_dp_size=2" in item["reason"] for item in skipped)
 
 
 def test_heterogeneous_reuse_uses_cold_target_as_correctness_baseline() -> None:
     cold_target = {"text": "cold-target-output"}
 
-    assert benchmark._ordered_modes(("manifest", "cold")) == ["cold", "manifest"]
+    assert benchmark._ordered_modes(("reshard", "cold")) == ["cold", "reshard"]
     assert benchmark._target_expected_response("cold", None) is None
-    assert benchmark._target_expected_response("manifest", cold_target) is cold_target
+    assert benchmark._target_expected_response("reshard", cold_target) is cold_target
     with pytest.raises(RuntimeError, match="cold target baseline"):
-        benchmark._target_expected_response("manifest", None)
+        benchmark._target_expected_response("reshard", None)
 
 
 def test_response_parity_compares_logprobs_with_tolerance() -> None:
@@ -266,7 +272,7 @@ def test_response_parity_compares_logprobs_with_tolerance() -> None:
 def test_source_probe_p95_must_stay_within_baseline_distribution(tmp_path) -> None:
     with pytest.raises(RuntimeError, match="source probe p95"):
         benchmark._assert_iteration_consistency(
-            mode="manifest",
+            mode="reshard",
             iteration=0,
             measurements=[],
             source_probe={
@@ -285,7 +291,7 @@ def test_source_probe_p95_must_stay_within_baseline_distribution(tmp_path) -> No
 def test_source_probe_requires_enough_samples_for_p95(tmp_path) -> None:
     with pytest.raises(RuntimeError, match="fewer than 5"):
         benchmark._assert_iteration_consistency(
-            mode="manifest",
+            mode="reshard",
             iteration=0,
             measurements=[],
             source_probe={
@@ -301,18 +307,18 @@ def test_source_probe_requires_enough_samples_for_p95(tmp_path) -> None:
         )
 
 
-def test_manifest_log_contract_requires_the_heterogeneous_loader(tmp_path) -> None:
-    log_path = tmp_path / "manifest.log"
+def test_reshard_log_contract_requires_the_heterogeneous_loader(tmp_path) -> None:
+    log_path = tmp_path / "reshard.log"
     log_path.write_text(
         "TransferEngine memory regions have been successfully registered.\n"
         "Loaded heterogeneous remote-instance weights: "
-        "manifest_format=placement_binding_v1, transfer_id=transfer-1, "
+        "transfer_id=transfer-1, "
         "release_success=true, bytes=4096, "
         "compact_operations=2, segments=4, elapsed=0.1s\n",
         encoding="utf-8",
     )
 
-    evidence = benchmark._assert_reuse_log_contract("manifest", log_path)
+    evidence = benchmark._assert_reuse_log_contract("reshard", log_path)
 
     assert evidence["passed"] is True
     assert (
@@ -320,37 +326,36 @@ def test_manifest_log_contract_requires_the_heterogeneous_loader(tmp_path) -> No
     )
 
 
-def test_manifest_log_contract_rejects_missing_success_marker(tmp_path) -> None:
-    log_path = tmp_path / "manifest.log"
+def test_reshard_log_contract_rejects_missing_success_marker(tmp_path) -> None:
+    log_path = tmp_path / "reshard.log"
     log_path.write_text(
         "TransferEngine memory regions have been successfully registered.\n",
         encoding="utf-8",
     )
 
     with pytest.raises(RuntimeError, match="missing required log marker"):
-        benchmark._assert_reuse_log_contract("manifest", log_path)
+        benchmark._assert_reuse_log_contract("reshard", log_path)
 
 
 @pytest.mark.parametrize(
     "failure_marker",
     [
         "Fallback load_format to 'auto'",
-        "using the runtime-v1 target builder",
-        "manifest_format=runtime_v1",
+        "using a retired target inventory builder",
         "Heterogeneous remote-instance weight loading failed",
         "completion remains unknown",
         "Loaded weights but failed to release source transfer session",
         "Remote weight transfer lease renewal failed",
     ],
 )
-def test_manifest_log_contract_rejects_fallback_and_transfer_failures(
+def test_reshard_log_contract_rejects_fallback_and_transfer_failures(
     tmp_path, failure_marker
 ) -> None:
-    log_path = tmp_path / "manifest.log"
+    log_path = tmp_path / "reshard.log"
     log_path.write_text(
         "TransferEngine memory regions have been successfully registered.\n"
         "Loaded heterogeneous remote-instance weights: "
-        "manifest_format=placement_binding_v1, transfer_id=transfer-1, "
+        "transfer_id=transfer-1, "
         "release_success=true, bytes=4096, "
         "compact_operations=2, segments=4, elapsed=0.1s\n"
         f"{failure_marker}\n",
@@ -358,15 +363,15 @@ def test_manifest_log_contract_rejects_fallback_and_transfer_failures(
     )
 
     with pytest.raises(RuntimeError, match="forbidden log marker"):
-        benchmark._assert_reuse_log_contract("manifest", log_path)
+        benchmark._assert_reuse_log_contract("reshard", log_path)
 
 
 def test_execution_schedule_balances_reuse_mode_order() -> None:
-    assert benchmark._execution_schedule(("manifest", "cold", "legacy"), 4) == [
-        ["cold", "manifest", "legacy"],
-        ["cold", "legacy", "manifest"],
-        ["cold", "manifest", "legacy"],
-        ["cold", "legacy", "manifest"],
+    assert benchmark._execution_schedule(("reshard", "cold", "legacy"), 4) == [
+        ["cold", "reshard", "legacy"],
+        ["cold", "legacy", "reshard"],
+        ["cold", "reshard", "legacy"],
+        ["cold", "legacy", "reshard"],
     ]
 
 
@@ -378,6 +383,8 @@ def test_parse_args_counts_only_eligible_reuse_modes(monkeypatch) -> None:
             "benchmark",
             "--model",
             "model",
+            "--content-revision",
+            "revision-1",
             "--source-gpus",
             "0,1",
             "--target-gpus",
@@ -403,6 +410,8 @@ def test_parse_args_requires_complete_reuse_order_cycles(monkeypatch, capsys) ->
             "benchmark",
             "--model",
             "model",
+            "--content-revision",
+            "revision-1",
             "--source-gpus",
             "0,1",
             "--target-gpus",

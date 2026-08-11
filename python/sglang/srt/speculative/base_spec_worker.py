@@ -101,6 +101,7 @@ class BaseSpecWorker(ABC):
             success, message = runner.weight_updater.update_weights_from_disk(
                 recv_req.model_path,
                 recv_req.load_format,
+                revision=recv_req.revision,
                 recapture_cuda_graph=recv_req.recapture_cuda_graph,
             )
             if not success:

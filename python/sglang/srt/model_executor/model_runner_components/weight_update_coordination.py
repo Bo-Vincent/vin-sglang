@@ -1,11 +1,37 @@
 from __future__ import annotations
 
 import logging
+from contextlib import contextmanager
+from contextvars import ContextVar
 from functools import wraps
-from inspect import signature
-from typing import Any
+from typing import Any, Iterator, Mapping
 
 logger = logging.getLogger(__name__)
+
+_PRE_RESERVED_WEIGHT_UPDATES: ContextVar[Mapping[int, Any]] = ContextVar(
+    "pre_reserved_weight_updates",
+    default={},
+)
+
+
+@contextmanager
+def use_pre_reserved_weight_updates(
+    reservations: Mapping[int, Any],
+) -> Iterator[None]:
+    """Expose scheduler-owned reservations to nested worker update calls."""
+
+    token = _PRE_RESERVED_WEIGHT_UPDATES.set(dict(reservations))
+    try:
+        yield
+    finally:
+        _PRE_RESERVED_WEIGHT_UPDATES.reset(token)
+
+
+def _pre_reserved_token(begin_weight_update: Any) -> Any | None:
+    coordinator = getattr(begin_weight_update, "__self__", None)
+    if coordinator is None:
+        return None
+    return _PRE_RESERVED_WEIGHT_UPDATES.get().get(id(coordinator))
 
 
 def begin_uncoordinated_update(*, full_restore: bool = False) -> None:
@@ -17,18 +43,6 @@ def finish_uncoordinated_update(token: Any, *, success: bool) -> None:
     del token, success
 
 
-def _is_complete_disk_restore(update_method, self, args, kwargs) -> bool:
-    if update_method.__name__ != "update_weights_from_disk":
-        return False
-
-    method_signature = signature(update_method)
-    if "weight_name_filter" not in method_signature.parameters:
-        return False
-    bound = method_signature.bind(self, *args, **kwargs)
-    bound.apply_defaults()
-    return bound.arguments["weight_name_filter"] is None
-
-
 def coordinated_weight_update(method=None, *, full_restore: bool = False):
     if not isinstance(full_restore, bool):
         raise TypeError("full_restore must be a boolean")
@@ -36,13 +50,14 @@ def coordinated_weight_update(method=None, *, full_restore: bool = False):
     def decorate(update_method):
         @wraps(update_method)
         def wrapper(self, *args, **kwargs):
-            complete_restore = full_restore or _is_complete_disk_restore(
-                update_method, self, args, kwargs
-            )
+            reserved_token = _pre_reserved_token(self.begin_weight_update)
+            if reserved_token is not None:
+                return update_method(self, *args, **kwargs)
+
             try:
                 token = (
                     self.begin_weight_update(full_restore=True)
-                    if complete_restore
+                    if full_restore
                     else self.begin_weight_update()
                 )
             except Exception as error:

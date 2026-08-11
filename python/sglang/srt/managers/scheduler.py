@@ -124,9 +124,9 @@ from sglang.srt.managers.io_struct import (
     ProfileReq,
     ReleaseMemoryOccupationReqInput,
     ReleaseRemoteInstanceWeightTransferReqInput,
-    RenewRemoteInstanceWeightTransferReqInput,
     RemoveExternalCorpusReqInput,
     RemoveExternalCorpusReqOutput,
+    RenewRemoteInstanceWeightTransferReqInput,
     ResumeMemoryOccupationReqInput,
     RpcReqInput,
     RpcReqOutput,
@@ -1745,10 +1745,7 @@ class Scheduler(
 
     def init_weight_updater(self) -> None:
         remote_weight_transfer_cpu_group = self.world_group.cpu_group
-        if (
-            self.server_args.enable_weight_runtime_manifest
-            and len(self.world_group.ranks) > 1
-        ):
+        if self.server_args.enable_weight_reshard and len(self.world_group.ranks) > 1:
             remote_weight_transfer_cpu_group = torch.distributed.new_group(
                 ranks=self.world_group.ranks,
                 backend="gloo",

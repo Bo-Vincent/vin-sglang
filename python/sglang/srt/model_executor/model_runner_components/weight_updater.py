@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import gc
 import logging
 from dataclasses import dataclass, field
@@ -8,9 +9,6 @@ from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple, Union
 import torch
 
 from sglang.srt.configs.load_config import LoadConfig
-from sglang.srt.model_loader.loader import DefaultModelLoader, get_model_loader
-from sglang.srt.model_loader.utils import set_default_torch_dtype
-from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.model_executor.model_runner_components.load_model_utils import (
     refresh_runtime_weight_state,
 )
@@ -19,6 +17,9 @@ from sglang.srt.model_executor.model_runner_components.weight_update_coordinatio
     coordinated_weight_update,
     finish_uncoordinated_update,
 )
+from sglang.srt.model_loader.loader import DefaultModelLoader, get_model_loader
+from sglang.srt.model_loader.utils import set_default_torch_dtype
+from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.platforms import current_platform
 from sglang.srt.utils import (
     MultiprocessingSerializer,
@@ -119,6 +120,7 @@ class WeightUpdater:
         self: WeightUpdater,
         model_path: str,
         load_format: str,
+        revision: str | None = None,
         weight_name_filter: Optional[Callable[[str], bool]] = None,
         recapture_cuda_graph: bool = False,
     ) -> tuple[bool, str]:
@@ -129,16 +131,20 @@ class WeightUpdater:
         )
 
         target_device = torch.device(self.device)
-        self.model_config.model_path = model_path
+        previous_revision = getattr(self.model_config, "revision", None)
+        target_revision = previous_revision if revision is None else revision
+        target_model_config = copy.copy(self.model_config)
+        target_model_config.model_path = model_path
+        target_model_config.revision = target_revision
         load_config = LoadConfig(load_format=load_format)
 
         # Only support DefaultModelLoader for now
-        loader = get_model_loader(load_config, self.model_config)
-        if not isinstance(loader, DefaultModelLoader):
-            message = f"Failed to get model loader: {loader}."
+        target_loader = get_model_loader(load_config, target_model_config)
+        if not isinstance(target_loader, DefaultModelLoader):
+            message = f"Failed to get model loader: {target_loader}."
             return False, message
 
-        def get_weight_iter(config):
+        def get_weight_iter(loader, config):
             iter = loader._get_weights_iterator(
                 DefaultModelLoader.Source.init_new(config, self.get_model())
             )
@@ -149,26 +155,49 @@ class WeightUpdater:
 
             return iter
 
-        def model_load_weights(model, iter):
+        def model_load_weights(model, iter, loader):
             loader.load_weights_and_postprocess(model, iter, target_device)
             return model
 
         with set_default_torch_dtype(self.model_config.dtype):
             try:
-                iter = get_weight_iter(self.model_config)
+                iter = get_weight_iter(target_loader, target_model_config)
             except Exception as e:
                 message = f"Failed to get weights iterator: {e}."
                 return False, message
             try:
-                model = model_load_weights(self.get_model(), iter)
+                model = model_load_weights(self.get_model(), iter, target_loader)
             except Exception as e:
-                message = (
-                    f"Failed to update weights: {e}.\nRolling back to original weights."
-                )
                 del iter
                 gc.collect()
-                iter = get_weight_iter(self.model_config)
-                model_load_weights(self.get_model(), iter)
+                try:
+                    rollback_loader = get_model_loader(load_config, self.model_config)
+                    if not isinstance(rollback_loader, DefaultModelLoader):
+                        raise TypeError(
+                            f"failed to get previous model loader: {rollback_loader}"
+                        )
+                    rollback_iter = get_weight_iter(
+                        rollback_loader,
+                        self.model_config,
+                    )
+                    rollback_model = model_load_weights(
+                        self.get_model(),
+                        rollback_iter,
+                        rollback_loader,
+                    )
+                    refresh_runtime_weight_state(rollback_model)
+                except Exception as rollback_error:
+                    message = (
+                        f"Failed to update weights: {e}. Previous-checkpoint "
+                        f"rollback also failed: {rollback_error}. A complete disk "
+                        "restore cannot be proven; restart the model process."
+                    )
+                else:
+                    message = (
+                        f"Failed to update weights: {e}. Restored the previous "
+                        "checkpoint, but this process cannot prove complete recovery; "
+                        "restart it before weight export."
+                    )
                 return False, message
 
         refresh_runtime_weight_state(model)
@@ -176,9 +205,12 @@ class WeightUpdater:
         self.update_model_fields(
             model,
             model_path=model_path,
+            revision=target_revision,
             load_format=load_format,
             load_config=load_config,
         )
+        self.model_config.model_path = model_path
+        self.model_config.revision = target_revision
 
         if recapture_cuda_graph and (
             self.device == "cuda"

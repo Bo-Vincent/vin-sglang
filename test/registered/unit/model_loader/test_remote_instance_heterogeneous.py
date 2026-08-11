@@ -1,1107 +1,978 @@
-import contextlib
-import sys
-from types import ModuleType, SimpleNamespace
+from __future__ import annotations
+
+from contextlib import contextmanager, nullcontext
+from math import prod
+from types import SimpleNamespace
 
 import pytest
-import torch
 
-from sglang.srt.layers.layernorm import GemmaRMSNorm
+from sglang.srt.managers.io_struct import (
+    BeginRemoteInstanceWeightTransferReqInput,
+    ReleaseRemoteInstanceWeightTransferReqInput,
+)
+from sglang.srt.managers.scheduler_components.weight_updater import (
+    SchedulerWeightUpdaterManager,
+)
+from sglang.srt.model_executor import model_runner as model_runner_module
+from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.model_executor.weight_inventory import WeightInventoryManager
+from sglang.srt.model_executor.weight_inventory_contracts import (
+    LogicalParallelAxis,
+    LogicalTensorView,
+    WeightInventoryError,
+    WeightParallelTopology,
+)
+from sglang.srt.model_executor.weight_snapshot import WeightSnapshotCoordinator
 from sglang.srt.model_loader import loader as loader_module
 from sglang.srt.model_loader.loader import RemoteInstanceModelLoader
-from sglang.test.ci.ci_register import register_cpu_ci
-
-register_cpu_ci(est_time=15, suite="base-a-test-cpu")
-
-_TARGET_MODEL_ID = "Qwen/Qwen3.5-0.8B"
-_TARGET_REVISION = "main"
-
-
-class _TransferEngineError(RuntimeError):
-    pass
-
-
-class _CompletionUnknownError(_TransferEngineError):
-    def __init__(self, message, *, pending_transfer_id="pending-1"):
-        super().__init__(message)
-        self.pending_transfer_id = pending_transfer_id
+from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
+    RemoteInstanceWeightLoaderBackend,
+    RemoteInstanceWeightTransferSession,
+)
+from sglang.srt.model_loader.weight_reshard_backend import (
+    WeightReshardBackendError,
+    WeightReshardBackendUnavailableError,
+    WeightReshardCompletionUnknownError,
+    WeightReshardExecutionResult,
+)
 
 
-@pytest.fixture(autouse=True)
-def _runtime_server_args(monkeypatch):
-    monkeypatch.setattr(
-        loader_module,
-        "get_server_args",
-        lambda: SimpleNamespace(torchao_config=None),
-    )
+class _World:
+    world_size = 1
+    rank_in_group = 0
+
+    def all_gather_object(self, value):
+        return [value]
+
+    def broadcast_object(self, value, src):
+        assert src == 0
+        return value
 
 
-def _load_heterogeneous(loader, *args, **kwargs):
-    kwargs.setdefault("target_model_id", _TARGET_MODEL_ID)
-    kwargs.setdefault("target_revision", _TARGET_REVISION)
-    return loader.load_model_from_remote_instance_by_transfer_engine_heterogeneous(
-        *args,
-        **kwargs,
-    )
+class _ActivationPeerFailureWorld:
+    world_size = 2
+    rank_in_group = 0
+
+    def all_gather_object(self, value):
+        if type(value) is bool:
+            return [value, False]
+        return [
+            value,
+            {
+                "success": False,
+                "message": "rank 1 target activation failed",
+            },
+        ]
+
+    def broadcast_object(self, value, src):
+        assert src == 0
+        return value
 
 
-def test_heterogeneous_loader_rejects_source_model_identity_mismatch() -> None:
-    loader = RemoteInstanceModelLoader.__new__(RemoteInstanceModelLoader)
+class _Storage:
+    def data_ptr(self):
+        return 0x1000
 
-    with pytest.raises(ValueError, match="source manifest identity"):
-        loader._require_manifest_identity(
+    def nbytes(self):
+        return 32
+
+
+class _Tensor:
+    shape = (4, 4)
+    dtype = "torch.float16"
+    device = SimpleNamespace(type="cpu")
+    layout = "torch.strided"
+    is_sparse = False
+
+    def data_ptr(self):
+        return 0x1000
+
+    def element_size(self):
+        return 2
+
+    def numel(self):
+        return prod(self.shape)
+
+    def is_contiguous(self):
+        return True
+
+    def stride(self):
+        return (4, 1)
+
+    def storage_offset(self):
+        return 0
+
+    def untyped_storage(self):
+        return _Storage()
+
+
+class _Model:
+    def named_parameters(self, *, remove_duplicate):
+        assert remove_duplicate is False
+        return iter((("runtime.weight", _Tensor()),))
+
+
+class _Fp8Tensor:
+    device = SimpleNamespace(type="cpu")
+    layout = "torch.strided"
+    is_sparse = False
+
+    def __init__(self, *, shape, dtype, itemsize, address) -> None:
+        self.shape = tuple(shape)
+        self.dtype = dtype
+        self._itemsize = itemsize
+        self._address = address
+        self._storage = SimpleNamespace(
+            data_ptr=lambda: address,
+            nbytes=lambda: prod(self.shape) * itemsize,
+        )
+
+    def data_ptr(self):
+        return self._address
+
+    def element_size(self):
+        return self._itemsize
+
+    def numel(self):
+        return prod(self.shape)
+
+    def is_contiguous(self):
+        return True
+
+    def stride(self):
+        result = []
+        running = 1
+        for extent in reversed(self.shape):
+            result.append(running)
+            running *= extent
+        return tuple(reversed(result))
+
+    def storage_offset(self):
+        return 0
+
+    def untyped_storage(self):
+        return self._storage
+
+
+class _SerializedBlockFp8Model:
+    def __init__(self, *, serialized: bool = True) -> None:
+        weight = _Fp8Tensor(
+            shape=(128, 128),
+            dtype="torch.float8_e4m3fn",
+            itemsize=1,
+            address=0x2000,
+        )
+        scale = _Fp8Tensor(
+            shape=(1, 1),
+            dtype="torch.float32",
+            itemsize=4,
+            address=0x12000,
+        )
+        quant_config = SimpleNamespace(
+            activation_scheme="dynamic",
+            is_checkpoint_fp8_serialized=serialized,
+            use_mxfp8=False,
+            weight_block_size=[128, 128],
+        )
+        self.quant_module = SimpleNamespace(
+            block_quant=True,
+            quant_method=SimpleNamespace(
+                block_quant=True,
+                is_checkpoint_fp8_serialized=serialized,
+                quant_config=quant_config,
+                use_marlin=False,
+                weight_block_size=[128, 128],
+            ),
+            weight=weight,
+            weight_scale_inv=scale,
+        )
+
+    def named_parameters(self, *, remove_duplicate):
+        assert remove_duplicate is False
+        prefix = "model.layers.0.mlp.down_proj"
+        return iter(
             (
-                SimpleNamespace(
-                    model_id=_TARGET_MODEL_ID,
-                    revision="different-revision",
+                (f"{prefix}.weight", self.quant_module.weight),
+                (f"{prefix}.weight_scale_inv", self.quant_module.weight_scale_inv),
+            )
+        )
+
+    def modules(self):
+        return (self.quant_module,)
+
+
+class _Semantics:
+    def describe_parameter(self, *, names, parameter, topology):
+        assert names == ("runtime.weight",)
+        return (
+            LogicalTensorView(
+                tensor_id="layers.0.weight",
+                global_shape=(4, 4),
+                global_offset=(0, 0),
+                local_shape=(4, 4),
+                byte_offset=0,
+                layer_id=0,
+                expert_id=None,
+                layout_fingerprint="logical-contiguous",
+                shard_dims=(),
+                parallel_axes=tuple(
+                    LogicalParallelAxis(
+                        kind=kind,
+                        mode="ownership" if kind == "pp" else "replicated",
+                    )
+                    for kind in ("dp", "tp", "pp", "ep")
                 ),
             ),
-            model_id=_TARGET_MODEL_ID,
-            revision=_TARGET_REVISION,
-            role="source",
         )
 
 
-@pytest.mark.parametrize("release_success", [True, False])
-def test_heterogeneous_loader_builds_local_plan_and_reads_from_source(
-    monkeypatch,
-    release_success,
-) -> None:
-    calls = {}
-    source_inventory = {
-        "model_id": _TARGET_MODEL_ID,
-        "revision": _TARGET_REVISION,
-        "lease_id": "source-runtime-lease",
-        "fragments": [SimpleNamespace(fragment_id="source-fragment")],
-    }
-    target_inventory = {
-        "model_id": source_inventory["model_id"],
-        "revision": source_inventory["revision"],
-        "lease_id": "target-runtime-lease",
-        "fragments": [SimpleNamespace(fragment_id="target-fragment")],
-    }
+class _InventoryRunner:
+    def __init__(self, manager) -> None:
+        self.manager = manager
 
-    class FakeRuntimeManifest:
-        @classmethod
-        def from_runtime_inventory(cls, inventory):
-            return SimpleNamespace(**inventory)
+    def get_remote_instance_weight_inventories(self, **kwargs):
+        return self.manager.snapshot_inventories(
+            model_id=kwargs["model_id"],
+            revision=kwargs["revision"],
+            instance_id="source-instance",
+            worker_id="source-worker",
+            endpoint="source:1234",
+            lease_timeout_sec=kwargs["lease_timeout_sec"],
+        )
 
-    class FakeRegistrationLease:
-        @classmethod
-        def from_fragment(cls, fragment, *, runtime_lease_id=None):
-            suffix = f":{runtime_lease_id}" if runtime_lease_id else ""
-            return f"lease:{fragment.fragment_id}{suffix}"
+    def release_weight_inventory(self, lease_id):
+        self.manager.release(lease_id)
 
-    class FakeReader:
-        def __init__(self, engine, **kwargs):
-            calls["engine"] = engine
-            calls["reader_options"] = kwargs
 
-        def execute(self, plan, sources, target, **kwargs):
-            calls["execute"] = (plan, sources, target, kwargs)
-            return [SimpleNamespace(nbytes=64, operation_count=2, request_count=1)]
-
-    transfer_session = SimpleNamespace(
-        transfer_id="transfer-1",
-        manifests=[source_inventory],
-        lease_timeout_sec=90,
-        manifest_format="runtime_v1",
+def _source_scheduler(monkeypatch):
+    coordinator = WeightSnapshotCoordinator()
+    coordinator.adopt_weight_generation(7)
+    inventory_manager = WeightInventoryManager(
+        model=_Model(),
+        adapter=_Semantics(),
+        topology=WeightParallelTopology(),
+        allowed_devices=("cpu",),
+        coordinator=coordinator,
     )
-
-    class FakeCoordinator:
-        def __init__(self, seed_url, world_group):
-            calls["coordinator"] = (seed_url, world_group)
-
-        def acquire(self):
-            calls["acquired"] = calls.get("acquired", 0) + 1
-            return transfer_session
-
-        def raise_if_failed(self):
-            raise AssertionError("loader must use the fixed readiness gate")
-
-        def ready_for_transfer(self, local_ready):
-            calls["ready"] = local_ready
-            return local_ready
-
-        def finish(self, *, local_success, local_release_safe=True):
-            calls["finish"] = (local_success, local_release_safe)
-            return local_success, release_success
-
-    fake_weight_transfer = ModuleType("mooncake.weight_transfer")
-    fake_weight_transfer.MemoryRegistrationLease = FakeRegistrationLease
-    fake_weight_transfer.MooncakeTransferEngineReader = FakeReader
-    fake_weight_transfer.RuntimeManifest = FakeRuntimeManifest
-    fake_weight_transfer.TransferCompletionUnknownError = _CompletionUnknownError
-    fake_weight_transfer.TransferEngineError = _TransferEngineError
-
-    def plan_runtime_transfer_to_local_target(sources, target):
-        calls["plan"] = (sources, target)
-        return SimpleNamespace(operations=("compact-operation",))
-
-    fake_weight_transfer.plan_runtime_transfer_to_local_target = (
-        plan_runtime_transfer_to_local_target
+    scheduler = SchedulerWeightUpdaterManager(
+        tp_worker=SimpleNamespace(
+            model_runner=_InventoryRunner(inventory_manager),
+        ),
+        draft_worker=None,
+        tp_cpu_group=object(),
+        world_cpu_group=object(),
+        memory_saver_adapter=object(),
+        flush_cache=lambda **_kwargs: True,
+        is_fully_idle=lambda: True,
     )
-    monkeypatch.setitem(sys.modules, "mooncake.weight_transfer", fake_weight_transfer)
+    monkeypatch.setattr("torch.distributed.get_world_size", lambda group: 1)
     monkeypatch.setattr(
-        loader_module,
-        "RemoteInstanceWeightTransferWorldCoordinator",
-        FakeCoordinator,
+        "torch.distributed.all_gather_object",
+        lambda outputs, value, group: outputs.__setitem__(0, value),
     )
-    monkeypatch.setattr(
-        loader_module,
-        "get_world_group",
-        lambda: "target-world",
-    )
-    monkeypatch.setattr(
-        loader_module.current_platform,
-        "synchronize",
-        lambda: calls.setdefault("synchronized", True),
-    )
-    monkeypatch.setattr(
-        loader_module,
-        "_post_load_weights",
-        lambda model: calls.setdefault("post_loaded", model),
-    )
-
-    class TargetBuilderOwner:
-        @contextlib.contextmanager
-        def build_remote_instance_target_weight_manifest_session(self, **kwargs):
-            del kwargs
-            raise AssertionError(
-                "runtime_v1 must use the legacy target manifest builder"
-            )
-            yield
-
-        @contextlib.contextmanager
-        def build_remote_instance_target_weight_runtime_manifest(self, **kwargs):
-            calls["builder"] = kwargs
-            yield target_inventory
-
-    model = object()
-    engine = object()
-    loader = RemoteInstanceModelLoader.__new__(RemoteInstanceModelLoader)
-    target_builder = (
-        TargetBuilderOwner().build_remote_instance_target_weight_manifest_session
-    )
-
-    success = _load_heterogeneous(
-        loader,
-        model,
-        engine,
-        "http://seed:30000",
-        "target-session",
-        target_builder,
-    )
-
-    assert success is release_success
-    assert calls["builder"] == {
-        "model": model,
-        "model_id": _TARGET_MODEL_ID,
-        "revision": _TARGET_REVISION,
-        "instance_id": "sglang:target-session",
-        "endpoint": "target-session",
-    }
-    assert calls["plan"][1].revision == source_inventory["revision"]
-    _, _, _, execute_kwargs = calls["execute"]
-    assert execute_kwargs == {
-        "source_pre_registered": True,
-        "source_registrations": ("lease:source-fragment:source-runtime-lease",),
-        "target_pre_registered": True,
-        "target_registrations": ("lease:target-fragment:target-runtime-lease",),
-    }
-    assert calls["reader_options"] == {"max_batch_operations": 8192}
-    assert calls["synchronized"] is True
-    assert calls["post_loaded"] is model
-    assert calls["coordinator"] == ("http://seed:30000", "target-world")
-    assert calls["acquired"] == 1
-    assert calls["ready"] is True
-    assert calls["finish"] == (True, True)
-
-
-def test_heterogeneous_loader_plans_placement_before_acquiring_target_binding(
-    monkeypatch,
-) -> None:
-    events = []
-    source_inventory = {
-        "model_id": _TARGET_MODEL_ID,
-        "revision": _TARGET_REVISION,
-        "lease_id": "source-runtime-lease",
-        "fragments": [SimpleNamespace(fragment_id="source-fragment")],
-    }
-    source_placement_inventory = SimpleNamespace(
-        model_id=source_inventory["model_id"],
-        revision=source_inventory["revision"],
-        placement_id="source-placement",
-    )
-    source_binding_inventory = SimpleNamespace(
-        model_id=source_inventory["model_id"],
-        revision=source_inventory["revision"],
-        placement_id="source-placement",
-        lease_id="source-runtime-lease",
-    )
-    placement_inventory = SimpleNamespace(
-        model_id=source_inventory["model_id"],
-        revision=source_inventory["revision"],
-        placement_id="target-placement",
-    )
-    binding_inventory = SimpleNamespace(
-        model_id=source_inventory["model_id"],
-        revision=source_inventory["revision"],
-        placement_id="target-placement",
-        lease_id="target-runtime-lease",
-    )
-    target_runtime = SimpleNamespace(
-        model_id=source_inventory["model_id"],
-        revision=source_inventory["revision"],
-        lease_id="target-runtime-lease",
-        fragments=[SimpleNamespace(fragment_id="target-fragment")],
-    )
-
-    class FakeRuntimeManifest:
-        @classmethod
-        def from_runtime_inventory(cls, inventory):
-            return SimpleNamespace(**inventory)
-
-    class FakeTargetPlacementManifest:
-        @classmethod
-        def from_runtime_inventory(cls, inventory):
-            events.append("placement")
-            return inventory
-
-    class FakeSourcePlacementManifest:
-        @classmethod
-        def from_runtime_inventory(cls, inventory):
-            events.append("source-placement")
-            return inventory
-
-    class FakeRuntimeBindingManifest:
-        @classmethod
-        def from_runtime_inventory(cls, inventory):
-            events.append("binding")
-            return inventory
-
-    class FakeRegistrationLease:
-        @classmethod
-        def from_fragment(cls, fragment, *, runtime_lease_id=None):
-            return (fragment.fragment_id, runtime_lease_id)
-
-    class FakeReader:
-        def __init__(self, engine, **kwargs):
-            del engine, kwargs
-
-        def execute(self, plan, sources, target, **kwargs):
-            del plan, sources, target
-            assert kwargs["source_registrations"] == (
-                ("source-fragment", "source-runtime-lease"),
-            )
-            assert kwargs["target_registrations"] == (
-                ("target-fragment", "target-runtime-lease"),
-            )
-            events.append("execute")
-            return [SimpleNamespace(nbytes=64, operation_count=1, request_count=1)]
-
-    class FakeCoordinator:
-        def __init__(self, seed_url, world_group):
-            del seed_url, world_group
-
-        def acquire(self):
-            return SimpleNamespace(
-                transfer_id="transfer-1",
-                manifests=[],
-                source_placements=[source_placement_inventory],
-                source_bindings=[source_binding_inventory],
-                manifest_format="placement_binding_v1",
-            )
-
-        def ready_for_transfer(self, local_ready):
-            return local_ready
-
-        def finish(self, *, local_success, local_release_safe=True):
-            return local_success, local_release_safe
-
-    fake_weight_transfer = ModuleType("mooncake.weight_transfer")
-    fake_weight_transfer.MemoryRegistrationLease = FakeRegistrationLease
-    fake_weight_transfer.MooncakeTransferEngineReader = FakeReader
-    fake_weight_transfer.RuntimeManifest = FakeRuntimeManifest
-    fake_weight_transfer.RuntimeBindingManifest = FakeRuntimeBindingManifest
-    fake_weight_transfer.SourcePlacementManifest = FakeSourcePlacementManifest
-    fake_weight_transfer.TargetPlacementManifest = FakeTargetPlacementManifest
-    fake_weight_transfer.TransferCompletionUnknownError = _CompletionUnknownError
-    fake_weight_transfer.TransferEngineError = _TransferEngineError
-
-    def bind_runtime_manifest(placement, binding):
-        if placement is source_placement_inventory:
-            events.append("source-runtime-bind")
-            return SimpleNamespace(**source_inventory)
-        events.append("target-runtime-bind")
-        return target_runtime
-
-    fake_weight_transfer.bind_runtime_manifest = bind_runtime_manifest
-
-    def plan_placement_transfer_to_local_target(sources, placement):
-        assert sources == (source_placement_inventory,)
-        assert placement is placement_inventory
-        events.append("logical-plan")
-        return "logical-plan"
-
-    fake_weight_transfer.plan_placement_transfer_to_local_target = (
-        plan_placement_transfer_to_local_target
-    )
-
-    def bind_logical_transfer_plan(logical, targets, *, source_bindings):
-        assert logical == "logical-plan"
-        assert targets == (binding_inventory,)
-        assert source_bindings == (source_binding_inventory,)
-        events.append("plan-bind")
-        return SimpleNamespace(operations=("bound-operation",))
-
-    fake_weight_transfer.bind_logical_transfer_plan = bind_logical_transfer_plan
-    fake_weight_transfer.plan_runtime_transfer_to_local_target = (
-        lambda sources, target: (_ for _ in ()).throw(
-            AssertionError("the session path must not use the legacy planner")
+    output = scheduler.begin_remote_instance_weight_transfer(
+        BeginRemoteInstanceWeightTransferReqInput(
+            transfer_id="production-chain",
+            model_id="model",
+            revision="checkpoint-sha",
+            lease_timeout_sec=60,
         )
     )
-    monkeypatch.setitem(sys.modules, "mooncake.weight_transfer", fake_weight_transfer)
-    monkeypatch.setattr(
-        loader_module,
-        "RemoteInstanceWeightTransferWorldCoordinator",
-        FakeCoordinator,
-    )
-    monkeypatch.setattr(loader_module, "get_world_group", lambda: object())
-    monkeypatch.setattr(loader_module.current_platform, "synchronize", lambda: None)
-    monkeypatch.setattr(loader_module, "_post_load_weights", lambda model: None)
-
-    class TargetSession:
-        placement = placement_inventory
-
-        @contextlib.contextmanager
-        def bind(self):
-            events.append("binding-lease-open")
-            try:
-                yield binding_inventory
-            finally:
-                events.append("binding-lease-close")
-
-    @contextlib.contextmanager
-    def target_builder(**kwargs):
-        del kwargs
-        yield TargetSession()
-
-    loader = RemoteInstanceModelLoader.__new__(RemoteInstanceModelLoader)
-    success = _load_heterogeneous(
-        loader,
-        object(),
-        object(),
-        "http://seed:30000",
-        "target-session",
-        target_builder,
+    assert output.success is True
+    return (
+        scheduler,
+        inventory_manager,
+        RemoteInstanceWeightTransferSession(
+            transfer_id=output.transfer_id,
+            placement_inventories=output.placement_inventories,
+            binding_inventories=output.binding_inventories,
+            lease_timeout_sec=60,
+        ),
     )
 
-    assert success is True
-    assert events == [
-        "source-placement",
-        "binding",
-        "source-runtime-bind",
-        "placement",
-        "logical-plan",
-        "binding-lease-open",
-        "binding",
-        "target-runtime-bind",
-        "plan-bind",
-        "execute",
-        "binding-lease-close",
-    ]
+
+class _SourceCoordinator:
+    instances = []
+    forced_finish_result = None
+
+    def __init__(self, seed_url, world_group) -> None:
+        self.seed_url = seed_url
+        self.world_group = world_group
+        self.finish_calls = []
+        self.ready_calls = []
+        self.session = RemoteInstanceWeightTransferSession(
+            transfer_id="source-transfer",
+            placement_inventories=[{"weight_generation": 7}],
+            binding_inventories=[{"generation": 13}],
+            lease_timeout_sec=300,
+        )
+        self.__class__.instances.append(self)
+
+    def acquire(self):
+        return self.session
+
+    def ready_for_transfer(self, local_ready):
+        self.ready_calls.append(local_ready)
+        return bool(local_ready)
+
+    def finish(self, *, local_success, local_release_safe=True):
+        self.finish_calls.append((local_success, local_release_safe))
+        if self.forced_finish_result is not None:
+            return self.forced_finish_result
+        return bool(local_success), bool(local_release_safe)
 
 
-def test_post_load_weights_refreshes_gemma_runtime_buffer() -> None:
-    norm = GemmaRMSNorm(4)
-    norm.weight.data.copy_(torch.tensor([0.5, -0.25, 1.0, 2.0]))
-    assert torch.equal(norm.gemma_weight, torch.ones(4))
+class _Prepared:
+    operation_count = 4
+    nbytes = 1024
 
-    loader_module._post_load_weights(norm)
+    def __init__(self) -> None:
+        self.completion_unknown_retained = False
+        self.closed = False
 
-    assert torch.equal(norm.gemma_weight, norm.weight.data + 1.0)
+
+class _Backend:
+    def __init__(self, *, outcome="success", activation_coordinator=None) -> None:
+        self.outcome = outcome
+        self.activation_coordinator = activation_coordinator
+        self.prepared = _Prepared()
+        self.events = []
+        self.prepare_kwargs = None
+
+    @contextmanager
+    def prepare(self, **kwargs):
+        self.prepare_kwargs = kwargs
+        self.events.append("prepare")
+        try:
+            yield self.prepared
+        finally:
+            if not self.prepared.completion_unknown_retained:
+                self.close_after_terminal(self.prepared)
+
+    def execute(self, prepared, *, transfer_engine):
+        self.events.append("execute")
+        if self.outcome.startswith("unknown"):
+            raise WeightReshardCompletionUnknownError(
+                "completion unknown",
+                pending_transfer_id="pending-1",
+            )
+        if self.outcome == "terminal-error":
+            raise WeightReshardBackendError("terminal failure")
+        if self.outcome == "unexpected-error":
+            raise RuntimeError("backend violated the terminal-error contract")
+        if self.outcome == "interrupted":
+            raise KeyboardInterrupt
+        if self.outcome == "missing-receipt":
+            return None
+        if self.outcome == "short-receipt":
+            return WeightReshardExecutionResult(nbytes=512, segment_count=4)
+        return WeightReshardExecutionResult(nbytes=1024, segment_count=4)
+
+    def activate(self, prepared):
+        self.events.append("activate")
+        if self.outcome == "activation-error":
+            raise WeightReshardBackendError("activation failed")
+        if self.activation_coordinator is not None:
+            self.activation_coordinator.adopt_weight_generation(7)
+
+    def drain_pending_transfer(self, prepared, *, pending_transfer_id, timeout_ms):
+        self.events.append("drain")
+        return "COMPLETION_UNKNOWN" if self.outcome == "unknown" else "FAILED"
+
+    def retain_completion_unknown(self, prepared):
+        self.events.append("retain")
+        prepared.completion_unknown_retained = True
+
+    def close_after_terminal(self, prepared):
+        if prepared.closed:
+            return
+        self.events.append("close")
+        prepared.closed = True
+        prepared.completion_unknown_retained = False
 
 
-def test_transfer_engine_without_manifest_builder_uses_legacy_loader(
+def _loader() -> RemoteInstanceModelLoader:
+    result = RemoteInstanceModelLoader.__new__(RemoteInstanceModelLoader)
+    result.load_config = SimpleNamespace(
+        remote_instance_weight_loader_backend=(
+            RemoteInstanceWeightLoaderBackend.TRANSFER_ENGINE
+        )
+    )
+    return result
+
+
+def test_loader_rejects_reshard_inventory_on_legacy_backend() -> None:
+    loader = _loader()
+    loader.load_config.remote_instance_weight_inventory_builder = object()
+    loader.load_config.remote_instance_weight_loader_backend = (
+        RemoteInstanceWeightLoaderBackend.NCCL
+    )
+
+    with pytest.raises(ValueError, match="requires the transfer_engine backend"):
+        loader._validate_reshard_backend_selection()
+
+
+def test_load_model_passes_canonical_resource_id_instead_of_local_path(
     monkeypatch,
 ) -> None:
-    calls = []
-    model = torch.nn.Module()
-    loader = RemoteInstanceModelLoader.__new__(RemoteInstanceModelLoader)
+    model = SimpleNamespace(eval=lambda: model)
+    loader = _loader()
     loader.load_config = SimpleNamespace(
         load_format=loader_module.LoadFormat.REMOTE_INSTANCE,
         remote_instance_weight_loader_backend=(
-            loader_module.RemoteInstanceWeightLoaderBackend.TRANSFER_ENGINE
+            RemoteInstanceWeightLoaderBackend.TRANSFER_ENGINE
         ),
-        remote_instance_weight_loader_transfer_engine="engine",
+        remote_instance_weight_loader_transfer_engine=object(),
         remote_instance_weight_loader_seed_instance_ip="127.0.0.1",
         remote_instance_weight_loader_seed_instance_service_port=30000,
-        remote_instance_weight_runtime_manifest_builder=None,
-        tp_rank=3,
+        remote_instance_weight_loader_transfer_engine_session_id="target-session",
+        remote_instance_weight_inventory_builder=object(),
+        weight_reshard_resource_id="checkpoint-family-42",
     )
-    monkeypatch.setattr(loader_module, "_get_quantization_config", lambda *args: None)
-    monkeypatch.setattr(loader_module, "_initialize_model", lambda *args: model)
-    monkeypatch.setattr(loader_module, "register_memory_region", lambda *args: ())
-    monkeypatch.setattr(
-        loader,
-        "load_model_from_remote_instance_by_transfer_engine",
-        lambda model, engine, seed_url, tp_rank: (
-            calls.append((model, engine, seed_url, tp_rank)) or True
-        ),
+    received = {}
+
+    def load_heterogeneous(*args, **kwargs):
+        received.update(kwargs)
+        return True
+
+    loader.load_model_from_remote_instance_by_transfer_engine_heterogeneous = (
+        load_heterogeneous
     )
+    monkeypatch.setattr(loader_module, "_get_quantization_config", lambda *_: None)
+    monkeypatch.setattr(loader_module, "_initialize_model", lambda *_: model)
     monkeypatch.setattr(
-        loader,
-        "load_model_from_remote_instance_by_transfer_engine_heterogeneous",
-        lambda *args, **kwargs: (_ for _ in ()).throw(
-            AssertionError("legacy dispatch must not enter manifest loading")
-        ),
+        loader_module, "set_default_torch_dtype", lambda _: nullcontext()
     )
 
-    loaded = loader.load_model(
-        model_config=SimpleNamespace(dtype=torch.float32),
+    result = loader.load_model(
+        model_config=SimpleNamespace(
+            dtype=None,
+            model_path="/node-b/cache/model",
+            revision="immutable-revision",
+        ),
         device_config=SimpleNamespace(device="cpu"),
     )
 
-    assert loaded is model
-    assert calls == [
-        (model, "engine", "http://127.0.0.1:30000", 3),
-    ]
+    assert result is model
+    assert received["target_model_id"] == "checkpoint-family-42"
+    assert received["target_revision"] == "immutable-revision"
 
 
-def test_heterogeneous_loader_fails_closed_without_source_manifests(
-    monkeypatch,
-) -> None:
-    class EmptyCoordinator:
-        def __init__(self, seed_url, world_group):
-            pass
-
-        def acquire(self):
-            return None
-
+def _patch_runtime(monkeypatch, backend) -> None:
+    _SourceCoordinator.instances.clear()
+    _SourceCoordinator.forced_finish_result = None
+    monkeypatch.setattr(loader_module, "get_world_group", lambda: _World())
     monkeypatch.setattr(
         loader_module,
         "RemoteInstanceWeightTransferWorldCoordinator",
-        EmptyCoordinator,
+        _SourceCoordinator,
     )
-    monkeypatch.setattr(loader_module, "get_world_group", lambda: object())
-    loader = RemoteInstanceModelLoader.__new__(RemoteInstanceModelLoader)
-
-    assert (
-        _load_heterogeneous(
-            loader, object(), object(), "http://seed:30000", "target-session", object()
-        )
-        is False
+    monkeypatch.setattr(
+        loader_module,
+        "create_weight_reshard_backend",
+        lambda configured: backend,
     )
-
-
-def test_heterogeneous_loader_blocks_world_when_any_rank_is_quarantined(
-    monkeypatch,
-) -> None:
-    gathered = []
-
-    class World:
-        world_size = 2
-
-        def all_gather_object(self, value):
-            gathered.append(value)
-            return [False, True]
-
-    monkeypatch.setattr(loader_module, "get_world_group", lambda: World())
+    monkeypatch.setattr(loader_module.current_platform, "synchronize", lambda: None)
+    monkeypatch.setattr(
+        loader_module,
+        "_post_load_weights",
+        lambda model: backend.events.append("post_load"),
+    )
+    monkeypatch.setattr(loader_module, "get_server_args", lambda: None)
+    monkeypatch.setattr(loader_module.time, "sleep", lambda _seconds: None)
     monkeypatch.setattr(
         loader_module,
         "_HETEROGENEOUS_UNKNOWN_TRANSFER_QUARANTINE",
         [],
     )
-    monkeypatch.setattr(
-        loader_module,
-        "RemoteInstanceWeightTransferWorldCoordinator",
-        lambda *args, **kwargs: pytest.fail(
-            "quarantined target world must not acquire a new source lease"
-        ),
+
+
+def _load(backend, *, target_revision="immutable-revision") -> bool:
+    return _loader().load_model_from_remote_instance_by_transfer_engine_heterogeneous(
+        model=SimpleNamespace(),
+        transfer_engine=object(),
+        seed_url="http://source",
+        local_session_id="target-session",
+        target_inventory_builder=object(),
+        target_model_id="model",
+        target_revision=target_revision,
     )
-    loader = RemoteInstanceModelLoader.__new__(RemoteInstanceModelLoader)
-
-    assert (
-        _load_heterogeneous(
-            loader, object(), object(), "http://seed:30000", "target-session", object()
-        )
-        is False
-    )
-    assert gathered == [False]
 
 
-def test_legacy_loader_drains_ticket_before_releasing_target_model(
+def test_production_loader_calls_replaceable_backend_and_activates_after_terminal(
     monkeypatch,
 ) -> None:
-    events = []
+    activation = WeightSnapshotCoordinator()
+    backend = _Backend(activation_coordinator=activation)
+    _patch_runtime(monkeypatch, backend)
 
-    class Ticket:
-        status = "COMPLETION_UNKNOWN"
+    assert _load(backend) is True
 
-        def __init__(self):
-            self.results = iter(("COMPLETION_UNKNOWN", "COMPLETED"))
-
-        def drain(self, timeout_ms):
-            assert timeout_ms > 0
-            events.append(("drain", timeout_ms))
-            return next(self.results)
-
-    class Engine:
-        def batch_transfer_sync_read_with_ticket(self, *args):
-            events.append(("submit", args))
-            return Ticket()
-
-        def batch_transfer_sync_read(self, *args):
-            raise AssertionError("ticket-capable engine must not use legacy sync API")
-
-    tensor = SimpleNamespace(
-        numel=lambda: 4,
-        element_size=lambda: 2,
-        data_ptr=lambda: 0x2000,
+    assert backend.prepare_kwargs["source_placement_inventories"] == (
+        {"weight_generation": 7},
     )
-    model = SimpleNamespace(named_parameters=lambda: [("weight", tensor)])
-    monkeypatch.setattr(
-        loader_module,
-        "get_remote_instance_transfer_engine_info_per_rank",
-        lambda seed_url, tp_rank: (
-            "source-session",
-            {"weight": (0x1000, 4, 2)},
-        ),
-    )
-    monkeypatch.setattr(
-        loader_module,
-        "_post_load_weights",
-        lambda loaded_model: events.append(("post_load", loaded_model)),
-    )
-    loader = RemoteInstanceModelLoader.__new__(RemoteInstanceModelLoader)
-
-    success = loader.load_model_from_remote_instance_by_transfer_engine(
-        model,
-        Engine(),
-        "http://seed:30000",
-        0,
-    )
-
-    assert success is True
-    assert [event[0] for event in events] == [
-        "submit",
-        "drain",
-        "drain",
+    assert backend.prepare_kwargs["source_binding_inventories"] == ({"generation": 13},)
+    assert backend.events == [
+        "prepare",
+        "execute",
         "post_load",
+        "activate",
+        "close",
     ]
-    assert events[-1][1] is model
+    assert activation.weight_generation == 7
+    assert activation.generation == 2
+    assert _SourceCoordinator.instances[0].finish_calls == [(True, True)]
 
 
-def test_legacy_loader_rejects_failed_drained_ticket(monkeypatch) -> None:
-    class Ticket:
-        status = "FAILED_DRAINED"
-
-    class Engine:
-        def batch_transfer_sync_read_with_ticket(self, *args):
-            return Ticket()
-
-    tensor = SimpleNamespace(
-        numel=lambda: 4,
-        element_size=lambda: 2,
-        data_ptr=lambda: 0x2000,
-    )
-    model = SimpleNamespace(named_parameters=lambda: [("weight", tensor)])
-    monkeypatch.setattr(
-        loader_module,
-        "get_remote_instance_transfer_engine_info_per_rank",
-        lambda seed_url, tp_rank: (
-            "source-session",
-            {"weight": (0x1000, 4, 2)},
-        ),
-    )
-    monkeypatch.setattr(
-        loader_module,
-        "_post_load_weights",
-        lambda loaded_model: pytest.fail("failed transfer must not post-load"),
-    )
-    loader = RemoteInstanceModelLoader.__new__(RemoteInstanceModelLoader)
-
-    assert (
-        loader.load_model_from_remote_instance_by_transfer_engine(
-            model,
-            Engine(),
-            "http://seed:30000",
-            0,
-        )
-        is False
-    )
-
-
-def test_legacy_loader_defers_interrupt_until_ticket_is_drained(monkeypatch) -> None:
-    events = []
-
-    class Ticket:
-        status = "COMPLETION_UNKNOWN"
-
-        def __init__(self):
-            self.drain_count = 0
-
-        def drain(self, timeout_ms):
-            self.drain_count += 1
-            events.append(("drain", self.drain_count))
-            if self.drain_count == 1:
-                raise KeyboardInterrupt
-            return "COMPLETED"
-
-    class Engine:
-        def batch_transfer_sync_read_with_ticket(self, *args):
-            events.append(("submit", args))
-            return Ticket()
-
-    tensor = SimpleNamespace(
-        numel=lambda: 4,
-        element_size=lambda: 2,
-        data_ptr=lambda: 0x2000,
-    )
-    model = SimpleNamespace(named_parameters=lambda: [("weight", tensor)])
-    monkeypatch.setattr(
-        loader_module,
-        "get_remote_instance_transfer_engine_info_per_rank",
-        lambda seed_url, tp_rank: (
-            "source-session",
-            {"weight": (0x1000, 4, 2)},
-        ),
-    )
-    monkeypatch.setattr(
-        loader_module,
-        "_post_load_weights",
-        lambda loaded_model: pytest.fail("interrupted load must not post-load"),
-    )
-    loader = RemoteInstanceModelLoader.__new__(RemoteInstanceModelLoader)
-
-    with pytest.raises(KeyboardInterrupt):
-        loader.load_model_from_remote_instance_by_transfer_engine(
-            model,
-            Engine(),
-            "http://seed:30000",
-            0,
-        )
-
-    assert [event[0] for event in events] == ["submit", "drain", "drain"]
-
-
-def test_heterogeneous_loader_releases_source_snapshot_after_transfer_failure(
+def test_scheduler_inventory_to_backend_activation_production_chain(
     monkeypatch,
 ) -> None:
-    outcomes = []
-    source_inventory = {
-        "model_id": _TARGET_MODEL_ID,
-        "revision": _TARGET_REVISION,
-        "lease_id": "source-runtime-lease",
-        "fragments": [],
-    }
+    scheduler, inventory_manager, session = _source_scheduler(monkeypatch)
+    activation = WeightSnapshotCoordinator()
+    backend = _Backend(activation_coordinator=activation)
 
-    class FakeCoordinator:
-        def __init__(self, seed_url, world_group):
-            pass
+    class SchedulerBackedCoordinator:
+        def __init__(self, seed_url, world_group) -> None:
+            self.seed_url = seed_url
+            self.world_group = world_group
 
         def acquire(self):
-            return SimpleNamespace(
-                transfer_id="transfer-1", manifests=[source_inventory]
-            )
-
-        def raise_if_failed(self):
-            raise AssertionError("loader must use the fixed readiness gate")
+            return session
 
         def ready_for_transfer(self, local_ready):
-            outcomes.append(("ready", local_ready))
-            return local_ready
+            return bool(local_ready)
 
         def finish(self, *, local_success, local_release_safe=True):
-            outcomes.append((local_success, local_release_safe))
-            return local_success, True
+            if not local_release_safe:
+                return False, False
+            released = scheduler.release_remote_instance_weight_transfer(
+                ReleaseRemoteInstanceWeightTransferReqInput(
+                    transfer_id=session.transfer_id
+                )
+            )
+            return bool(local_success), released.success
 
+    monkeypatch.setattr(loader_module, "get_world_group", lambda: _World())
     monkeypatch.setattr(
         loader_module,
         "RemoteInstanceWeightTransferWorldCoordinator",
-        FakeCoordinator,
+        SchedulerBackedCoordinator,
     )
-    monkeypatch.setattr(loader_module, "get_world_group", lambda: object())
-
-    fake_weight_transfer = ModuleType("mooncake.weight_transfer")
-
-    class FailingRuntimeManifest:
-        @classmethod
-        def from_runtime_inventory(cls, inventory):
-            raise RuntimeError("bad manifest")
-
-    fake_weight_transfer.RuntimeManifest = FailingRuntimeManifest
-    fake_weight_transfer.MemoryRegistrationLease = object
-    fake_weight_transfer.MooncakeTransferEngineReader = object
-    fake_weight_transfer.TransferCompletionUnknownError = _CompletionUnknownError
-    fake_weight_transfer.TransferEngineError = _TransferEngineError
-    fake_weight_transfer.plan_runtime_transfer_to_local_target = object
-    monkeypatch.setitem(sys.modules, "mooncake.weight_transfer", fake_weight_transfer)
-    loader = RemoteInstanceModelLoader.__new__(RemoteInstanceModelLoader)
-
-    assert (
-        _load_heterogeneous(
-            loader, object(), object(), "http://seed:30000", "target-session", object()
-        )
-        is False
+    monkeypatch.setattr(
+        loader_module,
+        "create_weight_reshard_backend",
+        lambda configured: backend,
     )
-    assert outcomes == [("ready", False), (False, True)]
-
-
-@pytest.mark.parametrize("drain_mode", ["terminal", "interrupt", "permanent"])
-def test_heterogeneous_loader_drains_unknown_before_releasing_target_and_source(
-    monkeypatch,
-    drain_mode,
-) -> None:
-    events = []
-    quarantine = []
+    monkeypatch.setattr(loader_module.current_platform, "synchronize", lambda: None)
+    monkeypatch.setattr(
+        loader_module,
+        "_post_load_weights",
+        lambda model: backend.events.append("post_load"),
+    )
+    monkeypatch.setattr(loader_module, "get_server_args", lambda: None)
     monkeypatch.setattr(
         loader_module,
         "_HETEROGENEOUS_UNKNOWN_TRANSFER_QUARANTINE",
-        quarantine,
+        [],
     )
-    if drain_mode == "permanent":
-        monkeypatch.setattr(
-            loader_module,
-            "_HETEROGENEOUS_UNKNOWN_DRAIN_MAX_ATTEMPTS",
-            2,
-        )
-        monkeypatch.setattr(
-            loader_module,
-            "_HETEROGENEOUS_UNKNOWN_DRAIN_TIMEOUT_MS",
-            0,
-        )
-    source_inventory = {
-        "model_id": _TARGET_MODEL_ID,
-        "revision": _TARGET_REVISION,
-        "lease_id": "source-runtime-lease",
-        "fragments": [SimpleNamespace(fragment_id="source-fragment")],
-    }
-    target_inventory = {
-        "model_id": source_inventory["model_id"],
-        "revision": source_inventory["revision"],
-        "lease_id": "target-runtime-lease",
-        "fragments": [SimpleNamespace(fragment_id="target-fragment")],
-    }
 
-    class FakeCoordinator:
-        def __init__(self, seed_url, world_group):
-            pass
+    assert _load(backend, target_revision="checkpoint-sha") is True
 
-        def acquire(self):
-            return SimpleNamespace(
-                transfer_id="transfer-1", manifests=[source_inventory]
-            )
-
-        def raise_if_failed(self):
-            raise AssertionError("loader must use the fixed readiness gate")
-
-        def ready_for_transfer(self, local_ready):
-            events.append(("ready", local_ready))
-            return local_ready
-
-        def finish(self, *, local_success, local_release_safe=True):
-            events.append(("finish", local_success, local_release_safe))
-            return False, local_release_safe
-
-    class FakeRuntimeManifest:
-        @classmethod
-        def from_runtime_inventory(cls, inventory):
-            return SimpleNamespace(**inventory)
-
-    class FakeRegistrationLease:
-        @classmethod
-        def from_fragment(cls, fragment, *, runtime_lease_id=None):
-            return fragment
-
-    class FailingReader:
-        def __init__(self, engine, **kwargs):
-            self.drain_results = iter(("COMPLETION_UNKNOWN", "FAILED_DRAINED"))
-            self.interrupted = False
-
-        def execute(self, *args, **kwargs):
-            assert kwargs["target_pre_registered"] is True
-            events.append("execute")
-            raise _CompletionUnknownError(
-                "completion unknown",
-                pending_transfer_id="pending-1",
-            )
-
-        def drain_pending_transfer(self, pending_transfer_id, *, timeout_ms):
-            assert pending_transfer_id == "pending-1"
-            assert timeout_ms >= 0
-            assert events[-1] != "target-close"
-            if drain_mode == "interrupt" and not self.interrupted:
-                self.interrupted = True
-                events.append(("drain-error", "KeyboardInterrupt"))
-                raise KeyboardInterrupt
-            if drain_mode == "permanent":
-                events.append(("drain", "COMPLETION_UNKNOWN"))
-                return "COMPLETION_UNKNOWN"
-            result = next(self.drain_results)
-            events.append(("drain", result))
-            return result
-
-    fake_weight_transfer = ModuleType("mooncake.weight_transfer")
-    fake_weight_transfer.MemoryRegistrationLease = FakeRegistrationLease
-    fake_weight_transfer.MooncakeTransferEngineReader = FailingReader
-    fake_weight_transfer.RuntimeManifest = FakeRuntimeManifest
-    fake_weight_transfer.TransferCompletionUnknownError = _CompletionUnknownError
-    fake_weight_transfer.TransferEngineError = _TransferEngineError
-    fake_weight_transfer.plan_runtime_transfer_to_local_target = (
-        lambda sources, target: object()
+    assert backend.prepare_kwargs["source_placement_inventories"] == tuple(
+        session.placement_inventories
     )
-    monkeypatch.setitem(sys.modules, "mooncake.weight_transfer", fake_weight_transfer)
-    monkeypatch.setattr(
-        loader_module,
-        "RemoteInstanceWeightTransferWorldCoordinator",
-        FakeCoordinator,
+    assert backend.prepare_kwargs["source_binding_inventories"] == tuple(
+        session.binding_inventories
     )
-    monkeypatch.setattr(loader_module, "get_world_group", lambda: object())
-
-    @contextlib.contextmanager
-    def target_builder(**kwargs):
-        events.append("target-open")
-        try:
-            yield target_inventory
-        finally:
-            events.append("target-close")
-
-    loader = RemoteInstanceModelLoader.__new__(RemoteInstanceModelLoader)
-    target_model = object()
-
-    def load():
-        return _load_heterogeneous(
-            loader,
-            target_model,
-            object(),
-            "http://seed:30000",
-            "target-session",
-            target_builder,
-        )
-
-    if drain_mode == "interrupt":
-        with pytest.raises(KeyboardInterrupt):
-            load()
-    else:
-        assert load() is False
-
-    expected_events = [
-        "target-open",
-        ("ready", True),
+    assert backend.events == [
+        "prepare",
         "execute",
+        "post_load",
+        "activate",
+        "close",
     ]
-    if drain_mode == "interrupt":
-        expected_events.append(("drain-error", "KeyboardInterrupt"))
-    if drain_mode == "permanent":
-        expected_events.extend(
-            [
-                ("drain", "COMPLETION_UNKNOWN"),
-                ("drain", "COMPLETION_UNKNOWN"),
-                ("finish", False, False),
-            ]
-        )
-    else:
-        expected_events.extend(
-            [
-                ("drain", "COMPLETION_UNKNOWN"),
-                ("drain", "FAILED_DRAINED"),
-                "target-close",
-                ("finish", False, True),
-            ]
-        )
-    assert events == expected_events
-    if drain_mode == "permanent":
-        assert len(quarantine) == 1
-        assert quarantine[0].pending_transfer_id == "pending-1"
-        assert target_model in quarantine[0].owners
-        quarantine[0].resources.close()
-        assert events[-1] == "target-close"
-        quarantine.clear()
+    assert activation.weight_generation == 7
+    assert activation.generation == 2
+    assert inventory_manager.list_leases() == ()
 
 
-@pytest.mark.parametrize("error_type", [_TransferEngineError, RuntimeError])
-def test_heterogeneous_loader_releases_source_after_known_transfer_failure(
-    monkeypatch, error_type
+def test_terminal_backend_failure_does_not_activate_content(monkeypatch) -> None:
+    activation = WeightSnapshotCoordinator()
+    backend = _Backend(
+        outcome="terminal-error",
+        activation_coordinator=activation,
+    )
+    _patch_runtime(monkeypatch, backend)
+
+    assert _load(backend) is False
+
+    assert "activate" not in backend.events
+    assert backend.prepared.closed is True
+    assert activation.weight_generation == 1
+    assert _SourceCoordinator.instances[0].finish_calls == [(False, True)]
+
+
+@pytest.mark.parametrize("outcome", ["missing-receipt", "short-receipt"])
+def test_invalid_execution_receipt_never_reaches_post_load_or_activation(
+    monkeypatch,
+    outcome,
 ) -> None:
-    outcomes = []
-    source_inventory = {
-        "model_id": _TARGET_MODEL_ID,
-        "revision": _TARGET_REVISION,
-        "lease_id": "source-runtime-lease",
-        "fragments": [SimpleNamespace(fragment_id="source-fragment")],
-    }
-    target_inventory = {
-        "model_id": source_inventory["model_id"],
-        "revision": source_inventory["revision"],
-        "lease_id": "target-runtime-lease",
-        "fragments": [SimpleNamespace(fragment_id="target-fragment")],
-    }
+    activation = WeightSnapshotCoordinator()
+    backend = _Backend(outcome=outcome, activation_coordinator=activation)
+    _patch_runtime(monkeypatch, backend)
 
-    class FakeCoordinator:
-        def __init__(self, seed_url, world_group):
-            pass
+    assert _load(backend) is False
 
-        def acquire(self):
-            return SimpleNamespace(
-                transfer_id="transfer-1", manifests=[source_inventory]
-            )
-
-        def ready_for_transfer(self, local_ready):
-            outcomes.append(("ready", local_ready))
-            return local_ready
-
-        def finish(self, *, local_success, local_release_safe=True):
-            outcomes.append((local_success, local_release_safe))
-            return False, local_release_safe
-
-    class FakeRuntimeManifest:
-        @classmethod
-        def from_runtime_inventory(cls, inventory):
-            return SimpleNamespace(**inventory)
-
-    class FakeRegistrationLease:
-        @classmethod
-        def from_fragment(cls, fragment, *, runtime_lease_id=None):
-            return fragment
-
-    class FailingReader:
-        def __init__(self, engine, **kwargs):
-            pass
-
-        def execute(self, *args, **kwargs):
-            raise error_type("known failure")
-
-    fake_weight_transfer = ModuleType("mooncake.weight_transfer")
-    fake_weight_transfer.MemoryRegistrationLease = FakeRegistrationLease
-    fake_weight_transfer.MooncakeTransferEngineReader = FailingReader
-    fake_weight_transfer.RuntimeManifest = FakeRuntimeManifest
-    fake_weight_transfer.TransferCompletionUnknownError = _CompletionUnknownError
-    fake_weight_transfer.TransferEngineError = _TransferEngineError
-    fake_weight_transfer.plan_runtime_transfer_to_local_target = (
-        lambda sources, target: object()
-    )
-    monkeypatch.setitem(sys.modules, "mooncake.weight_transfer", fake_weight_transfer)
-    monkeypatch.setattr(
-        loader_module,
-        "RemoteInstanceWeightTransferWorldCoordinator",
-        FakeCoordinator,
-    )
-    monkeypatch.setattr(loader_module, "get_world_group", lambda: object())
-
-    @contextlib.contextmanager
-    def target_builder(**kwargs):
-        yield target_inventory
-
-    loader = RemoteInstanceModelLoader.__new__(RemoteInstanceModelLoader)
-
-    assert (
-        _load_heterogeneous(
-            loader,
-            object(),
-            object(),
-            "http://seed:30000",
-            "target-session",
-            target_builder,
-        )
-        is False
-    )
-    assert outcomes == [("ready", True), (False, True)]
+    assert backend.events == ["prepare", "execute", "close"]
+    assert activation.weight_generation == 1
+    assert _SourceCoordinator.instances[0].finish_calls == [(False, True)]
 
 
-def test_heterogeneous_loader_fails_closed_when_heartbeat_fails_during_transfer(
+def test_world_or_source_release_failure_prevents_content_activation(
     monkeypatch,
 ) -> None:
-    state = {"outcomes": []}
-    source_inventory = {
-        "model_id": _TARGET_MODEL_ID,
-        "revision": _TARGET_REVISION,
-        "lease_id": "source-runtime-lease",
-        "fragments": [],
-    }
-    target_inventory = {
-        "model_id": source_inventory["model_id"],
-        "revision": source_inventory["revision"],
-        "lease_id": "target-runtime-lease",
-        "fragments": [],
-    }
+    activation = WeightSnapshotCoordinator()
+    backend = _Backend(activation_coordinator=activation)
+    _patch_runtime(monkeypatch, backend)
+    _SourceCoordinator.forced_finish_result = (False, False)
 
-    class FakeRuntimeManifest:
-        @classmethod
-        def from_runtime_inventory(cls, inventory):
-            return SimpleNamespace(**inventory)
+    assert _load(backend) is False
 
-    class FakeCoordinator:
-        def __init__(self, seed_url, world_group):
-            self.failed = False
-            state["coordinator"] = self
+    assert "activate" not in backend.events
+    assert activation.weight_generation == 1
+    assert activation.generation == 1
+    assert _SourceCoordinator.instances[0].finish_calls == [(True, True)]
 
-        def acquire(self):
-            return SimpleNamespace(
-                transfer_id="transfer-1",
-                manifests=[source_inventory],
-                lease_timeout_sec=60,
-            )
 
-        def raise_if_failed(self):
-            if self.failed:
-                raise RuntimeError("source lease renew failed")
-
-        def ready_for_transfer(self, local_ready):
-            state["readiness"] = local_ready
-            return local_ready and not self.failed
-
-        def finish(self, *, local_success, local_release_safe=True):
-            if self.failed:
-                local_success = False
-            state["outcomes"].append((local_success, local_release_safe))
-            return False, True
-
-    class FakeReader:
-        def __init__(self, engine, **kwargs):
-            pass
-
-        def execute(self, *args, **kwargs):
-            state["coordinator"].failed = True
-            return [SimpleNamespace(nbytes=64, operation_count=1, request_count=1)]
-
-    fake_weight_transfer = ModuleType("mooncake.weight_transfer")
-    fake_weight_transfer.MemoryRegistrationLease = SimpleNamespace(
-        from_fragment=lambda fragment, **kwargs: fragment
-    )
-    fake_weight_transfer.MooncakeTransferEngineReader = FakeReader
-    fake_weight_transfer.RuntimeManifest = FakeRuntimeManifest
-    fake_weight_transfer.TransferCompletionUnknownError = _CompletionUnknownError
-    fake_weight_transfer.TransferEngineError = _TransferEngineError
-    fake_weight_transfer.plan_runtime_transfer_to_local_target = (
-        lambda sources, target: object()
-    )
-    monkeypatch.setitem(sys.modules, "mooncake.weight_transfer", fake_weight_transfer)
+def test_peer_activation_failure_fails_the_entire_target_world(monkeypatch) -> None:
+    activation = WeightSnapshotCoordinator()
+    backend = _Backend(activation_coordinator=activation)
+    _patch_runtime(monkeypatch, backend)
     monkeypatch.setattr(
         loader_module,
-        "RemoteInstanceWeightTransferWorldCoordinator",
-        FakeCoordinator,
+        "get_world_group",
+        lambda: _ActivationPeerFailureWorld(),
     )
-    monkeypatch.setattr(loader_module, "get_world_group", lambda: object())
-    monkeypatch.setattr(loader_module.current_platform, "synchronize", lambda: None)
-    monkeypatch.setattr(loader_module, "_post_load_weights", lambda model: None)
 
-    @contextlib.contextmanager
-    def target_builder(**kwargs):
-        yield target_inventory
+    assert _load(backend) is False
 
-    loader = RemoteInstanceModelLoader.__new__(RemoteInstanceModelLoader)
+    assert "activate" in backend.events
+    assert activation.weight_generation == 7
+    assert _SourceCoordinator.instances[0].finish_calls == [(True, True)]
 
-    assert (
-        _load_heterogeneous(
-            loader,
-            object(),
-            object(),
-            "http://seed:30000",
-            "target-session",
-            target_builder,
+
+def test_local_activation_failure_is_published_to_the_target_world(monkeypatch) -> None:
+    activation = WeightSnapshotCoordinator()
+    backend = _Backend(
+        outcome="activation-error",
+        activation_coordinator=activation,
+    )
+    _patch_runtime(monkeypatch, backend)
+
+    assert _load(backend) is False
+
+    assert "activate" in backend.events
+    assert activation.weight_generation == 1
+    assert _SourceCoordinator.instances[0].finish_calls == [(True, True)]
+
+
+def test_completion_unknown_retains_context_and_blocks_source_release(
+    monkeypatch,
+) -> None:
+    activation = WeightSnapshotCoordinator()
+    backend = _Backend(outcome="unknown", activation_coordinator=activation)
+    _patch_runtime(monkeypatch, backend)
+    monkeypatch.setattr(
+        loader_module,
+        "_HETEROGENEOUS_UNKNOWN_DRAIN_MAX_ATTEMPTS",
+        1,
+    )
+
+    assert _load(backend) is False
+
+    assert backend.events == ["prepare", "execute", "retain", "drain"]
+    assert backend.prepared.closed is False
+    assert backend.prepared.completion_unknown_retained is True
+    assert activation.weight_generation == 1
+    assert _SourceCoordinator.instances[0].finish_calls == [(False, False)]
+    assert len(loader_module._HETEROGENEOUS_UNKNOWN_TRANSFER_QUARANTINE) == 1
+
+
+def test_completion_unknown_releases_resources_after_known_terminal_drain(
+    monkeypatch,
+) -> None:
+    activation = WeightSnapshotCoordinator()
+    backend = _Backend(
+        outcome="unknown-terminal",
+        activation_coordinator=activation,
+    )
+    _patch_runtime(monkeypatch, backend)
+    monkeypatch.setattr(
+        loader_module,
+        "_HETEROGENEOUS_UNKNOWN_DRAIN_MAX_ATTEMPTS",
+        1,
+    )
+
+    assert _load(backend) is False
+
+    assert backend.events == ["prepare", "execute", "retain", "drain", "close"]
+    assert backend.prepared.closed is True
+    assert backend.prepared.completion_unknown_retained is False
+    assert activation.weight_generation == 1
+    assert _SourceCoordinator.instances[0].finish_calls == [(False, True)]
+    assert loader_module._HETEROGENEOUS_UNKNOWN_TRANSFER_QUARANTINE == []
+
+
+def test_untyped_execute_failure_is_quarantined_and_blocks_source_release(
+    monkeypatch,
+) -> None:
+    backend = _Backend(outcome="unexpected-error")
+    _patch_runtime(monkeypatch, backend)
+
+    assert _load(backend) is False
+
+    assert backend.events == ["prepare", "execute", "retain"]
+    assert backend.prepared.closed is False
+    assert backend.prepared.completion_unknown_retained is True
+    assert _SourceCoordinator.instances[0].finish_calls == [(False, False)]
+    assert len(loader_module._HETEROGENEOUS_UNKNOWN_TRANSFER_QUARANTINE) == 1
+
+
+def test_execute_interruption_is_quarantined_before_it_propagates(monkeypatch) -> None:
+    backend = _Backend(outcome="interrupted")
+    _patch_runtime(monkeypatch, backend)
+
+    with pytest.raises(KeyboardInterrupt):
+        _load(backend)
+
+    assert backend.events == ["prepare", "execute", "retain"]
+    assert backend.prepared.closed is False
+    assert backend.prepared.completion_unknown_retained is True
+    assert _SourceCoordinator.instances[0].finish_calls == [(False, False)]
+    assert len(loader_module._HETEROGENEOUS_UNKNOWN_TRANSFER_QUARANTINE) == 1
+
+
+def test_backend_unavailable_fails_before_source_session_acquisition(
+    monkeypatch,
+) -> None:
+    _SourceCoordinator.instances.clear()
+    monkeypatch.setattr(loader_module, "get_world_group", lambda: _World())
+    monkeypatch.setattr(loader_module, "get_server_args", lambda: None)
+    monkeypatch.setattr(
+        loader_module,
+        "create_weight_reshard_backend",
+        lambda configured: (_ for _ in ()).throw(
+            WeightReshardBackendUnavailableError("Mooncake unavailable")
+        ),
+    )
+
+    assert _load(None) is False
+    assert _SourceCoordinator.instances == []
+
+
+@pytest.mark.parametrize(
+    "world_group",
+    [
+        object(),
+        SimpleNamespace(world_size=True, rank_in_group=0),
+        SimpleNamespace(world_size=1, rank_in_group=0),
+        SimpleNamespace(
+            world_size=1,
+            rank_in_group=1,
+            all_gather_object=lambda value: [value],
+            broadcast_object=lambda value, src: value,
+        ),
+    ],
+)
+def test_invalid_target_world_group_fails_before_backend_or_source_acquisition(
+    monkeypatch,
+    world_group,
+) -> None:
+    _SourceCoordinator.instances.clear()
+    backend_calls = []
+    monkeypatch.setattr(loader_module, "get_world_group", lambda: world_group)
+    monkeypatch.setattr(loader_module, "get_server_args", lambda: None)
+    monkeypatch.setattr(
+        loader_module,
+        "create_weight_reshard_backend",
+        lambda configured: backend_calls.append(configured),
+    )
+
+    assert _load(None) is False
+    assert backend_calls == []
+    assert _SourceCoordinator.instances == []
+
+
+def test_placeholder_target_revision_fails_before_backend_or_source_acquisition(
+    monkeypatch,
+) -> None:
+    _SourceCoordinator.instances.clear()
+    backend_calls = []
+    monkeypatch.setattr(loader_module, "get_world_group", lambda: _World())
+    monkeypatch.setattr(loader_module, "get_server_args", lambda: None)
+    monkeypatch.setattr(
+        loader_module,
+        "create_weight_reshard_backend",
+        lambda configured: backend_calls.append(configured),
+    )
+
+    assert _load(None, target_revision="default") is False
+    assert backend_calls == []
+    assert _SourceCoordinator.instances == []
+
+
+def test_post_load_refreshes_runtime_state_only_on_terminal_path() -> None:
+    calls = []
+    model = SimpleNamespace(
+        modules=lambda: (
+            SimpleNamespace(refresh_runtime_weight_state=lambda: calls.append("a")),
+            SimpleNamespace(refresh_runtime_weight_state=lambda: calls.append("b")),
+        ),
+        post_load_weights=lambda: calls.append("model"),
+    )
+
+    loader_module._post_load_weights(model)
+
+    assert calls == ["a", "b", "model"]
+
+
+def test_target_snapshot_coordinator_exists_before_target_inventory_binding() -> None:
+    runner = ModelRunner.__new__(ModelRunner)
+    runner.server_args = SimpleNamespace(enable_weight_reshard=True)
+    runner.init_weight_snapshot_coordinator()
+
+    assert isinstance(runner.weight_snapshot_coordinator, WeightSnapshotCoordinator)
+    assert runner.weight_inventory_manager is None
+
+
+def test_target_builder_allows_idempotent_runtime_state_refresh_modules() -> None:
+    runner = ModelRunner.__new__(ModelRunner)
+    runner.model_config = SimpleNamespace(quantization=None)
+    runner.weight_snapshot_coordinator = WeightSnapshotCoordinator()
+    runner.remote_instance_weight_transporter = SimpleNamespace(
+        worker_id="target-worker"
+    )
+    placement = SimpleNamespace(weight_generation=7)
+    manager = SimpleNamespace(
+        target_layout_inventory=lambda **_kwargs: placement,
+    )
+    observed = {}
+
+    def create_manager(*, model, coordinator):
+        observed["model"] = model
+        observed["coordinator"] = coordinator
+        return manager
+
+    runner._create_weight_inventory_manager = create_manager
+    model = SimpleNamespace(
+        modules=lambda: (SimpleNamespace(refresh_runtime_weight_state=lambda: None),)
+    )
+
+    with runner.build_remote_instance_target_weight_inventory_session(
+        model=model,
+        model_id="model",
+        revision="immutable-revision",
+        weight_generation=7,
+        instance_id="target-instance",
+        endpoint="target:1234",
+    ) as session:
+        assert session.placement_inventory is placement
+
+    assert observed == {
+        "model": model,
+        "coordinator": runner.weight_snapshot_coordinator,
+    }
+
+
+def _serialized_fp8_target_runner(monkeypatch) -> ModelRunner:
+    runner = ModelRunner.__new__(ModelRunner)
+    runner.model_config = SimpleNamespace(
+        quantization="fp8",
+        hf_config=SimpleNamespace(
+            model_type="qwen3",
+            hidden_size=128,
+            intermediate_size=128,
+        ),
+    )
+    runner.server_args = SimpleNamespace(
+        enable_lora=False,
+        mm_enable_dp_encoder=False,
+        enable_eplb=False,
+        elastic_ep_backend=None,
+        init_expert_location="trivial",
+        ep_num_redundant_experts=0,
+        moe_runner_backend="triton",
+        fp8_gemm_runner_backend="triton",
+        enable_dp_attention=False,
+    )
+    runner.ps = SimpleNamespace(
+        dp_rank=None,
+        dp_size=1,
+        moe_dp_rank=0,
+        moe_dp_size=1,
+        tp_rank=0,
+        tp_size=1,
+        pp_rank=0,
+        pp_size=1,
+        moe_ep_rank=0,
+        moe_ep_size=1,
+        attn_tp_rank=0,
+        attn_tp_size=1,
+    )
+    runner.device = "cpu"
+    runner.is_multimodal = False
+    runner.weight_snapshot_coordinator = WeightSnapshotCoordinator()
+    runner.remote_instance_weight_transporter = SimpleNamespace(
+        worker_id="target-worker"
+    )
+    monkeypatch.setattr(
+        model_runner_module,
+        "get_parallel",
+        lambda: SimpleNamespace(moe_tp_rank=0, moe_tp_size=1),
+    )
+    return runner
+
+
+def test_target_builder_accepts_serialized_block_fp8_runtime_layout(
+    monkeypatch,
+) -> None:
+    runner = _serialized_fp8_target_runner(monkeypatch)
+
+    with runner.build_remote_instance_target_weight_inventory_session(
+        model=_SerializedBlockFp8Model(),
+        model_id="model",
+        revision="immutable-revision",
+        weight_generation=7,
+        instance_id="target-instance",
+        endpoint="target:1234",
+    ) as session:
+        fragments = session.placement_inventory.fragments
+        assert {fragment.tensor_id for fragment in fragments} == {
+            "layers.0.mlp.down_proj.weight",
+            "layers.0.mlp.down_proj.weight_scale_inv",
+        }
+        assert all(
+            "serialized-block-fp8" in item.layout_fingerprint for item in fragments
         )
-        is False
-    )
-    assert state["readiness"] is True
-    assert state["outcomes"] == [(False, True)]
+        with session.bind() as binding:
+            assert len(binding.fragments) == 2
+
+
+def test_target_builder_rejects_online_fp8_through_inventory_validation(
+    monkeypatch,
+) -> None:
+    runner = _serialized_fp8_target_runner(monkeypatch)
+
+    with pytest.raises(
+        WeightInventoryError,
+        match="serialized FP8 checkpoint is required",
+    ):
+        with runner.build_remote_instance_target_weight_inventory_session(
+            model=_SerializedBlockFp8Model(serialized=False),
+            model_id="model",
+            revision="immutable-revision",
+            weight_generation=7,
+            instance_id="target-instance",
+            endpoint="target:1234",
+        ):
+            pass

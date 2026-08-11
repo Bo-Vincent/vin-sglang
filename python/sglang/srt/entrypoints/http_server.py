@@ -1276,14 +1276,12 @@ async def remote_instance_transfer_engine_info(rank: int = None):
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def begin_remote_instance_weight_transfer(
     lease_timeout_sec: int = 300,
-    manifest_format: str = "runtime_v1",
     transfer_id: str | None = None,
 ):
     try:
         return (
             await _global_state.tokenizer_manager.begin_remote_instance_weight_transfer(
                 lease_timeout_sec,
-                manifest_format=manifest_format,
                 transfer_id=transfer_id,
             )
         )
