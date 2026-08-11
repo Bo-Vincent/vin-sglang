@@ -14,6 +14,11 @@ publish = false  # binary-only; not published to crates.io
 name = "sgl_router"
 crate-type = ["rlib"]
 
+[features]
+# Enables the Step 3-only fields in the Router pressure benchmark.  Keeping
+# this opt-in lets the same benchmark source compile on the Step 2 baseline.
+step3-pressure = []
+
 [[bin]]
 name = "sgl-router"
 path = "src/main.rs"
@@ -119,3 +124,8 @@ path = "benches/tree_lookup.rs"
 name = "policy_select"
 harness = false
 path = "benches/policy_select.rs"
+
+[[bench]]
+name = "router_pressure"
+harness = false
+path = "benches/router_pressure.rs"

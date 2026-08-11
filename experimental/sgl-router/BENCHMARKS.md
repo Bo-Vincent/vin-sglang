@@ -86,6 +86,14 @@ Step 2 baseline 与 Step 3 多维 LoadMonitor candidate 的 48-case 正式主轮
 链路可用且多数场景中性或改善，但高压 Session workload 仍有高波动 TTFT 回退，不能外推为
 所有 workload 的稳定收益。
 
+## Router Policy 热路径 Microbenchmark
+
+8 / 64 / 256 endpoints 下 scheduling snapshot、P2、Session-Aware、Cache-Aware top-K
+和 Decode Policy 的三轮 Router-only latency、allocation、CPU、扩展性门槛与适用边界见
+[Router Policy 热路径 Microbenchmark 报告](docs/router-policy-pressure-microbenchmark-report.md)。
+正式 V6 共 211 项验收并全部通过；该结果不替代高 Router RPS 和并发 LoadMonitor 写入
+条件下的容量验证。
+
 ## Pre-deprecation calibration runbook
 
 Before deleting SMG, every routing-latency metric in the slim-design
