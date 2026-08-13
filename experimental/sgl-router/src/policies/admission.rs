@@ -436,15 +436,45 @@ impl<'a> FreshLoadLookup<'a> {
         }
     }
 
-    pub(crate) fn get(&self, worker_id: &crate::discovery::WorkerId) -> Option<&AggregateLoad> {
+    pub(crate) fn get(&self, worker_id: &crate::discovery::WorkerId) -> Option<&'a AggregateLoad> {
         self.by_worker_id.get(worker_id.0.as_str()).copied()
     }
 
-    fn comparable_get(&self, worker_id: &crate::discovery::WorkerId) -> Option<&AggregateLoad> {
+    fn comparable_get(&self, worker_id: &crate::discovery::WorkerId) -> Option<&'a AggregateLoad> {
         if self.compare_aggregate {
             self.get(worker_id)
         } else {
             None
+        }
+    }
+
+    /// Both inputs are a pure function of the worker id, so resolving once per
+    /// candidate is equivalent to resolving inside every comparison.
+    fn pressure_key(&self, worker: &Arc<Worker>) -> PressureKey<'a> {
+        PressureKey {
+            load: self.comparable_get(&worker.id),
+            local_active: self
+                .local_active_by_worker_id
+                .get(worker.id.0.as_str())
+                .copied()
+                .unwrap_or(usize::MAX),
+        }
+    }
+
+    fn compare_prefill_keys(&self, left: &PressureKey<'a>, right: &PressureKey<'a>) -> Ordering {
+        match (left.load, right.load) {
+            (Some(left_load), Some(right_load)) => load_pressure_key(left_load)
+                .cmp(&load_pressure_key(right_load))
+                .then_with(|| left.local_active.cmp(&right.local_active)),
+            _ => left.local_active.cmp(&right.local_active),
+        }
+    }
+
+    fn compare_decode_keys(&self, left: &PressureKey<'a>, right: &PressureKey<'a>) -> Ordering {
+        match (left.load, right.load) {
+            (Some(left_load), Some(right_load)) => compare_decode_aggregate(left_load, right_load)
+                .then_with(|| left.local_active.cmp(&right.local_active)),
+            _ => left.local_active.cmp(&right.local_active),
         }
     }
 
@@ -453,47 +483,43 @@ impl<'a> FreshLoadLookup<'a> {
         left: &Arc<Worker>,
         right: &Arc<Worker>,
     ) -> Ordering {
-        let left_local = self
-            .local_active_by_worker_id
-            .get(left.id.0.as_str())
-            .copied()
-            .unwrap_or(usize::MAX);
-        let right_local = self
-            .local_active_by_worker_id
-            .get(right.id.0.as_str())
-            .copied()
-            .unwrap_or(usize::MAX);
-        match (
-            self.comparable_get(&left.id),
-            self.comparable_get(&right.id),
-        ) {
-            (Some(left_load), Some(right_load)) => load_pressure_key(left_load)
-                .cmp(&load_pressure_key(right_load))
-                .then_with(|| left_local.cmp(&right_local)),
-            _ => left_local.cmp(&right_local),
-        }
+        self.compare_prefill_keys(&self.pressure_key(left), &self.pressure_key(right))
     }
 
-    fn compare_decode_pressure(&self, left: &Arc<Worker>, right: &Arc<Worker>) -> Ordering {
-        let left_local = self
-            .local_active_by_worker_id
-            .get(left.id.0.as_str())
-            .copied()
-            .unwrap_or(usize::MAX);
-        let right_local = self
-            .local_active_by_worker_id
-            .get(right.id.0.as_str())
-            .copied()
-            .unwrap_or(usize::MAX);
-        match (
-            self.comparable_get(&left.id),
-            self.comparable_get(&right.id),
-        ) {
-            (Some(left_load), Some(right_load)) => compare_decode_aggregate(left_load, right_load)
-                .then_with(|| left_local.cmp(&right_local)),
-            _ => left_local.cmp(&right_local),
+    /// Cheapest candidate under `compare`, resolving each candidate's inputs
+    /// exactly once. Ties keep the earlier candidate, matching `min_by`.
+    fn min_by_pressure_key(
+        &self,
+        candidates: Vec<Arc<Worker>>,
+        compare: impl Fn(&Self, &PressureKey<'a>, &PressureKey<'a>) -> Ordering,
+    ) -> Option<Arc<Worker>> {
+        let mut candidates = candidates.into_iter();
+        let first = candidates.next()?;
+        let second = match candidates.next() {
+            Some(candidate) => candidate,
+            None => return Some(first),
+        };
+        let mut best_key = self.pressure_key(&first);
+        let mut best = first;
+        let second_key = self.pressure_key(&second);
+        if compare(self, &second_key, &best_key).is_lt() {
+            best_key = second_key;
+            best = second;
         }
+        for candidate in candidates {
+            let key = self.pressure_key(&candidate);
+            if compare(self, &key, &best_key).is_lt() {
+                best_key = key;
+                best = candidate;
+            }
+        }
+        Some(best)
     }
+}
+
+struct PressureKey<'a> {
+    load: Option<&'a AggregateLoad>,
+    local_active: usize,
 }
 
 /// 两个候选都有 fresh snapshot 时才允许压力逃逸。
@@ -542,9 +568,8 @@ fn range_fallback(
         .cloned()
         .collect();
     let comparison_loads = FreshLoadLookup::new(Some(snapshot), admitted.iter());
-    admitted
-        .into_iter()
-        .min_by(|left, right| comparison_loads.compare_prefill_pressure(left, right))
+    comparison_loads
+        .min_by_pressure_key(admitted, FreshLoadLookup::compare_prefill_keys)
         .map(|worker| (worker, DecisionReason::RangeFallback))
 }
 
@@ -563,9 +588,8 @@ fn decode_domain_fallback(
         .cloned()
         .collect();
     let comparison_loads = FreshLoadLookup::new(Some(snapshot), admitted.iter());
-    admitted
-        .into_iter()
-        .min_by(|left, right| comparison_loads.compare_decode_pressure(left, right))
+    comparison_loads
+        .min_by_pressure_key(admitted, FreshLoadLookup::compare_decode_keys)
         .map(|worker| (worker, DecisionReason::RangeFallback))
 }
 
@@ -628,4 +652,126 @@ fn compare_decode_aggregate(left: &AggregateLoad, right: &AggregateLoad) -> Orde
         .then_with(|| left_kv.cmp(&right_kv))
         .then_with(|| left.num_running_reqs.cmp(&right.num_running_reqs))
         .then_with(|| left.num_total_tokens.cmp(&right.num_total_tokens))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
+    use crate::load_monitor::WorkerSnapshot;
+    use crate::policies::SelectionProposal;
+
+    fn worker(id: &str) -> Arc<Worker> {
+        Arc::new(Worker::new(WorkerSpec {
+            id: WorkerId(id.into()),
+            url: format!("http://{id}:30000"),
+            mode: WorkerMode::Plain,
+            model_ids: vec![ModelId("model".into())],
+            bootstrap_port: None,
+        }))
+    }
+
+    fn load(waiting_tokens: u64, running_requests: u64) -> AggregateLoad {
+        AggregateLoad {
+            num_running_reqs: running_requests,
+            num_waiting_uncached_tokens: waiting_tokens,
+            num_total_tokens: 1_024 + running_requests,
+            max_total_num_tokens: 8_192,
+            max_running_requests: 64,
+            ..Default::default()
+        }
+    }
+
+    fn snapshot(entries: &[(&Arc<Worker>, AggregateLoad)]) -> LoadMonitorSnapshot {
+        LoadMonitorSnapshot {
+            enabled: true,
+            version: 1,
+            captured_at: None,
+            workers: entries
+                .iter()
+                .map(|(worker, aggregate)| WorkerSnapshot {
+                    worker_id: worker.id.0.clone(),
+                    url: worker.url.clone(),
+                    mode: worker.mode(),
+                    model_ids: worker
+                        .model_ids
+                        .iter()
+                        .map(|model| model.0.clone())
+                        .collect(),
+                    freshness: Freshness::Fresh,
+                    source_instance_id: None,
+                    sequence_id: None,
+                    report_time_unix_ms: None,
+                    last_error: None,
+                    received_at: None,
+                    expires_at: None,
+                    aggregate: Some(aggregate.clone()),
+                    ranks: Vec::new(),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn pressure_key_fold_keeps_prefill_decode_and_tie_order() {
+        let first = worker("first");
+        let best = worker("best");
+        let last = worker("last");
+        let loads = snapshot(&[
+            (&first, load(20, 3)),
+            (&best, load(10, 1)),
+            (&last, load(30, 2)),
+        ]);
+        let candidates = vec![Arc::clone(&first), Arc::clone(&best), Arc::clone(&last)];
+        let lookup = FreshLoadLookup::new(Some(&loads), candidates.iter());
+
+        assert_eq!(
+            lookup
+                .min_by_pressure_key(candidates.clone(), FreshLoadLookup::compare_prefill_keys)
+                .expect("non-empty candidates")
+                .id,
+            best.id
+        );
+        assert_eq!(
+            lookup
+                .min_by_pressure_key(candidates, FreshLoadLookup::compare_decode_keys)
+                .expect("non-empty candidates")
+                .id,
+            best.id
+        );
+
+        let tied = vec![Arc::clone(&first), Arc::clone(&last)];
+        let tied_snapshot = snapshot(&[(&first, load(1, 1)), (&last, load(1, 1))]);
+        let tied_lookup = FreshLoadLookup::new(Some(&tied_snapshot), tied.iter());
+        assert_eq!(
+            tied_lookup
+                .min_by_pressure_key(tied, FreshLoadLookup::compare_prefill_keys)
+                .expect("non-empty candidates")
+                .id,
+            first.id
+        );
+    }
+
+    #[test]
+    fn prefill_fallback_filters_capacity_before_ranking() {
+        let busy = worker("busy");
+        let quick = worker("quick");
+        let roomy = worker("roomy");
+        let domain = CandidateDomain::bucket_prefill(
+            "bucket",
+            vec![Arc::clone(&busy), Arc::clone(&quick), Arc::clone(&roomy)],
+            Some(1_000),
+        );
+        let range = domain.prefill_range().expect("prefill domain");
+        let snapshot = snapshot(&[
+            (&busy, load(500, 1)),
+            (&quick, load(800, 1)),
+            (&roomy, load(10, 1)),
+        ]);
+
+        let decision = resolve_prefill(&range, &SelectionProposal::primary(busy), 900, &snapshot)
+            .expect("roomy remains admitted");
+        assert_eq!(decision.reason, DecisionReason::RangeFallback);
+        assert_eq!(decision.selected.id, roomy.id);
+    }
 }
