@@ -285,26 +285,6 @@ impl Cli {
                 "--kv-indexer-query-max-inflight requires --kv-indexer-endpoint"
             ));
         }
-        if self.kv_indexer_query_timeout_ms == Some(0) {
-            return Err(anyhow!(
-                "--kv-indexer-query-timeout-ms must be greater than zero"
-            ));
-        }
-        if self.kv_indexer_query_timeout_ms.is_some() && self.kv_indexer_endpoint.is_none() {
-            return Err(anyhow!(
-                "--kv-indexer-query-timeout-ms requires --kv-indexer-endpoint"
-            ));
-        }
-        if self.kv_indexer_query_max_inflight == Some(0) {
-            return Err(anyhow!(
-                "--kv-indexer-query-max-inflight must be greater than zero"
-            ));
-        }
-        if self.kv_indexer_query_max_inflight.is_some() && self.kv_indexer_endpoint.is_none() {
-            return Err(anyhow!(
-                "--kv-indexer-query-max-inflight requires --kv-indexer-endpoint"
-            ));
-        }
         if self.kv_indexer_endpoint.is_some() && self.policy != PolicyKind::CacheAware {
             return Err(anyhow!(
                 "--kv-indexer-endpoint requires --policy cache_aware"
@@ -315,6 +295,7 @@ impl Cli {
                 "--policy cache_aware requires --kv-indexer-endpoint"
             ));
         }
+        let tuned_cache_aware = tuned_legacy_cache_aware || self.kv_indexer_endpoint.is_some();
         let affinity_policy = matches!(
             self.policy,
             PolicyKind::SessionAware | PolicyKind::CacheAware
@@ -596,12 +577,6 @@ impl Cli {
         // Only build a CacheAwareConfig when the operator tuned at least
         // one knob; otherwise leave it None so the policy uses its own
         // defaults. Unset knobs fall back to the per-field defaults.
-        let kv_indexer_query_timeout_ms = self
-            .kv_indexer_query_timeout_ms
-            .unwrap_or(DEFAULT_KV_INDEXER_QUERY_TIMEOUT_MS);
-        let kv_indexer_query_max_inflight = self
-            .kv_indexer_query_max_inflight
-            .unwrap_or(DEFAULT_KV_INDEXER_QUERY_MAX_INFLIGHT);
         let cache_aware = if tuned_cache_aware {
             let d = CacheAwareConfig::default();
             let kv_indexer_endpoint = self.kv_indexer_endpoint.map(|url| KvIndexerEndpointConfig {
@@ -1173,7 +1148,10 @@ mod tests {
             .expect("cache-aware config")
             .kv_indexer_endpoint
             .expect("Indexer config");
-        assert_eq!(indexer.query_timeout_ms, DEFAULT_KV_INDEXER_QUERY_TIMEOUT_MS);
+        assert_eq!(
+            indexer.query_timeout_ms,
+            DEFAULT_KV_INDEXER_QUERY_TIMEOUT_MS
+        );
         assert_eq!(indexer.query_max_inflight, 32);
     }
 
@@ -1187,10 +1165,7 @@ mod tests {
         ]))
         .unwrap_err()
         .to_string();
-        assert!(
-            err.contains("requires --policy cache_aware"),
-            "got: {err}"
-        );
+        assert!(err.contains("requires --policy cache_aware"), "got: {err}");
     }
 
     #[test]
@@ -1732,7 +1707,8 @@ mod tests {
                 .as_ref()
                 .expect("cache-aware needs indexer config")
                 .kv_indexer_endpoint
-                .as_deref(),
+                .as_ref()
+                .map(|indexer| indexer.url.as_str()),
             Some("http://indexer:50051"),
         );
         let indexer_timeout_ms = config

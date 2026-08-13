@@ -373,11 +373,18 @@ fn cache_signal(workers: &[Arc<Worker>]) -> ExternalPrefixSignal {
         .enumerate()
         .map(|(index, worker)| PrefixMatch {
             matched_prefix_blocks: (workers.len() - index) as u32,
+            // Route on the worker URL: the #33370 indexer contract matches
+            // PrefixMatch.address against registered worker URLs.
+            address: worker.url.clone(),
             worker_id: worker.id.0.clone(),
         })
         .collect();
+    let best_prefix_blocks = workers.len() as u32;
     ExternalPrefixSignal {
-        outcome: PrefixOutcome::Matched { matches },
+        outcome: PrefixOutcome::Matched {
+            matches,
+            best_prefix_blocks,
+        },
         query_blocks: workers.len(),
     }
 }
