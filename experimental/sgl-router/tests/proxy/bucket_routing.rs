@@ -9,11 +9,12 @@
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use sgl_kv_indexer::{NoSignalReason, PrefixIndex, PrefixMatch, PrefixOutcome};
+use sgl_kv_indexer::{PrefixIndex, PrefixIndexError, PrefixMatch, PrefixOutcome};
 use sgl_router::config::{
     ActiveLoadConfig, AffinityConfig, BucketConfig, BucketSpec, BucketStage, CacheAwareConfig,
-    Config, DiscoveryBackend, ModelConfig, ObservabilityConfig, PolicyKind, ProxyConfig,
-    ServerConfig, SessionAffinityMode, SloBucketPolicy, StaticUrlsDiscoveryConfig,
+    Config, DiscoveryBackend, KvIndexerEndpointConfig, ModelConfig, ObservabilityConfig,
+    PolicyKind, ProxyConfig, ServerConfig, SessionAffinityMode, SloBucketPolicy,
+    StaticUrlsDiscoveryConfig,
 };
 use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
 use sgl_router::policies::factory::build_registry_with_defaults;
@@ -118,21 +119,21 @@ impl FakePrefixIndex {
 
 #[tonic::async_trait]
 impl PrefixIndex for FakePrefixIndex {
-    async fn match_prefix(&self, hashes: Vec<i64>) -> PrefixOutcome {
+    async fn match_prefix(&self, hashes: Vec<i64>) -> Result<PrefixOutcome, PrefixIndexError> {
         self.calls.fetch_add(1, Ordering::Relaxed);
         let Some(address) = &self.address else {
-            return PrefixOutcome::NoSignal(NoSignalReason::Empty);
+            return Ok(PrefixOutcome::Empty);
         };
         let matched_prefix_blocks =
             u32::try_from(hashes.len().saturating_sub(1)).unwrap_or(u32::MAX);
-        PrefixOutcome::Matched {
+        Ok(PrefixOutcome::Matched {
             matches: vec![PrefixMatch {
                 address: address.clone(),
                 matched_prefix_blocks,
                 worker_id: "fake-index-worker".into(),
             }],
             best_prefix_blocks: matched_prefix_blocks,
-        }
+        })
     }
 }
 
@@ -148,7 +149,11 @@ fn build_cache_ctx(
         Some(AffinityConfig::default()),
     );
     context.config.model.cache_aware = Some(CacheAwareConfig {
-        kv_indexer_endpoint: Some("http://fake-indexer".into()),
+        kv_indexer_endpoint: Some(KvIndexerEndpointConfig {
+            url: "http://fake-indexer".into(),
+            query_timeout_ms: 100,
+            query_max_inflight: 32,
+        }),
         ..CacheAwareConfig::default()
     });
     context.prefix_index = Some(prefix_index);

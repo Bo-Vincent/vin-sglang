@@ -320,6 +320,7 @@ impl Cli {
                 "--policy cache_aware requires --kv-indexer-endpoint"
             ));
         }
+        let tuned_cache_aware = tuned_legacy_cache_aware || self.kv_indexer_endpoint.is_some();
         let affinity_policy = matches!(
             self.policy,
             PolicyKind::SessionAware | PolicyKind::CacheAware
@@ -1851,7 +1852,8 @@ mod tests {
                 .as_ref()
                 .expect("cache-aware needs indexer config")
                 .kv_indexer_endpoint
-                .as_deref(),
+                .as_ref()
+                .map(|indexer| indexer.url.as_str()),
             Some("http://indexer:50051"),
         );
         let cache = config

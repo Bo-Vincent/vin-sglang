@@ -128,13 +128,9 @@ async fn main() -> Result<()> {
         .as_ref()
         .and_then(|cache| cache.kv_indexer_endpoint.as_ref())
         .map(|indexer| {
-            let config = sgl_kv_indexer::PrefixIndexConfig {
-                endpoint: indexer.url.clone(),
-                query_deadline: std::time::Duration::from_millis(indexer.query_timeout_ms),
-                max_inflight: indexer.query_max_inflight,
-            };
+            let config = prefix_index_config(indexer);
             sgl_kv_indexer::GrpcPrefixIndex::new(config)
-                .map(Arc::new)
+                .map(|index| Arc::new(index) as Arc<dyn sgl_kv_indexer::PrefixIndex>)
                 .context("configure KV Indexer client")
         })
         .transpose()?;
@@ -243,16 +239,15 @@ async fn main() -> Result<()> {
     server_result
 }
 
-/// Build the external Indexer client with an optional query deadline.
+/// Build the external Indexer client with the Router's bounded query settings.
 fn prefix_index_config(
-    endpoint: String,
-    query_timeout_ms: Option<u64>,
+    indexer: &sgl_router::config::KvIndexerEndpointConfig,
 ) -> sgl_kv_indexer::PrefixIndexConfig {
-    let mut config = sgl_kv_indexer::PrefixIndexConfig::new(endpoint);
-    if let Some(query_timeout_ms) = query_timeout_ms {
-        config.query_deadline = std::time::Duration::from_millis(query_timeout_ms);
+    sgl_kv_indexer::PrefixIndexConfig {
+        endpoint: indexer.url.clone(),
+        query_deadline: std::time::Duration::from_millis(indexer.query_timeout_ms),
+        max_inflight: indexer.query_max_inflight,
     }
-    config
 }
 
 /// Waits for either Unix termination signal and logs the selected cause.
@@ -268,19 +263,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn prefix_index_timeout_override_is_opt_in() {
-        let endpoint = "http://127.0.0.1:50051".to_string();
-        let dependency_default =
-            sgl_kv_indexer::PrefixIndexConfig::new(endpoint.clone()).query_deadline;
-        assert_eq!(
-            prefix_index_config(endpoint.clone(), None).query_deadline,
-            dependency_default,
-            "legacy cache_aware_zmq must retain the dependency client default"
-        );
-        assert_eq!(
-            prefix_index_config(endpoint, Some(25)).query_deadline,
-            std::time::Duration::from_millis(25),
-        );
+    fn prefix_index_config_preserves_router_limits() {
+        let config = prefix_index_config(&sgl_router::config::KvIndexerEndpointConfig {
+            url: "http://127.0.0.1:50051".to_string(),
+            query_timeout_ms: 25,
+            query_max_inflight: 17,
+        });
+        assert_eq!(config.endpoint, "http://127.0.0.1:50051");
+        assert_eq!(config.query_deadline, std::time::Duration::from_millis(25));
+        assert_eq!(config.max_inflight, 17);
     }
 
     #[tokio::test]
