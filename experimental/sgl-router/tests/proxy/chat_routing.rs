@@ -765,6 +765,44 @@ async fn no_healthy_workers_returns_503() {
     );
 }
 
+/// A model absent from both the policy registry and worker registry is a
+/// client error, not a transient worker-health failure.  This differs from
+/// `no_healthy_workers_returns_503`: there, the configured model exists and
+/// may become healthy again; here, retrying the unknown model cannot succeed.
+#[tokio::test]
+async fn unknown_model_without_registered_worker_returns_404_model_not_found() {
+    let cfg = config_for("http://unused");
+    let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
+    let registry = Arc::new(WorkerRegistry::default());
+    let policies = Arc::new(build_policy_registry(&cfg).unwrap());
+    let proxy = Arc::new(Proxy::new(TEST_TIMEOUT).unwrap());
+    let ctx = Arc::new(AppContext::new(cfg, tokenizers, proxy, registry, policies));
+    let app = build_router(ctx);
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&serde_json::json!({
+                "model": "definitely-not-served-model",
+                "messages": [{"role": "user", "content": "hi"}],
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        res.headers().get("x-router-error-code").unwrap(),
+        "model_not_found",
+    );
+    let bytes = res.into_body().collect().await.unwrap().to_bytes();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body["error"]["code"], "model_not_found");
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+}
+
 /// A worker is registered for a model that is NOT the configured `cfg.model` (so the
 /// policy registry has no entry for it).  The handler returns 404
 /// `model_not_found` rather than 500 — clients can recover by sending a

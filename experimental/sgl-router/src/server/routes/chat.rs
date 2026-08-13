@@ -185,6 +185,16 @@ pub async fn chat_completions(
         .ok_or_else(|| ApiError::BadRequest("missing `model` field".into()))?;
     let model_id = ModelId(model_str.clone());
 
+    // Validate the requested model before resolving its worker pool. An
+    // absent policy means the model is not configured and retrying it cannot
+    // succeed, so return 404 even when the registry also has no such model.
+    // A configured model with an empty/unhealthy pool proceeds to the
+    // resolver below and retains the retryable 503 `no_healthy_workers`.
+    let policy = ctx
+        .policies
+        .get(&model_id)
+        .ok_or_else(|| ApiError::ModelNotFound(model_str.clone()))?;
+
     // PD pool isolation: for PD-mode deployments, prefill traffic
     // selects from the prefill pool only. Plain-mode deployments fall
     // through to the full candidate set. Partial-failure errors
@@ -204,11 +214,6 @@ pub async fn chat_completions(
                 model: model_str.clone(),
             },
         })?;
-
-    let policy = ctx
-        .policies
-        .get(&model_id)
-        .ok_or_else(|| ApiError::ModelNotFound(model_str.clone()))?;
 
     // Tokenize once at ingress whenever it can pay off — decoupled from the
     // routing policy, because forwarding `input_ids` is a property of the
