@@ -19,7 +19,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     const PROTO_ROOT: &str = "../../proto";
     const PROTO_FILE: &str = "../../proto/sglang/router/loadmonitor/v1/load_monitor.proto";
     println!("cargo:rerun-if-changed={PROTO_FILE}");
-    tonic_build::configure()
+    tonic_prost_build::configure()
         .build_server(true)
         .build_client(true)
         .compile_protos(&[PROTO_FILE], &[PROTO_ROOT])?;

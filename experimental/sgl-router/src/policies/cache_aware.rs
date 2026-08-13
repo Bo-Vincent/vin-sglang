@@ -39,14 +39,17 @@ impl CacheAwarePolicy {
             return None;
         }
 
-        let by_id: HashMap<&str, &Arc<Worker>> = workers
+        // The #33370 indexer contract routes on the worker address (matched
+        // byte-for-byte against registered worker URLs); worker_id is for
+        // logs only.
+        let by_url: HashMap<&str, &Arc<Worker>> = workers
             .iter()
-            .map(|worker| (worker.id.0.as_str(), worker))
+            .map(|worker| (worker.url.as_str(), worker))
             .collect();
         let mut seen = HashSet::new();
         let mut candidates = Vec::new();
         for entry in matches {
-            let Some(worker) = by_id.get(entry.worker_id.as_str()) else {
+            let Some(worker) = by_url.get(entry.address.as_str()) else {
                 continue;
             };
             if entry.matched_prefix_blocks == 0 || !seen.insert(worker.id.clone()) {

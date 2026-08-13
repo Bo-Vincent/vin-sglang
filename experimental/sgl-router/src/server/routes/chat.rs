@@ -27,7 +27,6 @@ use axum::http::{HeaderMap, HeaderName, HeaderValue, Response};
 use bytes::Bytes;
 use serde::de::IgnoredAny;
 use serde::Deserialize;
-use sgl_kv_indexer::PrefixIndex;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -267,13 +266,15 @@ pub async fn chat_completions(
                 compute_block_hashes_bigram(&tokens.ids, block_size as usize)
             } else {
                 compute_block_hashes(&tokens.ids, block_size as usize)
-            }
-            .into_iter()
-            .map(|hash| hash.to_string())
-            .collect::<Vec<_>>();
+            };
             let query_blocks = hashes.len();
+            let outcome = if hashes.is_empty() {
+                sgl_kv_indexer::PrefixOutcome::Empty
+            } else {
+                resolve_prefix_query(index.match_prefix(hashes).await, &model_str)?
+            };
             Some(ExternalPrefixSignal {
-                outcome: index.match_prefix(hashes).await,
+                outcome,
                 query_blocks,
             })
         }

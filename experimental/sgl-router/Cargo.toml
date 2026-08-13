@@ -74,8 +74,9 @@ kube = { version = "0.96", features = ["runtime", "derive"] }
 k8s-openapi = { version = "0.23", features = ["v1_31"] }
 tokio-util = "0.7"
 uuid = { version = "1", features = ["v4"] }
-prost = "0.13"
-tonic = { version = "0.12", features = ["transport"] }
+prost = "0.14"
+tonic = { version = "0.14.6", features = ["transport"] }
+tonic-prost = "0.14.6"
 
 # KV-event subsystem — msgpack-encoded events over ZMQ and sha256-based
 # block hashing matching SGLang's `radix_cache`.  Wire format authority is
@@ -106,7 +107,7 @@ rand = "0.8"
 
 [build-dependencies]
 protoc-bin-vendored = "3"
-tonic-build = "0.12"
+tonic-prost-build = "0.14.6"
 
 [[test]]
 name = "component"
