@@ -104,19 +104,15 @@ async fn main() -> Result<()> {
     );
 
     let registry = Arc::new(sgl_router::workers::WorkerRegistry::default());
-    let prefix_index = cfg
+    let prefix_index: Option<Arc<dyn sgl_kv_indexer::PrefixIndex>> = cfg
         .model
         .cache_aware
         .as_ref()
         .and_then(|cache| cache.kv_indexer_endpoint.as_ref())
         .map(|indexer| {
-            Arc::new(sgl_kv_indexer::GrpcPrefixIndex::new(
-                sgl_kv_indexer::PrefixIndexConfig {
-                    endpoint: indexer.url.clone(),
-                    query_deadline: std::time::Duration::from_millis(indexer.query_timeout_ms),
-                    max_inflight: indexer.query_max_inflight,
-                },
-            ))
+            let config = prefix_index_config(indexer);
+            Arc::new(sgl_kv_indexer::GrpcPrefixIndex::new(config))
+                as Arc<dyn sgl_kv_indexer::PrefixIndex>
         });
 
     // Build the KV-event index up front so the cache-aware-zmq policy can
@@ -222,6 +218,17 @@ async fn main() -> Result<()> {
     server_result
 }
 
+/// Build the external Indexer client with the Router's bounded query settings.
+fn prefix_index_config(
+    indexer: &sgl_router::config::KvIndexerEndpointConfig,
+) -> sgl_kv_indexer::PrefixIndexConfig {
+    sgl_kv_indexer::PrefixIndexConfig {
+        endpoint: indexer.url.clone(),
+        query_deadline: std::time::Duration::from_millis(indexer.query_timeout_ms),
+        max_inflight: indexer.query_max_inflight,
+    }
+}
+
 /// Waits for either Unix termination signal and logs the selected cause.
 async fn shutdown_signal(mut sigterm: Signal, mut sigint: Signal) {
     tokio::select! {
@@ -234,6 +241,17 @@ async fn shutdown_signal(mut sigterm: Signal, mut sigint: Signal) {
 mod tests {
     use super::*;
 
+    #[test]
+    fn prefix_index_config_preserves_router_limits() {
+        let config = prefix_index_config(&sgl_router::config::KvIndexerEndpointConfig {
+            url: "http://127.0.0.1:50051".to_string(),
+            query_timeout_ms: 25,
+            query_max_inflight: 17,
+        });
+        assert_eq!(config.endpoint, "http://127.0.0.1:50051");
+        assert_eq!(config.query_deadline, std::time::Duration::from_millis(25));
+        assert_eq!(config.max_inflight, 17);
+    }
 
     #[tokio::test]
     async fn install_signal_handlers_returns_both() {

@@ -14,8 +14,8 @@ use crate::config::{
     resolve_mode, ActiveLoadConfig, AffinityConfig, AffinityMode, CacheAwareConfig,
     CircuitBreakerConfig, Config, DecodePolicyKind, DiscoveryBackend, EligibilityConfig, FusedTerm,
     K8sDiscoveryConfig, KvIndexerEndpointConfig, LoadMonitorConfig, LogFormat, ModelConfig,
-    ObservabilityConfig, PolicyKind, ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig,
-    SessionAffinityMode, StickyConfig, DEFAULT_FUSE, DEFAULT_KV_INDEXER_QUERY_MAX_INFLIGHT,
+    ObservabilityConfig, PolicyKind, ProxyConfig, ServerConfig, SessionAffinityMode,
+    StaticUrlsDiscoveryConfig, StickyConfig, DEFAULT_FUSE, DEFAULT_KV_INDEXER_QUERY_MAX_INFLIGHT,
     DEFAULT_KV_INDEXER_QUERY_TIMEOUT_MS,
 };
 
@@ -299,6 +299,7 @@ impl Cli {
                 "--policy cache_aware requires --kv-indexer-endpoint"
             ));
         }
+        let tuned_cache_aware = tuned_legacy_cache_aware || self.kv_indexer_endpoint.is_some();
         let affinity_policy = matches!(
             self.policy,
             PolicyKind::SessionAware | PolicyKind::CacheAware
@@ -1155,7 +1156,10 @@ mod tests {
             .expect("cache-aware config")
             .kv_indexer_endpoint
             .expect("Indexer config");
-        assert_eq!(indexer.query_timeout_ms, DEFAULT_KV_INDEXER_QUERY_TIMEOUT_MS);
+        assert_eq!(
+            indexer.query_timeout_ms,
+            DEFAULT_KV_INDEXER_QUERY_TIMEOUT_MS
+        );
         assert_eq!(indexer.query_max_inflight, 32);
     }
 
@@ -1169,10 +1173,7 @@ mod tests {
         ]))
         .unwrap_err()
         .to_string();
-        assert!(
-            err.contains("requires --policy cache_aware"),
-            "got: {err}"
-        );
+        assert!(err.contains("requires --policy cache_aware"), "got: {err}");
     }
 
     #[test]
@@ -1759,7 +1760,8 @@ mod tests {
                 .as_ref()
                 .expect("cache-aware needs indexer config")
                 .kv_indexer_endpoint
-                .as_deref(),
+                .as_ref()
+                .map(|indexer| indexer.url.as_str()),
             Some("http://indexer:50051"),
         );
         let indexer_timeout_ms = config

@@ -860,22 +860,18 @@ mod tests {
             outcome: sgl_kv_indexer::PrefixOutcome::Matched {
                 matches: vec![
                     sgl_kv_indexer::PrefixMatch {
-                        address: "http://gone:30000".into(),
                         matched_prefix_blocks: 8,
                         worker_id: "gone".into(),
                     },
                     sgl_kv_indexer::PrefixMatch {
-                        address: hot.url.clone(),
                         matched_prefix_blocks: 6,
                         worker_id: "hot".into(),
                     },
                     sgl_kv_indexer::PrefixMatch {
-                        address: other.url.clone(),
                         matched_prefix_blocks: 4,
                         worker_id: "other".into(),
                     },
                 ],
-                best_prefix_blocks: 8,
             },
             query_blocks: 8,
         };
@@ -903,22 +899,18 @@ mod tests {
             outcome: sgl_kv_indexer::PrefixOutcome::Matched {
                 matches: vec![
                     sgl_kv_indexer::PrefixMatch {
-                        address: "http://gone:30000".into(),
                         matched_prefix_blocks: 8,
                         worker_id: "gone".into(),
                     },
                     sgl_kv_indexer::PrefixMatch {
-                        address: hot.url.clone(),
                         matched_prefix_blocks: 6,
                         worker_id: "hot".into(),
                     },
                     sgl_kv_indexer::PrefixMatch {
-                        address: warm.url.clone(),
                         matched_prefix_blocks: 4,
                         worker_id: "warm".into(),
                     },
                 ],
-                best_prefix_blocks: 8,
             },
             query_blocks: 8,
         };
@@ -959,16 +951,12 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(index, worker)| sgl_kv_indexer::PrefixMatch {
-                address: worker.url.clone(),
                 matched_prefix_blocks: (index + 1) as u32,
                 worker_id: worker.id.0.clone(),
             })
             .collect();
         let signal = ExternalPrefixSignal {
-            outcome: sgl_kv_indexer::PrefixOutcome::Matched {
-                matches,
-                best_prefix_blocks: 64,
-            },
+            outcome: sgl_kv_indexer::PrefixOutcome::Matched { matches },
             query_blocks: 64,
         };
         let ctx = SelectionContext::new(&model, None)
@@ -1015,16 +1003,12 @@ mod tests {
         let matches = workers
             .iter()
             .map(|worker| sgl_kv_indexer::PrefixMatch {
-                address: worker.url.clone(),
                 matched_prefix_blocks: 4,
                 worker_id: worker.id.0.clone(),
             })
             .collect();
         let signal = ExternalPrefixSignal {
-            outcome: sgl_kv_indexer::PrefixOutcome::Matched {
-                matches,
-                best_prefix_blocks: 4,
-            },
+            outcome: sgl_kv_indexer::PrefixOutcome::Matched { matches },
             query_blocks: 4,
         };
         let ctx = SelectionContext::new(&model, None)
@@ -1064,17 +1048,14 @@ mod tests {
             outcome: sgl_kv_indexer::PrefixOutcome::Matched {
                 matches: vec![
                     sgl_kv_indexer::PrefixMatch {
-                        address: half.url.clone(),
                         matched_prefix_blocks: 4,
                         worker_id: "half".into(),
                     },
                     sgl_kv_indexer::PrefixMatch {
-                        address: below_ratio.url.clone(),
                         matched_prefix_blocks: 3,
                         worker_id: "below-ratio".into(),
                     },
                 ],
-                best_prefix_blocks: 4,
             },
             query_blocks: 8,
         };
@@ -1109,11 +1090,9 @@ mod tests {
         let signal = ExternalPrefixSignal {
             outcome: sgl_kv_indexer::PrefixOutcome::Matched {
                 matches: vec![sgl_kv_indexer::PrefixMatch {
-                    address: weak.url.clone(),
                     matched_prefix_blocks: 3,
                     worker_id: "weak".into(),
                 }],
-                best_prefix_blocks: 3,
             },
             query_blocks: 8,
         };
@@ -1140,11 +1119,9 @@ mod tests {
         let signal = ExternalPrefixSignal {
             outcome: sgl_kv_indexer::PrefixOutcome::Matched {
                 matches: vec![sgl_kv_indexer::PrefixMatch {
-                    address: holder.url.clone(),
                     matched_prefix_blocks: 2_048,
                     worker_id: "holder".into(),
                 }],
-                best_prefix_blocks: 2_048,
             },
             query_blocks: 4_125,
         };
