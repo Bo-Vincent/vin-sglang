@@ -131,3 +131,8 @@ path = "benches/policy_select.rs"
 name = "router_pressure"
 harness = false
 path = "benches/router_pressure.rs"
+
+[[bench]]
+name = "bucket_fallback"
+harness = false
+path = "benches/bucket_fallback.rs"
