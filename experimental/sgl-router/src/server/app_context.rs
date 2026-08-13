@@ -32,8 +32,6 @@ pub struct AppContext {
     /// cache-aware-zmq policy (overlap_blocks), active-load registry
     /// (active_load gauge + stale_requests_total), and PD dispatch.
     pub metrics: Arc<MetricsRegistry>,
-    pub prefix_index: Option<Arc<sgl_kv_indexer::GrpcPrefixIndex>>,
-    pub block_size_oracle: Arc<BlockSizeOracle>,
     /// Engine LoadMonitor snapshot 来源。
     pub load_monitor: Arc<LoadMonitor>,
     pub prefix_index: Option<Arc<dyn sgl_kv_indexer::PrefixIndex>>,
@@ -95,8 +93,6 @@ impl AppContext {
             prefix_index: None,
             block_size_oracle: BlockSizeOracle::new(),
             load_monitor: Arc::new(LoadMonitor::disabled()),
-            prefix_index: None,
-            block_size_oracle: BlockSizeOracle::new(),
             ready: AtomicBool::new(false),
         }
     }
@@ -151,8 +147,6 @@ impl AppContext {
             prefix_index: None,
             block_size_oracle: BlockSizeOracle::new(),
             load_monitor: Arc::new(LoadMonitor::disabled()),
-            prefix_index: None,
-            block_size_oracle: BlockSizeOracle::new(),
             ready: AtomicBool::new(false),
         }
     }
