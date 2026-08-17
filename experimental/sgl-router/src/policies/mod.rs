@@ -21,6 +21,7 @@ pub mod sticky;
 
 use crate::discovery::ModelId;
 use crate::load_monitor::LoadMonitorSnapshot;
+use crate::policies::buckets::{BucketRequest, BucketSelector};
 use crate::policies::scoring::{EligibilityFilter, ScoringPolicy};
 use crate::server::metrics::MetricsRegistry;
 use crate::tokenizer::{adapter, TokenizerRegistry};
@@ -194,6 +195,7 @@ pub struct SelectionContext<'a> {
     request_tokens: Option<&'a [u32]>,
     external_prefix: Option<&'a ExternalPrefixSignal>,
     load_snapshot: Option<&'a LoadMonitorSnapshot>,
+    prefill_cache_bucket: Option<(&'a BucketSelector, BucketRequest)>,
     affinity_lookup_enabled: bool,
     affinity_assignment_enabled: bool,
 }
@@ -210,6 +212,7 @@ impl<'a> SelectionContext<'a> {
             request_tokens: None,
             external_prefix: None,
             load_snapshot: None,
+            prefill_cache_bucket: None,
             affinity_lookup_enabled: true,
             affinity_assignment_enabled: true,
         }
@@ -230,6 +233,7 @@ impl<'a> SelectionContext<'a> {
             request_tokens: None,
             external_prefix: None,
             load_snapshot: None,
+            prefill_cache_bucket: None,
             affinity_lookup_enabled: true,
             affinity_assignment_enabled: true,
         }
@@ -270,6 +274,17 @@ impl<'a> SelectionContext<'a> {
     /// 附加请求开始时捕获的 LoadMonitor snapshot。
     pub fn with_load_snapshot(mut self, load_snapshot: &'a LoadMonitorSnapshot) -> Self {
         self.load_snapshot = Some(load_snapshot);
+        self
+    }
+
+    /// Cache-Aware uses this binding before Top-K truncation so an
+    /// incompatible cache holder cannot displace a lower-ranked usable one.
+    pub fn with_prefill_cache_bucket(
+        mut self,
+        selector: &'a BucketSelector,
+        request: BucketRequest,
+    ) -> Self {
+        self.prefill_cache_bucket = Some((selector, request));
         self
     }
 
@@ -320,6 +335,16 @@ impl<'a> SelectionContext<'a> {
 
     pub fn load_snapshot(&self) -> Option<&LoadMonitorSnapshot> {
         self.load_snapshot
+    }
+
+    pub(crate) fn bind_prefill_cache_candidate(
+        &self,
+        candidate: CacheCandidate,
+    ) -> Option<CacheCandidate> {
+        match self.prefill_cache_bucket {
+            Some((selector, request)) => selector.bind_prefill_cache_candidate(candidate, request),
+            None => Some(candidate),
+        }
     }
 
     pub fn affinity_lookup_enabled(&self) -> bool {
