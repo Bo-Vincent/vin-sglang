@@ -9,7 +9,7 @@
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use sgl_kv_indexer::{PrefixIndex, PrefixIndexError, PrefixMatch, PrefixOutcome};
+use sgl_kv_indexer::{NoSignalReason, PrefixIndex, PrefixMatch, PrefixOutcome};
 use sgl_router::config::{
     ActiveLoadConfig, AffinityConfig, BucketConfig, BucketSpec, BucketStage, CacheAwareConfig,
     Config, DiscoveryBackend, KvIndexerEndpointConfig, ModelConfig, ObservabilityConfig,
@@ -96,22 +96,23 @@ fn build_ctx(
     Arc::new(build_app_context(specs, bucket_config, policy, affinity))
 }
 
+#[derive(Debug)]
 struct FakePrefixIndex {
-    address: Option<String>,
+    worker_id: Option<String>,
     calls: AtomicUsize,
 }
 
 impl FakePrefixIndex {
-    fn matched(address: String) -> Arc<Self> {
+    fn matched(worker_id: String) -> Arc<Self> {
         Arc::new(Self {
-            address: Some(address),
+            worker_id: Some(worker_id),
             calls: AtomicUsize::new(0),
         })
     }
 
     fn no_signal() -> Arc<Self> {
         Arc::new(Self {
-            address: None,
+            worker_id: None,
             calls: AtomicUsize::new(0),
         })
     }
@@ -119,21 +120,35 @@ impl FakePrefixIndex {
 
 #[tonic::async_trait]
 impl PrefixIndex for FakePrefixIndex {
-    async fn match_prefix(&self, hashes: Vec<i64>) -> Result<PrefixOutcome, PrefixIndexError> {
+    async fn match_prefix(&self, hashes: Vec<String>) -> PrefixOutcome {
         self.calls.fetch_add(1, Ordering::Relaxed);
-        let Some(address) = &self.address else {
-            return Ok(PrefixOutcome::Empty);
+        let Some(worker_id) = &self.worker_id else {
+            return PrefixOutcome::NoSignal(NoSignalReason::Empty);
         };
         let matched_prefix_blocks =
             u32::try_from(hashes.len().saturating_sub(1)).unwrap_or(u32::MAX);
-        Ok(PrefixOutcome::Matched {
+        PrefixOutcome::Matched {
             matches: vec![PrefixMatch {
-                address: address.clone(),
+                worker_id: worker_id.clone(),
                 matched_prefix_blocks,
-                worker_id: "fake-index-worker".into(),
             }],
-            best_prefix_blocks: matched_prefix_blocks,
-        })
+        }
+    }
+}
+
+#[derive(Debug)]
+struct FixedPrefixIndex {
+    matches: Vec<PrefixMatch>,
+    calls: AtomicUsize,
+}
+
+#[tonic::async_trait]
+impl PrefixIndex for FixedPrefixIndex {
+    async fn match_prefix(&self, _hashes: Vec<String>) -> PrefixOutcome {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        PrefixOutcome::Matched {
+            matches: self.matches.clone(),
+        }
     }
 }
 
@@ -151,8 +166,8 @@ fn build_cache_ctx(
     context.config.model.cache_aware = Some(CacheAwareConfig {
         kv_indexer_endpoint: Some(KvIndexerEndpointConfig {
             url: "http://fake-indexer".into(),
-            query_timeout_ms: 100,
-            query_max_inflight: 32,
+            query_timeout_ms: 25,
+            query_max_inflight: 1,
         }),
         ..CacheAwareConfig::default()
     });
@@ -508,7 +523,7 @@ async fn cache_winner_uses_target_uncached_work_before_prompt_length_bucket() {
         ttft_slo_policy: SloBucketPolicy::Disabled,
         tps_slo_policy: SloBucketPolicy::Disabled,
     };
-    let index = FakePrefixIndex::matched(short.url.clone());
+    let index = FakePrefixIndex::matched("p-short".into());
     let prefix_index: Arc<dyn PrefixIndex> = index.clone();
     let ctx = build_cache_ctx(
         vec![
@@ -580,4 +595,91 @@ async fn cache_no_signal_restarts_normal_prompt_length_bucket_fallback() {
         "without a cache winner the request must restart the normal full-input Bucket path"
     );
     assert_eq!(index.calls.load(Ordering::Relaxed), 1);
+}
+
+#[tokio::test]
+async fn cache_hard_bucket_filter_runs_before_top_k_truncation() {
+    let mut cache_workers = Vec::new();
+    for _ in 0..9 {
+        cache_workers.push(crate::common::mock_worker::MockWorker::start(vec![]).await);
+    }
+    let no_hit = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let decode = crate::common::mock_worker::MockWorker::start(vec![]).await;
+
+    let mut buckets = Vec::new();
+    let mut specs = Vec::new();
+    let mut matches = Vec::new();
+    for (index, worker) in cache_workers.iter().enumerate() {
+        let id = format!("p{index}");
+        let mut cache_bucket = bucket(
+            &format!("cache-{index}"),
+            BucketStage::Prefill,
+            index as u32,
+            &id,
+        );
+        cache_bucket.max_extend_tokens = Some(8);
+        cache_bucket.max_context_tokens = Some(128 * 1024);
+        cache_bucket.ttft_p95_at_capacity_ms = Some(if index == 8 { 80 } else { 300 });
+        buckets.push(cache_bucket);
+        specs.push(worker_spec(&id, worker.url.clone(), WorkerMode::Prefill));
+        matches.push(PrefixMatch {
+            worker_id: id,
+            matched_prefix_blocks: u32::MAX,
+        });
+    }
+    let mut no_hit_bucket = bucket("no-hit", BucketStage::Prefill, 100, "p-no-hit");
+    no_hit_bucket.min_extend_tokens = Some(9);
+    no_hit_bucket.max_context_tokens = Some(128 * 1024);
+    no_hit_bucket.ttft_p95_at_capacity_ms = Some(80);
+    buckets.push(no_hit_bucket);
+    specs.push(worker_spec(
+        "p-no-hit",
+        no_hit.url.clone(),
+        WorkerMode::Prefill,
+    ));
+    let mut decode_bucket = bucket("d", BucketStage::Decode, 0, "d");
+    decode_bucket.max_context_tokens = Some(128 * 1024);
+    buckets.push(decode_bucket);
+    specs.push(worker_spec("d", decode.url.clone(), WorkerMode::Decode));
+
+    let index = Arc::new(FixedPrefixIndex {
+        matches,
+        calls: AtomicUsize::new(0),
+    });
+    let ctx = build_cache_ctx(
+        specs,
+        BucketConfig {
+            buckets,
+            ttft_slo_policy: SloBucketPolicy::SloFirst,
+            tps_slo_policy: SloBucketPolicy::Disabled,
+        },
+        index.clone(),
+    );
+
+    let content = "cacheable prompt ".repeat(2_048);
+    let response = build_router(Arc::clone(&ctx))
+        .oneshot(chat_request_with_content(
+            &content,
+            Some(100),
+            Some(8),
+            None,
+        ))
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read routing error body");
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    wait_for_prefill(&cache_workers[8]).await;
+    assert!(
+        no_hit.captured.lock().unwrap().last_body.is_none(),
+        "the ninth compatible cache holder must survive the default Top-K=8 filter instead of falling back to the no-hit bucket"
+    );
+    assert_eq!(index.calls.load(Ordering::Relaxed), 1);
+    let metrics = ctx.metrics.render();
+    assert!(metrics.contains(
+        r#"sgl_router_policy_decisions_total{policy="cache_aware",reason="cache_candidate"} 1"#
+    ));
+    assert!(!metrics.contains("no_cache_candidate"));
 }

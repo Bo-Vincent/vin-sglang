@@ -60,13 +60,17 @@ impl CacheAwarePolicy {
             if !self.passes_cache_gate(input_tokens, matched_prefix_tokens) {
                 continue;
             }
-            candidates.push(CacheCandidate {
+            let candidate = CacheCandidate {
                 worker: Arc::clone(worker),
                 matched_prefix_tokens,
                 uncached_tokens: input_tokens.saturating_sub(matched_prefix_tokens),
                 candidate_range_id: ctx.candidate_range_id().to_string(),
                 max_pending_prefill_tokens: None,
-            });
+            };
+            let Some(candidate) = ctx.bind_prefill_cache_candidate(candidate) else {
+                continue;
+            };
+            candidates.push(candidate);
         }
 
         let limit = self.candidate_limit(workers.len());
