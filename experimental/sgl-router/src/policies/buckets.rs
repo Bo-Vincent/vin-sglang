@@ -7,6 +7,7 @@ use crate::config::{BucketConfig, BucketSpec, BucketStage, SloBucketPolicy};
 use crate::policies::admission::CandidateDomain;
 use crate::policies::CacheCandidate;
 use crate::workers::Worker;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 /// Bucket 选择使用的请求字段。
@@ -21,11 +22,32 @@ pub struct BucketRequest {
 #[derive(Debug, Clone)]
 pub struct BucketSelector {
     config: Option<BucketConfig>,
+    /// Precomputed only for buckets above the measured scan/hash crossover.
+    member_ids: HashMap<String, HashSet<String>>,
 }
+
+/// Measured crossover: SipHash costs more than a few short string comparisons.
+const MEMBER_SCAN_MAX: usize = 4;
 
 impl BucketSelector {
     pub fn new(config: Option<BucketConfig>) -> Self {
-        Self { config }
+        let member_ids = config
+            .as_ref()
+            .map(|config| {
+                config
+                    .buckets
+                    .iter()
+                    .filter(|spec| spec.worker_ids.len() > MEMBER_SCAN_MAX)
+                    .map(|spec| {
+                        (
+                            spec.id.clone(),
+                            spec.worker_ids.iter().cloned().collect::<HashSet<_>>(),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Self { config, member_ids }
     }
 
     pub fn is_enabled(&self) -> bool {
@@ -42,14 +64,13 @@ impl BucketSelector {
         };
         self.ordered_specs(
             BucketStage::Prefill,
-            request,
             config.ttft_slo_policy,
             |spec| prefill_compatible(spec, request.input_tokens),
             |spec| ttft_eligible(spec, request.ttft_slo_ms),
         )
         .into_iter()
         .filter_map(|spec| {
-            let members = members(workers, spec);
+            let members = self.members(workers, spec);
             (!members.is_empty()).then(|| {
                 CandidateDomain::bucket_prefill(
                     spec.id.clone(),
@@ -79,7 +100,6 @@ impl BucketSelector {
         }
         self.ordered_specs(
             BucketStage::Decode,
-            request,
             config.tps_slo_policy,
             |spec| {
                 decode_compatible(
@@ -92,7 +112,7 @@ impl BucketSelector {
         )
         .into_iter()
         .filter_map(|spec| {
-            let members = members(workers, spec);
+            let members = self.members(workers, spec);
             (!members.is_empty()).then(|| CandidateDomain::bucket_decode(spec.id.clone(), members))
         })
         .collect()
@@ -111,10 +131,7 @@ impl BucketSelector {
         };
         let spec = config.buckets.iter().find(|spec| {
             spec.stage == BucketStage::Prefill
-                && spec
-                    .worker_ids
-                    .iter()
-                    .any(|id| id == &candidate.worker.id.0)
+                && self.contains(spec, &candidate.worker.id.0)
                 && within(
                     candidate.uncached_tokens,
                     spec.min_extend_tokens,
@@ -141,14 +158,14 @@ impl BucketSelector {
         let config = self.config.as_ref()?;
         let spec = config.buckets.iter().find(|spec| {
             spec.stage == BucketStage::Prefill
-                && spec.worker_ids.iter().any(|id| id == &primary.id.0)
+                && self.contains(spec, &primary.id.0)
                 && spec
                     .max_context_tokens
                     .is_none_or(|max_context| request.input_tokens <= max_context)
                 && (config.ttft_slo_policy != SloBucketPolicy::SloFirst
                     || ttft_eligible(spec, request.ttft_slo_ms))
         })?;
-        let members = members(workers, spec);
+        let members = self.members(workers, spec);
         members
             .iter()
             .any(|worker| worker.id == primary.id)
@@ -161,10 +178,37 @@ impl BucketSelector {
             })
     }
 
+    fn contains(&self, spec: &BucketSpec, worker_id: &str) -> bool {
+        if spec.worker_ids.len() <= MEMBER_SCAN_MAX {
+            return spec.worker_ids.iter().any(|id| id == worker_id);
+        }
+        self.member_ids
+            .get(&spec.id)
+            .is_some_and(|ids| ids.contains(worker_id))
+    }
+
+    fn members(&self, workers: &[Arc<Worker>], spec: &BucketSpec) -> Vec<Arc<Worker>> {
+        if spec.worker_ids.len() <= MEMBER_SCAN_MAX {
+            return workers
+                .iter()
+                .filter(|worker| spec.worker_ids.iter().any(|id| id == &worker.id.0))
+                .cloned()
+                .collect();
+        }
+        let ids = self
+            .member_ids
+            .get(&spec.id)
+            .expect("large bucket member index is built with the config");
+        workers
+            .iter()
+            .filter(|worker| ids.contains(&worker.id.0))
+            .cloned()
+            .collect()
+    }
+
     fn ordered_specs(
         &self,
         stage: BucketStage,
-        _request: BucketRequest,
         slo_policy: SloBucketPolicy,
         compatible: impl Fn(&BucketSpec) -> bool,
         slo_eligible: impl Fn(&BucketSpec) -> bool,
@@ -208,14 +252,6 @@ impl BucketSelector {
             }
         }
     }
-}
-
-fn members(workers: &[Arc<Worker>], spec: &BucketSpec) -> Vec<Arc<Worker>> {
-    workers
-        .iter()
-        .filter(|worker| spec.worker_ids.iter().any(|id| id == &worker.id.0))
-        .cloned()
-        .collect()
 }
 
 fn prefill_compatible(spec: &BucketSpec, input_tokens: u64) -> bool {
