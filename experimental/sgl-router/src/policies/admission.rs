@@ -351,23 +351,27 @@ fn compare_cache_candidates(
     }
 
     // Pressure can overturn cache benefit only inside the near-tie margin.
-    if materially_more_pressured(
-        &left.worker,
-        &right.worker,
-        proposal.pressure_abs_threshold_tokens,
-        proposal.pressure_rel_threshold,
-        loads,
-    ) {
-        return Ordering::Greater;
-    }
-    if materially_more_pressured(
-        &right.worker,
-        &left.worker,
-        proposal.pressure_abs_threshold_tokens,
-        proposal.pressure_rel_threshold,
-        loads,
-    ) {
-        return Ordering::Less;
+    if proposal.enable_pressure_guard {
+        if materially_more_pressured(
+            &left.worker,
+            &right.worker,
+            proposal.pressure_abs_threshold_tokens,
+            proposal.pressure_abs_threshold_ms,
+            proposal.pressure_rel_threshold,
+            loads,
+        ) {
+            return Ordering::Greater;
+        }
+        if materially_more_pressured(
+            &right.worker,
+            &left.worker,
+            proposal.pressure_abs_threshold_tokens,
+            proposal.pressure_abs_threshold_ms,
+            proposal.pressure_rel_threshold,
+            loads,
+        ) {
+            return Ordering::Less;
+        }
     }
 
     left.uncached_tokens
@@ -380,6 +384,7 @@ fn materially_more_pressured(
     candidate: &Arc<Worker>,
     other: &Arc<Worker>,
     absolute_threshold: u64,
+    absolute_threshold_ms: Option<f64>,
     relative_threshold: f64,
     loads: &FreshLoadLookup<'_>,
 ) -> bool {
@@ -389,6 +394,20 @@ fn materially_more_pressured(
     ) else {
         return false;
     };
+    if let Some(absolute_threshold_ms) = absolute_threshold_ms.filter(|_| {
+        loads.compare_prefill_queue_ms
+            && candidate_load.estimated_prefill_queue_ms.is_some()
+            && other_load.estimated_prefill_queue_ms.is_some()
+    }) {
+        let candidate_pressure = candidate_load
+            .estimated_prefill_queue_ms
+            .expect("queue estimate availability was checked");
+        let other_pressure = other_load
+            .estimated_prefill_queue_ms
+            .expect("queue estimate availability was checked");
+        return candidate_pressure - other_pressure > absolute_threshold_ms
+            && candidate_pressure > other_pressure * relative_threshold;
+    }
     let candidate_pressure = candidate_load.num_waiting_uncached_tokens;
     let other_pressure = other_load.num_waiting_uncached_tokens;
     candidate_pressure.saturating_sub(other_pressure) > absolute_threshold
@@ -400,6 +419,10 @@ pub(crate) struct FreshLoadLookup<'a> {
     by_worker_id: HashMap<&'a str, &'a AggregateLoad>,
     local_active_by_worker_id: HashMap<String, usize>,
     compare_aggregate: bool,
+    compare_prefill_queue_ms: bool,
+    compare_decode_queues: bool,
+    compare_decode_step_ms: bool,
+    compare_decode_active_tokens: bool,
 }
 
 impl<'a> FreshLoadLookup<'a> {
@@ -429,10 +452,32 @@ impl<'a> FreshLoadLookup<'a> {
         // Mixed fresh/stale sets use local load only to preserve transitivity.
         let compare_aggregate = !local_active_by_worker_id.is_empty()
             && by_worker_id.len() == local_active_by_worker_id.len();
+        let compare_prefill_queue_ms = compare_aggregate
+            && by_worker_id
+                .values()
+                .all(|load| load.estimated_prefill_queue_ms.is_some());
+        let compare_decode_queues = compare_aggregate
+            && by_worker_id.values().all(|load| {
+                load.decode_retracted_queue_reqs.is_some()
+                    && load.decode_prealloc_queue_reqs.is_some()
+                    && load.decode_transfer_queue_reqs.is_some()
+            });
+        let compare_decode_step_ms = compare_aggregate
+            && by_worker_id
+                .values()
+                .all(|load| load.mean_decode_step_ms.is_some());
+        let compare_decode_active_tokens = compare_aggregate
+            && by_worker_id
+                .values()
+                .all(|load| load.num_active_tokens.is_some());
         Self {
             by_worker_id,
             local_active_by_worker_id,
             compare_aggregate,
+            compare_prefill_queue_ms,
+            compare_decode_queues,
+            compare_decode_step_ms,
+            compare_decode_active_tokens,
         }
     }
 
@@ -463,17 +508,24 @@ impl<'a> FreshLoadLookup<'a> {
 
     fn compare_prefill_keys(&self, left: &PressureKey<'a>, right: &PressureKey<'a>) -> Ordering {
         match (left.load, right.load) {
-            (Some(left_load), Some(right_load)) => load_pressure_key(left_load)
-                .cmp(&load_pressure_key(right_load))
-                .then_with(|| left.local_active.cmp(&right.local_active)),
+            (Some(left_load), Some(right_load)) => {
+                compare_prefill_aggregate(left_load, right_load, self.compare_prefill_queue_ms)
+                    .then_with(|| left.local_active.cmp(&right.local_active))
+            }
             _ => left.local_active.cmp(&right.local_active),
         }
     }
 
     fn compare_decode_keys(&self, left: &PressureKey<'a>, right: &PressureKey<'a>) -> Ordering {
         match (left.load, right.load) {
-            (Some(left_load), Some(right_load)) => compare_decode_aggregate(left_load, right_load)
-                .then_with(|| left.local_active.cmp(&right.local_active)),
+            (Some(left_load), Some(right_load)) => compare_decode_aggregate(
+                left_load,
+                right_load,
+                self.compare_decode_queues,
+                self.compare_decode_step_ms,
+                self.compare_decode_active_tokens,
+            )
+            .then_with(|| left.local_active.cmp(&right.local_active)),
             _ => left.local_active.cmp(&right.local_active),
         }
     }
@@ -538,6 +590,19 @@ fn pressure_guard_prefers_backup(
     ) else {
         return false;
     };
+    if let Some(absolute_threshold_ms) = hints.pressure_abs_threshold_ms.filter(|_| {
+        primary_load.estimated_prefill_queue_ms.is_some()
+            && backup_load.estimated_prefill_queue_ms.is_some()
+    }) {
+        let primary_pressure = primary_load
+            .estimated_prefill_queue_ms
+            .expect("queue estimate availability was checked");
+        let backup_pressure = backup_load
+            .estimated_prefill_queue_ms
+            .expect("queue estimate availability was checked");
+        return primary_pressure - backup_pressure > absolute_threshold_ms
+            && primary_pressure > backup_pressure * hints.pressure_rel_threshold;
+    }
     let primary_pressure = primary_load.num_waiting_uncached_tokens;
     let backup_pressure = backup_load.num_waiting_uncached_tokens;
     primary_pressure.saturating_sub(backup_pressure) > hints.pressure_abs_threshold_tokens
@@ -605,19 +670,44 @@ pub(crate) fn compare_prefill_pressure(
             snapshot.fresh_load(&right.id)?,
         ))
     }) {
-        Some((left_load, right_load)) => load_pressure_key(&left_load)
-            .cmp(&load_pressure_key(&right_load))
-            .then_with(|| left.active_load().cmp(&right.active_load())),
+        Some((left_load, right_load)) => compare_prefill_aggregate(
+            &left_load,
+            &right_load,
+            left_load.estimated_prefill_queue_ms.is_some()
+                && right_load.estimated_prefill_queue_ms.is_some(),
+        )
+        .then_with(|| left.active_load().cmp(&right.active_load())),
         _ => left.active_load().cmp(&right.active_load()),
     }
 }
 
-fn load_pressure_key(load: &AggregateLoad) -> (u64, u64, u64) {
+fn fallback_prefill_pressure_key(load: &AggregateLoad) -> (u64, u64, u64) {
     (
         load.num_waiting_uncached_tokens,
         load.num_waiting_reqs,
         load.num_running_reqs,
     )
+}
+
+fn compare_prefill_aggregate(
+    left: &AggregateLoad,
+    right: &AggregateLoad,
+    compare_queue_ms: bool,
+) -> Ordering {
+    if compare_queue_ms {
+        return left
+            .estimated_prefill_queue_ms
+            .expect("queue estimate availability was checked")
+            .total_cmp(
+                &right
+                    .estimated_prefill_queue_ms
+                    .expect("queue estimate availability was checked"),
+            )
+            .then_with(|| {
+                fallback_prefill_pressure_key(left).cmp(&fallback_prefill_pressure_key(right))
+            });
+    }
+    fallback_prefill_pressure_key(left).cmp(&fallback_prefill_pressure_key(right))
 }
 
 /// 比较 Decode running/KV 占用比例，最后使用本地 active-load。
@@ -632,26 +722,104 @@ pub(crate) fn compare_decode_pressure(
             snapshot.fresh_load(&right.id)?,
         ))
     }) {
-        Some((left_load, right_load)) => compare_decode_aggregate(&left_load, &right_load)
-            .then_with(|| left.active_load().cmp(&right.active_load())),
+        Some((left_load, right_load)) => compare_decode_aggregate(
+            &left_load,
+            &right_load,
+            left_load.decode_retracted_queue_reqs.is_some()
+                && right_load.decode_retracted_queue_reqs.is_some()
+                && left_load.decode_prealloc_queue_reqs.is_some()
+                && right_load.decode_prealloc_queue_reqs.is_some()
+                && left_load.decode_transfer_queue_reqs.is_some()
+                && right_load.decode_transfer_queue_reqs.is_some(),
+            left_load.mean_decode_step_ms.is_some() && right_load.mean_decode_step_ms.is_some(),
+            left_load.num_active_tokens.is_some() && right_load.num_active_tokens.is_some(),
+        )
+        .then_with(|| left.active_load().cmp(&right.active_load())),
         None => left.active_load().cmp(&right.active_load()),
     }
 }
 
-fn compare_decode_aggregate(left: &AggregateLoad, right: &AggregateLoad) -> Ordering {
+fn compare_decode_aggregate(
+    left: &AggregateLoad,
+    right: &AggregateLoad,
+    compare_queues: bool,
+    compare_step_ms: bool,
+    compare_active_tokens: bool,
+) -> Ordering {
+    let mut ordering = Ordering::Equal;
+    if compare_queues {
+        ordering = left
+            .decode_retracted_queue_reqs
+            .expect("decode queue availability was checked")
+            .cmp(
+                &right
+                    .decode_retracted_queue_reqs
+                    .expect("decode queue availability was checked"),
+            )
+            .then_with(|| {
+                let left_incoming = left
+                    .decode_prealloc_queue_reqs
+                    .expect("decode queue availability was checked")
+                    .saturating_add(
+                        left.decode_transfer_queue_reqs
+                            .expect("decode queue availability was checked"),
+                    );
+                let right_incoming = right
+                    .decode_prealloc_queue_reqs
+                    .expect("decode queue availability was checked")
+                    .saturating_add(
+                        right
+                            .decode_transfer_queue_reqs
+                            .expect("decode queue availability was checked"),
+                    );
+                left_incoming.cmp(&right_incoming)
+            });
+    }
     let left_running =
         u128::from(left.num_running_reqs).saturating_mul(u128::from(right.max_running_requests));
     let right_running =
         u128::from(right.num_running_reqs).saturating_mul(u128::from(left.max_running_requests));
-    let left_kv =
-        u128::from(left.num_total_tokens).saturating_mul(u128::from(right.max_total_num_tokens));
-    let right_kv =
-        u128::from(right.num_total_tokens).saturating_mul(u128::from(left.max_total_num_tokens));
-    left_running
-        .cmp(&right_running)
-        .then_with(|| left_kv.cmp(&right_kv))
+    ordering = ordering.then_with(|| left_running.cmp(&right_running));
+    if compare_step_ms {
+        ordering = ordering.then_with(|| {
+            left.mean_decode_step_ms
+                .expect("decode step availability was checked")
+                .total_cmp(
+                    &right
+                        .mean_decode_step_ms
+                        .expect("decode step availability was checked"),
+                )
+        });
+    }
+    if compare_active_tokens {
+        let left_active = u128::from(
+            left.num_active_tokens
+                .expect("active-token availability was checked"),
+        )
+        .saturating_mul(u128::from(right.max_total_num_tokens));
+        let right_active = u128::from(
+            right
+                .num_active_tokens
+                .expect("active-token availability was checked"),
+        )
+        .saturating_mul(u128::from(left.max_total_num_tokens));
+        ordering = ordering.then_with(|| left_active.cmp(&right_active));
+    } else {
+        let left_kv = u128::from(left.num_total_tokens)
+            .saturating_mul(u128::from(right.max_total_num_tokens));
+        let right_kv = u128::from(right.num_total_tokens)
+            .saturating_mul(u128::from(left.max_total_num_tokens));
+        ordering = ordering.then_with(|| left_kv.cmp(&right_kv));
+    }
+    ordering
         .then_with(|| left.num_running_reqs.cmp(&right.num_running_reqs))
-        .then_with(|| left.num_total_tokens.cmp(&right.num_total_tokens))
+        .then_with(|| {
+            if compare_active_tokens {
+                left.num_active_tokens.cmp(&right.num_active_tokens)
+            } else {
+                left.num_total_tokens.cmp(&right.num_total_tokens)
+            }
+        })
 }
 
 #[cfg(test)]
@@ -773,5 +941,187 @@ mod tests {
             .expect("roomy remains admitted");
         assert_eq!(decision.reason, DecisionReason::RangeFallback);
         assert_eq!(decision.selected.id, roomy.id);
+    }
+
+    #[test]
+    fn prefill_pressure_prefers_estimated_queue_when_available() {
+        let token_light_but_slow = worker("token-light-but-slow");
+        let token_heavy_but_fast = worker("token-heavy-but-fast");
+        let mut slow = load(1, 1);
+        slow.estimated_prefill_queue_ms = Some(100.0);
+        let mut fast = load(10_000, 1);
+        fast.estimated_prefill_queue_ms = Some(10.0);
+        let snapshot = snapshot(&[(&token_light_but_slow, slow), (&token_heavy_but_fast, fast)]);
+
+        assert!(compare_prefill_pressure(
+            &token_light_but_slow,
+            &token_heavy_but_fast,
+            Some(&snapshot),
+        )
+        .is_gt());
+    }
+
+    #[test]
+    fn prefill_pressure_uses_token_fallback_when_queue_estimate_is_incomplete() {
+        let token_light = worker("token-light");
+        let token_heavy = worker("token-heavy");
+        let mut light = load(1, 1);
+        light.estimated_prefill_queue_ms = Some(100.0);
+        let heavy = load(10_000, 1);
+        let snapshot = snapshot(&[(&token_light, light), (&token_heavy, heavy)]);
+
+        assert!(compare_prefill_pressure(&token_light, &token_heavy, Some(&snapshot)).is_lt());
+    }
+
+    #[test]
+    fn prefill_candidate_set_uses_token_fallback_when_any_queue_estimate_is_missing() {
+        let token_light = worker("token-light");
+        let token_heavy = worker("token-heavy");
+        let incomplete = worker("incomplete");
+        let mut light = load(1, 1);
+        light.estimated_prefill_queue_ms = Some(100.0);
+        let mut heavy = load(10_000, 1);
+        heavy.estimated_prefill_queue_ms = Some(10.0);
+        let incomplete_load = load(20_000, 1);
+        let snapshot = snapshot(&[
+            (&token_light, light),
+            (&token_heavy, heavy),
+            (&incomplete, incomplete_load),
+        ]);
+        let candidates = vec![
+            Arc::clone(&token_light),
+            Arc::clone(&token_heavy),
+            Arc::clone(&incomplete),
+        ];
+        let lookup = FreshLoadLookup::new(Some(&snapshot), candidates.iter());
+
+        assert_eq!(
+            lookup
+                .min_by_pressure_key(candidates, FreshLoadLookup::compare_prefill_keys)
+                .expect("non-empty candidates")
+                .id,
+            token_light.id,
+        );
+    }
+
+    #[test]
+    fn prefill_pressure_guard_uses_queue_threshold_when_configured() {
+        let primary = worker("primary");
+        let backup = worker("backup");
+        let mut primary_load = load(1, 1);
+        primary_load.estimated_prefill_queue_ms = Some(100.0);
+        let mut backup_load = load(10_000, 1);
+        backup_load.estimated_prefill_queue_ms = Some(10.0);
+        let snapshot = snapshot(&[(&primary, primary_load), (&backup, backup_load)]);
+        let hints = GuardHints {
+            enable_pressure_guard: true,
+            pressure_abs_threshold_tokens: u64::MAX,
+            pressure_abs_threshold_ms: Some(20.0),
+            pressure_rel_threshold: 1.5,
+        };
+
+        assert!(pressure_guard_prefers_backup(
+            &primary, &backup, &hints, &snapshot
+        ));
+    }
+
+    #[test]
+    fn cache_guard_uses_queue_threshold_when_configured() {
+        let cached_but_slow = worker("cached-but-slow");
+        let less_cached_but_fast = worker("less-cached-but-fast");
+        let mut slow = load(1, 1);
+        slow.estimated_prefill_queue_ms = Some(100.0);
+        let mut fast = load(10_000, 1);
+        fast.estimated_prefill_queue_ms = Some(10.0);
+        let snapshot = snapshot(&[(&cached_but_slow, slow), (&less_cached_but_fast, fast)]);
+        let proposal = CacheCandidateProposal {
+            candidates: vec![
+                CacheCandidate {
+                    worker: Arc::clone(&cached_but_slow),
+                    matched_prefix_tokens: 90,
+                    uncached_tokens: 10,
+                    candidate_range_id: "global".into(),
+                    max_pending_prefill_tokens: None,
+                },
+                CacheCandidate {
+                    worker: Arc::clone(&less_cached_but_fast),
+                    matched_prefix_tokens: 80,
+                    uncached_tokens: 20,
+                    candidate_range_id: "global".into(),
+                    max_pending_prefill_tokens: None,
+                },
+            ],
+            cache_switch_margin_tokens: 32,
+            enable_pressure_guard: true,
+            pressure_abs_threshold_tokens: u64::MAX,
+            pressure_abs_threshold_ms: Some(20.0),
+            pressure_rel_threshold: 1.5,
+        };
+
+        let decision = resolve_cache_candidates(&proposal, 100, &snapshot)
+            .expect("both candidates are admitted");
+        assert_eq!(decision.selected.id, less_cached_but_fast.id);
+    }
+
+    #[test]
+    fn decode_pressure_prefers_retraction_then_incoming_queue() {
+        let retracted = worker("retracted");
+        let clear = worker("clear");
+        let mut retracted_load = load(10, 1);
+        retracted_load.decode_retracted_queue_reqs = Some(1);
+        retracted_load.decode_prealloc_queue_reqs = Some(0);
+        retracted_load.decode_transfer_queue_reqs = Some(0);
+        let mut clear_load = load(10, 1);
+        clear_load.decode_retracted_queue_reqs = Some(0);
+        clear_load.decode_prealloc_queue_reqs = Some(0);
+        clear_load.decode_transfer_queue_reqs = Some(0);
+        let retraction_snapshot = snapshot(&[(&retracted, retracted_load), (&clear, clear_load)]);
+
+        assert!(compare_decode_pressure(&retracted, &clear, Some(&retraction_snapshot),).is_gt());
+
+        let incoming = worker("incoming");
+        let idle = worker("idle");
+        let mut incoming_load = load(10, 1);
+        incoming_load.decode_retracted_queue_reqs = Some(0);
+        incoming_load.decode_prealloc_queue_reqs = Some(2);
+        incoming_load.decode_transfer_queue_reqs = Some(3);
+        let mut idle_load = load(10, 1);
+        idle_load.decode_retracted_queue_reqs = Some(0);
+        idle_load.decode_prealloc_queue_reqs = Some(0);
+        idle_load.decode_transfer_queue_reqs = Some(0);
+        let incoming_snapshot = snapshot(&[(&incoming, incoming_load), (&idle, idle_load)]);
+
+        assert!(compare_decode_pressure(&incoming, &idle, Some(&incoming_snapshot)).is_gt());
+    }
+
+    #[test]
+    fn decode_pressure_uses_step_time_then_active_tokens_before_total_tokens() {
+        let slow_step = worker("slow-step");
+        let fast_step = worker("fast-step");
+        let mut slow_load = load(10, 1);
+        slow_load.decode_retracted_queue_reqs = Some(0);
+        slow_load.decode_prealloc_queue_reqs = Some(0);
+        slow_load.decode_transfer_queue_reqs = Some(0);
+        slow_load.mean_decode_step_ms = Some(20.0);
+        slow_load.num_active_tokens = Some(10);
+        let mut fast_load = slow_load.clone();
+        fast_load.mean_decode_step_ms = Some(5.0);
+        let step_snapshot = snapshot(&[(&slow_step, slow_load), (&fast_step, fast_load)]);
+
+        assert!(compare_decode_pressure(&slow_step, &fast_step, Some(&step_snapshot)).is_gt());
+
+        let active = worker("active");
+        let quiet = worker("quiet");
+        let mut active_load = load(10, 1);
+        active_load.decode_retracted_queue_reqs = Some(0);
+        active_load.decode_prealloc_queue_reqs = Some(0);
+        active_load.decode_transfer_queue_reqs = Some(0);
+        active_load.mean_decode_step_ms = Some(5.0);
+        active_load.num_active_tokens = Some(100);
+        let mut quiet_load = active_load.clone();
+        quiet_load.num_active_tokens = Some(10);
+        let active_snapshot = snapshot(&[(&active, active_load), (&quiet, quiet_load)]);
+
+        assert!(compare_decode_pressure(&active, &quiet, Some(&active_snapshot)).is_gt());
     }
 }

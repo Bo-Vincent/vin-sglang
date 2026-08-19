@@ -145,6 +145,7 @@ impl SessionAwarePolicy {
                 enable_pressure_guard: self.config.pressure_guard
                     && self.config.mode == AffinityMode::Soft,
                 pressure_abs_threshold_tokens: self.config.pressure_abs_threshold_tokens,
+                pressure_abs_threshold_ms: self.config.pressure_abs_threshold_ms,
                 pressure_rel_threshold: self.config.pressure_rel_threshold,
             })
     }

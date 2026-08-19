@@ -383,7 +383,9 @@ pub struct CacheCandidate {
 pub struct CacheCandidateProposal {
     pub candidates: Vec<CacheCandidate>,
     pub cache_switch_margin_tokens: u64,
+    pub enable_pressure_guard: bool,
     pub pressure_abs_threshold_tokens: u64,
+    pub pressure_abs_threshold_ms: Option<f64>,
     pub pressure_rel_threshold: f64,
 }
 
@@ -467,6 +469,8 @@ pub struct GuardHints {
     pub enable_pressure_guard: bool,
     /// 压力逃逸需要超过的未命中 prefill token 绝对差。
     pub pressure_abs_threshold_tokens: u64,
+    /// 有可靠 Prefill queue estimate 时使用的毫秒绝对差。
+    pub pressure_abs_threshold_ms: Option<f64>,
     /// 压力逃逸需要超过的相对倍率。
     pub pressure_rel_threshold: f64,
 }
@@ -476,6 +480,7 @@ impl Default for GuardHints {
         Self {
             enable_pressure_guard: false,
             pressure_abs_threshold_tokens: 0,
+            pressure_abs_threshold_ms: None,
             pressure_rel_threshold: 1.0,
         }
     }
@@ -684,7 +689,9 @@ mod tests {
                 max_pending_prefill_tokens: None,
             }],
             cache_switch_margin_tokens: 8,
+            enable_pressure_guard: true,
             pressure_abs_threshold_tokens: 1_024,
+            pressure_abs_threshold_ms: None,
             pressure_rel_threshold: 1.5,
         };
 
@@ -1297,7 +1304,9 @@ mod tests {
                 cache_candidate(&winner, 70, 30, None),
             ],
             cache_switch_margin_tokens: 16,
+            enable_pressure_guard: true,
             pressure_abs_threshold_tokens: 1_024,
+            pressure_abs_threshold_ms: None,
             pressure_rel_threshold: 1.5,
         };
         let loads = snapshot(&[
@@ -1341,7 +1350,9 @@ mod tests {
                 cache_candidate(&final_winner, 80, 20, None),
             ],
             cache_switch_margin_tokens: 0,
+            enable_pressure_guard: true,
             pressure_abs_threshold_tokens: 1_024,
+            pressure_abs_threshold_ms: None,
             pressure_rel_threshold: 1.5,
         };
         let loads = snapshot(&[
@@ -1385,7 +1396,9 @@ mod tests {
         let proposal = CacheCandidateProposal {
             candidates: vec![cache_candidate(&candidate, 80, 20, Some(30))],
             cache_switch_margin_tokens: 16,
+            enable_pressure_guard: true,
             pressure_abs_threshold_tokens: 1_024,
+            pressure_abs_threshold_ms: None,
             pressure_rel_threshold: 1.5,
         };
         let pending_allows = snapshot(&[(
@@ -1428,7 +1441,9 @@ mod tests {
                 cache_candidate(&idle, 80, 20, None),
             ],
             cache_switch_margin_tokens: 32,
+            enable_pressure_guard: true,
             pressure_abs_threshold_tokens: 100,
+            pressure_abs_threshold_ms: None,
             pressure_rel_threshold: 1.5,
         };
         let loads = snapshot(&[
@@ -1466,7 +1481,9 @@ mod tests {
                 cache_candidate(&idle, 20, 80, None),
             ],
             cache_switch_margin_tokens: 32,
+            enable_pressure_guard: true,
             pressure_abs_threshold_tokens: 100,
+            pressure_abs_threshold_ms: None,
             pressure_rel_threshold: 1.5,
         };
         let loads = snapshot(&[
@@ -1512,7 +1529,9 @@ mod tests {
                 cache_candidate(&beyond_margin, 60, 40, None),
             ],
             cache_switch_margin_tokens: 32,
+            enable_pressure_guard: true,
             pressure_abs_threshold_tokens: 100,
+            pressure_abs_threshold_ms: None,
             pressure_rel_threshold: 1.5,
         };
         let loads = snapshot(&[
@@ -1654,6 +1673,7 @@ mod tests {
             SelectionProposal::with_backup(primary, backup).with_guard_hints(GuardHints {
                 enable_pressure_guard: true,
                 pressure_abs_threshold_tokens: 100,
+                pressure_abs_threshold_ms: None,
                 pressure_rel_threshold: 2.0,
             });
 

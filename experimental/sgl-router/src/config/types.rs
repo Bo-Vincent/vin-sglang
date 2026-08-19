@@ -466,6 +466,7 @@ pub struct AffinityConfig {
     pub session_affinity_mode: SessionAffinityMode,
     pub pressure_guard: bool,
     pub pressure_abs_threshold_tokens: u64,
+    pub pressure_abs_threshold_ms: Option<f64>,
     pub pressure_rel_threshold: f64,
     pub cache_affinity_min_matched_tokens: Option<u64>,
     pub cache_affinity_min_match_ratio: Option<f64>,
@@ -486,6 +487,7 @@ impl Default for AffinityConfig {
             session_affinity_mode: SessionAffinityMode::Bucket,
             pressure_guard: true,
             pressure_abs_threshold_tokens: 1_024,
+            pressure_abs_threshold_ms: None,
             pressure_rel_threshold: 1.5,
             // Indexer 会截断 prefix scan，默认使用绝对 token 下限。
             cache_affinity_min_matched_tokens: Some(1_024),
