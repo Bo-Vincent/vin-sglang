@@ -16,6 +16,7 @@ use crate::policies::{
         Pipeline, ScorePolicy,
     },
     session_aware::SessionAwarePolicy,
+    shortest_ttft::ShortestTtftPolicy,
     sticky::StickyPolicy,
     Policy, PolicyRegistry,
 };
@@ -36,6 +37,7 @@ fn build_sticky_fallback(kind: PolicyKind) -> Arc<dyn Policy> {
         PolicyKind::LoadBased => Arc::new(LoadBasedPolicy::new()),
         PolicyKind::CacheAwareZmq
         | PolicyKind::CacheAware
+        | PolicyKind::ShortestTtft
         | PolicyKind::SessionAware
         | PolicyKind::Overloaded
         | PolicyKind::Sticky
@@ -127,6 +129,7 @@ fn build_kind(
         PolicyKind::CacheAware => Arc::new(CacheAwarePolicy::new(
             model.affinity.clone().unwrap_or_default(),
         )),
+        PolicyKind::ShortestTtft => Arc::new(ShortestTtftPolicy::new()),
         PolicyKind::Sticky => build_sticky(model),
         PolicyKind::FusedScore => build_fused(model, &tree, &tokenizers, &block_size_oracle)?,
         PolicyKind::ScorePolicy => {
@@ -238,6 +241,7 @@ pub fn build_policy_kind_only(kind: PolicyKind) -> Result<Arc<dyn Policy>> {
         PolicyKind::CacheAware => Arc::new(CacheAwarePolicy::new(
             crate::config::AffinityConfig::default(),
         )),
+        PolicyKind::ShortestTtft => Arc::new(ShortestTtftPolicy::new()),
         PolicyKind::Sticky => {
             let s = crate::config::StickyConfig::default();
             Arc::new(StickyPolicy::new(
@@ -431,6 +435,7 @@ mod tests {
             PolicyKind::CacheAwareZmq,
             PolicyKind::SessionAware,
             PolicyKind::CacheAware,
+            PolicyKind::ShortestTtft,
             PolicyKind::Sticky,
             // INVERTED (was asserted is_err): the `not_wired_yet` refusal it
             // pinned was a temporary state, not the contract. PLAN requires

@@ -16,6 +16,7 @@ pub mod registry;
 pub mod round_robin;
 pub mod scoring;
 pub mod session_aware;
+pub mod shortest_ttft;
 pub mod sticky;
 
 use crate::discovery::ModelId;
@@ -48,6 +49,20 @@ pub struct RequestTokens {
 pub struct ExternalPrefixSignal {
     pub outcome: sgl_kv_indexer::PrefixOutcome,
     pub query_blocks: usize,
+}
+
+/// 将 Indexer 报告的共享 block 深度换算为保守的 token 命中量。
+///
+/// Indexer 的匹配块数属于外部输入，先按查询长度截断；两种使用外部
+/// Indexer 的 policy 必须共享这一定义，避免把相同 `H` 算成不同 `E=L-H`。
+pub(crate) fn estimate_matched_prefix_tokens(
+    input_tokens: u64,
+    query_blocks: usize,
+    matched_prefix_blocks: u32,
+) -> u64 {
+    let query_blocks = u64::try_from(query_blocks).unwrap_or(u64::MAX).max(1);
+    let matched_prefix_blocks = u64::from(matched_prefix_blocks).min(query_blocks);
+    input_tokens.saturating_mul(matched_prefix_blocks) / query_blocks
 }
 
 /// Produce the routing tokens — and whether they are engine-equivalent —
@@ -389,11 +404,22 @@ pub struct CacheCandidateProposal {
     pub pressure_rel_threshold: f64,
 }
 
+/// Shortest-TTFT 在 hard admission 前提交的全量候选。
+///
+/// 与 [`CacheCandidateProposal`] 不同，它保留没有命中 Indexer 的 worker：
+/// baseline 需要把它们的 `H=0`、`E=L` 一起纳入 TTFT 比较。
+#[derive(Clone)]
+pub struct ShortestTtftCandidateProposal {
+    pub candidates: Vec<CacheCandidate>,
+    pub outstanding_uncached_tokens_threshold: u64,
+}
+
 /// Prefill policy 返回 pair 或 Cache-Aware 候选集。
 #[derive(Clone)]
 pub enum PrefillProposal {
     Pair(SelectionProposal),
     CacheCandidates(CacheCandidateProposal),
+    ShortestTtftCandidates(ShortestTtftCandidateProposal),
 }
 
 impl PrefillProposal {
@@ -408,6 +434,14 @@ impl PrefillProposal {
                         .any(|worker| worker.id == candidate.worker.id)
                 });
                 Self::CacheCandidates(proposal)
+            }
+            Self::ShortestTtftCandidates(mut proposal) => {
+                proposal.candidates.retain(|candidate| {
+                    workers
+                        .iter()
+                        .any(|worker| worker.id == candidate.worker.id)
+                });
+                Self::ShortestTtftCandidates(proposal)
             }
         }
     }
@@ -519,6 +553,13 @@ pub trait Policy: Send + Sync + std::fmt::Debug {
     /// 是否进入共享 Prefill Admission / Guard。
     fn uses_shared_prefill_admission(&self) -> bool {
         false
+    }
+
+    /// Shortest-TTFT uses a policy-owned compare-and-set stamp to avoid
+    /// converging concurrent requests onto the same estimated winner.
+    /// Other policies have no mutable selection state and accept directly.
+    fn try_claim_shortest_ttft(&self, _worker_id: &crate::discovery::WorkerId) -> bool {
+        true
     }
 
     /// 是否参与 Bucket-aware affinity lookup。

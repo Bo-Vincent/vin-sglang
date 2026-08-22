@@ -6,7 +6,11 @@
 //! Pair proposal 先做容量检查再执行 Guard；Cache-Aware 候选走有界比较。
 
 use crate::load_monitor::{AggregateLoad, Freshness, LoadMonitorSnapshot};
-use crate::policies::{CacheCandidate, CacheCandidateProposal, GuardHints, SelectionProposal};
+use crate::policies::shortest_ttft::{select_shortest_ttft, ShortestTtftCandidate};
+use crate::policies::{
+    CacheCandidate, CacheCandidateProposal, GuardHints, SelectionProposal,
+    ShortestTtftCandidateProposal,
+};
 use crate::workers::Worker;
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -192,6 +196,80 @@ pub fn resolve_cache_candidates(
         pressure_guard_compared_pairs,
         pressure_guard_overrides,
     }
+}
+
+/// Shortest-TTFT 的最终解析结果，附带 baseline 内部 guard/CAS 原因。
+pub struct ShortestTtftFinalDecision {
+    pub decision: FinalDecision,
+    pub outstanding_guard_fallback: bool,
+    pub cas_retries: u32,
+    pub matched_prefix_tokens: u64,
+    pub uncached_tokens: u64,
+}
+
+/// 图中 baseline 先复用与 Cache-Aware 相同的 hard prefill admission；
+/// outstanding guard 保持为它自己的软规则。
+pub fn resolve_shortest_ttft_candidates(
+    proposal: &ShortestTtftCandidateProposal,
+    request_input_tokens: u64,
+    snapshot: &LoadMonitorSnapshot,
+    mut try_claim: impl FnMut(&crate::discovery::WorkerId) -> bool,
+) -> Option<ShortestTtftFinalDecision> {
+    let admission_loads = FreshLoadLookup::new(
+        Some(snapshot),
+        proposal
+            .candidates
+            .iter()
+            .map(|candidate| &candidate.worker),
+    );
+    let admitted = proposal
+        .candidates
+        .iter()
+        .filter(|candidate| {
+            is_cache_candidate_admitted(candidate, request_input_tokens, &admission_loads)
+        })
+        .collect::<Vec<_>>();
+    let score_loads = FreshLoadLookup::new(
+        Some(snapshot),
+        admitted.iter().map(|candidate| &candidate.worker),
+    );
+    let scored = admitted
+        .iter()
+        .map(|candidate| ShortestTtftCandidate {
+            worker_id: candidate.worker.id.0.clone(),
+            matched_prefix_tokens: candidate.matched_prefix_tokens,
+            uncached_tokens: candidate.uncached_tokens,
+            queue_ms: score_loads.prefill_queue_ms(&candidate.worker),
+            outstanding_uncached_tokens: score_loads.outstanding_uncached_tokens(&candidate.worker),
+        })
+        .collect::<Vec<_>>();
+    let selected = select_shortest_ttft(
+        &scored,
+        proposal.outstanding_uncached_tokens_threshold,
+        |worker_id| {
+            admitted
+                .iter()
+                .find(|candidate| candidate.worker.id.0 == worker_id)
+                .is_some_and(|candidate| try_claim(&candidate.worker.id))
+        },
+    )?;
+    let candidate = admitted
+        .iter()
+        .find(|candidate| candidate.worker.id.0 == selected.worker_id)?;
+    Some(ShortestTtftFinalDecision {
+        decision: FinalDecision {
+            selected: Arc::clone(&candidate.worker),
+            primary: Arc::clone(&candidate.worker),
+            backup: None,
+            reason: DecisionReason::CacheCandidate,
+            candidate_range_id: candidate.candidate_range_id.clone(),
+            load_snapshot_version: snapshot.version,
+        },
+        outstanding_guard_fallback: selected.outstanding_guard_fallback,
+        cas_retries: selected.cas_retries,
+        matched_prefix_tokens: candidate.matched_prefix_tokens,
+        uncached_tokens: candidate.uncached_tokens,
+    })
 }
 
 /// Admission / Guard 的最终结果。
@@ -600,6 +678,23 @@ impl<'a> FreshLoadLookup<'a> {
         } else {
             "router_local"
         }
+    }
+
+    /// 图中 baseline 只在所有被比较候选都提供同一份 fresh queue 精度时使用
+    /// queue；混合精度时全体取零，不能偏向碰巧有该指标的 worker。
+    pub(crate) fn prefill_queue_ms(&self, worker: &Arc<Worker>) -> f64 {
+        self.compare_prefill_queue_ms
+            .then(|| self.get(&worker.id)?.estimated_prefill_queue_ms)
+            .flatten()
+            .unwrap_or(0.0)
+    }
+
+    /// 现有 admission 的 waiting uncached work 即 Router 可见的 outstanding
+    /// prefill 量。缺失或 stale 报告按零处理；容量仍已由 hard admission 检查。
+    pub(crate) fn outstanding_uncached_tokens(&self, worker: &Arc<Worker>) -> u64 {
+        self.get(&worker.id)
+            .map(|load| load.num_waiting_uncached_tokens)
+            .unwrap_or(0)
     }
 
     /// Cheapest candidate under `compare`, resolving each candidate's inputs
