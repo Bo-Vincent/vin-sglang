@@ -111,3 +111,11 @@ virtual worker queue/cache 闭环完成的 8 / 64 / 256 worker CPU logical-time 
 [Router Policy 大规模 Virtual Fleet 模拟报告](docs/router-policy-simulator-large-fleet-report.md)。
 该实验验证策略行为与规模边界，不替代真实 GPU、HTTP、Indexer RPC 或 LoadMonitor stream
 的生产吞吐验证。
+
+## Router Policy 真实 LoadMonitor E2E
+
+真实 8×L20 worker reporter、Router outbound LoadMonitor session、Indexer Cache-Aware
+preflight 与 Session-Aware Pressure Guard 的功能性闭环证据见
+[Router Policy 真实 LoadMonitor E2E 验证](docs/router-policy-real-load-monitor-e2e-report.md)。
+该验证证明真实 snapshot 能改变最终 worker，不替代正式性能矩阵，也不覆盖 L20 对当前
+`sglang-kernel` 新版本的 ABI 兼容性。
