@@ -102,3 +102,12 @@ small-scale, CPU-only complement; it catches algorithmic regressions in
 the routing primitives without burning GPU time. Pair both: this file
 in pre-commit / CI tier-2, the real-cluster e2e in the
 `pr-test-rust.yml` matrix entry.
+
+## Simulator large-fleet policy evaluation
+
+临时引入 SGLang Simulator #33824 后，使用真实 Rust P2 / Cache-Aware 决策路径和
+virtual worker queue/cache 闭环完成的 8 / 64 / 256 worker CPU logical-time 矩阵、原始
+结果和适用边界见
+[Router Policy 大规模 Virtual Fleet 模拟报告](docs/router-policy-simulator-large-fleet-report.md)。
+该实验验证策略行为与规模边界，不替代真实 GPU、HTTP、Indexer RPC 或 LoadMonitor stream
+的生产吞吐验证。
