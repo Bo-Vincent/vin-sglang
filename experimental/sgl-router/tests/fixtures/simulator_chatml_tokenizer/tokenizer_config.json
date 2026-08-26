@@ -1,0 +1,7 @@
+{
+  "backend": "tokenizers",
+  "model_max_length": 8192,
+  "tokenizer_class": "TokenizersBackend",
+  "unk_token": "[UNK]",
+  "chat_template": "{% for message in messages %}<|im_start|>{{ message['role'] }}\n{{ message['content'] }}<|im_end|>\n{% endfor %}{% if add_generation_prompt %}<|im_start|>assistant\n{% endif %}"
+}

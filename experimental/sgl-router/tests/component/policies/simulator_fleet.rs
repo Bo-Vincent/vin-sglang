@@ -279,11 +279,15 @@ fn run_virtual_fleet_with_arrival(
                 {
                     PrefillProposal::CacheCandidates(proposal) => {
                         resolve_cache_candidates(&proposal, INPUT_TOKENS, &snapshot)
+                            .decision
                             .expect("cache candidate decision")
                     }
                     PrefillProposal::Pair(proposal) => {
                         resolve_prefill(&range, &proposal, INPUT_TOKENS, &snapshot)
                             .expect("cache fallback decision")
+                    }
+                    PrefillProposal::ShortestTtftCandidates(_) => {
+                        panic!("cache-aware policy must not return shortest-TTFT candidates")
                     }
                 }
             }
