@@ -18,6 +18,7 @@ use proto::{
 };
 use rand::Rng;
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::num::NonZeroU16;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -276,6 +277,7 @@ struct MonitorInner {
     store: RwLock<StoreState>,
     sessions: Mutex<HashMap<WorkerId, ReporterTask>>,
     next_session: AtomicU64,
+    reconcile_epoch: AtomicU64,
     shutting_down: AtomicBool,
 }
 
@@ -300,6 +302,7 @@ impl LoadMonitor {
                 store: RwLock::new(StoreState::default()),
                 sessions: Mutex::new(HashMap::new()),
                 next_session: AtomicU64::new(1),
+                reconcile_epoch: AtomicU64::new(0),
                 shutting_down: AtomicBool::new(false),
             }),
         }
@@ -345,34 +348,46 @@ impl LoadMonitor {
     /// Workers whose URL and role are unchanged preserve accepted reports,
     /// sequence state, and retired sources. Removed or identity-changed workers
     /// lose that state and have their prior reporter task cancelled.
-    pub async fn reconcile(&self, workers: Vec<Arc<Worker>>) {
-        if !self.enabled() || self.inner.shutting_down.load(Ordering::Acquire) {
-            return;
-        }
-        let fallback_port = self.inner.config.reporter_port;
-        let mut targets = HashMap::new();
-        for worker in workers {
-            match WorkerTarget::from_worker(&worker, fallback_port) {
-                Ok(target) => {
-                    targets.insert(target.id.clone(), target);
-                }
-                Err(_error) if worker.reporter_port().is_none() && fallback_port.is_none() => {
-                    tracing::debug!(
+    pub fn reconcile(
+        &self,
+        workers: Vec<Arc<Worker>>,
+    ) -> impl Future<Output = ()> + Send + 'static {
+        // `register_one` 并发完成；在构造 future 时记录新旧关系，避免较早的
+        // 局部 registry 快照晚于完整快照执行并错误移除有效 reporter。
+        let epoch = self.inner.reconcile_epoch.fetch_add(1, Ordering::AcqRel) + 1;
+        let monitor = self.clone();
+        async move {
+            if !monitor.enabled()
+                || monitor.inner.shutting_down.load(Ordering::Acquire)
+                || monitor.inner.reconcile_epoch.load(Ordering::Acquire) != epoch
+            {
+                return;
+            }
+            let fallback_port = monitor.inner.config.reporter_port;
+            let mut targets = HashMap::new();
+            for worker in workers {
+                match WorkerTarget::from_worker(&worker, fallback_port) {
+                    Ok(target) => {
+                        targets.insert(target.id.clone(), target);
+                    }
+                    Err(_error) if worker.reporter_port().is_none() && fallback_port.is_none() => {
+                        tracing::debug!(
+                            worker_id = %worker.id,
+                            worker_url = %worker.url,
+                            "load monitor: Worker has no load reporter port; monitoring disabled for this Worker",
+                        );
+                    }
+                    Err(error) => tracing::error!(
                         worker_id = %worker.id,
                         worker_url = %worker.url,
-                        "load monitor: Worker has no load reporter port; monitoring disabled for this Worker",
-                    );
+                        error = %error,
+                        "load monitor: cannot derive Worker reporter endpoint",
+                    ),
                 }
-                Err(error) => tracing::error!(
-                    worker_id = %worker.id,
-                    worker_url = %worker.url,
-                    error = %error,
-                    "load monitor: cannot derive Worker reporter endpoint",
-                ),
             }
+            let task_targets = monitor.update_store(targets);
+            monitor.reconcile_reporter_tasks(task_targets).await;
         }
-        let task_targets = self.update_store(targets);
-        self.reconcile_reporter_tasks(task_targets).await;
     }
 
     /// Updates Worker snapshot state and excludes duplicate endpoints from

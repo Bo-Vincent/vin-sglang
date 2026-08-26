@@ -266,6 +266,27 @@ fn captured_snapshot_is_immutable_across_updates() {
     assert!(second.version > first.version);
 }
 
+/// 延迟的注册 reconcile 不能覆盖较新的完整 registry 快照。
+/// 静态 URL discovery 会并发启动多项注册，Monitor future 的 poll 顺序可能与
+/// 注册完成顺序不同。
+#[tokio::test]
+async fn delayed_reconcile_does_not_remove_workers_from_newer_snapshot() {
+    let monitor = test_monitor(31000);
+    let first = test_worker("first", WorkerMode::Plain);
+    let second = test_worker("second", WorkerMode::Plain);
+
+    let delayed = monitor.reconcile(vec![first.clone()]);
+    let current = monitor.reconcile(vec![first, second]);
+    current.await;
+    delayed.await;
+
+    let workers = monitor.snapshot().workers;
+    assert_eq!(workers.len(), 2);
+    assert_eq!(workers[0].worker_id, "first");
+    assert_eq!(workers[1].worker_id, "second");
+    monitor.shutdown().await;
+}
+
 #[derive(Clone)]
 struct FakeReporter {
     report: LoadReport,
