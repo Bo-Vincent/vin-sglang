@@ -78,6 +78,13 @@ def parse_endpoint_counts(value: str) -> tuple[int, ...]:
     return counts
 
 
+def batched(values: Sequence[object], size: int) -> Iterable[tuple[object, ...]]:
+    if size <= 0:
+        raise ValueError("batch size must be positive")
+    for start in range(0, len(values), size):
+        yield tuple(values[start : start + size])
+
+
 def build_cases(
     *,
     endpoint_counts: Sequence[int],
@@ -550,36 +557,38 @@ def start_case_stack(
             source_root=args.source_root,
             simulator_config=args.simulator_config,
         )
-        workers: list[ManagedProcess] = []
-        for spec in specs:
-            command, worker_environment = simulator_worker_command(
-                spec,
-                python=args.python,
-                simulator_config=args.simulator_config,
-                model_path=args.model_path,
-                tokenizer_path=args.tokenizer_path,
-                max_total_tokens=args.max_total_tokens,
-                max_running_requests=args.max_running_requests,
+        for batch in batched(specs, args.worker_start_batch_size):
+            batch_specs = tuple(batch)
+            batch_workers: list[ManagedProcess] = []
+            for spec in batch_specs:
+                command, worker_environment = simulator_worker_command(
+                    spec,
+                    python=args.python,
+                    simulator_config=args.simulator_config,
+                    model_path=args.model_path,
+                    tokenizer_path=args.tokenizer_path,
+                    max_total_tokens=args.max_total_tokens,
+                    max_running_requests=args.max_running_requests,
+                )
+                worker_environment.update(environment)
+                worker = start_process(
+                    f"worker-{spec.index}",
+                    command,
+                    directory / "workers" / f"{spec.index}.log",
+                    cwd=args.source_root,
+                    env=worker_environment,
+                )
+                managed.append(worker)
+                batch_workers.append(worker)
+            asyncio.run(
+                wait_http_urls(
+                    tuple(f"{spec.url}/health" for spec in batch_specs),
+                    timeout=args.worker_start_timeout,
+                )
             )
-            worker_environment.update(environment)
-            worker = start_process(
-                f"worker-{spec.index}",
-                command,
-                directory / "workers" / f"{spec.index}.log",
-                cwd=args.source_root,
-                env=worker_environment,
-            )
-            managed.append(worker)
-            workers.append(worker)
-        asyncio.run(
-            wait_http_urls(
-                tuple(f"{spec.url}/health" for spec in specs),
-                timeout=args.worker_start_timeout,
-            )
-        )
-        for spec, worker in zip(specs, workers):
-            if worker.process.poll() is not None:
-                raise RuntimeError(f"worker {spec.index} exited during startup")
+            for spec, worker in zip(batch_specs, batch_workers):
+                if worker.process.poll() is not None:
+                    raise RuntimeError(f"worker {spec.index} exited during startup")
 
         router_environment: dict[str, str] = {}
         if case.policy in {"cache_aware", "shortest_ttft"}:
@@ -1029,6 +1038,7 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--indexer-port", type=int, default=50_551)
     parser.add_argument("--max-total-tokens", type=int, default=8192)
     parser.add_argument("--max-running-requests", type=int, default=32)
+    parser.add_argument("--worker-start-batch-size", type=int, default=16)
     parser.add_argument(
         "--max-cache-holders",
         type=int,
@@ -1053,7 +1063,11 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         parser.error(f"unsupported policies: {sorted(unsupported)}")
     if args.repeats <= 0:
         parser.error("--repeats must be positive")
-    if args.max_total_tokens <= 0 or args.max_running_requests <= 0:
+    if (
+        args.max_total_tokens <= 0
+        or args.max_running_requests <= 0
+        or args.worker_start_batch_size <= 0
+    ):
         parser.error("worker capacity arguments must be positive")
     if args.max_cache_holders < 0 or args.output_tokens <= 0 or args.qps_per_worker <= 0.0:
         parser.error("cache holders must be non-negative; output and QPS must be positive")

@@ -198,6 +198,14 @@ class SimulatorHttpFleetContractTest(unittest.TestCase):
             self.assertEqual((archived / "router.log").read_text(), "partial evidence\n")
             self.assertTrue((archived / "RESUME_ARCHIVED").is_file())
 
+    def test_worker_startup_batches_bound_concurrent_initialization(self):
+        runner = load_runner()
+
+        self.assertEqual(
+            tuple(runner.batched((0, 1, 2, 3, 4), 2)),
+            ((0, 1), (2, 3), (4,)),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
