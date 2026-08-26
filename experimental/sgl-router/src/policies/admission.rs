@@ -105,13 +105,25 @@ pub enum DecisionReason {
     RangeFallback,
 }
 
+/// Cache-Aware 最终选择及本次候选解析的审计信息。
+///
+/// 审计字段用于 Router metrics、决策日志和 E2E 审计，不参与任何选择或排序。
+pub struct CacheCandidateResolution {
+    pub decision: Option<FinalDecision>,
+    pub prefill_pressure_source: &'static str,
+    pub admission_rejected_candidates: u64,
+    pub pressure_guard_compared_pairs: u64,
+    pub pressure_guard_overrides: u64,
+}
+
 /// Resolve Cache-Aware candidates inside one margin above the admitted
-/// minimum-work floor. The winner is final; `None` starts no-hit fallback.
+/// minimum-work floor. A missing winner starts no-hit fallback while preserving
+/// admission and guard audit counters.
 pub fn resolve_cache_candidates(
     proposal: &CacheCandidateProposal,
     request_input_tokens: u64,
     snapshot: &LoadMonitorSnapshot,
-) -> Option<FinalDecision> {
+) -> CacheCandidateResolution {
     let loads = FreshLoadLookup::new(
         Some(snapshot),
         proposal
@@ -124,30 +136,62 @@ pub fn resolve_cache_candidates(
         .iter()
         .filter(|candidate| is_cache_candidate_admitted(candidate, request_input_tokens, &loads))
         .collect();
-    let work_floor = admitted
+    let admission_rejected_candidates =
+        proposal.candidates.len().saturating_sub(admitted.len()) as u64;
+    let Some(work_floor) = admitted
         .iter()
         .copied()
-        .min_by_key(|candidate| candidate.uncached_tokens)?;
+        .min_by_key(|candidate| candidate.uncached_tokens)
+    else {
+        return CacheCandidateResolution {
+            decision: None,
+            prefill_pressure_source: loads.prefill_pressure_source(),
+            admission_rejected_candidates,
+            pressure_guard_compared_pairs: 0,
+            pressure_guard_overrides: 0,
+        };
+    };
     let near_tie_ceiling = work_floor
         .uncached_tokens
         .saturating_add(proposal.cache_switch_margin_tokens);
     let mut winner = work_floor;
+    let mut pressure_guard_compared_pairs = 0;
+    let mut pressure_guard_overrides = 0;
     for candidate in admitted {
-        if candidate.uncached_tokens > near_tie_ceiling {
+        if candidate.worker.id == winner.worker.id || candidate.uncached_tokens > near_tie_ceiling {
             continue;
         }
-        if compare_cache_candidates(winner, candidate, proposal, &loads).is_gt() {
+        let baseline = compare_cache_candidates(winner, candidate, proposal, &loads, false);
+        let ordering = if proposal.enable_pressure_guard
+            && cache_pressure_guard_comparable(winner, candidate, &loads)
+        {
+            pressure_guard_compared_pairs += 1;
+            let guarded = compare_cache_candidates(winner, candidate, proposal, &loads, true);
+            if guarded != baseline {
+                pressure_guard_overrides += 1;
+            }
+            guarded
+        } else {
+            baseline
+        };
+        if ordering.is_gt() {
             winner = candidate;
         }
     }
-    Some(FinalDecision {
-        selected: Arc::clone(&winner.worker),
-        primary: Arc::clone(&winner.worker),
-        backup: None,
-        reason: DecisionReason::CacheCandidate,
-        candidate_range_id: winner.candidate_range_id.clone(),
-        load_snapshot_version: snapshot.version,
-    })
+    CacheCandidateResolution {
+        decision: Some(FinalDecision {
+            selected: Arc::clone(&winner.worker),
+            primary: Arc::clone(&winner.worker),
+            backup: None,
+            reason: DecisionReason::CacheCandidate,
+            candidate_range_id: winner.candidate_range_id.clone(),
+            load_snapshot_version: snapshot.version,
+        }),
+        prefill_pressure_source: loads.prefill_pressure_source(),
+        admission_rejected_candidates,
+        pressure_guard_compared_pairs,
+        pressure_guard_overrides,
+    }
 }
 
 /// Admission / Guard 的最终结果。
@@ -340,6 +384,7 @@ fn compare_cache_candidates(
     right: &CacheCandidate,
     proposal: &CacheCandidateProposal,
     loads: &FreshLoadLookup<'_>,
+    enable_pressure_guard: bool,
 ) -> Ordering {
     let work_delta = left.uncached_tokens.abs_diff(right.uncached_tokens);
     if work_delta > proposal.cache_switch_margin_tokens {
@@ -351,7 +396,7 @@ fn compare_cache_candidates(
     }
 
     // Pressure can overturn cache benefit only inside the near-tie margin.
-    if proposal.enable_pressure_guard {
+    if enable_pressure_guard {
         if materially_more_pressured(
             &left.worker,
             &right.worker,
@@ -378,6 +423,15 @@ fn compare_cache_candidates(
         .cmp(&right.uncached_tokens)
         .then_with(|| loads.compare_prefill_pressure(&left.worker, &right.worker))
         .then_with(|| left.worker.id.0.cmp(&right.worker.id.0))
+}
+
+fn cache_pressure_guard_comparable(
+    left: &CacheCandidate,
+    right: &CacheCandidate,
+    loads: &FreshLoadLookup<'_>,
+) -> bool {
+    loads.comparable_get(&left.worker.id).is_some()
+        && loads.comparable_get(&right.worker.id).is_some()
 }
 
 fn materially_more_pressured(
@@ -536,6 +590,16 @@ impl<'a> FreshLoadLookup<'a> {
         right: &Arc<Worker>,
     ) -> Ordering {
         self.compare_prefill_keys(&self.pressure_key(left), &self.pressure_key(right))
+    }
+
+    pub(crate) fn prefill_pressure_source(&self) -> &'static str {
+        if self.compare_prefill_queue_ms {
+            "estimated_prefill_queue_ms"
+        } else if self.compare_aggregate {
+            "monitor_fallback"
+        } else {
+            "router_local"
+        }
     }
 
     /// Cheapest candidate under `compare`, resolving each candidate's inputs
@@ -1058,9 +1122,93 @@ mod tests {
             pressure_rel_threshold: 1.5,
         };
 
-        let decision = resolve_cache_candidates(&proposal, 100, &snapshot)
-            .expect("both candidates are admitted");
-        assert_eq!(decision.selected.id, less_cached_but_fast.id);
+        let decision = resolve_cache_candidates(&proposal, 100, &snapshot);
+        assert_eq!(
+            decision
+                .decision
+                .as_ref()
+                .expect("both candidates are admitted")
+                .selected
+                .id,
+            less_cached_but_fast.id
+        );
+        assert_eq!(decision.admission_rejected_candidates, 0);
+        assert_eq!(decision.pressure_guard_compared_pairs, 1);
+        assert_eq!(decision.pressure_guard_overrides, 1);
+    }
+
+    #[test]
+    fn cache_candidate_decision_counts_hard_admission_rejections() {
+        let saturated = worker("saturated");
+        let available = worker("available");
+        let mut saturated_load = load(0, 64);
+        saturated_load.max_running_requests = 64;
+        let snapshot = snapshot(&[(&saturated, saturated_load), (&available, load(0, 1))]);
+        let proposal = CacheCandidateProposal {
+            candidates: vec![
+                CacheCandidate {
+                    worker: Arc::clone(&saturated),
+                    matched_prefix_tokens: 90,
+                    uncached_tokens: 10,
+                    candidate_range_id: "global".into(),
+                    max_pending_prefill_tokens: None,
+                },
+                CacheCandidate {
+                    worker: Arc::clone(&available),
+                    matched_prefix_tokens: 80,
+                    uncached_tokens: 20,
+                    candidate_range_id: "global".into(),
+                    max_pending_prefill_tokens: None,
+                },
+            ],
+            cache_switch_margin_tokens: 32,
+            enable_pressure_guard: true,
+            pressure_abs_threshold_tokens: 8_192,
+            pressure_abs_threshold_ms: None,
+            pressure_rel_threshold: 1.5,
+        };
+
+        let decision = resolve_cache_candidates(&proposal, 100, &snapshot);
+        assert_eq!(
+            decision
+                .decision
+                .as_ref()
+                .expect("available candidate should remain eligible")
+                .selected
+                .id,
+            available.id
+        );
+        assert_eq!(decision.admission_rejected_candidates, 1);
+        assert_eq!(decision.pressure_guard_compared_pairs, 0);
+        assert_eq!(decision.pressure_guard_overrides, 0);
+    }
+
+    #[test]
+    fn cache_candidate_resolution_keeps_rejections_when_no_candidate_is_admitted() {
+        let saturated = worker("saturated");
+        let mut saturated_load = load(0, 64);
+        saturated_load.max_running_requests = 64;
+        let snapshot = snapshot(&[(&saturated, saturated_load)]);
+        let proposal = CacheCandidateProposal {
+            candidates: vec![CacheCandidate {
+                worker: Arc::clone(&saturated),
+                matched_prefix_tokens: 90,
+                uncached_tokens: 10,
+                candidate_range_id: "global".into(),
+                max_pending_prefill_tokens: None,
+            }],
+            cache_switch_margin_tokens: 32,
+            enable_pressure_guard: true,
+            pressure_abs_threshold_tokens: 8_192,
+            pressure_abs_threshold_ms: None,
+            pressure_rel_threshold: 1.5,
+        };
+
+        let resolution = resolve_cache_candidates(&proposal, 100, &snapshot);
+        assert!(resolution.decision.is_none());
+        assert_eq!(resolution.admission_rejected_candidates, 1);
+        assert_eq!(resolution.pressure_guard_compared_pairs, 0);
+        assert_eq!(resolution.pressure_guard_overrides, 0);
     }
 
     #[test]
