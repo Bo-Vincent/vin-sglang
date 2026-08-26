@@ -1174,6 +1174,11 @@ def run_case(
         atomic_write_text(directory / "COMPLETE", "ok\n")
     finally:
         stop_processes(managed)
+        if worker_fleet is not None and args.control_plane_quiesce_seconds > 0.0:
+            # Simulator 的 reporter 每个 worker 只保留一个 Router session。
+            # 在同一 worker fleet 上切换 case 前等待上一个 Router 的 lease
+            # 失效，避免旧 session 短暂覆盖新 Router 的 fresh snapshot。
+            time.sleep(args.control_plane_quiesce_seconds)
 
 
 def run_cases(args: argparse.Namespace, cases: Sequence[Case]) -> None:
@@ -1247,6 +1252,7 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--router-start-timeout", type=float, default=180.0)
     parser.add_argument("--router-settle-seconds", type=float, default=35.0)
     parser.add_argument("--indexer-settle-seconds", type=float, default=4.0)
+    parser.add_argument("--control-plane-quiesce-seconds", type=float, default=16.0)
     parser.add_argument("--reuse-worker-fleet", action="store_true")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--execute", action="store_true")
@@ -1267,7 +1273,11 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         parser.error("worker capacity arguments must be positive")
     if args.max_cache_holders < 0 or args.output_tokens <= 0 or args.qps_per_worker <= 0.0:
         parser.error("cache holders must be non-negative; output and QPS must be positive")
-    if args.router_settle_seconds < 0.0 or args.indexer_settle_seconds < 0.0:
+    if (
+        args.router_settle_seconds < 0.0
+        or args.indexer_settle_seconds < 0.0
+        or args.control_plane_quiesce_seconds < 0.0
+    ):
         parser.error("settle durations must be non-negative")
     if args.worker_port_layout_wait_timeout < 0.0:
         parser.error("worker port layout wait timeout must be non-negative")
@@ -1330,6 +1340,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         "qps_per_worker": args.qps_per_worker,
         "max_cache_holders": args.max_cache_holders,
         "worker_port_layout_wait_timeout": args.worker_port_layout_wait_timeout,
+        "control_plane_quiesce_seconds": args.control_plane_quiesce_seconds,
         "reuse_worker_fleet": args.reuse_worker_fleet,
         "simulator_config": str(args.simulator_config),
         "cases": [asdict(case) | {"name": case.name} for case in cases],

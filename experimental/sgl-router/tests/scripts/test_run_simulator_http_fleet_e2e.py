@@ -188,6 +188,13 @@ class SimulatorHttpFleetContractTest(unittest.TestCase):
 
         self.assertEqual(args.max_cache_holders, 0)
 
+    def test_reused_worker_fleet_quiesces_router_reporter_leases_between_cases(self):
+        runner = load_runner()
+
+        args = runner.parse_args(["--endpoint-counts", "128", "--reuse-worker-fleet"])
+
+        self.assertEqual(args.control_plane_quiesce_seconds, 16.0)
+
     def test_worker_cache_flush_uses_each_worker_control_endpoint(self):
         runner = load_runner()
 
