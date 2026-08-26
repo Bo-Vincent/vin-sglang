@@ -180,6 +180,23 @@ class SimulatorHttpFleetContractTest(unittest.TestCase):
         self.assertNotIn("--kv-indexer-endpoint", power_of_two)
         self.assertEqual(power_of_two, ["--policy", "power_of_two"])
 
+    def test_indexer_query_limit_tracks_the_runner_concurrency_bound(self):
+        runner = load_runner()
+
+        self.assertEqual(runner.indexer_query_concurrency(32), 32)
+        self.assertEqual(runner.indexer_query_concurrency(128), 128)
+        self.assertEqual(runner.indexer_query_concurrency(256), 256)
+        self.assertEqual(runner.indexer_query_concurrency(512), 256)
+        self.assertEqual(runner.indexer_query_concurrency(1024), 256)
+
+        native = runner.policy_args(
+            "cache_aware",
+            "http://127.0.0.1:50551",
+            indexer_query_max_inflight=256,
+        )
+        position = native.index("--kv-indexer-query-max-inflight")
+        self.assertEqual(native[position + 1], "256")
+
     def test_worker_environment_keeps_the_simulator_runtime_isolated(self):
         runner = load_runner()
 

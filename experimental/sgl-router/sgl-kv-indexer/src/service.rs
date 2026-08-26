@@ -182,7 +182,12 @@ where
 /// [`KvIndexerService::into_server`]: that sets the per-message ceiling, this
 /// bounds how many messages can be in flight against it at once.
 pub fn server_builder() -> Server {
-    Server::builder().max_concurrent_streams(MAX_CONCURRENT_STREAMS)
+    server_builder_with_max_concurrent_streams(MAX_CONCURRENT_STREAMS)
+}
+
+/// Builds a transport server with an explicit HTTP/2 stream bound.
+pub fn server_builder_with_max_concurrent_streams(max_concurrent_streams: u32) -> Server {
+    Server::builder().max_concurrent_streams(max_concurrent_streams)
 }
 
 #[tonic::async_trait]

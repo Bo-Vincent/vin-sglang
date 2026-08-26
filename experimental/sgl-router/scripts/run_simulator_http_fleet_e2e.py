@@ -27,6 +27,7 @@ DEFAULT_POLICIES = (
     "shortest_ttft",
 )
 DEFAULT_WORKLOADS = ("tracelab_multiturn", "multi_holder_pressure")
+MAX_HTTP_REQUEST_CONCURRENCY = 256
 ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 
 
@@ -314,7 +315,15 @@ def simulator_environment(
     }
 
 
-def policy_args(policy: str, indexer_endpoint: str) -> list[str]:
+def indexer_query_concurrency(endpoint_count: int) -> int:
+    if endpoint_count <= 0:
+        raise ValueError("endpoint count must be positive")
+    return min(endpoint_count, MAX_HTTP_REQUEST_CONCURRENCY)
+
+
+def policy_args(
+    policy: str, indexer_endpoint: str, *, indexer_query_max_inflight: int = 32
+) -> list[str]:
     if policy == "power_of_two":
         return ["--policy", policy]
     if policy == "cache_aware_zmq":
@@ -336,6 +345,8 @@ def policy_args(policy: str, indexer_endpoint: str) -> list[str]:
             indexer_endpoint,
             "--kv-indexer-query-timeout-ms",
             "100",
+            "--kv-indexer-query-max-inflight",
+            str(indexer_query_max_inflight),
             "--cache-affinity-min-matched-tokens",
             "1024",
             "--cache-candidate-min-workers",
@@ -359,6 +370,8 @@ def policy_args(policy: str, indexer_endpoint: str) -> list[str]:
             indexer_endpoint,
             "--kv-indexer-query-timeout-ms",
             "100",
+            "--kv-indexer-query-max-inflight",
+            str(indexer_query_max_inflight),
         ]
     raise ValueError(f"unsupported policy: {policy}")
 
@@ -600,7 +613,11 @@ def router_command(
         "--stale-request-timeout-secs",
         "240",
         "--load-monitor",
-        *policy_args(case.policy, indexer_endpoint),
+        *policy_args(
+            case.policy,
+            indexer_endpoint,
+            indexer_query_max_inflight=indexer_query_concurrency(case.endpoint_count),
+        ),
     ]
 
 
@@ -705,6 +722,7 @@ def start_case_control_plane(
     args: argparse.Namespace, case: Case, directory: Path, specs: Sequence[WorkerSpec]
 ) -> list[ManagedProcess]:
     indexer_endpoint = f"http://127.0.0.1:{args.indexer_port}"
+    indexer_query_max_inflight = indexer_query_concurrency(case.endpoint_count)
     managed: list[ManagedProcess] = []
     try:
         if needs_external_indexer(case.policy):
@@ -713,7 +731,13 @@ def start_case_control_plane(
                 [str(args.indexer_server)],
                 directory / "kv-indexer-server.log",
                 cwd=args.router_cwd,
-                env={"KV_INDEXER_LISTEN_ADDR": f"127.0.0.1:{args.indexer_port}"},
+                env={
+                    "KV_INDEXER_LISTEN_ADDR": f"127.0.0.1:{args.indexer_port}",
+                    "KV_INDEXER_PREFIX_QUERY_MAX_INFLIGHT": str(indexer_query_max_inflight),
+                    "KV_INDEXER_MAX_CONCURRENT_STREAMS": str(
+                        max(64, indexer_query_max_inflight)
+                    ),
+                },
             )
             managed.append(indexer)
             wait_tcp(
@@ -903,7 +927,7 @@ async def stream_requests(
         raise RuntimeError("HTTP fleet runner requires aiohttp") from error
     prefix = long_prefix(workload)
     gate = RateGate(qps)
-    semaphore = asyncio.Semaphore(256)
+    semaphore = asyncio.Semaphore(MAX_HTTP_REQUEST_CONCURRENCY)
     timeout = aiohttp.ClientTimeout(total=180)
     async with aiohttp.ClientSession(timeout=timeout) as session:
 

@@ -89,6 +89,8 @@ KV_INDEXER_LISTEN_ADDR=127.0.0.1:50051 \
 `KV_INDEXER_PREFIX_QUERY_MAX_INFLIGHT` sets the maximum number of prefix
 queries executing concurrently and defaults to `32`. Requests above the limit
 are rejected immediately with gRPC `RESOURCE_EXHAUSTED`.
+`KV_INDEXER_MAX_CONCURRENT_STREAMS` sets the per-connection HTTP/2 stream cap
+and defaults to `64`.
 There is no backend or storage configuration.
 
 2. Start one bridge per worker event stream. This FULL+SWA example uses the
