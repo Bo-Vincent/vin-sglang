@@ -390,19 +390,39 @@ impl LoadMonitor {
         }
     }
 
-    /// Updates Worker snapshot state and excludes duplicate endpoints from
+    /// Removes one Worker only after discovery has observed a concrete
+    /// `Removed` event. Registration snapshots are allowed to be partial
+    /// while static discovery finishes concurrent `/server_info` calls, so
+    /// they must not remove an already tracked reporter session.
+    pub async fn remove_worker(&self, worker_id: &WorkerId) {
+        if !self.enabled() {
+            return;
+        }
+        {
+            let mut store = self.inner.store.write();
+            if store.workers.remove(worker_id).is_some() {
+                store.version = store.version.wrapping_add(1);
+            }
+        }
+        let task = self.inner.sessions.lock().await.remove(worker_id);
+        if let Some(task) = task {
+            task.cancel.cancel();
+            let _ = task.handle.await;
+        }
+    }
+
+    /// Upserts Worker snapshot state and excludes duplicate endpoints from
     /// client-task creation.
+    ///
+    /// Discovery registrations are concurrent, so a call may observe only a
+    /// prefix of the eventual registry. Deletion is handled by
+    /// [`Self::remove_worker`] from the concrete discovery `Removed` path.
     fn update_store(
         &self,
         mut targets: HashMap<WorkerId, WorkerTarget>,
     ) -> HashMap<WorkerId, WorkerTarget> {
         let mut store = self.inner.store.write();
         let mut changed = false;
-        store.workers.retain(|id, _| {
-            let keep = targets.contains_key(id);
-            changed |= !keep;
-            keep
-        });
         for (id, target) in &targets {
             match store.workers.get_mut(id) {
                 Some(state) if state.target.same_identity(target) => {

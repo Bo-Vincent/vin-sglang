@@ -322,6 +322,7 @@ async fn handle_discovery_event(
                 al.forget_worker(&id);
             }
             if let Some(monitor) = &context.load_monitor {
+                monitor.remove_worker(&id).await;
                 monitor.reconcile(context.registry.all()).await;
             }
         }

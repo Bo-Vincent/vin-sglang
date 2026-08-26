@@ -287,6 +287,25 @@ async fn delayed_reconcile_does_not_remove_workers_from_newer_snapshot() {
     monitor.shutdown().await;
 }
 
+/// Added-worker snapshots can be partial while static discovery registrations
+/// finish concurrently. Only a concrete discovery removal may delete state.
+#[tokio::test]
+async fn partial_reconcile_preserves_existing_workers_until_explicit_removal() {
+    let monitor = test_monitor(31000);
+    let first = test_worker("first", WorkerMode::Plain);
+    let second = test_worker("second", WorkerMode::Plain);
+
+    monitor.reconcile(vec![first.clone(), second]).await;
+    monitor.reconcile(vec![first]).await;
+    assert_eq!(monitor.snapshot().workers.len(), 2);
+
+    monitor.remove_worker(&WorkerId("second".to_string())).await;
+    let workers = monitor.snapshot().workers;
+    assert_eq!(workers.len(), 1);
+    assert_eq!(workers[0].worker_id, "first");
+    monitor.shutdown().await;
+}
+
 #[derive(Clone)]
 struct FakeReporter {
     report: LoadReport,
