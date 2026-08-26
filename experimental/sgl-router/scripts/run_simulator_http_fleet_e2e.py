@@ -1174,11 +1174,17 @@ def run_case(
         atomic_write_text(directory / "COMPLETE", "ok\n")
     finally:
         stop_processes(managed)
-        if worker_fleet is not None and args.control_plane_quiesce_seconds > 0.0:
-            # Simulator 的 reporter 每个 worker 只保留一个 Router session。
-            # 在同一 worker fleet 上切换 case 前等待上一个 Router 的 lease
-            # 失效，避免旧 session 短暂覆盖新 Router 的 fresh snapshot。
-            time.sleep(args.control_plane_quiesce_seconds)
+        if worker_fleet is not None:
+            wait_for_control_plane_quiescence(args)
+
+
+def wait_for_control_plane_quiescence(args: argparse.Namespace) -> None:
+    if args.control_plane_quiesce_seconds <= 0.0:
+        return
+    # Simulator 的 reporter 每个 worker 只保留一个 Router session。
+    # 在 Router 或整组 worker fleet 停止后等待旧 lease 失效，避免后续使用
+    # 相同 reporter 端口的新控制面连接被旧 session 覆盖。
+    time.sleep(args.control_plane_quiesce_seconds)
 
 
 def run_cases(args: argparse.Namespace, cases: Sequence[Case]) -> None:
@@ -1189,6 +1195,7 @@ def run_cases(args: argparse.Namespace, cases: Sequence[Case]) -> None:
             run_case(args, case)
         return
 
+    previous_fleet_stopped = False
     for endpoint_count, group in group_cases_by_endpoint_count(cases):
         pending = [
             case
@@ -1198,6 +1205,8 @@ def run_cases(args: argparse.Namespace, cases: Sequence[Case]) -> None:
         worker_fleet: tuple[Sequence[WorkerSpec], Sequence[ManagedProcess]] | None = None
         fleet_processes: list[ManagedProcess] = []
         if pending:
+            if previous_fleet_stopped:
+                wait_for_control_plane_quiescence(args)
             fleet_directory = args.results_dir / "worker-fleets" / f"{endpoint_count}w"
             specs, fleet_processes = start_worker_fleet(args, endpoint_count, fleet_directory)
             worker_fleet = (specs, fleet_processes)
@@ -1207,6 +1216,7 @@ def run_cases(args: argparse.Namespace, cases: Sequence[Case]) -> None:
                 run_case(args, case, worker_fleet=worker_fleet)
         finally:
             stop_processes(fleet_processes)
+            previous_fleet_stopped |= bool(fleet_processes)
 
 
 def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:

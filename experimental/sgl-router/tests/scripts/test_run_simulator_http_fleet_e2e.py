@@ -6,6 +6,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 
 SCRIPT = (
@@ -274,6 +275,51 @@ class SimulatorHttpFleetContractTest(unittest.TestCase):
 
         self.assertEqual(tuple(endpoint_count for endpoint_count, _ in groups), (4, 8))
         self.assertEqual(tuple(len(group) for _, group in groups), (2, 2))
+
+    def test_reused_fleet_quiesces_before_reusing_worker_reporter_ports(self):
+        runner = load_runner()
+        cases = runner.build_cases(
+            endpoint_counts=(4, 8),
+            policies=("power_of_two",),
+            workloads=("tracelab_multiturn",),
+            repeats=1,
+        )
+        sleeps = []
+        started = []
+        stopped = []
+        original_start = runner.start_worker_fleet
+        original_run = runner.run_case
+        original_stop = runner.stop_processes
+        original_sleep = runner.time.sleep
+        try:
+            runner.start_worker_fleet = lambda _args, count, _directory: (
+                [count],
+                [f"fleet-{count}"],
+            )
+            runner.run_case = lambda _args, case, *, worker_fleet: started.append(
+                (case.endpoint_count, tuple(worker_fleet[0]))
+            )
+            runner.stop_processes = lambda processes: stopped.append(tuple(processes))
+            runner.time.sleep = lambda seconds: sleeps.append(seconds)
+            with tempfile.TemporaryDirectory() as temporary:
+                runner.run_cases(
+                    SimpleNamespace(
+                        resume=False,
+                        reuse_worker_fleet=True,
+                        results_dir=Path(temporary),
+                        control_plane_quiesce_seconds=16.0,
+                    ),
+                    cases,
+                )
+        finally:
+            runner.start_worker_fleet = original_start
+            runner.run_case = original_run
+            runner.stop_processes = original_stop
+            runner.time.sleep = original_sleep
+
+        self.assertEqual(started, [(4, (4,)), (8, (8,))])
+        self.assertEqual(stopped, [("fleet-4",), ("fleet-8",)])
+        self.assertEqual(sleeps, [16.0])
 
 
 if __name__ == "__main__":
