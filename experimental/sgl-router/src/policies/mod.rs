@@ -1330,6 +1330,7 @@ mod tests {
         ]);
 
         let decision = resolve_cache_candidates(&proposal, 100, &loads)
+            .decision
             .expect("a later admitted cache match must survive");
 
         assert_eq!(decision.selected.id, winner.id);
@@ -1383,6 +1384,7 @@ mod tests {
         ]);
 
         let decision = resolve_cache_candidates(&proposal, 100, &loads)
+            .decision
             .expect("all admitted candidates must participate in the tournament");
 
         assert_eq!(decision.selected.id, final_winner.id);
@@ -1411,7 +1413,9 @@ mod tests {
             },
         )]);
         assert!(
-            resolve_cache_candidates(&proposal, 100, &pending_allows).is_some(),
+            resolve_cache_candidates(&proposal, 100, &pending_allows)
+                .decision
+                .is_some(),
             "pending admission must project E=20, not L=100"
         );
 
@@ -1426,7 +1430,9 @@ mod tests {
             },
         )]);
         assert!(
-            resolve_cache_candidates(&proposal, 100, &kv_rejects).is_none(),
+            resolve_cache_candidates(&proposal, 100, &kv_rejects)
+                .decision
+                .is_none(),
             "KV safety must conservatively project the complete input L=100"
         );
     }
@@ -1467,7 +1473,9 @@ mod tests {
             ),
         ]);
 
-        let decision = resolve_cache_candidates(&proposal, 100, &loads).unwrap();
+        let decision = resolve_cache_candidates(&proposal, 100, &loads)
+            .decision
+            .expect("idle must be admitted");
         assert_eq!(decision.selected.id, idle.id);
     }
 
@@ -1507,7 +1515,9 @@ mod tests {
             ),
         ]);
 
-        let decision = resolve_cache_candidates(&proposal, 100, &loads).unwrap();
+        let decision = resolve_cache_candidates(&proposal, 100, &loads)
+            .decision
+            .expect("one cache candidate must remain admitted");
         assert_eq!(
             decision.selected.id, hot.id,
             "pressure may break a near tie, but must not erase a material cache-work gain"
@@ -1564,7 +1574,9 @@ mod tests {
             ),
         ]);
 
-        let decision = resolve_cache_candidates(&proposal, 100, &loads).unwrap();
+        let decision = resolve_cache_candidates(&proposal, 100, &loads)
+            .decision
+            .expect("one cache candidate must remain admitted");
         assert_eq!(
             decision.selected.id, near_tie.id,
             "one near-tie pressure escape is allowed, but escapes must not accumulate past the global work margin"

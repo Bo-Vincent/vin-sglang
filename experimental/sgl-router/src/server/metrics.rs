@@ -33,6 +33,9 @@
 //! | `sgl_router_decode_affinity_total` | Counter | `outcome` |
 //! | `sgl_router_sticky_total` | Counter | `outcome` |
 //! | `sgl_router_policy_decisions_total` | Counter | `policy`, `reason` |
+//! | `sgl_router_cache_admission_rejected_total` | Counter | — |
+//! | `sgl_router_cache_pressure_guard_compared_total` | Counter | — |
+//! | `sgl_router_cache_pressure_guard_override_total` | Counter | — |
 //! | `sgl_router_ingress_tokenize_errors_total` | Counter | `model_id` |
 //!
 //! The four `sgl_router_worker*` gauges and `sgl_router_workers` are sampled
@@ -226,6 +229,9 @@ pub struct MetricsRegistry {
     decode_affinity_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
     sticky_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
     policy_decisions_total: Mutex<HashMap<PolicyDecisionKey, Arc<AtomicU64>>>,
+    cache_admission_rejected_total: AtomicU64,
+    cache_pressure_guard_compared_total: AtomicU64,
+    cache_pressure_guard_override_total: AtomicU64,
     ingress_tokenize_errors_total: Mutex<HashMap<String, Arc<AtomicU64>>>,
 }
 
@@ -502,6 +508,20 @@ impl MetricsRegistry {
             .clone();
         drop(guard);
         counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record Cache-Aware candidates rejected by hard admission.
+    pub fn record_cache_admission_rejections(&self, count: u64) {
+        self.cache_admission_rejected_total
+            .fetch_add(count, Ordering::Relaxed);
+    }
+
+    /// Record Cache-Aware pressure-guard comparisons and result overrides.
+    pub fn record_cache_pressure_guard(&self, compared: u64, overrides: u64) {
+        self.cache_pressure_guard_compared_total
+            .fetch_add(compared, Ordering::Relaxed);
+        self.cache_pressure_guard_override_total
+            .fetch_add(overrides, Ordering::Relaxed);
     }
 
     /// Bump `sgl_router_ingress_tokenize_errors_total{model_id}`.
@@ -828,6 +848,34 @@ impl MetricsRegistry {
             ));
         }
         drop(guard);
+
+        // Cache-Aware admission / pressure guard counters.
+        out.push_str(
+            "# HELP sgl_router_cache_admission_rejected_total Cache-Aware candidates rejected by hard admission.\n",
+        );
+        out.push_str("# TYPE sgl_router_cache_admission_rejected_total counter\n");
+        out.push_str(&format!(
+            "sgl_router_cache_admission_rejected_total {}\n",
+            self.cache_admission_rejected_total.load(Ordering::Relaxed),
+        ));
+        out.push_str(
+            "# HELP sgl_router_cache_pressure_guard_compared_total Fresh comparable Cache-Aware candidate pairs evaluated by the pressure guard.\n",
+        );
+        out.push_str("# TYPE sgl_router_cache_pressure_guard_compared_total counter\n");
+        out.push_str(&format!(
+            "sgl_router_cache_pressure_guard_compared_total {}\n",
+            self.cache_pressure_guard_compared_total
+                .load(Ordering::Relaxed),
+        ));
+        out.push_str(
+            "# HELP sgl_router_cache_pressure_guard_override_total Pressure-guard comparisons whose outcome differs from cache/work ordering without the guard.\n",
+        );
+        out.push_str("# TYPE sgl_router_cache_pressure_guard_override_total counter\n");
+        out.push_str(&format!(
+            "sgl_router_cache_pressure_guard_override_total {}\n",
+            self.cache_pressure_guard_override_total
+                .load(Ordering::Relaxed),
+        ));
 
         // ingress_tokenize_errors_total
         out.push_str(
@@ -1231,6 +1279,21 @@ mod tests {
         assert!(out.contains(
             r#"sgl_router_policy_decisions_total{policy="session_aware",reason="session_primary"} 2"#
         ));
+    }
+
+    #[test]
+    fn cache_resolution_counters_are_always_exposed() {
+        let reg = MetricsRegistry::new();
+        reg.record_cache_admission_rejections(2);
+        reg.record_cache_pressure_guard(3, 1);
+
+        let out = reg.render();
+        assert!(out.contains("# TYPE sgl_router_cache_admission_rejected_total counter"));
+        assert!(out.contains("sgl_router_cache_admission_rejected_total 2"));
+        assert!(out.contains("# TYPE sgl_router_cache_pressure_guard_compared_total counter"));
+        assert!(out.contains("sgl_router_cache_pressure_guard_compared_total 3"));
+        assert!(out.contains("# TYPE sgl_router_cache_pressure_guard_override_total counter"));
+        assert!(out.contains("sgl_router_cache_pressure_guard_override_total 1"));
     }
 
     #[test]

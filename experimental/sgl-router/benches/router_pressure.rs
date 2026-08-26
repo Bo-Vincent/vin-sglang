@@ -406,6 +406,7 @@ fn cache_decision(
         panic!("cache benchmark must exercise the candidate path");
     };
     resolve_cache_candidates(&proposal, INPUT_TOKENS, snapshot)
+        .decision
         .expect("cache candidates must pass admission")
         .selected
         .id

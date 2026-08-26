@@ -431,8 +431,15 @@ pub async fn chat_completions(
                 return None;
             };
             let bounded_candidate_count = proposal.candidates.len();
-            let decision =
-                resolve_cache_candidates(&proposal, request_input_tokens, &load_snapshot)?;
+            let cache_decision =
+                resolve_cache_candidates(&proposal, request_input_tokens, &load_snapshot);
+            ctx.metrics
+                .record_cache_admission_rejections(cache_decision.admission_rejected_candidates);
+            ctx.metrics.record_cache_pressure_guard(
+                cache_decision.pressure_guard_compared_pairs,
+                cache_decision.pressure_guard_overrides,
+            );
+            let decision = cache_decision.decision?;
             let selected_candidate = proposal
                 .candidates
                 .iter()
@@ -448,6 +455,7 @@ pub async fn chat_completions(
                 uncached_tokens = selected_candidate.uncached_tokens,
                 reason = ?decision.reason,
                 load_snapshot_version = decision.load_snapshot_version,
+                prefill_pressure_source = cache_decision.prefill_pressure_source,
                 "cache candidate winner",
             );
             ctx.metrics
