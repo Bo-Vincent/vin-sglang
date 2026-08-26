@@ -100,6 +100,20 @@ class SimulatorHttpFleetContractTest(unittest.TestCase):
 
         self.assertEqual(layout, runner.DEFAULT_PORT_LAYOUTS[1])
 
+    def test_256_worker_tier_falls_back_when_a_primary_port_is_occupied(self):
+        runner = load_runner()
+        candidates = runner.auto_port_layout_candidates(256)
+        blocked_port = candidates[0].reporter_base_port + 79
+
+        layout = runner.select_available_port_layout(
+            endpoint_count=256,
+            candidates=candidates,
+            reserved_ports=(30_380, 50_551),
+            port_is_available=lambda port: port != blocked_port,
+        )
+
+        self.assertEqual(layout, candidates[1])
+
     def test_port_layout_waits_for_a_previous_fleet_socket_to_be_released(self):
         runner = load_runner()
         checks = 0

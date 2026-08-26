@@ -78,7 +78,10 @@ DEFAULT_PORT_LAYOUTS = (
 TIER_PORT_LAYOUTS = {
     32: (WorkerPortLayout(4_000, 4_100, 4_200, 4_300),),
     128: (WorkerPortLayout(5_000, 5_200, 5_400, 5_600),),
-    256: (WorkerPortLayout(6_000, 6_300, 6_600, 6_900),),
+    256: (
+        WorkerPortLayout(6_000, 6_300, 6_600, 6_900),
+        WorkerPortLayout(17_000, 17_400, 17_800, 18_200),
+    ),
     512: (WorkerPortLayout(8_000, 8_600, 9_200, 9_800),),
     1024: (WorkerPortLayout(11_000, 12_500, 14_000, 15_500),),
 }
