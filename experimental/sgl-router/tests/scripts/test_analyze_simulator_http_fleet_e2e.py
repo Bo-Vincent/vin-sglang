@@ -133,6 +133,28 @@ class SimulatorHttpFleetAnalyzerTest(unittest.TestCase):
         self.assertEqual(analysis["measurement_kind"], "simulator_predicted_relative")
         self.assertIn("not GPU", analysis["measurement_notice"])
 
+    def test_analyzer_marks_zmq_reason_as_not_emitted(self):
+        analyzer = load_analyzer()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.create_result(root)
+            manifest = json.loads((root / "manifest.json").read_text())
+            for expected in manifest["contract"]["cases"]:
+                expected["policy"] = "cache_aware_zmq"
+                directory = root / expected["name"]
+                case = json.loads((directory / "case.json").read_text())
+                case["policy"] = "cache_aware_zmq"
+                (directory / "case.json").write_text(json.dumps(case))
+                summary = json.loads((directory / "summary.json").read_text())
+                summary["policy_reasons"] = {}
+                (directory / "summary.json").write_text(json.dumps(summary))
+            (root / "manifest.json").write_text(json.dumps(manifest))
+
+            group = analyzer.analyze_results(root)["groups"][0]
+
+        self.assertEqual(group["policy_reasons"], {})
+        self.assertEqual(group["policy_reason_observability"], "not_emitted_by_policy")
+
 
 if __name__ == "__main__":
     unittest.main()

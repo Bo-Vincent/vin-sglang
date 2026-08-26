@@ -88,7 +88,7 @@ def validate_summary(case: Mapping[str, object], summary: Mapping[str, object]) 
     reasons = summary.get("policy_reasons")
     if not isinstance(reasons, Mapping):
         raise RuntimeError("summary policy_reasons must be an object")
-    if not reasons:
+    if not reasons and case.get("policy") != "cache_aware_zmq":
         raise RuntimeError("summary policy_reasons must not be empty")
     for reason, count in reasons.items():
         if not isinstance(reason, str) or not isinstance(count, (int, float)) or count < 0:
@@ -164,6 +164,9 @@ def analyze_results(results_dir: Path) -> dict[str, object]:
         }
         reasons: dict[str, float] = defaultdict(float)
         audit_totals: dict[str, int] = defaultdict(int)
+        reason_presence = {bool(summary["policy_reasons"]) for _, summary in samples}
+        if len(reason_presence) != 1:
+            raise RuntimeError(f"inconsistent policy-reason observability for {policy}")
         for _, summary in samples:
             for reason, count in summary["policy_reasons"].items():
                 reasons[str(reason)] += float(count)
@@ -178,6 +181,9 @@ def analyze_results(results_dir: Path) -> dict[str, object]:
             "repeat_count": len(samples),
             "metrics": metrics,
             "policy_reasons": dict(sorted(reasons.items())),
+            "policy_reason_observability": (
+                "emitted" if reason_presence.pop() else "not_emitted_by_policy"
+            ),
         }
         if audit_totals:
             group["native_cache_audit"] = dict(audit_totals)

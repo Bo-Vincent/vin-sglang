@@ -108,6 +108,13 @@ def build_cases(
     )
 
 
+def group_cases_by_endpoint_count(cases: Sequence[Case]) -> tuple[tuple[int, tuple[Case, ...]], ...]:
+    groups: dict[int, list[Case]] = {}
+    for case in cases:
+        groups.setdefault(case.endpoint_count, []).append(case)
+    return tuple((endpoint_count, tuple(groups[endpoint_count])) for endpoint_count in sorted(groups))
+
+
 def worker_spec(
     index: int,
     *,
@@ -512,51 +519,21 @@ def worker_specs(args: argparse.Namespace, endpoint_count: int) -> list[WorkerSp
     ]
 
 
-def start_case_stack(
-    args: argparse.Namespace, case: Case, directory: Path
+def needs_external_indexer(policy: str) -> bool:
+    return policy in {"cache_aware", "shortest_ttft"}
+
+
+def start_worker_fleet(
+    args: argparse.Namespace, endpoint_count: int, directory: Path
 ) -> tuple[list[WorkerSpec], list[ManagedProcess]]:
-    specs = worker_specs(args, case.endpoint_count)
-    indexer_endpoint = f"http://127.0.0.1:{args.indexer_port}"
+    specs = worker_specs(args, endpoint_count)
     managed: list[ManagedProcess] = []
+    environment = simulator_environment(
+        simulator_site=args.simulator_site,
+        source_root=args.source_root,
+        simulator_config=args.simulator_config,
+    )
     try:
-        indexer = start_process(
-            "kv-indexer-server",
-            [str(args.indexer_server)],
-            directory / "kv-indexer-server.log",
-            cwd=args.router_cwd,
-            env={"KV_INDEXER_LISTEN_ADDR": f"127.0.0.1:{args.indexer_port}"},
-        )
-        managed.append(indexer)
-        wait_tcp(
-            "127.0.0.1",
-            args.indexer_port,
-            timeout=args.indexer_start_timeout,
-            process=indexer.process,
-        )
-
-        for spec in specs:
-            managed.append(
-                start_process(
-                    f"kv-indexer-bridge-{spec.index}",
-                    [str(args.indexer_bridge)],
-                    directory / "bridges" / f"{spec.index}.log",
-                    cwd=args.router_cwd,
-                    env={
-                        "KV_INDEXER_WORKER_ID": spec.worker_id,
-                        "KV_INDEXER_WORKER_ADDRESS": spec.url,
-                        "KV_INDEXER_ENDPOINT": indexer_endpoint,
-                        "SGLANG_KV_EVENT_ENDPOINT": f"tcp://127.0.0.1:{spec.kv_port}",
-                        "SGLANG_KV_EVENT_TOPIC": "kv",
-                        "KV_INDEXER_CLEAR_TIERS": "HBM,DRAM,SSD",
-                    },
-                )
-            )
-
-        environment = simulator_environment(
-            simulator_site=args.simulator_site,
-            source_root=args.source_root,
-            simulator_config=args.simulator_config,
-        )
         for batch in batched(specs, args.worker_start_batch_size):
             batch_specs = tuple(batch)
             batch_workers: list[ManagedProcess] = []
@@ -589,7 +566,56 @@ def start_case_stack(
             for spec, worker in zip(batch_specs, batch_workers):
                 if worker.process.poll() is not None:
                     raise RuntimeError(f"worker {spec.index} exited during startup")
+        return specs, managed
+    except Exception:
+        stop_processes(managed)
+        raise
 
+
+def ensure_worker_fleet_healthy(specs: Sequence[WorkerSpec], workers: Sequence[ManagedProcess]) -> None:
+    for spec, worker in zip(specs, workers):
+        if worker.process.poll() is not None:
+            raise RuntimeError(f"worker {spec.index} exited before case dispatch")
+
+
+def start_case_control_plane(
+    args: argparse.Namespace, case: Case, directory: Path, specs: Sequence[WorkerSpec]
+) -> list[ManagedProcess]:
+    indexer_endpoint = f"http://127.0.0.1:{args.indexer_port}"
+    managed: list[ManagedProcess] = []
+    try:
+        if needs_external_indexer(case.policy):
+            indexer = start_process(
+                "kv-indexer-server",
+                [str(args.indexer_server)],
+                directory / "kv-indexer-server.log",
+                cwd=args.router_cwd,
+                env={"KV_INDEXER_LISTEN_ADDR": f"127.0.0.1:{args.indexer_port}"},
+            )
+            managed.append(indexer)
+            wait_tcp(
+                "127.0.0.1",
+                args.indexer_port,
+                timeout=args.indexer_start_timeout,
+                process=indexer.process,
+            )
+            for spec in specs:
+                managed.append(
+                    start_process(
+                        f"kv-indexer-bridge-{spec.index}",
+                        [str(args.indexer_bridge)],
+                        directory / "bridges" / f"{spec.index}.log",
+                        cwd=args.router_cwd,
+                        env={
+                            "KV_INDEXER_WORKER_ID": spec.worker_id,
+                            "KV_INDEXER_WORKER_ADDRESS": spec.url,
+                            "KV_INDEXER_ENDPOINT": indexer_endpoint,
+                            "SGLANG_KV_EVENT_ENDPOINT": f"tcp://127.0.0.1:{spec.kv_port}",
+                            "SGLANG_KV_EVENT_TOPIC": "kv",
+                            "KV_INDEXER_CLEAR_TIERS": "HBM,DRAM,SSD",
+                        },
+                    )
+                )
         router_environment: dict[str, str] = {}
         if case.policy in {"cache_aware", "shortest_ttft"}:
             router_environment["RUST_LOG"] = "info,sgl_router::server::routes::chat=debug"
@@ -608,9 +634,20 @@ def start_case_stack(
             )
         )
         time.sleep(args.router_settle_seconds)
-        return specs, managed
+        return managed
     except Exception:
         stop_processes(managed)
+        raise
+
+
+def start_case_stack(
+    args: argparse.Namespace, case: Case, directory: Path
+) -> tuple[list[WorkerSpec], list[ManagedProcess]]:
+    specs, workers = start_worker_fleet(args, case.endpoint_count, directory)
+    try:
+        return specs, [*workers, *start_case_control_plane(args, case, directory, specs)]
+    except Exception:
+        stop_processes(workers)
         raise
 
 
@@ -922,7 +959,11 @@ def archive_incomplete_case(directory: Path) -> Path:
     raise RuntimeError(f"too many archived attempts for {directory}")
 
 
-def run_case(args: argparse.Namespace, case: Case) -> None:
+def run_case(
+    args: argparse.Namespace,
+    case: Case,
+    worker_fleet: tuple[Sequence[WorkerSpec], Sequence[ManagedProcess]] | None = None,
+) -> None:
     directory = args.results_dir / case.name
     if directory.exists():
         if args.resume and case_complete(directory, case):
@@ -937,7 +978,12 @@ def run_case(args: argparse.Namespace, case: Case) -> None:
     atomic_write_text(args.results_dir / "CURRENT", case.name + "\n")
     managed: list[ManagedProcess] = []
     try:
-        specs, managed = start_case_stack(args, case, directory)
+        if worker_fleet is None:
+            specs, managed = start_case_stack(args, case, directory)
+        else:
+            specs, workers = worker_fleet
+            ensure_worker_fleet_healthy(specs, workers)
+            managed = start_case_control_plane(args, case, directory, specs)
         worker_urls = [spec.url for spec in specs]
         holder_count = min(args.max_cache_holders, case.endpoint_count)
         asyncio.run(flush_worker_caches(worker_urls))
@@ -1010,6 +1056,34 @@ def run_case(args: argparse.Namespace, case: Case) -> None:
         stop_processes(managed)
 
 
+def run_cases(args: argparse.Namespace, cases: Sequence[Case]) -> None:
+    positions = {case.name: index for index, case in enumerate(cases, start=1)}
+    if not args.reuse_worker_fleet:
+        for case in cases:
+            print(f"[{positions[case.name]}/{len(cases)}] run {case.name}", flush=True)
+            run_case(args, case)
+        return
+
+    for endpoint_count, group in group_cases_by_endpoint_count(cases):
+        pending = [
+            case
+            for case in group
+            if not (args.resume and case_complete(args.results_dir / case.name, case))
+        ]
+        worker_fleet: tuple[Sequence[WorkerSpec], Sequence[ManagedProcess]] | None = None
+        fleet_processes: list[ManagedProcess] = []
+        if pending:
+            fleet_directory = args.results_dir / "worker-fleets" / f"{endpoint_count}w"
+            specs, fleet_processes = start_worker_fleet(args, endpoint_count, fleet_directory)
+            worker_fleet = (specs, fleet_processes)
+        try:
+            for case in group:
+                print(f"[{positions[case.name]}/{len(cases)}] run {case.name}", flush=True)
+                run_case(args, case, worker_fleet=worker_fleet)
+        finally:
+            stop_processes(fleet_processes)
+
+
 def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source-root", type=Path)
@@ -1052,6 +1126,7 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--router-start-timeout", type=float, default=180.0)
     parser.add_argument("--router-settle-seconds", type=float, default=35.0)
     parser.add_argument("--indexer-settle-seconds", type=float, default=4.0)
+    parser.add_argument("--reuse-worker-fleet", action="store_true")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--execute", action="store_true")
     args = parser.parse_args(argv)
@@ -1132,13 +1207,12 @@ def main(argv: Iterable[str] | None = None) -> int:
         "output_tokens": args.output_tokens,
         "qps_per_worker": args.qps_per_worker,
         "max_cache_holders": args.max_cache_holders,
+        "reuse_worker_fleet": args.reuse_worker_fleet,
         "simulator_config": str(args.simulator_config),
         "cases": [asdict(case) | {"name": case.name} for case in cases],
     }
     write_or_verify_manifest(args.results_dir, contract, resume=args.resume)
-    for index, case in enumerate(cases, start=1):
-        print(f"[{index}/{len(cases)}] run {case.name}", flush=True)
-        run_case(args, case)
+    run_cases(args, cases)
     atomic_write_text(args.results_dir / "RUN_COMPLETE", "ok\n")
     atomic_write_text(args.results_dir / "CURRENT", "complete\n")
     return 0

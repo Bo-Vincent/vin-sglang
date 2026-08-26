@@ -206,6 +206,20 @@ class SimulatorHttpFleetContractTest(unittest.TestCase):
             ((0, 1), (2, 3), (4,)),
         )
 
+    def test_reusable_fleet_groups_cases_by_endpoint_count(self):
+        runner = load_runner()
+        cases = runner.build_cases(
+            endpoint_counts=(4, 8),
+            policies=("power_of_two",),
+            workloads=("tracelab_multiturn",),
+            repeats=2,
+        )
+
+        groups = runner.group_cases_by_endpoint_count(cases)
+
+        self.assertEqual(tuple(endpoint_count for endpoint_count, _ in groups), (4, 8))
+        self.assertEqual(tuple(len(group) for _, group in groups), (2, 2))
+
 
 if __name__ == "__main__":
     unittest.main()
