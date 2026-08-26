@@ -86,6 +86,54 @@ class SimulatorHttpFleetContractTest(unittest.TestCase):
         self.assertEqual(environment["SGLANG_USE_CPU_ENGINE"], "1")
         self.assertEqual(environment["SGLANG_SIMULATOR_OUTPUT_MODE"], "BLOCKING")
 
+    def test_auto_port_layout_skips_a_candidate_with_an_occupied_worker_port(self):
+        runner = load_runner()
+        blocked_port = runner.DEFAULT_PORT_LAYOUTS[0].reporter_base_port + 18
+
+        layout = runner.select_available_port_layout(
+            endpoint_count=1_024,
+            candidates=runner.DEFAULT_PORT_LAYOUTS,
+            reserved_ports=(30_380, 50_551),
+            port_is_available=lambda port: port != blocked_port,
+        )
+
+        self.assertEqual(layout, runner.DEFAULT_PORT_LAYOUTS[1])
+
+    def test_port_layout_waits_for_a_previous_fleet_socket_to_be_released(self):
+        runner = load_runner()
+        checks = 0
+        sleeps = []
+
+        def port_is_available(_port):
+            nonlocal checks
+            checks += 1
+            return checks > 1
+
+        layout = runner.wait_for_available_port_layout(
+            endpoint_count=4,
+            candidates=(runner.DEFAULT_PORT_LAYOUTS[0],),
+            reserved_ports=(),
+            timeout=1.0,
+            port_is_available=port_is_available,
+            sleep=lambda duration: sleeps.append(duration),
+            monotonic=iter((0.0, 0.0)).__next__,
+        )
+
+        self.assertEqual(layout, runner.DEFAULT_PORT_LAYOUTS[0])
+        self.assertEqual(sleeps, [0.5])
+
+    def test_default_tier_layouts_do_not_reuse_ports_or_enter_ephemeral_range(self):
+        runner = load_runner()
+        used_ports = set()
+
+        for endpoint_count in runner.DEFAULT_ENDPOINT_COUNTS:
+            layout = runner.auto_port_layout_candidates(endpoint_count)[0]
+            ports = set(layout.ports(endpoint_count))
+
+            self.assertLess(max(ports), 32_768)
+            self.assertFalse(used_ports.intersection(ports))
+            used_ports.update(ports)
+
     def test_cache_aware_audit_rejects_missing_indexer_or_fresh_monitor(self):
         runner = load_runner()
         good = {

@@ -17,7 +17,7 @@ import socket
 import subprocess
 import time
 from dataclasses import asdict, dataclass
-from typing import Iterable, Mapping, Sequence
+from typing import Callable, Iterable, Mapping, Sequence
 
 DEFAULT_ENDPOINT_COUNTS = (32, 128, 256, 512, 1024)
 DEFAULT_POLICIES = (
@@ -45,6 +45,43 @@ class WorkerSpec:
     @property
     def url(self) -> str:
         return f"http://127.0.0.1:{self.http_port}"
+
+
+@dataclass(frozen=True)
+class WorkerPortLayout:
+    http_base_port: int
+    reporter_base_port: int
+    kv_base_port: int
+    dist_base_port: int
+
+    def ports(self, endpoint_count: int) -> tuple[int, ...]:
+        if endpoint_count <= 0:
+            raise ValueError("endpoint count must be positive")
+        return tuple(
+            port
+            for base in (
+                self.http_base_port,
+                self.reporter_base_port,
+                self.kv_base_port,
+                self.dist_base_port,
+            )
+            for port in range(base, base + endpoint_count)
+        )
+
+
+DEFAULT_PORT_LAYOUTS = (
+    WorkerPortLayout(16_000, 20_000, 24_000, 28_000),
+    WorkerPortLayout(33_000, 37_000, 41_000, 45_000),
+    WorkerPortLayout(54_000, 57_000, 60_000, 63_000),
+)
+
+TIER_PORT_LAYOUTS = {
+    32: (WorkerPortLayout(4_000, 4_100, 4_200, 4_300),),
+    128: (WorkerPortLayout(5_000, 5_200, 5_400, 5_600),),
+    256: (WorkerPortLayout(6_000, 6_300, 6_600, 6_900),),
+    512: (WorkerPortLayout(8_000, 8_600, 9_200, 9_800),),
+    1024: (WorkerPortLayout(11_000, 12_500, 14_000, 15_500),),
+}
 
 
 @dataclass(frozen=True)
@@ -132,6 +169,64 @@ def worker_spec(
         kv_port=kv_base_port + index,
         dist_port=dist_base_port + index,
     )
+
+
+def tcp_port_is_available(port: int) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        try:
+            probe.bind(("127.0.0.1", port))
+        except OSError:
+            return False
+    return True
+
+
+def select_available_port_layout(
+    *,
+    endpoint_count: int,
+    candidates: Sequence[WorkerPortLayout],
+    reserved_ports: Sequence[int],
+    port_is_available: Callable[[int], bool] = tcp_port_is_available,
+) -> WorkerPortLayout:
+    reserved = set(reserved_ports)
+    for layout in candidates:
+        ports = layout.ports(endpoint_count)
+        if any(port > 65_535 for port in ports):
+            continue
+        if reserved.intersection(ports):
+            continue
+        if all(port_is_available(port) for port in ports):
+            return layout
+    raise RuntimeError(f"no available worker port layout for {endpoint_count} endpoints")
+
+
+def auto_port_layout_candidates(endpoint_count: int) -> Sequence[WorkerPortLayout]:
+    return TIER_PORT_LAYOUTS.get(endpoint_count, DEFAULT_PORT_LAYOUTS)
+
+
+def wait_for_available_port_layout(
+    *,
+    endpoint_count: int,
+    candidates: Sequence[WorkerPortLayout],
+    reserved_ports: Sequence[int],
+    timeout: float,
+    port_is_available: Callable[[int], bool] = tcp_port_is_available,
+    sleep: Callable[[float], None] = time.sleep,
+    monotonic: Callable[[], float] = time.monotonic,
+) -> WorkerPortLayout:
+    deadline = monotonic() + timeout
+    while True:
+        try:
+            return select_available_port_layout(
+                endpoint_count=endpoint_count,
+                candidates=candidates,
+                reserved_ports=reserved_ports,
+                port_is_available=port_is_available,
+            )
+        except RuntimeError:
+            now = monotonic()
+            if now >= deadline:
+                raise
+            sleep(min(0.5, deadline - now))
 
 
 def simulator_worker_command(
@@ -506,14 +601,28 @@ def router_command(
     ]
 
 
-def worker_specs(args: argparse.Namespace, endpoint_count: int) -> list[WorkerSpec]:
+def configured_port_layout(args: argparse.Namespace) -> WorkerPortLayout | None:
+    values = (
+        args.http_base_port,
+        args.reporter_base_port,
+        args.kv_base_port,
+        args.dist_base_port,
+    )
+    if all(value is None for value in values):
+        return None
+    if any(value is None for value in values):
+        raise ValueError("worker port bases must be configured together")
+    return WorkerPortLayout(*values)
+
+
+def worker_specs(endpoint_count: int, layout: WorkerPortLayout) -> list[WorkerSpec]:
     return [
         worker_spec(
             index,
-            http_base_port=args.http_base_port,
-            reporter_base_port=args.reporter_base_port,
-            kv_base_port=args.kv_base_port,
-            dist_base_port=args.dist_base_port,
+            http_base_port=layout.http_base_port,
+            reporter_base_port=layout.reporter_base_port,
+            kv_base_port=layout.kv_base_port,
+            dist_base_port=layout.dist_base_port,
         )
         for index in range(endpoint_count)
     ]
@@ -526,7 +635,18 @@ def needs_external_indexer(policy: str) -> bool:
 def start_worker_fleet(
     args: argparse.Namespace, endpoint_count: int, directory: Path
 ) -> tuple[list[WorkerSpec], list[ManagedProcess]]:
-    specs = worker_specs(args, endpoint_count)
+    configured = configured_port_layout(args)
+    layout = wait_for_available_port_layout(
+        endpoint_count=endpoint_count,
+        candidates=(configured,) if configured is not None else auto_port_layout_candidates(endpoint_count),
+        reserved_ports=(args.router_port, args.indexer_port),
+        timeout=args.worker_port_layout_wait_timeout,
+    )
+    atomic_write_text(
+        directory / "port_layout.json",
+        json.dumps(asdict(layout), indent=2, sort_keys=True) + "\n",
+    )
+    specs = worker_specs(endpoint_count, layout)
     managed: list[ManagedProcess] = []
     environment = simulator_environment(
         simulator_site=args.simulator_site,
@@ -1104,15 +1224,16 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--policies", default=",".join(DEFAULT_POLICIES))
     parser.add_argument("--workloads", default=",".join(DEFAULT_WORKLOADS))
     parser.add_argument("--repeats", type=int, default=3)
-    parser.add_argument("--http-base-port", type=int, default=31_000)
-    parser.add_argument("--reporter-base-port", type=int, default=47_000)
-    parser.add_argument("--kv-base-port", type=int, default=51_000)
-    parser.add_argument("--dist-base-port", type=int, default=53_000)
+    parser.add_argument("--http-base-port", type=int)
+    parser.add_argument("--reporter-base-port", type=int)
+    parser.add_argument("--kv-base-port", type=int)
+    parser.add_argument("--dist-base-port", type=int)
     parser.add_argument("--router-port", type=int, default=30_380)
     parser.add_argument("--indexer-port", type=int, default=50_551)
     parser.add_argument("--max-total-tokens", type=int, default=8192)
     parser.add_argument("--max-running-requests", type=int, default=32)
     parser.add_argument("--worker-start-batch-size", type=int, default=16)
+    parser.add_argument("--worker-port-layout-wait-timeout", type=float, default=90.0)
     parser.add_argument(
         "--max-cache-holders",
         type=int,
@@ -1148,14 +1269,15 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         parser.error("cache holders must be non-negative; output and QPS must be positive")
     if args.router_settle_seconds < 0.0 or args.indexer_settle_seconds < 0.0:
         parser.error("settle durations must be non-negative")
-    largest = max(args.endpoint_counts)
-    for base in (
-        args.http_base_port,
-        args.reporter_base_port,
-        args.kv_base_port,
-        args.dist_base_port,
-    ):
-        if not 1 <= base <= 65535 - (largest - 1):
+    if args.worker_port_layout_wait_timeout < 0.0:
+        parser.error("worker port layout wait timeout must be non-negative")
+    try:
+        configured = configured_port_layout(args)
+    except ValueError as error:
+        parser.error(str(error))
+    if configured is not None:
+        largest = max(args.endpoint_counts)
+        if any(port > 65_535 for port in configured.ports(largest)):
             parser.error("every worker port range must fit in 1..65535")
     if args.execute:
         required = (
@@ -1207,6 +1329,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         "output_tokens": args.output_tokens,
         "qps_per_worker": args.qps_per_worker,
         "max_cache_holders": args.max_cache_holders,
+        "worker_port_layout_wait_timeout": args.worker_port_layout_wait_timeout,
         "reuse_worker_fleet": args.reuse_worker_fleet,
         "simulator_config": str(args.simulator_config),
         "cases": [asdict(case) | {"name": case.name} for case in cases],
