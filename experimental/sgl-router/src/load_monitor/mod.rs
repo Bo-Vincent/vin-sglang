@@ -419,11 +419,11 @@ impl LoadMonitor {
     /// [`Self::remove_worker`] from the concrete discovery `Removed` path.
     fn update_store(
         &self,
-        mut targets: HashMap<WorkerId, WorkerTarget>,
+        updates: HashMap<WorkerId, WorkerTarget>,
     ) -> HashMap<WorkerId, WorkerTarget> {
         let mut store = self.inner.store.write();
         let mut changed = false;
-        for (id, target) in &targets {
+        for (id, target) in &updates {
             match store.workers.get_mut(id) {
                 Some(state) if state.target.same_identity(target) => {
                     changed |= state.target.model_ids != target.model_ids;
@@ -444,6 +444,13 @@ impl LoadMonitor {
         if changed {
             store.version = store.version.wrapping_add(1);
         }
+        // 注册是增量完成的；task 对账必须使用当前 store 中的全量目标，不能
+        // 把本次局部更新误认为 discovery 的完整成员列表。
+        let mut targets = store
+            .workers
+            .iter()
+            .map(|(id, state)| (id.clone(), state.target.clone()))
+            .collect::<HashMap<_, _>>();
         drop(store);
 
         let mut endpoint_members: HashMap<String, Vec<WorkerId>> = HashMap::new();

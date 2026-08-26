@@ -306,6 +306,33 @@ async fn partial_reconcile_preserves_existing_workers_until_explicit_removal() {
     monitor.shutdown().await;
 }
 
+/// 局部注册快照不能取消已存在 Worker 的 reporter task。
+///
+/// 静态 discovery 会并发完成 `/server_info` 查询；后到的局部快照只携带
+/// 当时已解析 reporter 端口的 Worker。只有显式 `Removed` 才能结束已有
+/// session，否则下一次策略快照会在该 Worker 上失去 fresh load。
+#[tokio::test]
+async fn partial_reconcile_preserves_existing_reporter_tasks() {
+    let monitor = test_monitor(31000);
+    let first = test_worker("first", WorkerMode::Plain);
+    first.set_reporter_port(Some(31001));
+    let second = test_worker("second", WorkerMode::Plain);
+    second.set_reporter_port(Some(31002));
+
+    monitor.reconcile(vec![first.clone(), second.clone()]).await;
+    assert_eq!(monitor.inner.sessions.lock().await.len(), 2);
+
+    monitor.reconcile(vec![first]).await;
+    let sessions = monitor.inner.sessions.lock().await;
+    assert!(sessions.contains_key(&WorkerId("first".to_string())));
+    assert!(sessions.contains_key(&WorkerId("second".to_string())));
+    drop(sessions);
+
+    monitor.remove_worker(&WorkerId("second".to_string())).await;
+    assert_eq!(monitor.inner.sessions.lock().await.len(), 1);
+    monitor.shutdown().await;
+}
+
 #[derive(Clone)]
 struct FakeReporter {
     report: LoadReport,
