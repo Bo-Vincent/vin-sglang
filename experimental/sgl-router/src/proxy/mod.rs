@@ -16,6 +16,12 @@ use reqwest::{Client, Url};
 use std::sync::Arc;
 use std::time::Duration;
 
+// SGLang's Uvicorn server closes idle HTTP/1.1 connections after five seconds
+// by default. Keep the Router's pool lifetime below that value so a POST never
+// reuses a connection the worker has already closed. POST forwarding is not
+// retried automatically because the worker may have observed the request body.
+const UPSTREAM_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(4);
+
 /// Parse a worker URL emitted by discovery.  On failure, trip the worker's
 /// circuit breaker so the malformed worker drops out of subsequent
 /// `healthy_workers_for(...)` selection, then surface the error as
@@ -28,6 +34,21 @@ fn parse_worker_url(worker_url: &str, breaker: &CircuitBreaker) -> Result<Url, A
             source: anyhow::Error::new(e).context("parse worker URL"),
         }
     })
+}
+
+fn build_proxy_client() -> Result<Client, anyhow::Error> {
+    build_proxy_client_with_pool_idle_timeout(UPSTREAM_POOL_IDLE_TIMEOUT)
+}
+
+fn build_proxy_client_with_pool_idle_timeout(
+    pool_idle_timeout: Duration,
+) -> Result<Client, anyhow::Error> {
+    Client::builder()
+        .pool_max_idle_per_host(64)
+        .pool_idle_timeout(pool_idle_timeout)
+        .connect_timeout(Duration::from_secs(5))
+        .build()
+        .context("build reqwest client")
 }
 
 #[derive(Debug)]
@@ -43,11 +64,7 @@ impl Proxy {
     /// non-streaming forwards. Connect timeout is hard-coded to 5 s — even a
     /// streaming request fails fast at TCP setup if the worker is unreachable.
     pub fn new(request_timeout: Duration) -> Result<Self, anyhow::Error> {
-        let client = Client::builder()
-            .pool_max_idle_per_host(64)
-            .connect_timeout(Duration::from_secs(5))
-            .build()
-            .context("build reqwest client")?;
+        let client = build_proxy_client()?;
         Ok(Self {
             client,
             request_timeout,
@@ -260,10 +277,78 @@ impl Proxy {
 mod tests {
     use super::*;
     use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+
+    async fn read_request_headers(stream: &mut TcpStream) {
+        let mut bytes = Vec::new();
+        let mut chunk = [0_u8; 1024];
+        loop {
+            let read = stream.read(&mut chunk).await.unwrap();
+            assert!(read > 0, "client closed before sending HTTP headers");
+            bytes.extend_from_slice(&chunk[..read]);
+            if bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+                return;
+            }
+        }
+    }
+
+    async fn write_keep_alive_response(stream: &mut TcpStream) {
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: keep-alive\r\n\r\nok")
+            .await
+            .unwrap();
+        stream.flush().await.unwrap();
+    }
 
     #[tokio::test]
     async fn new_returns_result_not_panic() {
         let p = Proxy::new(Duration::from_secs(5)).unwrap();
         assert_eq!(p.request_timeout, Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn pool_discards_idle_connection_before_a_closed_worker_connection_is_reused() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut first, _) = listener.accept().await.unwrap();
+            read_request_headers(&mut first).await;
+            write_keep_alive_response(&mut first).await;
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            drop(first);
+
+            let (mut second, _) = tokio::time::timeout(Duration::from_secs(1), listener.accept())
+                .await
+                .expect("client must open a new connection after the worker closes idle keep-alive")
+                .unwrap();
+            read_request_headers(&mut second).await;
+            write_keep_alive_response(&mut second).await;
+        });
+
+        let client = build_proxy_client_with_pool_idle_timeout(Duration::from_millis(20)).unwrap();
+        let url = format!("http://{address}/v1/chat/completions");
+        assert_eq!(
+            client
+                .post(&url)
+                .body("first")
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            reqwest::StatusCode::OK
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            client
+                .post(&url)
+                .body("second")
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            reqwest::StatusCode::OK
+        );
+        server.await.unwrap();
     }
 }
