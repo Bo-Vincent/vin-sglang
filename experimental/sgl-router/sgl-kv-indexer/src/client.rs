@@ -255,7 +255,10 @@ fn parse_endpoint(endpoint: &str) -> Result<Endpoint, InvalidEndpoint> {
 
 fn classify(code: tonic::Code) -> PrefixIndexError {
     match code {
-        tonic::Code::Unavailable => PrefixIndexError::Unreachable,
+        // 本地 deadline 过期后，h2 的 peer reset 可能表现为 UNKNOWN 而非
+        // UNAVAILABLE。Indexer 只提供 affinity hint，必须退化到负载路由而
+        // 不能让请求变成服务拒绝。
+        tonic::Code::Unavailable | tonic::Code::Unknown => PrefixIndexError::Unreachable,
         // The indexer sheds an expired query as DEADLINE_EXCEEDED, while tonic
         // reports its own enforcement of the same `grpc-timeout` as CANCELLED.
         // This client cancels a query for no other reason.
@@ -281,6 +284,14 @@ mod tests {
         assert_eq!(
             classify(tonic::Code::ResourceExhausted),
             PrefixIndexError::Overloaded
+        );
+    }
+
+    #[test]
+    fn classifies_transport_unknown_as_unreachable() {
+        assert_eq!(
+            classify(tonic::Code::Unknown),
+            PrefixIndexError::Unreachable
         );
     }
 
