@@ -3,10 +3,9 @@
 
 use crate::config::Config;
 
-use crate::load_monitor::LoadMonitor;
-
 use crate::policies::active_load::ActiveLoadRegistry;
 use crate::policies::buckets::BucketSelector;
+use crate::policies::engine_load::EngineLoadTable;
 use crate::policies::kv_events::BlockSizeOracle;
 use crate::policies::PolicyRegistry;
 use crate::proxy::Proxy;
@@ -32,8 +31,8 @@ pub struct AppContext {
     /// cache-aware-zmq policy (overlap_blocks), active-load registry
     /// (active_load gauge + stale_requests_total), and PD dispatch.
     pub metrics: Arc<MetricsRegistry>,
-    /// Engine LoadMonitor snapshot 来源。
-    pub load_monitor: Arc<LoadMonitor>,
+    /// #34608 Engine LoadStat 的共享表；请求入口从它捕获一次不可变快照。
+    pub engine_load: Arc<EngineLoadTable>,
     pub prefix_index: Option<Arc<dyn sgl_kv_indexer::PrefixIndex>>,
     pub block_size_oracle: Arc<BlockSizeOracle>,
     ready: AtomicBool,
@@ -92,7 +91,7 @@ impl AppContext {
             metrics,
             prefix_index: None,
             block_size_oracle: BlockSizeOracle::new(),
-            load_monitor: Arc::new(LoadMonitor::disabled()),
+            engine_load: EngineLoadTable::new(),
             ready: AtomicBool::new(false),
         }
     }
@@ -146,7 +145,7 @@ impl AppContext {
             metrics: MetricsRegistry::new(),
             prefix_index: None,
             block_size_oracle: BlockSizeOracle::new(),
-            load_monitor: Arc::new(LoadMonitor::disabled()),
+            engine_load: EngineLoadTable::new(),
             ready: AtomicBool::new(false),
         }
     }

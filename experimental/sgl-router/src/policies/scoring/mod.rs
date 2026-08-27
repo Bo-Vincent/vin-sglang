@@ -473,11 +473,13 @@ mod tests {
     use super::*;
     use crate::config::AffinityConfig;
     use crate::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
-    use crate::load_monitor::{AggregateLoad, Freshness, LoadMonitorSnapshot, WorkerSnapshot};
     use crate::policies::admission::{resolve_prefill, CandidateRange};
+    use crate::policies::engine_load::{EngineLoadSnapshot, EngineWorkerLoad};
     use crate::policies::power_of_two::PowerOfTwoChoicesPolicy;
     use crate::policies::round_robin::RoundRobinPolicy;
     use crate::policies::session_aware::SessionAwarePolicy;
+    use std::collections::HashMap;
+    use std::time::Instant;
 
     fn worker(id: &str) -> Arc<Worker> {
         Arc::new(Worker::new(WorkerSpec {
@@ -491,6 +493,27 @@ mod tests {
 
     fn fleet() -> Vec<Arc<Worker>> {
         vec![worker("a"), worker("b"), worker("c")]
+    }
+
+    fn snapshot(entries: &[(&Arc<Worker>, u64, u64, u64, u64)]) -> EngineLoadSnapshot {
+        EngineLoadSnapshot::from_workers(
+            1,
+            entries
+                .iter()
+                .map(|(worker, running, waiting, used, capacity)| {
+                    (
+                        worker.url.clone(),
+                        EngineWorkerLoad {
+                            num_running_reqs: *running,
+                            num_waiting_reqs: *waiting,
+                            num_tokens: *used,
+                            max_total_num_tokens: *capacity,
+                            captured_at: Instant::now(),
+                        },
+                    )
+                })
+                .collect::<HashMap<_, _>>(),
+        )
     }
 
     fn urls(ws: &[Arc<Worker>]) -> Vec<String> {
@@ -745,39 +768,11 @@ mod tests {
         let proposal = pipeline
             .propose(&ws, &ctx)
             .expect("the two eligible workers produce a P2 proposal");
-        let snapshot = LoadMonitorSnapshot {
-            enabled: true,
-            version: 1,
-            captured_at: None,
-            workers: ws
-                .iter()
-                .enumerate()
-                .map(|(index, worker)| WorkerSnapshot {
-                    worker_id: worker.id.0.clone(),
-                    url: worker.url.clone(),
-                    mode: worker.mode(),
-                    model_ids: worker
-                        .model_ids
-                        .iter()
-                        .map(|model| model.0.clone())
-                        .collect(),
-                    freshness: Freshness::Fresh,
-                    source_instance_id: None,
-                    sequence_id: None,
-                    report_time_unix_ms: None,
-                    last_error: None,
-                    received_at: None,
-                    expires_at: None,
-                    aggregate: Some(AggregateLoad {
-                        num_running_reqs: u64::from(index < 2) * 4,
-                        max_running_requests: 4,
-                        max_total_num_tokens: 4_096,
-                        ..Default::default()
-                    }),
-                    ranks: Vec::new(),
-                })
-                .collect(),
-        };
+        let snapshot = snapshot(&[
+            (&ws[0], 0, 0, 4_090, 4_096),
+            (&ws[1], 0, 0, 4_090, 4_096),
+            (&ws[2], 0, 0, 0, 4_096),
+        ]);
 
         assert!(
             resolve_prefill(&CandidateRange::global(&ws), &proposal, 32, &snapshot).is_none(),
@@ -815,12 +810,7 @@ mod tests {
         );
         assert_eq!(proposal.primary.id, ws[2].id);
 
-        let snapshot = LoadMonitorSnapshot {
-            enabled: false,
-            version: 0,
-            captured_at: None,
-            workers: Vec::new(),
-        };
+        let snapshot = EngineLoadSnapshot::default();
         let decision = resolve_prefill(&CandidateRange::global(&ws), &proposal, 32, &snapshot)
             .expect("an eligible escape worker exists");
         assert_ne!(decision.selected.id, ws[2].id);

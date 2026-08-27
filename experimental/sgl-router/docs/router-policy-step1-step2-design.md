@@ -1,5 +1,9 @@
 # SGLang Router Policy：Step 1 / Step 2 方案设计
 
+> **历史设计说明。** 本文记录 v2 的 policy 分层决策；其中的 LoadMonitor 字段、
+> token-pressure guard 和 gRPC 连接都不适用于 `vin/rust-v4`。v4 仅使用 main #34608
+> ZMQ `LoadStat` 的运行请求、等待请求、KV 已用量和 KV 容量。
+
 日期：2026-08-04
 状态：v2 集成分支实现设计；Step 1 是同构集群的 Policy / Admission / Guard 共设计，Step 2 在同一骨架上增加 work-aware Bucket 与 SLO。
 范围：`experimental/sgl-router`
@@ -202,7 +206,7 @@ Cache-Aware:
 ```
 
 `PrefillProposal` 仅表达“谁可被比较”，不绕过 Router 的 Admission。未来 policy
-贡献者可以复用 pair，也可以增加新的有界 proposal；Bucket、LoadMonitor、dispatch 和
+贡献者可以复用 pair，也可以增加新的有界 proposal；Bucket、Engine Load、dispatch 和
 Reservation 不复制到各 policy 内。
 
 ### 3.3 P、D 与最终结果
@@ -487,7 +491,7 @@ Bucket，rank 在同一 stage 唯一。Prefill 只能配置 extend/TTFT/pending 
 Bucket 时，Decode 保持 Step 1 的全局候选域；配置任意 Decode Bucket 后才启用 Decode
 Bucket 解析，此后没有兼容域就是明确的路由失败，不再回退到全局 Decode 域。
 
-## 7. Admission、LoadMonitor 与 Guard
+## 7. Admission、历史 LoadMonitor 与 Guard
 
 Prefill candidate 的处理顺序固定：
 
@@ -499,7 +503,7 @@ candidate
 → Final P
 ```
 
-当前可用 LoadMonitor 输入：
+历史版本的 LoadMonitor 输入（不适用于 v4）：
 
 ```text
 num_running_reqs

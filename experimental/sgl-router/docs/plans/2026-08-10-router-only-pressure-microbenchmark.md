@@ -1,5 +1,8 @@
 # Router-only Pressure Microbenchmark Implementation Plan
 
+> **历史计划。** v4 的 `router_pressure` 已改为直接构造 `EngineLoadTable`，不再通过
+> 旧 gRPC LoadMonitor 注入负载；本文的变体和指标不能解释为当前 benchmark 合同。
+
 **Goal:** Quantify Step 3 pressure collection/consumption overhead at 8, 64, and 256 endpoints, and fix any measured hot-path regression in the semantic commit that introduced it.
 
 **Architecture:** Add one Criterion bench that exercises the public Router APIs with real LoadMonitor state seeded through the load-reporting gRPC contract. Step 2 captures the existing diagnostic snapshot; Step 3 captures the scheduling snapshot consumed by the Router hot path. Measure snapshot capture, policy-only selection, and snapshot-plus-policy decisions separately; emit allocation counts alongside Criterion samples and collect process CPU counters with `perf stat`. Run the same bench on the Step 2 base, the Step 3 fallback-metric build, and the Step 3 rich-pressure build.

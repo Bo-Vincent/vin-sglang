@@ -17,6 +17,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -43,6 +44,41 @@ pub struct LoadStat {
     pub num_tokens: u64,
     /// KV-cache token capacity; 0 when unknown.
     pub max_total_num_tokens: u64,
+}
+
+/// 一个 Worker 在一次固定时刻采集到的可用 Engine 负载。
+///
+/// 只包含 #34608 实际发布的四个字段的跨 DP-rank 求和结果。`captured_at`
+/// 保留最老 rank 的接收时刻，供 Router 把该时刻之后的本地派发叠加到队列深度。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EngineWorkerLoad {
+    pub num_running_reqs: u64,
+    pub num_waiting_reqs: u64,
+    pub num_tokens: u64,
+    pub max_total_num_tokens: u64,
+    pub captured_at: Instant,
+}
+
+/// 请求入口一次性捕获的不可变 Engine 负载视图。
+///
+/// key 为 Router 实际派发使用的 Worker URL。缺少、过期或 DP rank 不完整的
+/// Worker 不会出现在该映射中，消费者必须回退到 Router 本地 active-load。
+#[derive(Debug, Clone, Default)]
+pub struct EngineLoadSnapshot {
+    pub version: u64,
+    workers: HashMap<String, EngineWorkerLoad>,
+}
+
+impl EngineLoadSnapshot {
+    pub fn fresh_load_for_url(&self, worker_url: &str) -> Option<&EngineWorkerLoad> {
+        self.workers.get(worker_url)
+    }
+
+    /// 用已经完成 freshness/rank 校验的 Worker 数据构造视图。主要供组件测试和
+    /// 离线策略验证复用；生产请求应通过 [`EngineLoadTable::capture_snapshot`] 获取。
+    pub fn from_workers(version: u64, workers: HashMap<String, EngineWorkerLoad>) -> Self {
+        Self { version, workers }
+    }
 }
 
 impl<'de> Deserialize<'de> for LoadStat {
@@ -128,6 +164,7 @@ pub struct EngineLoadTable {
     /// aggregate would make a silent rank look idle and attract traffic.
     expected: DashSet<(String, u32)>,
     freshness: Duration,
+    version: AtomicU64,
 }
 
 impl EngineLoadTable {
@@ -136,6 +173,7 @@ impl EngineLoadTable {
             by_rank: DashMap::new(),
             expected: DashSet::new(),
             freshness: DEFAULT_FRESHNESS,
+            version: AtomicU64::new(0),
         })
     }
 
@@ -145,6 +183,7 @@ impl EngineLoadTable {
             by_rank: DashMap::new(),
             expected: DashSet::new(),
             freshness,
+            version: AtomicU64::new(0),
         })
     }
 
@@ -152,11 +191,14 @@ impl EngineLoadTable {
     pub fn set(&self, url: &str, dp_rank: u32, load: LoadStat, at: Instant) {
         self.by_rank
             .insert((url.to_string(), dp_rank), LoadEntry { load, at });
+        self.version.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Mark one advertised scheduler rank as expected to publish load.
     pub fn mark_expected_rank(&self, url: &str, dp_rank: u32) {
-        self.expected.insert((url.to_string(), dp_rank));
+        if self.expected.insert((url.to_string(), dp_rank)) {
+            self.version.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// Number of workers expected to publish load. Compared against the size
@@ -170,13 +212,10 @@ impl EngineLoadTable {
             .len()
     }
 
-    /// Shared accumulation pass behind [`Self::snapshot_fresh`] (and used
-    /// directly by `cache_aware_zmq::WorkerLoads`, which needs both halves):
-    /// one walk of the table, per worker URL, producing the summed queue
-    /// depth (`num_running_reqs + num_waiting_reqs`) across that worker's
-    /// ranks and the OLDEST snapshot timestamp among them — **but only for
-    /// workers whose every known rank is fresh**. A worker with any stale
-    /// advertised rank is present and fresh. A missing or stale rank is
+    /// Shared accumulation pass behind [`Self::snapshot_fresh`] and
+    /// [`Self::capture_snapshot`]. It produces the #34608 fields summed across
+    /// ranks and the OLDEST snapshot timestamp — **but only for workers whose
+    /// every advertised rank is present and fresh**. A missing or stale rank is
     /// omitted, so the caller falls back to its own load signal. (Summing
     /// only the fresh ranks would make a worker whose other ranks went silent
     /// look misleadingly idle and draw *more* traffic.) Callers that never
@@ -200,18 +239,16 @@ impl EngineLoadTable {
     /// not a correctness hole) rather than something this method can close
     /// on its own — closing it would require per-rank dispatch attribution,
     /// which the router-side slot tracking below doesn't have.
-    pub(crate) fn fresh_worker_state(&self, now: Instant) -> HashMap<String, (usize, Instant)> {
-        // url -> rank -> (depth, fresh, timestamp).
-        let mut observed: HashMap<String, HashMap<u32, (usize, bool, Instant)>> = HashMap::new();
+    fn fresh_worker_loads(&self, now: Instant) -> HashMap<String, EngineWorkerLoad> {
+        // url -> rank -> (reported load, fresh, timestamp).
+        let mut observed: HashMap<String, HashMap<u32, (LoadStat, bool, Instant)>> = HashMap::new();
         for entry in self.by_rank.iter() {
             let at = entry.value().at;
             let fresh = now.saturating_duration_since(at) <= self.freshness;
-            let l = &entry.value().load;
-            let depth = (l.num_running_reqs.saturating_add(l.num_waiting_reqs)) as usize;
             observed
                 .entry(entry.key().0.clone())
                 .or_default()
-                .insert(entry.key().1, (depth, fresh, at));
+                .insert(entry.key().1, (entry.value().load.clone(), fresh, at));
         }
         let mut expected: HashMap<String, HashSet<u32>> = HashMap::new();
         for entry in self.expected.iter() {
@@ -230,17 +267,62 @@ impl EngineLoadTable {
                     Some(expected_ranks) => expected_ranks.iter().copied().collect(),
                     None => ranks.keys().copied().collect(),
                 };
-                let mut depth = 0usize;
+                let mut num_running_reqs = 0u64;
+                let mut num_waiting_reqs = 0u64;
+                let mut num_tokens = 0u64;
+                let mut max_total_num_tokens = 0u64;
                 let mut oldest_at = None;
                 for rank in required {
-                    let (rank_depth, fresh, at) = ranks.get(&rank)?;
+                    let (load, fresh, at) = ranks.get(&rank)?;
                     if !fresh {
                         return None;
                     }
-                    depth = depth.saturating_add(*rank_depth);
+                    num_running_reqs = num_running_reqs.saturating_add(load.num_running_reqs);
+                    num_waiting_reqs = num_waiting_reqs.saturating_add(load.num_waiting_reqs);
+                    num_tokens = num_tokens.saturating_add(load.num_tokens);
+                    max_total_num_tokens =
+                        max_total_num_tokens.saturating_add(load.max_total_num_tokens);
                     oldest_at = Some(oldest_at.map_or(*at, |oldest: Instant| oldest.min(*at)));
                 }
-                oldest_at.map(|at| (url, (depth, at)))
+                oldest_at.map(|captured_at| {
+                    (
+                        url,
+                        EngineWorkerLoad {
+                            num_running_reqs,
+                            num_waiting_reqs,
+                            num_tokens,
+                            max_total_num_tokens,
+                            captured_at,
+                        },
+                    )
+                })
+            })
+            .collect()
+    }
+
+    /// 当前时间点的不可变视图。请求入口只应调用一次，再把这个值传给全部
+    /// Prefill/Cache/Session/Decode 决策，避免一次请求内部观察到不同负载。
+    pub fn capture_snapshot(&self, now: Instant) -> EngineLoadSnapshot {
+        EngineLoadSnapshot {
+            version: self.version.load(Ordering::Acquire),
+            workers: self.fresh_worker_loads(now),
+        }
+    }
+
+    pub(crate) fn fresh_worker_state(&self, now: Instant) -> HashMap<String, (usize, Instant)> {
+        self.fresh_worker_loads(now)
+            .into_iter()
+            .map(|(url, load)| {
+                (
+                    url,
+                    (
+                        load.num_running_reqs
+                            .saturating_add(load.num_waiting_reqs)
+                            .try_into()
+                            .unwrap_or(usize::MAX),
+                        load.captured_at,
+                    ),
+                )
             })
             .collect()
     }
@@ -262,6 +344,7 @@ impl EngineLoadTable {
     pub fn forget_worker(&self, url: &str) {
         self.by_rank.retain(|k, _| k.0 != url);
         self.expected.retain(|key| key.0 != url);
+        self.version.fetch_add(1, Ordering::Relaxed);
     }
 
     #[cfg(test)]

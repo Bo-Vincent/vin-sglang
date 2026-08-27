@@ -1,8 +1,11 @@
 # Router Policy Step 1 集成说明
 
+> **历史设计说明。** `vin/rust-v4` 已移除本文所述旧 LoadMonitor 协议；运行时
+> 负载输入改为 main #34608 的 ZMQ `LoadStat`，准确字段与退化规则见 `README.md`。
+
 日期：2026-08-05
-状态：v2 集成分支已实现
-范围：同构、无静态 Bucket 的 Router Policy / Admission / Guard；Step 2 的增量见
+状态：v2 历史集成说明；v4 的 Engine Load 合同以 README 为准
+范围：同构、无静态 Bucket 的 Router Policy / Admission；Step 2 的增量见
 [Step 1 / Step 2 方案设计](router-policy-step1-step2-design.md)。
 
 ## 1. 目标与边界
@@ -11,9 +14,9 @@ Step 1 在不改变既有 dispatch、`sticky` 和 `cache_aware_zmq` 语义的前
 
 - 顶层 `power_of_two`、`session_aware`、`cache_aware`、`score_policy`；
 - 一次请求只使用一种顶层 policy；Session 与 Cache 不叠加；
-- Prefill 的 proposal → Admission → Guard/comparator → Final P；
-- PD 模式下 Final P 之后独立执行 Decode proposal → Admission/Guard → Final D；
-- LoadMonitor 缺失或 snapshot stale 时退化，不把监控可用性变成推理可用性的单点；
+- Prefill 的 proposal → Admission → comparator → Final P；
+- PD 模式下 Final P 之后独立执行 Decode proposal → Admission/comparator → Final D；
+- Engine Load 快照缺失或 stale 时退化，不把负载发布可用性变成推理可用性的单点；
 - proposal 与 final decision 之间保留后续 Bucket 和 optional Reservation 的插入边界。
 
 Step 1 不实现静态 Bucket/SLO、KV 预扣、投机发送或 Transfer-Aware Decode。
@@ -137,7 +140,7 @@ Cache candidate 的 `E_i` 表达目标相关的实际 Prefill work；完整 `L` 
 3. 其余情况按 E、共享 pressure、稳定 worker id 排序。
 
 因此 Cache-Aware 的候选比较已经完成收益与负载平衡，选出 winner 后不再构造 backup。
-构造 Top-K 时只对第 K 个元素做 partition，再排序保留的 K 项；fresh LoadMonitor
+构造 Top-K 时只对第 K 个元素做 partition，再排序保留的 K 项；fresh Engine Load
 aggregate 和 Router local active load 在候选阶段各捕获一次，并建立 O(1) lookup。
 等命中候选按共享 pressure、该次 local snapshot、稳定 worker id 依次打破平局，不对
 每个 worker 发起额外查询，也不在 sort comparator 中反复读取可变计数。

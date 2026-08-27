@@ -3,19 +3,21 @@
 
 //! Decode policy 的最小可观察契约。
 //!
-//! 这些测试只覆盖 Router 已有的 running/KV/local active-load 输入；不把尚未
-//! 采集的 transfer、decode queue 或 retraction 指标伪造成可用数据。
+//! 这些测试只覆盖 #34608 实际发布的 running/waiting/KV/local active-load 输入；
+//! 不把未发布的 transfer、decode queue 或 retraction 指标伪造成可用数据。
 
 use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
-use sgl_router::load_monitor::{AggregateLoad, Freshness, LoadMonitorSnapshot, WorkerSnapshot};
 use sgl_router::policies::admission::{resolve_decode, CandidateDomain, DecisionReason};
 use sgl_router::policies::decode::{
     DecodePolicy, DecodePowerOfTwoPolicy, DecodeSelectionContext, LegacyHostAffinityDecodePolicy,
 };
+use sgl_router::policies::engine_load::{EngineLoadSnapshot, EngineWorkerLoad};
 use sgl_router::policies::SelectionProposal;
 use sgl_router::workers::Worker;
+use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::time::Instant;
 
 fn worker(id: &str) -> Arc<Worker> {
     Arc::new(Worker::new(WorkerSpec {
@@ -27,34 +29,25 @@ fn worker(id: &str) -> Arc<Worker> {
     }))
 }
 
-fn snapshot(entries: &[(&Arc<Worker>, AggregateLoad)]) -> LoadMonitorSnapshot {
-    LoadMonitorSnapshot {
-        enabled: true,
-        version: 7,
-        captured_at: Some("2026-08-04T00:00:00Z".into()),
-        workers: entries
+fn snapshot(entries: &[(&Arc<Worker>, u64, u64, u64, u64)]) -> EngineLoadSnapshot {
+    EngineLoadSnapshot::from_workers(
+        7,
+        entries
             .iter()
-            .map(|(worker, aggregate)| WorkerSnapshot {
-                worker_id: worker.id.0.clone(),
-                url: worker.url.clone(),
-                mode: worker.mode(),
-                model_ids: worker
-                    .model_ids
-                    .iter()
-                    .map(|model| model.0.clone())
-                    .collect(),
-                freshness: Freshness::Fresh,
-                source_instance_id: None,
-                sequence_id: None,
-                report_time_unix_ms: None,
-                last_error: None,
-                received_at: None,
-                expires_at: None,
-                aggregate: Some(aggregate.clone()),
-                ranks: Vec::new(),
+            .map(|(worker, running, waiting, used, capacity)| {
+                (
+                    worker.url.clone(),
+                    EngineWorkerLoad {
+                        num_running_reqs: *running,
+                        num_waiting_reqs: *waiting,
+                        num_tokens: *used,
+                        max_total_num_tokens: *capacity,
+                        captured_at: Instant::now(),
+                    },
+                )
             })
-            .collect(),
-    }
+            .collect::<HashMap<_, _>>(),
+    )
 }
 
 #[test]
@@ -106,31 +99,9 @@ fn decode_admission_uses_backup_before_scanning_domain() {
         Arc::clone(&fallback),
     ]);
     let loads = snapshot(&[
-        (
-            &primary,
-            AggregateLoad {
-                num_running_reqs: 4,
-                max_running_requests: 4,
-                max_total_num_tokens: 1_000,
-                ..Default::default()
-            },
-        ),
-        (
-            &backup,
-            AggregateLoad {
-                max_running_requests: 4,
-                max_total_num_tokens: 1_000,
-                ..Default::default()
-            },
-        ),
-        (
-            &fallback,
-            AggregateLoad {
-                max_running_requests: 4,
-                max_total_num_tokens: 1_000,
-                ..Default::default()
-            },
-        ),
+        (&primary, 4, 0, 950, 1_000),
+        (&backup, 0, 0, 0, 1_000),
+        (&fallback, 0, 0, 0, 1_000),
     ]);
     let proposal = SelectionProposal::with_backup(Arc::clone(&primary), Arc::clone(&backup));
 
@@ -146,33 +117,12 @@ fn decode_guard_can_escape_a_primary_to_lower_dynamic_pressure_backup() {
     let primary = worker("primary");
     let backup = worker("backup");
     let domain = CandidateDomain::global_decode(&[Arc::clone(&primary), Arc::clone(&backup)]);
-    let loads = snapshot(&[
-        (
-            &primary,
-            AggregateLoad {
-                num_running_reqs: 3,
-                max_running_requests: 8,
-                num_total_tokens: 900,
-                max_total_num_tokens: 2_000,
-                ..Default::default()
-            },
-        ),
-        (
-            &backup,
-            AggregateLoad {
-                num_running_reqs: 1,
-                max_running_requests: 8,
-                num_total_tokens: 100,
-                max_total_num_tokens: 2_000,
-                ..Default::default()
-            },
-        ),
-    ]);
+    let loads = snapshot(&[(&primary, 3, 2, 900, 2_000), (&backup, 1, 0, 100, 2_000)]);
     let proposal = SelectionProposal::with_backup(Arc::clone(&primary), Arc::clone(&backup));
 
     let decision =
         resolve_decode(&domain, &proposal, 64, &loads).expect("both candidates are admitted");
 
     assert_eq!(decision.selected.id, backup.id);
-    assert_eq!(decision.reason, DecisionReason::BackupPressureGuard);
+    assert_eq!(decision.reason, DecisionReason::BackupLoadComparison);
 }

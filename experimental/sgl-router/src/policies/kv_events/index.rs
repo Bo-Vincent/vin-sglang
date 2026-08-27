@@ -264,10 +264,11 @@ impl KvEventIndex {
         // hash KV blocks over token bigrams, so the policy must use the bigram
         // hasher for its query hashes to match the worker's stored hashes.
         self.block_size_oracle.set_bigram(cfg.is_bigram);
-        let kv_dp_ranks = self
-            .maintain_tree
-            .then(|| subscribable_ranks(cfg.port_base, cfg.dp_size))
-            .unwrap_or_default();
+        let kv_dp_ranks = if self.maintain_tree {
+            subscribable_ranks(cfg.port_base, cfg.dp_size)
+        } else {
+            Vec::new()
+        };
         let load_descriptor_complete = cfg.load_port_base.is_some() && cfg.load_topic.is_some();
         if cfg.load_port_base.is_some() != cfg.load_topic.is_some() {
             warn!(

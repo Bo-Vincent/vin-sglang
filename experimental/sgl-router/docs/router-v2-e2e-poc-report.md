@@ -1,5 +1,9 @@
 # Router v2 Policy / PD E2E 验证报告
 
+> **历史记录，不是 `vin/rust-v4` 的验证证据。** 本报告运行于旧 gRPC LoadMonitor
+> 架构。v4 已切换到 main 的 #34608 ZMQ `LoadStat` 发布与 Router 侧严格 DP-rank
+> 快照聚合；其中旧监控、Guard 和 E2E 结论不能直接沿用。
+
 日期：2026-08-05
 
 分支：`vin/router-v2`
