@@ -112,6 +112,14 @@ virtual worker queue/cache 闭环完成的 8 / 64 / 256 worker CPU logical-time 
 该实验验证策略行为与规模边界，不替代真实 GPU、HTTP、Indexer RPC 或 LoadMonitor stream
 的生产吞吐验证。
 
+## Router Policy 256-worker HTTP Simulator 四策略对比
+
+真实 HTTP Router、256 个 CPU Simulator endpoint、LoadMonitor、KV Indexer 与 ZMQ KV
+event bridge 的四策略（三轮主矩阵 + Shortest-TTFT 独立确认轮）结果见
+[Router Policy 256-worker HTTP Simulator 四策略对比](docs/router-policy-http-simulator-256-four-policy-report.md)。
+该结果是 `simulator_predicted_relative` 控制面规模验证：可比较相同合同下的策略相对行为，
+不替代真实 GPU TTFT、E2E 和吞吐结论。
+
 ## Router Policy 真实 LoadMonitor E2E
 
 真实 8×L20 worker reporter、Router outbound LoadMonitor session、Indexer Cache-Aware
