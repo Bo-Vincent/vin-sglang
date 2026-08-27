@@ -6,8 +6,8 @@ pub mod admission;
 pub mod buckets;
 pub mod cache_aware;
 pub mod cache_aware_zmq;
-pub mod engine_load;
 pub mod decode;
+pub mod engine_load;
 pub mod factory;
 pub mod kv_events;
 pub mod load_based;
@@ -20,8 +20,8 @@ pub mod session_aware;
 pub mod sticky;
 
 use crate::discovery::ModelId;
-use crate::load_monitor::LoadMonitorSnapshot;
 use crate::policies::buckets::{BucketRequest, BucketSelector};
+use crate::policies::engine_load::EngineLoadSnapshot;
 use crate::policies::scoring::{EligibilityFilter, ScoringPolicy};
 use crate::server::metrics::MetricsRegistry;
 use crate::tokenizer::{adapter, TokenizerRegistry};
@@ -194,7 +194,7 @@ pub struct SelectionContext<'a> {
     input_tokens: Option<u64>,
     request_tokens: Option<&'a [u32]>,
     external_prefix: Option<&'a ExternalPrefixSignal>,
-    load_snapshot: Option<&'a LoadMonitorSnapshot>,
+    load_snapshot: Option<&'a EngineLoadSnapshot>,
     prefill_cache_bucket: Option<(&'a BucketSelector, BucketRequest)>,
     affinity_lookup_enabled: bool,
     affinity_assignment_enabled: bool,
@@ -271,8 +271,8 @@ impl<'a> SelectionContext<'a> {
         self
     }
 
-    /// 附加请求开始时捕获的 LoadMonitor snapshot。
-    pub fn with_load_snapshot(mut self, load_snapshot: &'a LoadMonitorSnapshot) -> Self {
+    /// 附加请求开始时捕获的 Engine Load snapshot。
+    pub fn with_load_snapshot(mut self, load_snapshot: &'a EngineLoadSnapshot) -> Self {
         self.load_snapshot = Some(load_snapshot);
         self
     }
@@ -333,7 +333,7 @@ impl<'a> SelectionContext<'a> {
         self.external_prefix
     }
 
-    pub fn load_snapshot(&self) -> Option<&LoadMonitorSnapshot> {
+    pub fn load_snapshot(&self) -> Option<&EngineLoadSnapshot> {
         self.load_snapshot
     }
 
@@ -362,7 +362,6 @@ pub struct SelectionProposal {
     pub primary: Arc<Worker>,
     pub backup: Option<Arc<Worker>>,
     pub kind: ProposalKind,
-    pub guard_hints: GuardHints,
     /// EligibilityFilter 之后可用于 fallback 的 worker。
     pub eligible_workers: Option<Vec<Arc<Worker>>>,
 }
@@ -384,8 +383,6 @@ pub struct CacheCandidate {
 pub struct CacheCandidateProposal {
     pub candidates: Vec<CacheCandidate>,
     pub cache_switch_margin_tokens: u64,
-    pub pressure_abs_threshold_tokens: u64,
-    pub pressure_rel_threshold: f64,
 }
 
 /// Prefill policy 返回 pair 或 Cache-Aware 候选集。
@@ -419,7 +416,6 @@ impl SelectionProposal {
             primary,
             backup: None,
             kind: ProposalKind::Generic,
-            guard_hints: GuardHints::default(),
             eligible_workers: None,
         }
     }
@@ -430,18 +426,12 @@ impl SelectionProposal {
             primary,
             backup: Some(backup),
             kind: ProposalKind::PowerOfTwo,
-            guard_hints: GuardHints::default(),
             eligible_workers: None,
         }
     }
 
     pub fn with_kind(mut self, kind: ProposalKind) -> Self {
         self.kind = kind;
-        self
-    }
-
-    pub fn with_guard_hints(mut self, guard_hints: GuardHints) -> Self {
-        self.guard_hints = guard_hints;
         self
     }
 
@@ -459,27 +449,6 @@ pub enum ProposalKind {
     SessionAffinity,
     CacheAffinity,
     Score,
-}
-
-/// Pair proposal 的可选 Guard 参数。
-#[derive(Debug, Clone)]
-pub struct GuardHints {
-    /// 是否允许按压力逃逸到 backup。
-    pub enable_pressure_guard: bool,
-    /// 压力逃逸需要超过的未命中 prefill token 绝对差。
-    pub pressure_abs_threshold_tokens: u64,
-    /// 压力逃逸需要超过的相对倍率。
-    pub pressure_rel_threshold: f64,
-}
-
-impl Default for GuardHints {
-    fn default() -> Self {
-        Self {
-            enable_pressure_guard: false,
-            pressure_abs_threshold_tokens: 0,
-            pressure_rel_threshold: 1.0,
-        }
-    }
 }
 
 pub trait Policy: Send + Sync + std::fmt::Debug {
@@ -598,14 +567,25 @@ mod tests {
     use super::*;
     use crate::config::{AffinityConfig, SessionAffinityMode};
     use crate::discovery::{WorkerId, WorkerMode, WorkerSpec};
-    use crate::load_monitor::{AggregateLoad, Freshness, LoadMonitorSnapshot, WorkerSnapshot};
     use crate::policies::admission::{
         resolve_cache_candidates, resolve_prefill, CandidateRange, DecisionReason, FreshLoadLookup,
     };
     use crate::policies::cache_aware::CacheAwarePolicy;
+    use crate::policies::engine_load::{EngineLoadSnapshot, EngineWorkerLoad};
     use crate::policies::power_of_two::PowerOfTwoChoicesPolicy;
     use crate::policies::round_robin::RoundRobinPolicy;
     use crate::policies::session_aware::SessionAwarePolicy;
+    use std::collections::HashMap;
+    use std::time::Instant;
+
+    /// 仅用于策略测试的 #34608 `LoadStat` 聚合值。
+    #[derive(Clone, Default)]
+    struct TestEngineLoad {
+        num_running_reqs: u64,
+        num_waiting_reqs: u64,
+        num_tokens: u64,
+        max_total_num_tokens: u64,
+    }
 
     fn worker(id: &str) -> Arc<Worker> {
         Arc::new(Worker::new(WorkerSpec {
@@ -685,8 +665,6 @@ mod tests {
                 max_pending_prefill_tokens: None,
             }],
             cache_switch_margin_tokens: 8,
-            pressure_abs_threshold_tokens: 1_024,
-            pressure_rel_threshold: 1.5,
         };
 
         assert_eq!(proposal.candidates[0].worker.id, hot.id);
@@ -695,7 +673,7 @@ mod tests {
     }
 
     #[test]
-    fn power_of_two_orders_its_sample_with_fresh_load_monitor_snapshot() {
+    fn power_of_two_orders_its_sample_with_fresh_engine_load_snapshot() {
         let model = ModelId("model".into());
         let busy = worker("busy");
         let idle = worker("idle");
@@ -703,18 +681,16 @@ mod tests {
         let load_snapshot = snapshot(&[
             (
                 &busy,
-                AggregateLoad {
-                    num_waiting_uncached_tokens: 512,
-                    max_running_requests: 8,
+                TestEngineLoad {
+                    num_waiting_reqs: 512,
                     max_total_num_tokens: 4_096,
                     ..Default::default()
                 },
             ),
             (
                 &idle,
-                AggregateLoad {
-                    num_waiting_uncached_tokens: 16,
-                    max_running_requests: 8,
+                TestEngineLoad {
+                    num_waiting_reqs: 16,
                     max_total_num_tokens: 4_096,
                     ..Default::default()
                 },
@@ -764,7 +740,7 @@ mod tests {
     }
 
     #[test]
-    fn new_session_commits_the_final_admitted_worker_not_the_rejected_primary() {
+    fn new_session_commits_the_final_capacity_admitted_worker() {
         let model = ModelId("model".into());
         let workers = vec![worker("first"), worker("second")];
         let policy = SessionAwarePolicy::new(AffinityConfig::default());
@@ -779,17 +755,16 @@ mod tests {
         let loads = snapshot(&[
             (
                 &proposal.primary,
-                AggregateLoad {
+                TestEngineLoad {
                     num_running_reqs: 1,
-                    max_running_requests: 1,
+                    num_tokens: 4_090,
                     max_total_num_tokens: 4_096,
                     ..Default::default()
                 },
             ),
             (
                 &backup,
-                AggregateLoad {
-                    max_running_requests: 1,
+                TestEngineLoad {
                     max_total_num_tokens: 4_096,
                     ..Default::default()
                 },
@@ -1206,30 +1181,25 @@ mod tests {
         assert!(proposal.backup.is_some());
     }
 
-    fn snapshot(entries: &[(&Arc<Worker>, AggregateLoad)]) -> LoadMonitorSnapshot {
-        LoadMonitorSnapshot {
-            enabled: true,
-            version: 1,
-            captured_at: Some("2026-08-04T00:00:00Z".into()),
-            workers: entries
+    fn snapshot(entries: &[(&Arc<Worker>, TestEngineLoad)]) -> EngineLoadSnapshot {
+        EngineLoadSnapshot::from_workers(
+            1,
+            entries
                 .iter()
-                .map(|(worker, aggregate)| WorkerSnapshot {
-                    worker_id: worker.id.0.clone(),
-                    url: worker.url.clone(),
-                    mode: worker.mode(),
-                    model_ids: worker.model_ids.iter().map(|m| m.0.clone()).collect(),
-                    freshness: Freshness::Fresh,
-                    source_instance_id: None,
-                    sequence_id: None,
-                    report_time_unix_ms: None,
-                    last_error: None,
-                    received_at: None,
-                    expires_at: None,
-                    aggregate: Some(aggregate.clone()),
-                    ranks: Vec::new(),
+                .map(|(worker, aggregate)| {
+                    (
+                        worker.url.clone(),
+                        EngineWorkerLoad {
+                            num_running_reqs: aggregate.num_running_reqs,
+                            num_waiting_reqs: aggregate.num_waiting_reqs,
+                            num_tokens: aggregate.num_tokens,
+                            max_total_num_tokens: aggregate.max_total_num_tokens,
+                            captured_at: Instant::now(),
+                        },
+                    )
                 })
-                .collect(),
-        }
+                .collect::<HashMap<_, _>>(),
+        )
     }
 
     #[test]
@@ -1243,24 +1213,22 @@ mod tests {
         aggregate_busy
             .active_requests
             .store(1, std::sync::atomic::Ordering::Relaxed);
-        let mut snapshot = snapshot(&[
+        let snapshot = snapshot(&[
             (
                 &aggregate_idle,
-                AggregateLoad {
-                    num_waiting_uncached_tokens: 0,
-                    ..AggregateLoad::default()
+                TestEngineLoad {
+                    num_waiting_reqs: 0,
+                    ..TestEngineLoad::default()
                 },
             ),
             (
                 &aggregate_busy,
-                AggregateLoad {
-                    num_waiting_uncached_tokens: 1_000,
-                    ..AggregateLoad::default()
+                TestEngineLoad {
+                    num_waiting_reqs: 1_000,
+                    ..TestEngineLoad::default()
                 },
             ),
-            (&stale, AggregateLoad::default()),
         ]);
-        snapshot.workers[2].freshness = Freshness::Stale;
 
         let lookup =
             FreshLoadLookup::new(Some(&snapshot), [&aggregate_idle, &aggregate_busy, &stale]);
@@ -1289,7 +1257,7 @@ mod tests {
     }
 
     #[test]
-    fn cache_tournament_skips_inadmissible_matches_and_returns_no_backup() {
+    fn cache_tournament_skips_capacity_exhausted_matches_and_returns_no_backup() {
         let full = worker("full");
         let winner = worker("winner");
         let proposal = CacheCandidateProposal {
@@ -1298,25 +1266,22 @@ mod tests {
                 cache_candidate(&winner, 70, 30, None),
             ],
             cache_switch_margin_tokens: 16,
-            pressure_abs_threshold_tokens: 1_024,
-            pressure_rel_threshold: 1.5,
         };
         let loads = snapshot(&[
             (
                 &full,
-                AggregateLoad {
+                TestEngineLoad {
                     num_running_reqs: 8,
-                    max_running_requests: 8,
+                    num_tokens: 9_950,
                     max_total_num_tokens: 10_000,
-                    ..AggregateLoad::default()
+                    ..TestEngineLoad::default()
                 },
             ),
             (
                 &winner,
-                AggregateLoad {
-                    max_running_requests: 8,
+                TestEngineLoad {
                     max_total_num_tokens: 10_000,
-                    ..AggregateLoad::default()
+                    ..TestEngineLoad::default()
                 },
             ),
         ]);
@@ -1342,32 +1307,27 @@ mod tests {
                 cache_candidate(&final_winner, 80, 20, None),
             ],
             cache_switch_margin_tokens: 0,
-            pressure_abs_threshold_tokens: 1_024,
-            pressure_rel_threshold: 1.5,
         };
         let loads = snapshot(&[
             (
                 &first,
-                AggregateLoad {
-                    max_running_requests: 8,
+                TestEngineLoad {
                     max_total_num_tokens: 10_000,
-                    ..AggregateLoad::default()
+                    ..TestEngineLoad::default()
                 },
             ),
             (
                 &second,
-                AggregateLoad {
-                    max_running_requests: 8,
+                TestEngineLoad {
                     max_total_num_tokens: 10_000,
-                    ..AggregateLoad::default()
+                    ..TestEngineLoad::default()
                 },
             ),
             (
                 &final_winner,
-                AggregateLoad {
-                    max_running_requests: 8,
+                TestEngineLoad {
                     max_total_num_tokens: 10_000,
-                    ..AggregateLoad::default()
+                    ..TestEngineLoad::default()
                 },
             ),
         ]);
@@ -1386,16 +1346,13 @@ mod tests {
         let proposal = CacheCandidateProposal {
             candidates: vec![cache_candidate(&candidate, 80, 20, Some(30))],
             cache_switch_margin_tokens: 16,
-            pressure_abs_threshold_tokens: 1_024,
-            pressure_rel_threshold: 1.5,
         };
         let pending_allows = snapshot(&[(
             &candidate,
-            AggregateLoad {
-                num_waiting_uncached_tokens: 5,
-                max_running_requests: 8,
+            TestEngineLoad {
+                num_waiting_reqs: 5,
                 max_total_num_tokens: 1_000,
-                ..AggregateLoad::default()
+                ..TestEngineLoad::default()
             },
         )]);
         assert!(
@@ -1405,12 +1362,11 @@ mod tests {
 
         let kv_rejects = snapshot(&[(
             &candidate,
-            AggregateLoad {
-                num_total_tokens: 30,
-                num_waiting_uncached_tokens: 5,
-                max_running_requests: 8,
+            TestEngineLoad {
+                num_tokens: 30,
+                num_waiting_reqs: 5,
                 max_total_num_tokens: 100,
-                ..AggregateLoad::default()
+                ..TestEngineLoad::default()
             },
         )]);
         assert!(
@@ -1420,7 +1376,7 @@ mod tests {
     }
 
     #[test]
-    fn cache_tournament_pressure_vetoes_a_small_cache_gain() {
+    fn cache_tournament_keeps_cache_gain_when_legacy_token_guard_is_unavailable() {
         let congested = worker("congested");
         let idle = worker("idle");
         let proposal = CacheCandidateProposal {
@@ -1429,32 +1385,28 @@ mod tests {
                 cache_candidate(&idle, 80, 20, None),
             ],
             cache_switch_margin_tokens: 32,
-            pressure_abs_threshold_tokens: 100,
-            pressure_rel_threshold: 1.5,
         };
         let loads = snapshot(&[
             (
                 &congested,
-                AggregateLoad {
-                    num_waiting_uncached_tokens: 1_000,
-                    max_running_requests: 8,
+                TestEngineLoad {
+                    num_waiting_reqs: 1_000,
                     max_total_num_tokens: 10_000,
-                    ..AggregateLoad::default()
+                    ..TestEngineLoad::default()
                 },
             ),
             (
                 &idle,
-                AggregateLoad {
-                    num_waiting_uncached_tokens: 10,
-                    max_running_requests: 8,
+                TestEngineLoad {
+                    num_waiting_reqs: 10,
                     max_total_num_tokens: 10_000,
-                    ..AggregateLoad::default()
+                    ..TestEngineLoad::default()
                 },
             ),
         ]);
 
         let decision = resolve_cache_candidates(&proposal, 100, &loads).unwrap();
-        assert_eq!(decision.selected.id, idle.id);
+        assert_eq!(decision.selected.id, congested.id);
     }
 
     #[test]
@@ -1467,26 +1419,22 @@ mod tests {
                 cache_candidate(&idle, 20, 80, None),
             ],
             cache_switch_margin_tokens: 32,
-            pressure_abs_threshold_tokens: 100,
-            pressure_rel_threshold: 1.5,
         };
         let loads = snapshot(&[
             (
                 &hot,
-                AggregateLoad {
-                    num_waiting_uncached_tokens: 1_000,
-                    max_running_requests: 8,
+                TestEngineLoad {
+                    num_waiting_reqs: 1_000,
                     max_total_num_tokens: 10_000,
-                    ..AggregateLoad::default()
+                    ..TestEngineLoad::default()
                 },
             ),
             (
                 &idle,
-                AggregateLoad {
-                    num_waiting_uncached_tokens: 10,
-                    max_running_requests: 8,
+                TestEngineLoad {
+                    num_waiting_reqs: 10,
                     max_total_num_tokens: 10_000,
-                    ..AggregateLoad::default()
+                    ..TestEngineLoad::default()
                 },
             ),
         ]);
@@ -1499,7 +1447,7 @@ mod tests {
     }
 
     #[test]
-    fn cache_tournament_cannot_chain_pressure_switches_beyond_work_margin() {
+    fn cache_tournament_uses_work_order_when_legacy_token_guard_is_unavailable() {
         let best_work = worker("best-work");
         let near_tie = worker("near-tie");
         let beyond_margin = worker("beyond-margin");
@@ -1513,43 +1461,38 @@ mod tests {
                 cache_candidate(&beyond_margin, 60, 40, None),
             ],
             cache_switch_margin_tokens: 32,
-            pressure_abs_threshold_tokens: 100,
-            pressure_rel_threshold: 1.5,
         };
         let loads = snapshot(&[
             (
                 &best_work,
-                AggregateLoad {
-                    num_waiting_uncached_tokens: 10_000,
-                    max_running_requests: 8,
+                TestEngineLoad {
+                    num_waiting_reqs: 10_000,
                     max_total_num_tokens: 10_000,
-                    ..AggregateLoad::default()
+                    ..TestEngineLoad::default()
                 },
             ),
             (
                 &near_tie,
-                AggregateLoad {
-                    num_waiting_uncached_tokens: 1_000,
-                    max_running_requests: 8,
+                TestEngineLoad {
+                    num_waiting_reqs: 1_000,
                     max_total_num_tokens: 10_000,
-                    ..AggregateLoad::default()
+                    ..TestEngineLoad::default()
                 },
             ),
             (
                 &beyond_margin,
-                AggregateLoad {
-                    num_waiting_uncached_tokens: 0,
-                    max_running_requests: 8,
+                TestEngineLoad {
+                    num_waiting_reqs: 0,
                     max_total_num_tokens: 10_000,
-                    ..AggregateLoad::default()
+                    ..TestEngineLoad::default()
                 },
             ),
         ]);
 
         let decision = resolve_cache_candidates(&proposal, 100, &loads).unwrap();
         assert_eq!(
-            decision.selected.id, near_tie.id,
-            "one near-tie pressure escape is allowed, but escapes must not accumulate past the global work margin"
+            decision.selected.id, best_work.id,
+            "without a unit-compatible token-pressure signal, cache work remains authoritative"
         );
     }
 
@@ -1566,28 +1509,25 @@ mod tests {
         let snapshot = snapshot(&[
             (
                 &primary,
-                AggregateLoad {
+                TestEngineLoad {
                     num_running_reqs: 4,
-                    max_running_requests: 4,
-                    num_total_tokens: 10,
+                    num_tokens: 990,
                     max_total_num_tokens: 1_000,
                     ..Default::default()
                 },
             ),
             (
                 &backup,
-                AggregateLoad {
-                    max_running_requests: 4,
-                    num_total_tokens: 10,
+                TestEngineLoad {
+                    num_tokens: 10,
                     max_total_num_tokens: 1_000,
                     ..Default::default()
                 },
             ),
             (
                 &fallback,
-                AggregateLoad {
-                    max_running_requests: 4,
-                    num_total_tokens: 10,
+                TestEngineLoad {
+                    num_tokens: 10,
                     max_total_num_tokens: 1_000,
                     ..Default::default()
                 },
@@ -1604,15 +1544,10 @@ mod tests {
     }
 
     #[test]
-    fn disabled_monitor_does_not_hard_reject_a_registry_healthy_primary() {
+    fn missing_engine_snapshot_does_not_hard_reject_a_registry_healthy_primary() {
         let primary = worker("primary");
         let workers = vec![Arc::clone(&primary)];
-        let snapshot = LoadMonitorSnapshot {
-            enabled: false,
-            version: 0,
-            captured_at: None,
-            workers: Vec::new(),
-        };
+        let snapshot = EngineLoadSnapshot::default();
 
         let decision = resolve_prefill(
             &CandidateRange::global(&workers),
@@ -1627,41 +1562,34 @@ mod tests {
     }
 
     #[test]
-    fn pressure_guard_uses_fresh_waiting_uncached_tokens_not_local_load() {
+    fn prefill_pair_keeps_primary_when_both_workers_fit_capacity() {
         let primary = worker("primary");
         let backup = worker("backup");
         let workers = vec![Arc::clone(&primary), Arc::clone(&backup)];
         let snapshot = snapshot(&[
             (
                 &primary,
-                AggregateLoad {
-                    num_waiting_uncached_tokens: 200,
-                    max_running_requests: 4,
+                TestEngineLoad {
+                    num_waiting_reqs: 200,
                     max_total_num_tokens: 1_000,
                     ..Default::default()
                 },
             ),
             (
                 &backup,
-                AggregateLoad {
-                    num_waiting_uncached_tokens: 20,
-                    max_running_requests: 4,
+                TestEngineLoad {
+                    num_waiting_reqs: 20,
                     max_total_num_tokens: 1_000,
                     ..Default::default()
                 },
             ),
         ]);
-        let proposal =
-            SelectionProposal::with_backup(primary, backup).with_guard_hints(GuardHints {
-                enable_pressure_guard: true,
-                pressure_abs_threshold_tokens: 100,
-                pressure_rel_threshold: 2.0,
-            });
+        let proposal = SelectionProposal::with_backup(primary, backup);
 
         let decision = resolve_prefill(&CandidateRange::global(&workers), &proposal, 80, &snapshot)
             .expect("both candidates fit capacity");
 
-        assert_eq!(decision.reason, DecisionReason::BackupPressureGuard);
+        assert_eq!(decision.reason, DecisionReason::Primary);
     }
 
     #[test]
@@ -1677,26 +1605,24 @@ mod tests {
         let snapshot = snapshot(&[
             (
                 &primary,
-                AggregateLoad {
+                TestEngineLoad {
                     num_running_reqs: 4,
-                    max_running_requests: 4,
+                    num_tokens: 990,
                     max_total_num_tokens: 1_000,
                     ..Default::default()
                 },
             ),
             (
                 &backup,
-                AggregateLoad {
-                    num_total_tokens: 990,
-                    max_running_requests: 4,
+                TestEngineLoad {
+                    num_tokens: 990,
                     max_total_num_tokens: 1_000,
                     ..Default::default()
                 },
             ),
             (
                 &fallback,
-                AggregateLoad {
-                    max_running_requests: 4,
+                TestEngineLoad {
                     max_total_num_tokens: 1_000,
                     ..Default::default()
                 },

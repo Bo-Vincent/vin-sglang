@@ -3,7 +3,6 @@
 
 use crate::config::{PolicyKind, SessionAffinityMode};
 use crate::discovery::{ModelId, WorkerMode};
-use crate::load_monitor::LoadMonitorSnapshot;
 use crate::policies::admission::{
     resolve_cache_candidates, resolve_decode, resolve_prefill, CandidateDomain, CandidateRange,
     DecisionReason,
@@ -69,8 +68,8 @@ fn prefill_policy_reason(
             (ProposalKind::SessionAffinity, DecisionReason::BackupPrimaryAdmission) => {
                 "session_admission_backup"
             }
-            (ProposalKind::SessionAffinity, DecisionReason::BackupPressureGuard) => {
-                "session_pressure_backup"
+            (ProposalKind::SessionAffinity, DecisionReason::BackupLoadComparison) => {
+                "session_load_backup"
             }
             (ProposalKind::SessionAffinity, DecisionReason::RangeFallback) => {
                 "session_range_fallback"
@@ -86,14 +85,14 @@ fn prefill_policy_reason(
             | (ProposalKind::CacheAffinity, DecisionReason::Primary) => "cache_candidate",
             (_, DecisionReason::Primary) => "no_cache_candidate",
             (_, DecisionReason::BackupPrimaryAdmission) => "no_cache_candidate_admission_backup",
-            (_, DecisionReason::BackupPressureGuard) => "no_cache_candidate_pressure_backup",
+            (_, DecisionReason::BackupLoadComparison) => "no_cache_candidate_load_backup",
             (_, DecisionReason::RangeFallback) => "no_cache_candidate_range_fallback",
         },
         _ => match decision {
             DecisionReason::Primary => "primary",
             DecisionReason::CacheCandidate => "cache_candidate",
             DecisionReason::BackupPrimaryAdmission => "admission_backup",
-            DecisionReason::BackupPressureGuard => "pressure_backup",
+            DecisionReason::BackupLoadComparison => "load_backup",
             DecisionReason::RangeFallback => "range_fallback",
         },
     }
@@ -288,13 +287,9 @@ pub async fn chat_completions(
         .map(|tokens| tokens.ids.len().max(1))
         .unwrap_or_else(|| estimate_prefill_tokens(&body));
     let request_input_tokens = prefill_load as u64;
-    // Shared Prefill Admission uses one immutable snapshot per request.
-    let prefill_snapshot_captured = policy.uses_shared_prefill_admission();
-    let load_snapshot = if prefill_snapshot_captured {
-        ctx.load_monitor.snapshot()
-    } else {
-        empty_load_snapshot()
-    };
+    // 每个请求仅捕获一次；Prefill、Cache、Session 与 Decode 都消费同一视图。
+    // 缺失/过期/DP 不完整的 Worker 已在捕获时省略，消费者回退本地 active-load。
+    let load_snapshot = ctx.engine_load.capture_snapshot(std::time::Instant::now());
     let (ttft_slo_ms, tps_slo) = if ctx.bucket_selector.is_enabled() {
         (
             parse_optional_positive_u64_header(&headers, &X_SGL_TTFT_SLO_MS, "TTFT SLO")?,
@@ -519,9 +514,6 @@ pub async fn chat_completions(
     // decode peer (`NoDecodeWorkersAvailable`) bubble up as 503 so
     // operators can alert on prefill-vs-decode pool imbalance.
     let decode_peer: Option<Arc<Worker>> = if worker.mode() == WorkerMode::Prefill {
-        let decode_snapshot_storage =
-            (!prefill_snapshot_captured).then(|| ctx.load_monitor.snapshot());
-        let decode_load_snapshot = decode_snapshot_storage.as_ref().unwrap_or(&load_snapshot);
         let decode_workers = resolver.decode_candidates(&model_id).map_err(|e| match e {
             PdResolveError::NoHealthyWorkers => ApiError::NoHealthyWorkers {
                 model: model_str.clone(),
@@ -549,7 +541,7 @@ pub async fn chat_completions(
             .iter()
             .find_map(|decode_domain| {
                 let decode_ctx = DecodeSelectionContext::new()
-                    .with_load_snapshot(decode_load_snapshot)
+                    .with_load_snapshot(&load_snapshot)
                     .with_prefill_url(&worker.url);
                 let decode_policy = build_decode_policy(ctx.config.model.decode_policy);
                 let decode_proposal = decode_policy.propose(decode_domain, &decode_ctx)?;
@@ -557,7 +549,7 @@ pub async fn chat_completions(
                     decode_domain,
                     &decode_proposal,
                     request_kv_tokens,
-                    decode_load_snapshot,
+                    &load_snapshot,
                 )?;
                 tracing::debug!(
                     model = %model_str,
@@ -1054,14 +1046,6 @@ fn should_tokenize_request(
     has_chat_encoder || policy_needs_request_tokens || bucket_enabled
 }
 
-fn empty_load_snapshot() -> LoadMonitorSnapshot {
-    LoadMonitorSnapshot {
-        enabled: false,
-        version: 0,
-        captured_at: None,
-        workers: Vec::new(),
-    }
-}
 /// Estimate prefill-token count from the raw request body for use as
 /// the active-load `prefill_load` counter. Returns 1 at minimum so
 /// a registered request always shows up as "load > 0" — under-counting
@@ -1437,11 +1421,11 @@ mod tests {
             prefill_policy_reason(
                 PolicyKind::SessionAware,
                 ProposalKind::SessionAffinity,
-                DecisionReason::BackupPressureGuard,
+                DecisionReason::BackupLoadComparison,
                 true,
                 true,
             ),
-            "session_pressure_backup"
+            "session_load_backup"
         );
     }
 

@@ -1,14 +1,14 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Session-Aware Prefill policy。Guard 逃逸不会改写 session assignment。
+//! Session-Aware Prefill policy。最终 admission 不会改写 session assignment。
 
-use crate::config::{AffinityConfig, AffinityMode, SessionAffinityMode};
+use crate::config::{AffinityConfig, SessionAffinityMode};
 use crate::discovery::WorkerId;
 use crate::policies::active_load::{spawn_sweeper, Clock, JanitorHandle, SystemTimeClock};
 use crate::policies::admission::compare_prefill_pressure;
 use crate::policies::power_of_two::PowerOfTwoChoicesPolicy;
-use crate::policies::{GuardHints, Policy, ProposalKind, SelectionContext, SelectionProposal};
+use crate::policies::{Policy, ProposalKind, SelectionContext, SelectionProposal};
 use crate::workers::Worker;
 use dashmap::DashMap;
 use rand::Rng;
@@ -139,14 +139,7 @@ impl SessionAwarePolicy {
             Some(backup) => SelectionProposal::with_backup(primary, backup),
             None => SelectionProposal::primary(primary),
         };
-        proposal
-            .with_kind(ProposalKind::SessionAffinity)
-            .with_guard_hints(GuardHints {
-                enable_pressure_guard: self.config.pressure_guard
-                    && self.config.mode == AffinityMode::Soft,
-                pressure_abs_threshold_tokens: self.config.pressure_abs_threshold_tokens,
-                pressure_rel_threshold: self.config.pressure_rel_threshold,
-            })
+        proposal.with_kind(ProposalKind::SessionAffinity)
     }
 }
 

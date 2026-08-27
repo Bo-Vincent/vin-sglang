@@ -1,5 +1,8 @@
 # Router v2 执行计划
 
+> **历史计划。** `vin/rust-v4` 已改为 #34608 ZMQ Engine Load 协议；本文的
+> LoadMonitor 假设仅供追溯，不可作为当前实现或验证依据。
+
 日期：2026-08-04
 状态：历史计划；原始 Rust 验证和 8xL20 E2E PoC 结果见 `router-v2-e2e-poc-report.md`。
 Cache-Aware 的后续替换计划以

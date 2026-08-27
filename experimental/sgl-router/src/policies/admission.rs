@@ -1,18 +1,23 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Prefill / Decode 共享 Admission 与 Guard。
+//! Prefill / Decode 共享准入与候选比较。
 //!
-//! Pair proposal 先做容量检查再执行 Guard；Cache-Aware 候选走有界比较。
+//! 这里的外部负载只来自 #34608 发布的 `LoadStat`：运行请求数、等待请求数、
+//! 已用 KV tokens 与 KV 容量。旧 LoadMonitor 的未缓存 token、最大并发、时延和
+//! Decode 子队列都不可由该 wire 推导，因此不会参与准入或 guard。
 
-use crate::load_monitor::{AggregateLoad, Freshness, LoadMonitorSnapshot};
-use crate::policies::{CacheCandidate, CacheCandidateProposal, GuardHints, SelectionProposal};
+use crate::policies::engine_load::{EngineLoadSnapshot, EngineWorkerLoad};
+use crate::policies::{CacheCandidate, CacheCandidateProposal, SelectionProposal};
 use crate::workers::Worker;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-/// Prefill policy 的候选域及其容量上限。
+/// Prefill policy 的候选域及其配置化排队预算。
+///
+/// `max_pending_prefill_tokens` 仍保留在 Bucket 契约中，但 Engine LoadStat
+/// 没有等待 token 数，不能与它进行单位一致的比较。
 pub struct CandidateRange<'a> {
     pub id: &'a str,
     pub workers: &'a [Arc<Worker>],
@@ -85,7 +90,6 @@ impl CandidateDomain {
         }
     }
 
-    /// 将统一 Domain 投影为 Prefill Admission 使用的借用视图。
     pub fn prefill_range(&self) -> Option<CandidateRange<'_>> {
         (self.stage == RoutingStage::Prefill).then(|| CandidateRange {
             id: self.id.as_str(),
@@ -95,22 +99,32 @@ impl CandidateDomain {
     }
 }
 
-/// 最终 worker 的选择原因。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DecisionReason {
     Primary,
     CacheCandidate,
     BackupPrimaryAdmission,
-    BackupPressureGuard,
+    /// 两个 Decode 候选都通过容量准入时，由 #34608 负载比较选择 backup。
+    BackupLoadComparison,
     RangeFallback,
 }
 
-/// Resolve Cache-Aware candidates inside one margin above the admitted
-/// minimum-work floor. The winner is final; `None` starts no-hit fallback.
+#[derive(Clone)]
+pub struct FinalDecision {
+    pub selected: Arc<Worker>,
+    pub primary: Arc<Worker>,
+    pub backup: Option<Arc<Worker>>,
+    pub reason: DecisionReason,
+    pub candidate_range_id: String,
+    pub load_snapshot_version: u64,
+}
+
+/// 从有界 Cache 候选中选择最终 Worker。缓存收益仍以 token 数比较；当收益相同
+/// 时，仅以 #34608 的等待请求数、运行请求数和 KV 使用率打破平局。
 pub fn resolve_cache_candidates(
     proposal: &CacheCandidateProposal,
     request_input_tokens: u64,
-    snapshot: &LoadMonitorSnapshot,
+    snapshot: &EngineLoadSnapshot,
 ) -> Option<FinalDecision> {
     let loads = FreshLoadLookup::new(
         Some(snapshot),
@@ -133,10 +147,9 @@ pub fn resolve_cache_candidates(
         .saturating_add(proposal.cache_switch_margin_tokens);
     let mut winner = work_floor;
     for candidate in admitted {
-        if candidate.uncached_tokens > near_tie_ceiling {
-            continue;
-        }
-        if compare_cache_candidates(winner, candidate, proposal, &loads).is_gt() {
+        if candidate.uncached_tokens <= near_tie_ceiling
+            && compare_cache_candidates(winner, candidate, &loads).is_gt()
+        {
             winner = candidate;
         }
     }
@@ -150,23 +163,11 @@ pub fn resolve_cache_candidates(
     })
 }
 
-/// Admission / Guard 的最终结果。
-#[derive(Clone)]
-pub struct FinalDecision {
-    pub selected: Arc<Worker>,
-    pub primary: Arc<Worker>,
-    pub backup: Option<Arc<Worker>>,
-    pub reason: DecisionReason,
-    pub candidate_range_id: String,
-    pub load_snapshot_version: u64,
-}
-
-/// 解析 Prefill proposal。缺少 fresh LoadMonitor 数据时退化为 registry 健康结果。
 pub fn resolve_prefill(
     range: &CandidateRange<'_>,
     proposal: &SelectionProposal,
     request_input_tokens: u64,
-    snapshot: &LoadMonitorSnapshot,
+    snapshot: &EngineLoadSnapshot,
 ) -> Option<FinalDecision> {
     if !contains_worker(range, &proposal.primary) {
         return None;
@@ -177,30 +178,17 @@ pub fn resolve_prefill(
         .filter(|worker| contains_worker(range, worker))
         .cloned();
     let primary_admitted = is_proposal_worker_eligible(proposal, &proposal.primary)
-        && is_admitted(range, &proposal.primary, request_input_tokens, snapshot);
+        && is_prefill_admitted(&proposal.primary, request_input_tokens, snapshot);
     let backup_admitted = backup.as_ref().is_some_and(|worker| {
         is_proposal_worker_eligible(proposal, worker)
-            && is_admitted(range, worker, request_input_tokens, snapshot)
+            && is_prefill_admitted(worker, request_input_tokens, snapshot)
     });
 
     let (selected, reason) = match (primary_admitted, backup.as_ref(), backup_admitted) {
-        (true, Some(backup), true) => {
-            if pressure_guard_prefers_backup(
-                &proposal.primary,
-                backup,
-                &proposal.guard_hints,
-                snapshot,
-            ) {
-                (Arc::clone(backup), DecisionReason::BackupPressureGuard)
-            } else {
-                (Arc::clone(&proposal.primary), DecisionReason::Primary)
-            }
-        }
         (true, _, _) => (Arc::clone(&proposal.primary), DecisionReason::Primary),
         (false, Some(backup), true) => (Arc::clone(backup), DecisionReason::BackupPrimaryAdmission),
         _ => range_fallback(range, proposal, request_input_tokens, snapshot)?,
     };
-
     Some(FinalDecision {
         selected,
         primary: Arc::clone(&proposal.primary),
@@ -211,12 +199,11 @@ pub fn resolve_prefill(
     })
 }
 
-/// 解析 Decode proposal。缺少 fresh snapshot 时不做容量拒绝。
 pub fn resolve_decode(
     domain: &CandidateDomain,
     proposal: &SelectionProposal,
     request_kv_tokens: u64,
-    snapshot: &LoadMonitorSnapshot,
+    snapshot: &EngineLoadSnapshot,
 ) -> Option<FinalDecision> {
     if domain.stage != RoutingStage::Decode || !contains_domain_worker(domain, &proposal.primary) {
         return None;
@@ -230,11 +217,10 @@ pub fn resolve_decode(
     let backup_admitted = backup
         .as_ref()
         .is_some_and(|worker| is_decode_admitted(worker, request_kv_tokens, snapshot));
-
     let (selected, reason) = match (primary_admitted, backup.as_ref(), backup_admitted) {
         (true, Some(backup), true) => {
             if compare_decode_pressure(&proposal.primary, backup, Some(snapshot)).is_gt() {
-                (Arc::clone(backup), DecisionReason::BackupPressureGuard)
+                (Arc::clone(backup), DecisionReason::BackupLoadComparison)
             } else {
                 (Arc::clone(&proposal.primary), DecisionReason::Primary)
             }
@@ -243,7 +229,6 @@ pub fn resolve_decode(
         (false, Some(backup), true) => (Arc::clone(backup), DecisionReason::BackupPrimaryAdmission),
         _ => decode_domain_fallback(domain, request_kv_tokens, snapshot)?,
     };
-
     Some(FinalDecision {
         selected,
         primary: Arc::clone(&proposal.primary),
@@ -272,49 +257,32 @@ fn is_proposal_worker_eligible(proposal: &SelectionProposal, candidate: &Arc<Wor
         .is_none_or(|workers| workers.iter().any(|worker| worker.id == candidate.id))
 }
 
-/// 只有 fresh engine snapshot 参与容量判断。
-fn is_admitted(
-    range: &CandidateRange<'_>,
-    worker: &Arc<Worker>,
-    request_input_tokens: u64,
-    snapshot: &LoadMonitorSnapshot,
-) -> bool {
-    let load = snapshot.fresh_load(&worker.id);
-    is_prefill_admitted_with_load(range, request_input_tokens, load.as_ref())
-}
-
-fn is_prefill_admitted_with_load(
-    range: &CandidateRange<'_>,
-    request_input_tokens: u64,
-    load: Option<&AggregateLoad>,
-) -> bool {
+/// LoadStat 只在 `max_total_num_tokens > 0` 时提供可信容量上限。
+fn has_kv_capacity(load: Option<&EngineWorkerLoad>, requested_tokens: u64) -> bool {
     let Some(load) = load else {
         return true;
     };
-    load.num_running_reqs.saturating_add(1) <= load.max_running_requests
-        && load.num_total_tokens.saturating_add(request_input_tokens) <= load.max_total_num_tokens
-        && range.max_pending_prefill_tokens.is_none_or(|limit| {
-            load.num_waiting_uncached_tokens
-                .saturating_add(request_input_tokens)
-                <= limit
-        })
+    load.max_total_num_tokens == 0
+        || load.num_tokens.saturating_add(requested_tokens) <= load.max_total_num_tokens
+}
+
+fn is_prefill_admitted(
+    worker: &Arc<Worker>,
+    request_input_tokens: u64,
+    snapshot: &EngineLoadSnapshot,
+) -> bool {
+    has_kv_capacity(
+        snapshot.fresh_load_for_url(&worker.url),
+        request_input_tokens,
+    )
 }
 
 fn is_decode_admitted(
     worker: &Arc<Worker>,
     request_kv_tokens: u64,
-    snapshot: &LoadMonitorSnapshot,
+    snapshot: &EngineLoadSnapshot,
 ) -> bool {
-    let load = snapshot.fresh_load(&worker.id);
-    is_decode_admitted_with_load(request_kv_tokens, load.as_ref())
-}
-
-fn is_decode_admitted_with_load(request_kv_tokens: u64, load: Option<&AggregateLoad>) -> bool {
-    let Some(load) = load else {
-        return true;
-    };
-    load.num_running_reqs.saturating_add(1) <= load.max_running_requests
-        && load.num_total_tokens.saturating_add(request_kv_tokens) <= load.max_total_num_tokens
+    has_kv_capacity(snapshot.fresh_load_for_url(&worker.url), request_kv_tokens)
 }
 
 fn is_cache_candidate_admitted(
@@ -322,134 +290,71 @@ fn is_cache_candidate_admitted(
     request_input_tokens: u64,
     loads: &FreshLoadLookup<'_>,
 ) -> bool {
-    let Some(load) = loads.get(&candidate.worker.id) else {
-        return true;
-    };
-    load.num_running_reqs.saturating_add(1) <= load.max_running_requests
-        && load.num_total_tokens.saturating_add(request_input_tokens) <= load.max_total_num_tokens
-        && candidate.max_pending_prefill_tokens.is_none_or(|limit| {
-            load.num_waiting_uncached_tokens
-                .saturating_add(candidate.uncached_tokens)
-                <= limit
-        })
+    has_kv_capacity(loads.get(&candidate.worker.id), request_input_tokens)
 }
 
-/// Compare admitted cache candidates. `Less` means `left` is preferred.
 fn compare_cache_candidates(
     left: &CacheCandidate,
     right: &CacheCandidate,
-    proposal: &CacheCandidateProposal,
     loads: &FreshLoadLookup<'_>,
 ) -> Ordering {
-    let work_delta = left.uncached_tokens.abs_diff(right.uncached_tokens);
-    if work_delta > proposal.cache_switch_margin_tokens {
-        return left
-            .uncached_tokens
-            .cmp(&right.uncached_tokens)
-            .then_with(|| loads.compare_prefill_pressure(&left.worker, &right.worker))
-            .then_with(|| left.worker.id.0.cmp(&right.worker.id.0));
-    }
-
-    // Pressure can overturn cache benefit only inside the near-tie margin.
-    if materially_more_pressured(
-        &left.worker,
-        &right.worker,
-        proposal.pressure_abs_threshold_tokens,
-        proposal.pressure_rel_threshold,
-        loads,
-    ) {
-        return Ordering::Greater;
-    }
-    if materially_more_pressured(
-        &right.worker,
-        &left.worker,
-        proposal.pressure_abs_threshold_tokens,
-        proposal.pressure_rel_threshold,
-        loads,
-    ) {
-        return Ordering::Less;
-    }
-
     left.uncached_tokens
         .cmp(&right.uncached_tokens)
         .then_with(|| loads.compare_prefill_pressure(&left.worker, &right.worker))
         .then_with(|| left.worker.id.0.cmp(&right.worker.id.0))
 }
 
-fn materially_more_pressured(
-    candidate: &Arc<Worker>,
-    other: &Arc<Worker>,
-    absolute_threshold: u64,
-    relative_threshold: f64,
-    loads: &FreshLoadLookup<'_>,
-) -> bool {
-    let (Some(candidate_load), Some(other_load)) = (
-        loads.comparable_get(&candidate.id),
-        loads.comparable_get(&other.id),
-    ) else {
-        return false;
-    };
-    let candidate_pressure = candidate_load.num_waiting_uncached_tokens;
-    let other_pressure = other_load.num_waiting_uncached_tokens;
-    candidate_pressure.saturating_sub(other_pressure) > absolute_threshold
-        && candidate_pressure as f64 > other_pressure as f64 * relative_threshold
-}
-
-/// Request-local O(1) lookup for fresh LoadMonitor and captured local load.
+/// 请求内 O(1) 视图。仅在候选集合的所有 Worker 都拥有同一次捕获的外部
+/// 快照时比较外部数值；混合集保持本地 active-load 排序，从而保证传递性。
 pub(crate) struct FreshLoadLookup<'a> {
-    by_worker_id: HashMap<&'a str, &'a AggregateLoad>,
+    by_worker_id: HashMap<String, &'a EngineWorkerLoad>,
     local_active_by_worker_id: HashMap<String, usize>,
-    compare_aggregate: bool,
+    compare_engine: bool,
 }
 
 impl<'a> FreshLoadLookup<'a> {
     pub(crate) fn new<'w>(
-        snapshot: Option<&'a LoadMonitorSnapshot>,
+        snapshot: Option<&'a EngineLoadSnapshot>,
         workers: impl IntoIterator<Item = &'w Arc<Worker>>,
     ) -> Self {
-        // Snapshot atomics once so sort comparisons remain stable.
+        let workers: Vec<&Arc<Worker>> = workers.into_iter().collect();
         let local_active_by_worker_id: HashMap<String, usize> = workers
-            .into_iter()
+            .iter()
             .map(|worker| (worker.id.0.clone(), worker.active_load()))
             .collect();
-        let by_worker_id: HashMap<&'a str, &'a AggregateLoad> = snapshot
+        let by_worker_id = snapshot
             .into_iter()
-            .flat_map(|snapshot| snapshot.workers.iter())
-            .filter(|worker| {
-                worker.freshness == Freshness::Fresh
-                    && local_active_by_worker_id.contains_key(worker.worker_id.as_str())
+            .flat_map(|snapshot| {
+                workers.iter().filter_map(move |worker| {
+                    snapshot
+                        .fresh_load_for_url(&worker.url)
+                        .map(|load| (worker.id.0.clone(), load))
+                })
             })
-            .filter_map(|worker| {
-                worker
-                    .aggregate
-                    .as_ref()
-                    .map(|aggregate| (worker.worker_id.as_str(), aggregate))
-            })
-            .collect();
-        // Mixed fresh/stale sets use local load only to preserve transitivity.
-        let compare_aggregate = !local_active_by_worker_id.is_empty()
+            .collect::<HashMap<_, _>>();
+        let compare_engine = !local_active_by_worker_id.is_empty()
             && by_worker_id.len() == local_active_by_worker_id.len();
         Self {
             by_worker_id,
             local_active_by_worker_id,
-            compare_aggregate,
+            compare_engine,
         }
     }
 
-    pub(crate) fn get(&self, worker_id: &crate::discovery::WorkerId) -> Option<&'a AggregateLoad> {
+    pub(crate) fn get(
+        &self,
+        worker_id: &crate::discovery::WorkerId,
+    ) -> Option<&'a EngineWorkerLoad> {
         self.by_worker_id.get(worker_id.0.as_str()).copied()
     }
 
-    fn comparable_get(&self, worker_id: &crate::discovery::WorkerId) -> Option<&'a AggregateLoad> {
-        if self.compare_aggregate {
-            self.get(worker_id)
-        } else {
-            None
-        }
+    fn comparable_get(
+        &self,
+        worker_id: &crate::discovery::WorkerId,
+    ) -> Option<&'a EngineWorkerLoad> {
+        self.compare_engine.then(|| self.get(worker_id)).flatten()
     }
 
-    /// Both inputs are a pure function of the worker id, so resolving once per
-    /// candidate is equivalent to resolving inside every comparison.
     fn pressure_key(&self, worker: &Arc<Worker>) -> PressureKey<'a> {
         PressureKey {
             load: self.comparable_get(&worker.id),
@@ -463,8 +368,8 @@ impl<'a> FreshLoadLookup<'a> {
 
     fn compare_prefill_keys(&self, left: &PressureKey<'a>, right: &PressureKey<'a>) -> Ordering {
         match (left.load, right.load) {
-            (Some(left_load), Some(right_load)) => load_pressure_key(left_load)
-                .cmp(&load_pressure_key(right_load))
+            (Some(left_load), Some(right_load)) => prefill_pressure_key(left_load)
+                .cmp(&prefill_pressure_key(right_load))
                 .then_with(|| left.local_active.cmp(&right.local_active)),
             _ => left.local_active.cmp(&right.local_active),
         }
@@ -472,7 +377,7 @@ impl<'a> FreshLoadLookup<'a> {
 
     fn compare_decode_keys(&self, left: &PressureKey<'a>, right: &PressureKey<'a>) -> Ordering {
         match (left.load, right.load) {
-            (Some(left_load), Some(right_load)) => compare_decode_aggregate(left_load, right_load)
+            (Some(left_load), Some(right_load)) => compare_decode_load(left_load, right_load)
                 .then_with(|| left.local_active.cmp(&right.local_active)),
             _ => left.local_active.cmp(&right.local_active),
         }
@@ -486,31 +391,38 @@ impl<'a> FreshLoadLookup<'a> {
         self.compare_prefill_keys(&self.pressure_key(left), &self.pressure_key(right))
     }
 
-    /// Cheapest candidate under `compare`, resolving each candidate's inputs
-    /// exactly once. Ties keep the earlier candidate, matching `min_by`.
+    /// 为纯评分项提供与同一请求 admission 一致的队列深度：当候选集合完整
+    /// 覆盖在入口冻结的 Engine Load 快照中时，使用 `waiting + running`；否则
+    /// 整个集合一致回退到 Router 本地 active-load，避免部分新旧视图混排。
+    pub(crate) fn score_load(&self, worker: &Arc<Worker>) -> usize {
+        self.comparable_get(&worker.id)
+            .map(|load| {
+                load.num_waiting_reqs
+                    .saturating_add(load.num_running_reqs)
+                    .try_into()
+                    .unwrap_or(usize::MAX)
+            })
+            .unwrap_or_else(|| {
+                self.local_active_by_worker_id
+                    .get(worker.id.0.as_str())
+                    .copied()
+                    .unwrap_or(usize::MAX)
+            })
+    }
+
     fn min_by_pressure_key(
         &self,
         candidates: Vec<Arc<Worker>>,
         compare: impl Fn(&Self, &PressureKey<'a>, &PressureKey<'a>) -> Ordering,
     ) -> Option<Arc<Worker>> {
         let mut candidates = candidates.into_iter();
-        let first = candidates.next()?;
-        let second = match candidates.next() {
-            Some(candidate) => candidate,
-            None => return Some(first),
-        };
-        let mut best_key = self.pressure_key(&first);
-        let mut best = first;
-        let second_key = self.pressure_key(&second);
-        if compare(self, &second_key, &best_key).is_lt() {
-            best_key = second_key;
-            best = second;
-        }
+        let mut best = candidates.next()?;
+        let mut best_key = self.pressure_key(&best);
         for candidate in candidates {
             let key = self.pressure_key(&candidate);
             if compare(self, &key, &best_key).is_lt() {
-                best_key = key;
                 best = candidate;
+                best_key = key;
             }
         }
         Some(best)
@@ -518,57 +430,28 @@ impl<'a> FreshLoadLookup<'a> {
 }
 
 struct PressureKey<'a> {
-    load: Option<&'a AggregateLoad>,
+    load: Option<&'a EngineWorkerLoad>,
     local_active: usize,
-}
-
-/// 两个候选都有 fresh snapshot 时才允许压力逃逸。
-fn pressure_guard_prefers_backup(
-    primary: &Arc<Worker>,
-    backup: &Arc<Worker>,
-    hints: &GuardHints,
-    snapshot: &LoadMonitorSnapshot,
-) -> bool {
-    if !hints.enable_pressure_guard {
-        return false;
-    }
-    let (Some(primary_load), Some(backup_load)) = (
-        snapshot.fresh_load(&primary.id),
-        snapshot.fresh_load(&backup.id),
-    ) else {
-        return false;
-    };
-    let primary_pressure = primary_load.num_waiting_uncached_tokens;
-    let backup_pressure = backup_load.num_waiting_uncached_tokens;
-    primary_pressure.saturating_sub(backup_pressure) > hints.pressure_abs_threshold_tokens
-        && (primary_pressure as f64) > (backup_pressure as f64) * hints.pressure_rel_threshold
 }
 
 fn range_fallback(
     range: &CandidateRange<'_>,
     proposal: &SelectionProposal,
     request_input_tokens: u64,
-    snapshot: &LoadMonitorSnapshot,
+    snapshot: &EngineLoadSnapshot,
 ) -> Option<(Arc<Worker>, DecisionReason)> {
     let candidates = proposal
         .eligible_workers
         .as_deref()
         .unwrap_or(range.workers);
-    let admission_loads = FreshLoadLookup::new(Some(snapshot), candidates.iter());
-    let admitted: Vec<Arc<Worker>> = candidates
+    let admitted = candidates
         .iter()
         .filter(|worker| contains_worker(range, worker))
-        .filter(|worker| {
-            is_prefill_admitted_with_load(
-                range,
-                request_input_tokens,
-                admission_loads.get(&worker.id),
-            )
-        })
+        .filter(|worker| is_prefill_admitted(worker, request_input_tokens, snapshot))
         .cloned()
-        .collect();
-    let comparison_loads = FreshLoadLookup::new(Some(snapshot), admitted.iter());
-    comparison_loads
+        .collect::<Vec<_>>();
+    let loads = FreshLoadLookup::new(Some(snapshot), admitted.iter());
+    loads
         .min_by_pressure_key(admitted, FreshLoadLookup::compare_prefill_keys)
         .map(|worker| (worker, DecisionReason::RangeFallback))
 }
@@ -576,90 +459,85 @@ fn range_fallback(
 fn decode_domain_fallback(
     domain: &CandidateDomain,
     request_kv_tokens: u64,
-    snapshot: &LoadMonitorSnapshot,
+    snapshot: &EngineLoadSnapshot,
 ) -> Option<(Arc<Worker>, DecisionReason)> {
-    let admission_loads = FreshLoadLookup::new(Some(snapshot), domain.workers.iter());
-    let admitted: Vec<Arc<Worker>> = domain
+    let admitted = domain
         .workers
         .iter()
-        .filter(|worker| {
-            is_decode_admitted_with_load(request_kv_tokens, admission_loads.get(&worker.id))
-        })
+        .filter(|worker| is_decode_admitted(worker, request_kv_tokens, snapshot))
         .cloned()
-        .collect();
-    let comparison_loads = FreshLoadLookup::new(Some(snapshot), admitted.iter());
-    comparison_loads
+        .collect::<Vec<_>>();
+    let loads = FreshLoadLookup::new(Some(snapshot), admitted.iter());
+    loads
         .min_by_pressure_key(admitted, FreshLoadLookup::compare_decode_keys)
         .map(|worker| (worker, DecisionReason::RangeFallback))
 }
 
-/// 比较 Prefill 压力；任一 fresh report 缺失时退化为本地 active-load。
+/// Prefill 的真实外部比较顺序：等待请求、运行请求、KV 使用率。
 pub(crate) fn compare_prefill_pressure(
     left: &Arc<Worker>,
     right: &Arc<Worker>,
-    snapshot: Option<&LoadMonitorSnapshot>,
+    snapshot: Option<&EngineLoadSnapshot>,
 ) -> Ordering {
     match snapshot.and_then(|snapshot| {
         Some((
-            snapshot.fresh_load(&left.id)?,
-            snapshot.fresh_load(&right.id)?,
+            snapshot.fresh_load_for_url(&left.url)?,
+            snapshot.fresh_load_for_url(&right.url)?,
         ))
     }) {
-        Some((left_load, right_load)) => load_pressure_key(&left_load)
-            .cmp(&load_pressure_key(&right_load))
-            .then_with(|| left.active_load().cmp(&right.active_load())),
-        _ => left.active_load().cmp(&right.active_load()),
-    }
-}
-
-fn load_pressure_key(load: &AggregateLoad) -> (u64, u64, u64) {
-    (
-        load.num_waiting_uncached_tokens,
-        load.num_waiting_reqs,
-        load.num_running_reqs,
-    )
-}
-
-/// 比较 Decode running/KV 占用比例，最后使用本地 active-load。
-pub(crate) fn compare_decode_pressure(
-    left: &Arc<Worker>,
-    right: &Arc<Worker>,
-    snapshot: Option<&LoadMonitorSnapshot>,
-) -> Ordering {
-    match snapshot.and_then(|snapshot| {
-        Some((
-            snapshot.fresh_load(&left.id)?,
-            snapshot.fresh_load(&right.id)?,
-        ))
-    }) {
-        Some((left_load, right_load)) => compare_decode_aggregate(&left_load, &right_load)
+        Some((left_load, right_load)) => prefill_pressure_key(left_load)
+            .cmp(&prefill_pressure_key(right_load))
             .then_with(|| left.active_load().cmp(&right.active_load())),
         None => left.active_load().cmp(&right.active_load()),
     }
 }
 
-fn compare_decode_aggregate(left: &AggregateLoad, right: &AggregateLoad) -> Ordering {
-    let left_running =
-        u128::from(left.num_running_reqs).saturating_mul(u128::from(right.max_running_requests));
-    let right_running =
-        u128::from(right.num_running_reqs).saturating_mul(u128::from(left.max_running_requests));
-    let left_kv =
-        u128::from(left.num_total_tokens).saturating_mul(u128::from(right.max_total_num_tokens));
-    let right_kv =
-        u128::from(right.num_total_tokens).saturating_mul(u128::from(left.max_total_num_tokens));
-    left_running
-        .cmp(&right_running)
-        .then_with(|| left_kv.cmp(&right_kv))
+fn prefill_pressure_key(load: &EngineWorkerLoad) -> (u64, u64, u64, u64) {
+    (
+        load.num_waiting_reqs,
+        load.num_running_reqs,
+        load.num_tokens,
+        load.max_total_num_tokens,
+    )
+}
+
+/// Decode 比较也只使用 LoadStat。容量未知时不把 0 当作真实容量。
+pub(crate) fn compare_decode_pressure(
+    left: &Arc<Worker>,
+    right: &Arc<Worker>,
+    snapshot: Option<&EngineLoadSnapshot>,
+) -> Ordering {
+    match snapshot.and_then(|snapshot| {
+        Some((
+            snapshot.fresh_load_for_url(&left.url)?,
+            snapshot.fresh_load_for_url(&right.url)?,
+        ))
+    }) {
+        Some((left_load, right_load)) => compare_decode_load(left_load, right_load)
+            .then_with(|| left.active_load().cmp(&right.active_load())),
+        None => left.active_load().cmp(&right.active_load()),
+    }
+}
+
+fn compare_decode_load(left: &EngineWorkerLoad, right: &EngineWorkerLoad) -> Ordering {
+    let kv_usage = match (left.max_total_num_tokens, right.max_total_num_tokens) {
+        (left_cap, right_cap) if left_cap > 0 && right_cap > 0 => u128::from(left.num_tokens)
+            .saturating_mul(u128::from(right_cap))
+            .cmp(&u128::from(right.num_tokens).saturating_mul(u128::from(left_cap))),
+        _ => Ordering::Equal,
+    };
+    left.num_waiting_reqs
+        .cmp(&right.num_waiting_reqs)
         .then_with(|| left.num_running_reqs.cmp(&right.num_running_reqs))
-        .then_with(|| left.num_total_tokens.cmp(&right.num_total_tokens))
+        .then(kv_usage)
+        .then_with(|| left.num_tokens.cmp(&right.num_tokens))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
-    use crate::load_monitor::WorkerSnapshot;
-    use crate::policies::SelectionProposal;
+    use std::time::Instant;
 
     fn worker(id: &str) -> Arc<Worker> {
         Arc::new(Worker::new(WorkerSpec {
@@ -671,107 +549,64 @@ mod tests {
         }))
     }
 
-    fn load(waiting_tokens: u64, running_requests: u64) -> AggregateLoad {
-        AggregateLoad {
-            num_running_reqs: running_requests,
-            num_waiting_uncached_tokens: waiting_tokens,
-            num_total_tokens: 1_024 + running_requests,
-            max_total_num_tokens: 8_192,
-            max_running_requests: 64,
-            ..Default::default()
-        }
-    }
-
-    fn snapshot(entries: &[(&Arc<Worker>, AggregateLoad)]) -> LoadMonitorSnapshot {
-        LoadMonitorSnapshot {
-            enabled: true,
-            version: 1,
-            captured_at: None,
-            workers: entries
+    fn snapshot(entries: &[(&Arc<Worker>, u64, u64, u64, u64)]) -> EngineLoadSnapshot {
+        EngineLoadSnapshot::from_workers(
+            7,
+            entries
                 .iter()
-                .map(|(worker, aggregate)| WorkerSnapshot {
-                    worker_id: worker.id.0.clone(),
-                    url: worker.url.clone(),
-                    mode: worker.mode(),
-                    model_ids: worker
-                        .model_ids
-                        .iter()
-                        .map(|model| model.0.clone())
-                        .collect(),
-                    freshness: Freshness::Fresh,
-                    source_instance_id: None,
-                    sequence_id: None,
-                    report_time_unix_ms: None,
-                    last_error: None,
-                    received_at: None,
-                    expires_at: None,
-                    aggregate: Some(aggregate.clone()),
-                    ranks: Vec::new(),
+                .map(|(worker, running, waiting, used, capacity)| {
+                    (
+                        worker.url.clone(),
+                        EngineWorkerLoad {
+                            num_running_reqs: *running,
+                            num_waiting_reqs: *waiting,
+                            num_tokens: *used,
+                            max_total_num_tokens: *capacity,
+                            captured_at: Instant::now(),
+                        },
+                    )
                 })
                 .collect(),
-        }
+        )
     }
 
     #[test]
-    fn pressure_key_fold_keeps_prefill_decode_and_tie_order() {
-        let first = worker("first");
-        let best = worker("best");
-        let last = worker("last");
-        let loads = snapshot(&[
-            (&first, load(20, 3)),
-            (&best, load(10, 1)),
-            (&last, load(30, 2)),
-        ]);
-        let candidates = vec![Arc::clone(&first), Arc::clone(&best), Arc::clone(&last)];
-        let lookup = FreshLoadLookup::new(Some(&loads), candidates.iter());
+    fn capacity_rejects_only_when_the_published_capacity_is_exceeded() {
+        let full = worker("full");
+        let unknown = worker("unknown");
+        let workers = vec![Arc::clone(&full), Arc::clone(&unknown)];
+        let range = CandidateRange::global(&workers);
+        let loads = snapshot(&[(&full, 0, 0, 90, 100), (&unknown, 0, 0, 90, 0)]);
 
+        assert!(resolve_prefill(
+            &range,
+            &SelectionProposal::primary(Arc::clone(&full)),
+            20,
+            &loads
+        )
+        .is_some());
         assert_eq!(
-            lookup
-                .min_by_pressure_key(candidates.clone(), FreshLoadLookup::compare_prefill_keys)
-                .expect("non-empty candidates")
+            resolve_prefill(&range, &SelectionProposal::primary(full), 20, &loads)
+                .expect("fallback selects unknown-capacity worker")
+                .selected
                 .id,
-            best.id
-        );
-        assert_eq!(
-            lookup
-                .min_by_pressure_key(candidates, FreshLoadLookup::compare_decode_keys)
-                .expect("non-empty candidates")
-                .id,
-            best.id
-        );
-
-        let tied = vec![Arc::clone(&first), Arc::clone(&last)];
-        let tied_snapshot = snapshot(&[(&first, load(1, 1)), (&last, load(1, 1))]);
-        let tied_lookup = FreshLoadLookup::new(Some(&tied_snapshot), tied.iter());
-        assert_eq!(
-            tied_lookup
-                .min_by_pressure_key(tied, FreshLoadLookup::compare_prefill_keys)
-                .expect("non-empty candidates")
-                .id,
-            first.id
+            unknown.id
         );
     }
 
     #[test]
-    fn prefill_fallback_filters_capacity_before_ranking() {
+    fn prefill_pressure_uses_waiting_then_running_requests() {
         let busy = worker("busy");
-        let quick = worker("quick");
-        let roomy = worker("roomy");
-        let domain = CandidateDomain::bucket_prefill(
-            "bucket",
-            vec![Arc::clone(&busy), Arc::clone(&quick), Arc::clone(&roomy)],
-            Some(1_000),
-        );
-        let range = domain.prefill_range().expect("prefill domain");
-        let snapshot = snapshot(&[
-            (&busy, load(500, 1)),
-            (&quick, load(800, 1)),
-            (&roomy, load(10, 1)),
-        ]);
+        let idle = worker("idle");
+        let loads = snapshot(&[(&busy, 1, 8, 10, 100), (&idle, 9, 2, 90, 100)]);
+        assert!(compare_prefill_pressure(&busy, &idle, Some(&loads)).is_gt());
+    }
 
-        let decision = resolve_prefill(&range, &SelectionProposal::primary(busy), 900, &snapshot)
-            .expect("roomy remains admitted");
-        assert_eq!(decision.reason, DecisionReason::RangeFallback);
-        assert_eq!(decision.selected.id, roomy.id);
+    #[test]
+    fn missing_snapshot_uses_local_active_load() {
+        let left = worker("left");
+        let right = worker("right");
+        let _guard = left.load_guard();
+        assert!(compare_prefill_pressure(&left, &right, None).is_gt());
     }
 }

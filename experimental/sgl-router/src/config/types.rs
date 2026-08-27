@@ -1,5 +1,5 @@
 use serde::Deserialize;
-use std::num::{NonZeroU16, NonZeroU32};
+use std::num::NonZeroU32;
 
 /// In-memory router configuration, built from CLI flags by
 /// [`crate::config::cli::Cli::into_config`] and validated by
@@ -443,9 +443,6 @@ pub struct AffinityConfig {
     pub stable_pair: bool,
     pub mode: AffinityMode,
     pub session_affinity_mode: SessionAffinityMode,
-    pub pressure_guard: bool,
-    pub pressure_abs_threshold_tokens: u64,
-    pub pressure_rel_threshold: f64,
     pub cache_affinity_min_matched_tokens: Option<u64>,
     pub cache_affinity_min_match_ratio: Option<f64>,
     pub cache_candidate_min_workers: usize,
@@ -463,9 +460,6 @@ impl Default for AffinityConfig {
             stable_pair: false,
             mode: AffinityMode::Soft,
             session_affinity_mode: SessionAffinityMode::Bucket,
-            pressure_guard: true,
-            pressure_abs_threshold_tokens: 1_024,
-            pressure_rel_threshold: 1.5,
             // Indexer 会截断 prefix scan，默认使用绝对 token 下限。
             cache_affinity_min_matched_tokens: Some(1_024),
             cache_affinity_min_match_ratio: None,

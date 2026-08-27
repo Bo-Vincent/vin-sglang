@@ -6,12 +6,12 @@
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 use sgl_router::config::{BucketConfig, BucketSpec, BucketStage, SloBucketPolicy};
 use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
-use sgl_router::load_monitor::{AggregateLoad, Freshness, LoadMonitorSnapshot, WorkerSnapshot};
 use sgl_router::policies::admission::{resolve_decode, resolve_prefill, CandidateDomain};
 use sgl_router::policies::buckets::{BucketRequest, BucketSelector};
+use sgl_router::policies::engine_load::{EngineLoadSnapshot, EngineWorkerLoad};
 use sgl_router::policies::SelectionProposal;
 use sgl_router::workers::Worker;
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc, time::Instant};
 
 const FLEET: usize = 64;
 
@@ -29,42 +29,27 @@ fn workers(count: usize) -> Vec<Arc<Worker>> {
     (0..count).map(worker).collect()
 }
 
-fn snapshot(workers: &[Arc<Worker>]) -> LoadMonitorSnapshot {
-    LoadMonitorSnapshot {
-        enabled: true,
-        version: 1,
-        captured_at: None,
-        workers: workers
+fn snapshot(workers: &[Arc<Worker>]) -> EngineLoadSnapshot {
+    let captured_at = Instant::now();
+    EngineLoadSnapshot::from_workers(
+        1,
+        workers
             .iter()
             .enumerate()
-            .map(|(index, worker)| WorkerSnapshot {
-                worker_id: worker.id.0.clone(),
-                url: worker.url.clone(),
-                mode: worker.mode(),
-                model_ids: worker
-                    .model_ids
-                    .iter()
-                    .map(|model| model.0.clone())
-                    .collect(),
-                freshness: Freshness::Fresh,
-                source_instance_id: None,
-                sequence_id: None,
-                report_time_unix_ms: None,
-                last_error: None,
-                received_at: None,
-                expires_at: None,
-                aggregate: Some(AggregateLoad {
-                    num_running_reqs: if index == 0 { 64 } else { index as u64 % 8 },
-                    num_waiting_uncached_tokens: index as u64 * 64,
-                    num_total_tokens: 1_024 + index as u64,
-                    max_total_num_tokens: 262_144,
-                    max_running_requests: 64,
-                    ..Default::default()
-                }),
-                ranks: Vec::new(),
+            .map(|(index, worker)| {
+                (
+                    worker.url.clone(),
+                    EngineWorkerLoad {
+                        num_running_reqs: if index == 0 { 64 } else { index as u64 % 8 },
+                        num_waiting_reqs: index as u64 % 16,
+                        num_tokens: 1_024 + index as u64,
+                        max_total_num_tokens: 262_144,
+                        captured_at,
+                    },
+                )
             })
-            .collect(),
-    }
+            .collect::<HashMap<_, _>>(),
+    )
 }
 
 fn bench_admission_fallback(c: &mut Criterion) {

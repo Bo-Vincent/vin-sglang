@@ -3,30 +3,21 @@
 
 //! Router-only pressure-path microbenchmark.
 //!
-//! The fixture is populated through the public load-reporting gRPC contract,
-//! so snapshot capture measures the same store representation used by
-//! production. Policy-only cases reuse one captured snapshot; `request_path`
-//! cases include a fresh snapshot capture on every decision.
-
-#![allow(unexpected_cfgs)]
+//! The fixture constructs the same #34608 engine-load table that the ZMQ load
+//! subscriber fills in production. Policy-only cases reuse one captured
+//! snapshot; `request_path` cases include a fresh snapshot capture on every
+//! decision.
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use sgl_kv_indexer::{PrefixMatch, PrefixOutcome};
-use sgl_router::config::{AffinityConfig, LoadMonitorConfig};
+use sgl_router::config::AffinityConfig;
 use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
-use sgl_router::load_monitor::proto::load_monitor_service_server::{
-    LoadMonitorService, LoadMonitorServiceServer,
-};
-use sgl_router::load_monitor::proto::{
-    router_frame, worker_frame, LoadReport, RankLoad, RegisterResponse, ReportStatus, RouterFrame,
-    Worker as ReportWorker, WorkerFrame, WorkerType,
-};
-use sgl_router::load_monitor::{Freshness, LoadMonitor, LoadMonitorSnapshot};
 use sgl_router::policies::admission::{
     resolve_cache_candidates, resolve_decode, resolve_prefill, CandidateDomain,
 };
 use sgl_router::policies::cache_aware::CacheAwarePolicy;
 use sgl_router::policies::decode::{DecodePolicy, DecodePowerOfTwoPolicy, DecodeSelectionContext};
+use sgl_router::policies::engine_load::{EngineLoadSnapshot, EngineLoadTable, LoadStat};
 use sgl_router::policies::power_of_two::PowerOfTwoChoicesPolicy;
 use sgl_router::policies::session_aware::SessionAwarePolicy;
 use sgl_router::policies::{
@@ -36,19 +27,15 @@ use sgl_router::workers::Worker;
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::fs::OpenOptions;
 use std::io::Write;
-use std::num::NonZeroU16;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
-use tokio::sync::mpsc;
-use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
-use tonic::{Request, Response, Status};
+use std::time::{Duration, Instant};
 
 const ENDPOINT_COUNTS: &[usize] = &[8, 64, 256];
 const CACHE_TOP_K: &[usize] = &[4, 16, 32];
 const MODEL: &str = "router-pressure-bench";
 const INPUT_TOKENS: u64 = 32_768;
-const MAX_TOTAL_TOKENS: i64 = 262_144;
+const MAX_TOTAL_TOKENS: u64 = 262_144;
 
 struct CountingAllocator;
 
@@ -94,27 +81,14 @@ unsafe impl GlobalAlloc for CountingAllocator {
 }
 
 struct Fixture {
-    _runtime: tokio::runtime::Runtime,
-    monitor: LoadMonitor,
+    loads: Arc<EngineLoadTable>,
     workers: Vec<Arc<Worker>>,
-    snapshot: LoadMonitorSnapshot,
+    snapshot: EngineLoadSnapshot,
     model: ModelId,
 }
 
-fn capture_policy_snapshot(monitor: &LoadMonitor) -> LoadMonitorSnapshot {
-    monitor.snapshot()
-}
-
-fn snapshot_len(snapshot: &LoadMonitorSnapshot) -> usize {
-    snapshot.workers.len()
-}
-
-fn worker_type(mode: WorkerMode) -> WorkerType {
-    match mode {
-        WorkerMode::Plain => WorkerType::Regular,
-        WorkerMode::Prefill => WorkerType::Prefill,
-        WorkerMode::Decode => WorkerType::Decode,
-    }
+fn capture_policy_snapshot(loads: &EngineLoadTable) -> EngineLoadSnapshot {
+    loads.capture_snapshot(Instant::now())
 }
 
 fn worker(index: usize, mode: WorkerMode) -> Arc<Worker> {
@@ -128,176 +102,34 @@ fn worker(index: usize, mode: WorkerMode) -> Arc<Worker> {
     }))
 }
 
-fn common_rank(index: usize, rank: usize, sequence: u64) -> RankLoad {
-    let running = ((index + rank) % 32) as i64;
-    let waiting = ((index * 3 + rank) % 24) as i64;
-    let waiting_tokens = 512 + ((index * 97 + rank * 31) % 16_384) as i64;
-    let used_tokens = 32_768 + ((index * 257 + rank * 101) % 65_536) as i64;
-    let mut load = RankLoad {
-        dp_rank: rank as i32,
-        snapshot_time_unix_ms: 1_700_000_000_000 + sequence as i64 * 1_000,
-        num_running_reqs: running,
-        num_waiting_reqs: waiting,
-        num_waiting_uncached_tokens: waiting_tokens,
-        num_used_tokens: used_tokens,
-        num_total_tokens: used_tokens + 8_192,
-        max_total_num_tokens: MAX_TOTAL_TOKENS,
-        max_running_requests: 256,
-        token_usage: used_tokens as f64 / MAX_TOTAL_TOKENS as f64,
-        gen_throughput: 100.0 + (index % 20) as f64,
-        cache_hit_rate: 0.5,
-        utilization: 0.4 + (index % 40) as f64 / 100.0,
-        ..Default::default()
-    };
-    enrich_step3_rank(&mut load, index, rank, sequence);
-    load
-}
-
-#[cfg(feature = "step3-pressure")]
-fn enrich_step3_rank(load: &mut RankLoad, index: usize, rank: usize, sequence: u64) {
-    let offset = (index * 1_000 + rank * 100) as i64;
-    load.num_active_tokens = Some(load.num_total_tokens);
-    load.total_prefill_uncached_tokens = Some(1_000_000 + offset + sequence as i64 * 80_000);
-    load.total_prefill_busy_us = Some(2_000_000 + sequence as i64 * 1_000_000);
-    load.decode_prealloc_queue_reqs = Some(((index + rank) % 7) as i64);
-    load.decode_transfer_queue_reqs = Some(((index * 2 + rank) % 9) as i64);
-    load.decode_retracted_queue_reqs = Some(((index + rank * 3) % 3) as i64);
-    load.total_decode_steps = Some(10_000 + sequence as i64 * 1_000);
-    load.total_decode_step_us =
-        Some(50_000_000 + sequence as i64 * (8_000_000 + (index % 5) as i64 * 100_000));
-}
-
-#[cfg(not(feature = "step3-pressure"))]
-fn enrich_step3_rank(_load: &mut RankLoad, _index: usize, _rank: usize, _sequence: u64) {}
-
-fn report(index: usize, mode: WorkerMode, ranks: usize, sequence: u64) -> LoadReport {
-    LoadReport {
-        source_instance_id: format!("source-{index:04}"),
-        sequence_id: sequence,
-        report_time_unix_ms: 1_700_000_000_000 + sequence as i64 * 1_000,
-        worker: Some(ReportWorker {
-            worker_addr: format!("127.0.0.1:{}", 30_000 + index),
-            worker_type: worker_type(mode) as i32,
-            model: Some(MODEL.to_string()),
-            zone: None,
-        }),
-        status: ReportStatus::Healthy as i32,
-        last_error: None,
-        ranks: (0..ranks)
-            .map(|rank| common_rank(index, rank, sequence))
-            .collect(),
-    }
-}
-
-#[derive(Clone)]
-struct BenchmarkReporter {
-    reports: Vec<LoadReport>,
-}
-
-#[tonic::async_trait]
-impl LoadMonitorService for BenchmarkReporter {
-    type MonitorStream = ReceiverStream<Result<WorkerFrame, Status>>;
-
-    async fn monitor(
-        &self,
-        request: Request<tonic::Streaming<RouterFrame>>,
-    ) -> Result<Response<Self::MonitorStream>, Status> {
-        let mut inbound = request.into_inner();
-        let first = inbound
-            .message()
-            .await?
-            .ok_or_else(|| Status::invalid_argument("missing register frame"))?;
-        if !matches!(first.payload, Some(router_frame::Payload::Register(_))) {
-            return Err(Status::invalid_argument("first frame must register"));
-        }
-
-        let (response_tx, response_rx) = mpsc::channel(4);
-        let reports = self.reports.clone();
-        tokio::spawn(async move {
-            if response_tx
-                .send(Ok(WorkerFrame {
-                    payload: Some(worker_frame::Payload::Registered(RegisterResponse {
-                        lease_ttl_ms: 15_000,
-                        renew_after_ms: 1_000,
-                    })),
-                }))
-                .await
-                .is_err()
-            {
-                return;
-            }
-            for report in reports {
-                if response_tx
-                    .send(Ok(WorkerFrame {
-                        payload: Some(worker_frame::Payload::Report(report)),
-                    }))
-                    .await
-                    .is_err()
-                {
-                    return;
-                }
-            }
-            while let Ok(Some(frame)) = inbound.message().await {
-                if matches!(frame.payload, Some(router_frame::Payload::Stop(_))) {
-                    break;
-                }
-            }
-        });
-        Ok(Response::new(ReceiverStream::new(response_rx)))
-    }
-}
-
 fn build_fixture(endpoint_count: usize, ranks: usize, mode: WorkerMode) -> Fixture {
-    let runtime = tokio::runtime::Runtime::new().expect("build benchmark runtime");
-    let (monitor, workers) = runtime.block_on(async move {
-        let listener = tokio::net::TcpListener::bind("0.0.0.0:0")
-            .await
-            .expect("bind benchmark reporter");
-        let reporter_port = listener
-            .local_addr()
-            .expect("read benchmark reporter port")
-            .port();
-        let reporter = BenchmarkReporter {
-            reports: vec![report(0, mode, ranks, 1), report(0, mode, ranks, 2)],
-        };
-        tokio::spawn(async move {
-            tonic::transport::Server::builder()
-                .add_service(LoadMonitorServiceServer::new(reporter))
-                .serve_with_incoming(TcpListenerStream::new(listener))
-                .await
-                .expect("serve benchmark reporter");
-        });
-        let config = LoadMonitorConfig {
-            enabled: true,
-            reporter_port: NonZeroU16::new(reporter_port),
-        };
-        let monitor = LoadMonitor::new(config);
-        let workers: Vec<_> = (0..endpoint_count)
-            .map(|index| worker(index, mode))
-            .collect();
-        monitor.reconcile(workers.clone()).await;
-        tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                let snapshot = monitor.snapshot();
-                if snapshot_len(&snapshot) == endpoint_count
-                    && snapshot.workers.iter().all(|worker| {
-                        worker.freshness == Freshness::Fresh && worker.sequence_id == Some(2)
-                    })
-                {
-                    return;
-                }
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .expect("benchmark reporters must publish two fresh reports");
-        (monitor, workers)
-    });
-    let snapshot = capture_policy_snapshot(&monitor);
-    assert_eq!(snapshot_len(&snapshot), endpoint_count);
+    let loads = EngineLoadTable::new();
+    let workers: Vec<_> = (0..endpoint_count)
+        .map(|index| worker(index, mode))
+        .collect();
+    let now = Instant::now();
+    for (index, worker) in workers.iter().enumerate() {
+        for rank in 0..ranks {
+            loads.mark_expected_rank(&worker.url, rank as u32);
+            loads.set(
+                &worker.url,
+                rank as u32,
+                LoadStat {
+                    num_running_reqs: ((index + rank) % 32) as u64,
+                    num_waiting_reqs: ((index * 3 + rank) % 24) as u64,
+                    num_tokens: 32_768 + ((index * 257 + rank * 101) % 65_536) as u64,
+                    max_total_num_tokens: MAX_TOTAL_TOKENS,
+                },
+                now,
+            );
+        }
+    }
+    let snapshot = capture_policy_snapshot(&loads);
+    assert!(workers
+        .iter()
+        .all(|worker| snapshot.fresh_load_for_url(&worker.url).is_some()));
     Fixture {
-        _runtime: runtime,
-        monitor,
+        loads,
         workers,
         snapshot,
         model: ModelId(MODEL.to_string()),
@@ -337,7 +169,7 @@ fn prefill_decision(
     policy: &dyn Policy,
     fixture: &Fixture,
     domain: &CandidateDomain,
-    snapshot: &LoadMonitorSnapshot,
+    snapshot: &EngineLoadSnapshot,
     session_id: Option<&str>,
 ) -> WorkerId {
     let range = domain
@@ -393,7 +225,7 @@ fn cache_decision(
     policy: &CacheAwarePolicy,
     fixture: &Fixture,
     signal: &ExternalPrefixSignal,
-    snapshot: &LoadMonitorSnapshot,
+    snapshot: &EngineLoadSnapshot,
 ) -> WorkerId {
     let ctx = SelectionContext::new(&fixture.model, None)
         .with_input_tokens(INPUT_TOKENS)
@@ -412,7 +244,7 @@ fn cache_decision(
         .clone()
 }
 
-fn decode_decision(domain: &CandidateDomain, snapshot: &LoadMonitorSnapshot) -> WorkerId {
+fn decode_decision(domain: &CandidateDomain, snapshot: &EngineLoadSnapshot) -> WorkerId {
     let ctx = DecodeSelectionContext::new().with_load_snapshot(snapshot);
     let proposal = DecodePowerOfTwoPolicy::new()
         .propose(domain, &ctx)
@@ -431,24 +263,24 @@ fn bench_snapshot(c: &mut Criterion) {
         let fixture = build_fixture(endpoint_count, 1, WorkerMode::Prefill);
         let name = format!("endpoints={endpoint_count},dp=1");
         record_allocations(&format!("snapshot/{name}"), || {
-            capture_policy_snapshot(&fixture.monitor)
+            capture_policy_snapshot(&fixture.loads)
         });
         group.bench_with_input(
             BenchmarkId::new("capture", &name),
             &endpoint_count,
-            |b, _| b.iter(|| black_box(capture_policy_snapshot(&fixture.monitor))),
+            |b, _| b.iter(|| black_box(capture_policy_snapshot(&fixture.loads))),
         );
     }
     for &endpoint_count in ENDPOINT_COUNTS {
         let fixture = build_fixture(endpoint_count, 8, WorkerMode::Prefill);
         let name = format!("endpoints={endpoint_count},dp=8");
         record_allocations(&format!("snapshot/{name}"), || {
-            capture_policy_snapshot(&fixture.monitor)
+            capture_policy_snapshot(&fixture.loads)
         });
         group.bench_with_input(
             BenchmarkId::new("capture", &name),
             &endpoint_count,
-            |b, _| b.iter(|| black_box(capture_policy_snapshot(&fixture.monitor))),
+            |b, _| b.iter(|| black_box(capture_policy_snapshot(&fixture.loads))),
         );
     }
     group.finish();
@@ -481,13 +313,13 @@ fn bench_prefill_p2(c: &mut Criterion) {
         let full_policy = PowerOfTwoChoicesPolicy::new();
         let full_name = format!("request_path/endpoints={endpoint_count}");
         record_allocations(&format!("prefill_p2/{full_name}"), || {
-            let snapshot = capture_policy_snapshot(&full_fixture.monitor);
+            let snapshot = capture_policy_snapshot(&full_fixture.loads);
             let domain = CandidateDomain::global_prefill(&full_fixture.workers);
             prefill_decision(&full_policy, &full_fixture, &domain, &snapshot, None)
         });
         group.bench_function(BenchmarkId::new("request_path", endpoint_count), |b| {
             b.iter(|| {
-                let snapshot = capture_policy_snapshot(&full_fixture.monitor);
+                let snapshot = capture_policy_snapshot(&full_fixture.loads);
                 let domain = CandidateDomain::global_prefill(&full_fixture.workers);
                 black_box(prefill_decision(
                     &full_policy,
@@ -535,7 +367,7 @@ fn bench_session(c: &mut Criterion) {
         let full_policy = initialized_session_policy(&full_fixture);
         let full_name = format!("request_path/endpoints={endpoint_count}");
         record_allocations(&format!("session/{full_name}"), || {
-            let snapshot = capture_policy_snapshot(&full_fixture.monitor);
+            let snapshot = capture_policy_snapshot(&full_fixture.loads);
             let domain = CandidateDomain::global_prefill(&full_fixture.workers);
             prefill_decision(
                 &full_policy,
@@ -547,7 +379,7 @@ fn bench_session(c: &mut Criterion) {
         });
         group.bench_function(BenchmarkId::new("request_path", endpoint_count), |b| {
             b.iter(|| {
-                let snapshot = capture_policy_snapshot(&full_fixture.monitor);
+                let snapshot = capture_policy_snapshot(&full_fixture.loads);
                 let domain = CandidateDomain::global_prefill(&full_fixture.workers);
                 black_box(prefill_decision(
                     &full_policy,
@@ -603,7 +435,7 @@ fn bench_cache(c: &mut Criterion) {
             let full_policy = CacheAwarePolicy::new(config);
             let full_name = format!("request_path/endpoints={endpoint_count},top_k={top_k}");
             record_allocations(&format!("cache/{full_name}"), || {
-                let snapshot = capture_policy_snapshot(&full_fixture.monitor);
+                let snapshot = capture_policy_snapshot(&full_fixture.loads);
                 cache_decision(&full_policy, &full_fixture, &full_signal, &snapshot)
             });
             group.bench_function(
@@ -613,7 +445,7 @@ fn bench_cache(c: &mut Criterion) {
                 ),
                 |b| {
                     b.iter(|| {
-                        let snapshot = capture_policy_snapshot(&full_fixture.monitor);
+                        let snapshot = capture_policy_snapshot(&full_fixture.loads);
                         black_box(cache_decision(
                             &full_policy,
                             &full_fixture,
@@ -645,13 +477,13 @@ fn bench_decode(c: &mut Criterion) {
         let full_fixture = build_fixture(endpoint_count, 1, WorkerMode::Decode);
         let full_name = format!("request_path/endpoints={endpoint_count}");
         record_allocations(&format!("decode/{full_name}"), || {
-            let snapshot = capture_policy_snapshot(&full_fixture.monitor);
+            let snapshot = capture_policy_snapshot(&full_fixture.loads);
             let domain = CandidateDomain::global_decode(&full_fixture.workers);
             decode_decision(&domain, &snapshot)
         });
         group.bench_function(BenchmarkId::new("request_path", endpoint_count), |b| {
             b.iter(|| {
-                let snapshot = capture_policy_snapshot(&full_fixture.monitor);
+                let snapshot = capture_policy_snapshot(&full_fixture.loads);
                 let domain = CandidateDomain::global_decode(&full_fixture.workers);
                 black_box(decode_decision(&domain, &snapshot))
             })

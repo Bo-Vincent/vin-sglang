@@ -97,8 +97,6 @@ impl CacheAwarePolicy {
         Some(CacheCandidateProposal {
             candidates,
             cache_switch_margin_tokens: self.config.cache_switch_margin_tokens,
-            pressure_abs_threshold_tokens: self.config.pressure_abs_threshold_tokens,
-            pressure_rel_threshold: self.config.pressure_rel_threshold,
         })
     }
 

@@ -54,7 +54,7 @@
 
 use crate::config::CacheAwareConfig;
 
-use crate::policies::engine_load::EngineLoadTable;
+use crate::policies::engine_load::{EngineLoadSnapshot, EngineLoadTable};
 use crate::policies::kv_events::{
     compute_block_hashes, compute_block_hashes_bigram, BlockSizeOracle, HashTree,
 };
@@ -138,6 +138,29 @@ impl WorkerLoads {
         Self {
             fresh: table.fresh_worker_state(now),
         }
+    }
+
+    /// 使用请求入口冻结的快照。只从当前候选集合投影，保证同一请求的 Cache
+    /// 选择与 Prefill/Session/Decode 准入不会读取到后续到达的 ZMQ gauge。
+    fn from_snapshot(snapshot: &EngineLoadSnapshot, workers: &[Arc<Worker>]) -> Self {
+        let fresh = workers
+            .iter()
+            .filter_map(|worker| {
+                snapshot.fresh_load_for_url(&worker.url).map(|load| {
+                    (
+                        worker.url.clone(),
+                        (
+                            load.num_running_reqs
+                                .saturating_add(load.num_waiting_reqs)
+                                .try_into()
+                                .unwrap_or(usize::MAX),
+                            load.captured_at,
+                        ),
+                    )
+                })
+            })
+            .collect();
+        Self { fresh }
     }
 
     /// A worker's current load: the engine-reported queue depth as of the
@@ -252,6 +275,7 @@ impl CacheAwareZmqPolicy {
         workers: &[Arc<Worker>],
         ctx: &SelectionContext<'_>,
         signal: &crate::policies::ExternalPrefixSignal,
+        loads: &WorkerLoads,
     ) -> Option<Arc<Worker>> {
         let sgl_kv_indexer::PrefixOutcome::Matched { matches, .. } = &signal.outcome else {
             return None;
@@ -283,7 +307,7 @@ impl CacheAwareZmqPolicy {
                     m.matched_prefix_blocks == best_routable_blocks && m.address == worker.url
                 })
             })
-            .min_by_key(|worker| worker.active_load())
+            .min_by_key(|worker| loads.load_of(worker))
             .cloned()
     }
 }
@@ -298,7 +322,10 @@ impl Policy for CacheAwareZmqPolicy {
         // else the router-side in-flight counter. One snapshot pass serves
         // every comparison below (imbalance check, min-load fallback,
         // matched-set tiebreak).
-        let loads = WorkerLoads::from_engine(&self.engine_load, Instant::now());
+        let loads = ctx
+            .load_snapshot()
+            .map(|snapshot| WorkerLoads::from_snapshot(snapshot, workers))
+            .unwrap_or_else(|| WorkerLoads::from_engine(&self.engine_load, Instant::now()));
 
         // 1. Load-imbalance fast-path: even the best cache hit gets
         //    dropped in favour of evening out load. Logged on every
@@ -341,7 +368,7 @@ impl Policy for CacheAwareZmqPolicy {
         // degrades only to min-load and never consults the local radix tree.
         if let Some(signal) = ctx.external_prefix() {
             return self
-                .select_external(workers, ctx, signal)
+                .select_external(workers, ctx, signal, &loads)
                 .or_else(|| Self::pick_min_load(workers, &loads));
         }
 
@@ -455,7 +482,7 @@ mod tests {
     use super::*;
     use crate::config::CacheAwareConfig;
     use crate::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
-    use crate::policies::engine_load::LoadStat;
+    use crate::policies::engine_load::{EngineWorkerLoad, LoadStat};
     use crate::policies::kv_events::tree::KvWorkerId;
     use crate::policies::kv_events::HashTree;
     use crate::tokenizer::adapter;
@@ -661,6 +688,80 @@ mod tests {
         let ctx = SelectionContext::new(&model, Some(&body)).with_external_prefix(Some(&signal));
         let chosen = policy.select(&workers, &ctx).expect("must pick");
         assert_eq!(chosen.url, w1.url);
+    }
+
+    /// 外部 Indexer 命中的同一 cache depth 必须用入口冻结的 Engine Load 破局；
+    /// Router 本地 active-load 在该快照之后改变时，不能让同一次请求观察到不同顺序。
+    #[test]
+    fn external_match_tiebreak_uses_the_request_snapshot() {
+        let mut config = cfg_default();
+        config.cache_threshold = 0.0;
+        config.balance_abs_threshold = 100;
+        let policy = new_policy(
+            config,
+            Arc::new(HashTree::new()),
+            tokenizer_registry_with_tiny(),
+            oracle_for_tests(4),
+        );
+        let w0 = worker("http://w0:30000", "tiny");
+        let w1 = worker("http://w1:30000", "tiny");
+        // 与快照反向的本地计数：旧实现会因此选择 w0。
+        let _after_snapshot: Vec<_> = (0..10).map(|_| w1.load_guard()).collect();
+        let workers = vec![Arc::clone(&w0), Arc::clone(&w1)];
+        let snapshot_at = Instant::now();
+        let snapshot = EngineLoadSnapshot::from_workers(
+            17,
+            HashMap::from([
+                (
+                    w0.url.clone(),
+                    EngineWorkerLoad {
+                        num_running_reqs: 50,
+                        num_waiting_reqs: 0,
+                        num_tokens: 0,
+                        max_total_num_tokens: 0,
+                        captured_at: snapshot_at,
+                    },
+                ),
+                (
+                    w1.url.clone(),
+                    EngineWorkerLoad {
+                        num_running_reqs: 1,
+                        num_waiting_reqs: 0,
+                        num_tokens: 0,
+                        max_total_num_tokens: 0,
+                        captured_at: snapshot_at,
+                    },
+                ),
+            ]),
+        );
+        let signal = crate::policies::ExternalPrefixSignal {
+            outcome: sgl_kv_indexer::PrefixOutcome::Matched {
+                matches: vec![
+                    sgl_kv_indexer::PrefixMatch {
+                        address: w0.url.clone(),
+                        matched_prefix_blocks: 4,
+                        worker_id: w0.id.0.clone(),
+                    },
+                    sgl_kv_indexer::PrefixMatch {
+                        address: w1.url.clone(),
+                        matched_prefix_blocks: 4,
+                        worker_id: w1.id.0.clone(),
+                    },
+                ],
+                best_prefix_blocks: 4,
+            },
+            query_blocks: 4,
+        };
+        let model = ModelId("tiny".into());
+        let ctx = SelectionContext::new(&model, None)
+            .with_external_prefix(Some(&signal))
+            .with_load_snapshot(&snapshot);
+
+        assert_eq!(
+            policy.select(&workers, &ctx).expect("must select").url,
+            w1.url,
+            "external-match tiebreak must use the request snapshot, not later active load"
+        );
     }
 
     /// Tree contains w0's prefix; cache-aware selection picks w0 even
@@ -1326,6 +1427,60 @@ mod tests {
         assert_eq!(
             chosen.url, "http://w1:30000",
             "engine-reported load must drive selection",
+        );
+    }
+
+    /// 请求入口冻结的快照必须覆盖随后到达的 LoadStat。这样一次请求的
+    /// Cache 选择不会和同一次 Prefill/Decode 准入观察到不同的 Worker 顺序。
+    #[test]
+    fn request_snapshot_is_stable_after_new_load_stats_arrive() {
+        let table = EngineLoadTable::new();
+        let snapshot_at = Instant::now();
+        let snapshot = EngineLoadSnapshot::from_workers(
+            9,
+            HashMap::from([
+                (
+                    "http://w0:30000".to_string(),
+                    EngineWorkerLoad {
+                        num_running_reqs: 50,
+                        num_waiting_reqs: 0,
+                        num_tokens: 0,
+                        max_total_num_tokens: 0,
+                        captured_at: snapshot_at,
+                    },
+                ),
+                (
+                    "http://w1:30000".to_string(),
+                    EngineWorkerLoad {
+                        num_running_reqs: 1,
+                        num_waiting_reqs: 0,
+                        num_tokens: 0,
+                        max_total_num_tokens: 0,
+                        captured_at: snapshot_at,
+                    },
+                ),
+            ]),
+        );
+        // 之后的 gauge 与已捕获视图相反；本次 request 仍必须选择 w1。
+        table.set("http://w0:30000", 0, load_stat(1, 0), Instant::now());
+        table.set("http://w1:30000", 0, load_stat(50, 0), Instant::now());
+        let policy = new_policy_with_load(
+            cfg_default(),
+            Arc::new(HashTree::new()),
+            tokenizer_registry_with_tiny(),
+            oracle_for_tests(4),
+            table,
+        );
+        let w0 = worker("http://w0:30000", "tiny");
+        let w1 = worker("http://w1:30000", "tiny");
+        let workers = vec![Arc::clone(&w0), Arc::clone(&w1)];
+        let model = ModelId("tiny".into());
+        let ctx = SelectionContext::new(&model, None).with_load_snapshot(&snapshot);
+
+        assert_eq!(
+            policy.select(&workers, &ctx).expect("must select").url,
+            w1.url,
+            "the request must use its frozen snapshot, not the newer table value"
         );
     }
 
