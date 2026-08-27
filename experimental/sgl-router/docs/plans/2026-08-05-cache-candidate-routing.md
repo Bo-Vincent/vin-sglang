@@ -1,5 +1,8 @@
 # Cache candidate routing implementation plan
 
+> **历史计划。** `vin/rust-v4` 仅使用 #34608 的 ZMQ `LoadStat`；本文提到的
+> `LoadMonitorSnapshot` 为旧架构术语，不可用于当前运行时或测试设计。
+
 **Goal:** Replace Cache-Aware's single affinity primary plus arbitrary backup with one bounded global prefix-match candidate tournament, while preserving the existing Step 1 admission/guard framework and making Step 2 Bucket routing the no-hit fallback.
 
 **Architecture:** `Policy::propose_prefill` is the compatibility seam: existing policies return their current pair proposal, while Cache-Aware returns target-specific cache candidates carrying `H` and `E=L-H`. The Router admits and reduces those candidates once; if none survives, it re-enters the normal Bucket/Global domains with affinity lookup disabled and P2 selection. Session-Aware, P2, Decode, legacy sticky, and `cache_aware_zmq` retain their current contracts.

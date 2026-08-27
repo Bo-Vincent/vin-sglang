@@ -75,7 +75,6 @@ fn build_app_context(
         }),
         proxy: ProxyConfig::default(),
         active_load: ActiveLoadConfig::default(),
-        load_monitor: Default::default(),
     };
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&config).unwrap());
     let registry = Arc::new(WorkerRegistry::default());

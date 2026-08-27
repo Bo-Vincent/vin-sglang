@@ -72,18 +72,20 @@ measures the metric, nothing currently runs or gates on these results.
 
 ## Router v2 policy / PD E2E
 
-正式 108-case Policy 对照、RSD 确认轮、真实 LoadMonitor Pressure Guard、Indexer
-Cache candidate 和单机 4P+4D Mooncake KV transfer 的环境、结果与边界见
-[Router v2 Policy / PD E2E 报告](docs/router-v2-e2e-poc-report.md)。该验证证明 Step 1
-Policy/Admission/Guard 数据流可用；静态 Bucket 仍是 Step 2 实验接口，不代表同构
+`vin/rust-v4` 使用 main 已合入的 #34608 Engine Load ZMQ 负载发布；旧 gRPC
+LoadMonitor 的 E2E 结果不能作为本分支的验证证据。历史 4P+4D 环境、模型与
+Indexer 数据路径可参考 [Router v2 Policy / PD E2E 报告](docs/router-v2-e2e-poc-report.md)，
+但必须以当前 ZMQ 协议和当前源码重新执行。静态 Bucket 仍是实验接口，不代表同构
 4+4 切分或异构生产 Bucket 已达到 production GO。
 
 ## Router Policy 热路径 Microbenchmark
 
 8 / 64 / 256 endpoints 下 scheduling snapshot、P2、Session-Aware、Cache-Aware top-K
-和 Decode Policy 的三轮 Router-only latency、allocation、CPU、扩展性门槛与适用边界见
+和 Decode Policy 的 Router-only latency、allocation、CPU、扩展性门槛与适用边界见
 [Router Policy 热路径 Microbenchmark 报告](docs/router-policy-pressure-microbenchmark-report.md)。
-该结果不替代高 Router RPS 和并发 Engine load 快照写入条件下的容量验证。
+旧报告的数值来自已经移除的 gRPC fixture；v4 已将 bench fixture 改为
+`EngineLoadTable`，因此报告中的历史数值不能与当前实现比较。该基准不替代高 Router
+RPS 和并发 Engine load 快照写入条件下的容量验证。
 ## Pre-deprecation calibration runbook
 
 Before deleting SMG, every routing-latency metric in the slim-design

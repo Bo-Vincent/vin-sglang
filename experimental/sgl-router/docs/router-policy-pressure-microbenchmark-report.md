@@ -1,5 +1,10 @@
 # Router Policy 热路径 Microbenchmark 报告
 
+> **历史记录，不是 `vin/rust-v4` 的验证证据。** 本报告的 fixture 通过已移除的
+> gRPC LoadMonitor 写入旧协议字段。v4 使用 #34608 的 ZMQ `LoadStat`，只接受运行
+> 请求数、等待请求数、KV 已用量和 KV 容量；需要以当前 `router_pressure` benchmark
+> 重新采样后才能发布可比较的性能结论。
+
 ## 结论
 
 本轮 Router-only 验证通过：8、64、256 endpoints 下，Step 3 的多维压力指标没有给
@@ -17,7 +22,7 @@ P2、Session-Aware、Cache-Aware 或 Decode Policy 引入不可接受的决策�
 
 因此，本结果支持将 scheduling snapshot、候选成员索引和 Session 快路径作为当前
 Step 3 实现保留。它证明的是单 Router 决策热路径在 256 endpoints 内可接受，不等价于
-已经证明高 Router RPS、并发 LoadMonitor 写入或多 Router 实例下的生产容量。
+已经证明高 Router RPS、并发 Engine Load 发布或多 Router 实例下的生产容量。
 
 ## 验证对象
 

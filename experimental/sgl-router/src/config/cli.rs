@@ -13,9 +13,9 @@ use crate::config::{
     default_cb_cool_down, default_proxy_request_timeout_secs, default_stale_request_timeout_secs,
     resolve_mode, ActiveLoadConfig, AffinityConfig, AffinityMode, CacheAwareConfig,
     CircuitBreakerConfig, Config, DecodePolicyKind, DiscoveryBackend, EligibilityConfig, FusedTerm,
-    K8sDiscoveryConfig, KvIndexerEndpointConfig, LogFormat, ModelConfig,
-    ObservabilityConfig, PolicyKind, ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig,
-    SessionAffinityMode, StickyConfig, DEFAULT_FUSE,
+    K8sDiscoveryConfig, KvIndexerEndpointConfig, LogFormat, ModelConfig, ObservabilityConfig,
+    PolicyKind, ProxyConfig, ServerConfig, SessionAffinityMode, StaticUrlsDiscoveryConfig,
+    StickyConfig, DEFAULT_FUSE,
 };
 
 const DEFAULT_KV_INDEXER_QUERY_TIMEOUT_MS: u64 = 100;
@@ -112,15 +112,6 @@ pub struct Cli {
     /// Session affinity primary 的查找与 fallback 行为。
     #[arg(long, value_enum)]
     pub session_affinity_mode: Option<SessionAffinityMode>,
-    /// 关闭 Session-Aware 可选的软 Pressure Guard。
-    #[arg(long)]
-    pub disable_pressure_guard: bool,
-    /// Pressure Guard 所需的 waiting uncached token 绝对差。
-    #[arg(long)]
-    pub pressure_abs_threshold_tokens: Option<u64>,
-    /// Pressure Guard 所需的 waiting uncached token 相对倍率。
-    #[arg(long)]
-    pub pressure_rel_threshold: Option<f64>,
     /// Cache-Aware 候选必须至少命中的 token 数；默认 1024。
     #[arg(long)]
     pub cache_affinity_min_matched_tokens: Option<u64>,
@@ -305,13 +296,11 @@ impl Cli {
             || self.session_eviction_interval_secs.is_some()
             || self.stable_pair
             || self.affinity_mode.is_some()
-            || self.session_affinity_mode.is_some()
-            || self.disable_pressure_guard;
+            || self.session_affinity_mode.is_some();
         if tuned_session_affinity && self.policy != PolicyKind::SessionAware {
             return Err(anyhow!(
-                "--session-id-header, --session-*-secs, --stable-pair, --affinity-mode, \
-                 --session-affinity-mode, and --disable-pressure-guard require \
-                 --policy session_aware"
+                "--session-id-header, --session-*-secs, --stable-pair, --affinity-mode, and \
+                 --session-affinity-mode require --policy session_aware"
             ));
         }
         let tuned_cache_candidates = self.cache_affinity_min_matched_tokens.is_some()
@@ -323,13 +312,6 @@ impl Cli {
         if tuned_cache_candidates && self.policy != PolicyKind::CacheAware {
             return Err(anyhow!(
                 "cache candidate tuning flags require --policy cache_aware"
-            ));
-        }
-        if (self.pressure_abs_threshold_tokens.is_some() || self.pressure_rel_threshold.is_some())
-            && !affinity_policy
-        {
-            return Err(anyhow!(
-                "pressure thresholds require --policy session_aware or cache_aware"
             ));
         }
         let is_score_composition = matches!(
@@ -487,14 +469,6 @@ impl Cli {
             axum::http::HeaderName::try_from(session_id_header.as_str()).map_err(|e| {
                 anyhow!("--session-id-header {session_id_header:?} is not a valid HTTP header name: {e}")
             })?;
-            let pressure_rel_threshold = self
-                .pressure_rel_threshold
-                .unwrap_or(d.pressure_rel_threshold);
-            if !pressure_rel_threshold.is_finite() || pressure_rel_threshold <= 1.0 {
-                return Err(anyhow!(
-                    "--pressure-rel-threshold must be finite and greater than 1"
-                ));
-            }
             let cache_affinity_min_match_ratio = self
                 .cache_affinity_min_match_ratio
                 .or(d.cache_affinity_min_match_ratio);
@@ -549,11 +523,6 @@ impl Cli {
                 session_affinity_mode: self
                     .session_affinity_mode
                     .unwrap_or(d.session_affinity_mode),
-                pressure_guard: !self.disable_pressure_guard,
-                pressure_abs_threshold_tokens: self
-                    .pressure_abs_threshold_tokens
-                    .unwrap_or(d.pressure_abs_threshold_tokens),
-                pressure_rel_threshold,
                 cache_affinity_min_matched_tokens: self
                     .cache_affinity_min_matched_tokens
                     .or(d.cache_affinity_min_matched_tokens),
@@ -1629,8 +1598,7 @@ mod tests {
     fn session_aware_builds_affinity_config_from_its_cli_knobs() {
         let config = cfg_of(
             "--policy session_aware --session-id-header x-agent-session --stable-pair \
-             --affinity-mode strict --session-affinity-mode global-rebind --disable-pressure-guard \
-             --pressure-abs-threshold-tokens 2048 --pressure-rel-threshold 2.0",
+             --affinity-mode strict --session-affinity-mode global-rebind",
         )
         .unwrap();
         let affinity = config
@@ -1646,9 +1614,20 @@ mod tests {
             affinity.session_affinity_mode,
             SessionAffinityMode::GlobalRebind
         );
-        assert!(!affinity.pressure_guard);
-        assert_eq!(affinity.pressure_abs_threshold_tokens, 2_048);
-        assert_eq!(affinity.pressure_rel_threshold, 2.0);
+    }
+
+    #[test]
+    fn rejects_removed_token_pressure_flags() {
+        for flag in [
+            "--disable-pressure-guard",
+            "--pressure-abs-threshold-tokens 2048",
+            "--pressure-rel-threshold 2.0",
+        ] {
+            let error = cfg_of(&format!("--policy session_aware {flag}"))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("unexpected argument"), "{flag}: {error}");
+        }
     }
 
     #[test]
@@ -1748,7 +1727,10 @@ mod tests {
             Some(1_024)
         );
         assert_eq!(defaults_affinity.cache_affinity_min_match_ratio, None);
-        assert_eq!(defaults_indexer_timeout_ms, 25);
+        assert_eq!(
+            defaults_indexer_timeout_ms,
+            DEFAULT_KV_INDEXER_QUERY_TIMEOUT_MS
+        );
 
         let err = cfg_of("--policy power_of_two --stable-pair")
             .unwrap_err()
