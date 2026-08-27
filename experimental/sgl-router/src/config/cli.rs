@@ -13,9 +13,8 @@ use crate::config::{
     default_cb_cool_down, default_proxy_request_timeout_secs, default_stale_request_timeout_secs,
     resolve_mode, ActiveLoadConfig, CacheAwareConfig, CircuitBreakerConfig, Config,
     DiscoveryBackend, EligibilityConfig, FusedTerm, K8sDiscoveryConfig, KvIndexerEndpointConfig,
-    LogFormat, ModelConfig, DEFAULT_FUSE,
-    ObservabilityConfig, PolicyKind, ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig,
-    StickyConfig,
+    LogFormat, ModelConfig, ObservabilityConfig, PolicyKind, ProxyConfig, ServerConfig,
+    StaticUrlsDiscoveryConfig, StickyConfig, DEFAULT_FUSE,
 };
 
 const DEFAULT_KV_INDEXER_QUERY_TIMEOUT_MS: u64 = 100;

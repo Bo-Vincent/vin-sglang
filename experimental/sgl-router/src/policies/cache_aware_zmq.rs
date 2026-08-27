@@ -342,7 +342,7 @@ impl Policy for CacheAwareZmqPolicy {
         if let Some(signal) = ctx.external_prefix() {
             return self
                 .select_external(workers, ctx, signal)
-                .or_else(|| Self::pick_min_load(workers));
+                .or_else(|| Self::pick_min_load(workers, &loads));
         }
 
         // 2. Routing tokens. Prefer the ids computed once at ingress; fall
@@ -598,6 +598,7 @@ mod tests {
             Arc::new(HashTree::new()),
             tokenizer_registry_with_tiny(),
             oracle_for_tests(4),
+            EngineLoadTable::new(),
         );
         let w0 = worker("http://w0:30000", "tiny");
         let w1 = worker("http://w1:30000", "tiny");
@@ -637,7 +638,13 @@ mod tests {
         let hashes = compute_block_hashes(&ids, 4);
         tree.insert(&KvWorkerId::new("http://w0:30000".into(), 0), None, &hashes);
 
-        let policy = CacheAwareZmqPolicy::new(cfg_default(), tree, registry, oracle_for_tests(4));
+        let policy = CacheAwareZmqPolicy::new(
+            cfg_default(),
+            tree,
+            registry,
+            oracle_for_tests(4),
+            EngineLoadTable::new(),
+        );
         let w0 = worker("http://w0:30000", "tiny");
         let w1 = worker("http://w1:30000", "tiny");
         let _load = w0.load_guard();
@@ -1298,6 +1305,7 @@ mod tests {
                 cache_threshold: 0.0,
                 balance_abs_threshold: 5,
                 balance_rel_threshold: 2.0,
+                kv_indexer_endpoint: None,
             },
             tree,
             registry,
@@ -1345,6 +1353,7 @@ mod tests {
                 // 2) and selection reaches the matched-set tiebreak.
                 balance_abs_threshold: 100,
                 balance_rel_threshold: 100.0,
+                kv_indexer_endpoint: None,
             },
             tree,
             registry,
@@ -1395,6 +1404,7 @@ mod tests {
                 // matched-set tiebreak, which also uses `load_of`.
                 balance_abs_threshold: 100,
                 balance_rel_threshold: 100.0,
+                kv_indexer_endpoint: None,
             },
             tree,
             registry,
@@ -1501,6 +1511,7 @@ mod tests {
                 cache_threshold: 0.0,
                 balance_abs_threshold: 32,
                 balance_rel_threshold: 1.1,
+                kv_indexer_endpoint: None,
             },
             tree,
             registry,
