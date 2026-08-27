@@ -115,10 +115,9 @@ fn bench_membership_index(c: &mut Criterion) {
         tps_slo: None,
     };
     let mut group = c.benchmark_group("bucket_membership");
-    // Compare each cardinality against the same case on the base revision:
-    // eight stays on the scan path, while nine crosses into the indexed path.
-    // The 8-vs-9 values are not themselves an A/B comparison.
-    for member_count in [8, 9] {
+    // Compare each cardinality against the same case on the base revision.
+    // Four stays on the scan path; five and above use the precomputed index.
+    for member_count in [4, 5, 8, 9] {
         let selector = BucketSelector::new(Some(bucket_config(member_count)));
         group.bench_function(BenchmarkId::from_parameter(member_count), |b| {
             b.iter(|| black_box(selector.prefill_domains(&workers, request)))
