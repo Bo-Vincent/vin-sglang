@@ -155,6 +155,24 @@ class SimulatorHttpFleetAnalyzerTest(unittest.TestCase):
         self.assertEqual(group["policy_reasons"], {})
         self.assertEqual(group["policy_reason_observability"], "not_emitted_by_policy")
 
+    def test_analyzer_combines_confirmation_repeats_without_replacing_primary(self):
+        analyzer = load_analyzer()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            primary = root / "primary"
+            confirmation = root / "confirmation"
+            self.create_result(primary, repeats=3)
+            self.create_result(confirmation, repeats=2)
+
+            group = analyzer.analyze_results(
+                primary, confirmation_results_dir=confirmation
+            )["groups"][0]
+
+        self.assertEqual(group["repeat_count"], 5)
+        self.assertEqual(group["primary_repeat_count"], 3)
+        self.assertEqual(group["confirmation_repeat_count"], 2)
+        self.assertEqual(group["native_cache_audit"]["cache_candidate_decisions"], 160)
+
 
 if __name__ == "__main__":
     unittest.main()

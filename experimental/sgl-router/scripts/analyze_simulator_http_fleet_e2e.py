@@ -124,7 +124,9 @@ def median_rsd(values: Iterable[float]) -> dict[str, float]:
     }
 
 
-def analyze_results(results_dir: Path) -> dict[str, object]:
+def load_result_groups(
+    results_dir: Path,
+) -> dict[tuple[int, str, str], list[tuple[dict[str, object], dict[str, object]]]]:
     results_dir = results_dir.resolve()
     run_complete = results_dir / "RUN_COMPLETE"
     if (run_complete.read_text() if run_complete.is_file() else "") != "ok\n":
@@ -153,11 +155,32 @@ def analyze_results(results_dir: Path) -> dict[str, object]:
             raise RuntimeError("case has an invalid grouping key")
         grouped[(endpoint_count, policy, workload)].append((case, summary))
 
-    groups = []
     for (endpoint_count, policy, workload), samples in sorted(grouped.items()):
         observed_repeats = {case["repeat"] for case, _ in samples}
         if observed_repeats != set(range(repeats)):
             raise RuntimeError(f"incomplete repeats for {endpoint_count}/{policy}/{workload}")
+    return grouped
+
+
+def analyze_results(
+    results_dir: Path, *, confirmation_results_dir: Path | None = None
+) -> dict[str, object]:
+    primary = load_result_groups(results_dir)
+    confirmation = (
+        load_result_groups(confirmation_results_dir)
+        if confirmation_results_dir is not None
+        else {}
+    )
+    extra_confirmation = set(confirmation) - set(primary)
+    if extra_confirmation:
+        raise RuntimeError(
+            f"confirmation has groups absent from primary results: {sorted(extra_confirmation)}"
+        )
+
+    groups = []
+    for (endpoint_count, policy, workload), primary_samples in sorted(primary.items()):
+        confirmation_samples = confirmation.get((endpoint_count, policy, workload), [])
+        samples = primary_samples + confirmation_samples
         metrics = {
             name: median_rsd(number_at(summary, path) for _, summary in samples)
             for name, path in METRIC_PATHS.items()
@@ -179,6 +202,8 @@ def analyze_results(results_dir: Path) -> dict[str, object]:
             "policy": policy,
             "workload": workload,
             "repeat_count": len(samples),
+            "primary_repeat_count": len(primary_samples),
+            "confirmation_repeat_count": len(confirmation_samples),
             "metrics": metrics,
             "policy_reasons": dict(sorted(reasons.items())),
             "policy_reason_observability": (
@@ -192,7 +217,7 @@ def analyze_results(results_dir: Path) -> dict[str, object]:
     return {
         "measurement_kind": MEASUREMENT_KIND,
         "measurement_notice": MEASUREMENT_NOTICE,
-        "case_count": len(expected_cases),
+        "case_count": sum(len(samples) for samples in primary.values()),
         "group_count": len(groups),
         "groups": groups,
     }
@@ -228,8 +253,11 @@ def main(argv: Iterable[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--results-dir", required=True, type=Path)
     parser.add_argument("--output-dir", type=Path)
+    parser.add_argument("--confirmation-results-dir", type=Path)
     args = parser.parse_args(argv)
-    analysis = analyze_results(args.results_dir)
+    analysis = analyze_results(
+        args.results_dir, confirmation_results_dir=args.confirmation_results_dir
+    )
     output_dir = args.output_dir or args.results_dir / "analysis"
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / "analysis.json").write_text(json.dumps(analysis, indent=2, sort_keys=True) + "\n")
