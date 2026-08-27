@@ -45,6 +45,7 @@ use crate::server::metrics::MetricsRegistry;
 use crate::tokenizer::TokenizerRegistry;
 use crate::workers::Worker;
 use std::sync::{Arc, OnceLock};
+use std::time::Instant;
 
 /// Selection policy that scores candidates by tree-overlap with the
 /// request's prefix and falls back to load-based picking when the tree
@@ -240,6 +241,7 @@ impl Policy for CacheAwareZmqPolicy {
         if block_hashes.is_empty() {
             return Self::pick_min_load(workers);
         }
+        let lookup_started = Instant::now();
         let matched = self.tree.match_prefix(None, &block_hashes);
         let match_rate = matched.matched_blocks as f32 / block_hashes.len() as f32;
         tracing::debug!(
@@ -258,6 +260,15 @@ impl Policy for CacheAwareZmqPolicy {
         // is matching prefixes at all.
         if let Some(m) = self.metrics.get() {
             m.observe_overlap_blocks(ctx.model().0.as_str(), matched.matched_blocks as u64);
+            m.observe_zmq_prefix_lookup_duration(
+                ctx.model().0.as_str(),
+                if matched.matched_blocks == 0 {
+                    "empty"
+                } else {
+                    "matched"
+                },
+                lookup_started.elapsed().as_secs_f64(),
+            );
         }
         if match_rate <= self.config.cache_threshold || matched.workers.is_empty() {
             tracing::debug!(

@@ -23,6 +23,8 @@
 //! | `sgl_router_worker_requests_total` | Counter | `worker_url`, `model_id`, `mode`, `outcome` |
 //! | `sgl_router_request_duration_seconds` | Histogram | `model_id` |
 //! | `sgl_router_ttft_seconds` | Histogram | `model_id` |
+//! | `sgl_router_kv_indexer_query_duration_seconds` | Histogram | `model_id`, `outcome` |
+//! | `sgl_router_zmq_prefix_lookup_duration_seconds` | Histogram | `model_id`, `outcome` |
 //! | `sgl_router_overlap_blocks` | Histogram | `model_id` |
 //! | `sgl_router_active_load` | Gauge | `worker_url`, `kind` |
 //! | `sgl_router_workers` | Gauge | `mode` |
@@ -90,6 +92,15 @@ const TTFT_BUCKETS: &[f64] = &[
     0.005, 0.01, 0.025, 0.05, // router-only sub-100 ms head
     0.1, 0.2, 0.4, 0.6, 0.8, 1.0, 2.0, 4.0, 6.0, 8.0, 10.0, 20.0, 40.0, 60.0, 80.0, 100.0, 200.0,
     400.0,
+];
+
+const INDEXER_QUERY_DURATION_BUCKETS: &[f64] = &[
+    0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0,
+];
+
+const ZMQ_PREFIX_LOOKUP_DURATION_BUCKETS: &[f64] = &[
+    0.000_001, 0.000_002_5, 0.000_005, 0.000_01, 0.000_025, 0.000_05, 0.000_1, 0.000_25,
+    0.000_5, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1,
 ];
 
 /// Recordable outcome for a request — narrowed to a handful of variants so
@@ -223,6 +234,8 @@ pub struct MetricsRegistry {
     // on `worker_requests_total` / the worker gauges instead.
     request_duration: Mutex<HashMap<String, Histogram>>,
     ttft_seconds: Mutex<HashMap<String, Histogram>>,
+    kv_indexer_query_duration: Mutex<HashMap<IndexerQueryKey, Histogram>>,
+    zmq_prefix_lookup_duration: Mutex<HashMap<ZmqPrefixLookupKey, Histogram>>,
     overlap_blocks: Mutex<HashMap<String, Histogram>>,
     active_load: Mutex<HashMap<ActiveLoadKey, Arc<AtomicI64>>>,
     stale_requests_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
@@ -286,6 +299,18 @@ struct ActiveLoadKey {
 struct PolicyDecisionKey {
     policy: String,
     reason: String,
+}
+
+#[derive(Debug, Hash, Eq, PartialEq, Clone)]
+struct IndexerQueryKey {
+    model_id: String,
+    outcome: &'static str,
+}
+
+#[derive(Debug, Hash, Eq, PartialEq, Clone)]
+struct ZmqPrefixLookupKey {
+    model_id: String,
+    outcome: &'static str,
 }
 
 #[derive(Debug)]
@@ -425,6 +450,46 @@ impl MetricsRegistry {
         let hist = guard
             .entry(model_id.to_owned())
             .or_insert_with(|| Histogram::new(TTFT_BUCKETS));
+        hist.observe(seconds);
+    }
+
+    pub fn observe_kv_indexer_query_duration(
+        &self,
+        model_id: &str,
+        outcome: &'static str,
+        seconds: f64,
+    ) {
+        if !seconds.is_finite() {
+            return;
+        }
+        let key = IndexerQueryKey {
+            model_id: model_id.to_owned(),
+            outcome,
+        };
+        let mut guard = self.kv_indexer_query_duration.lock();
+        let hist = guard
+            .entry(key)
+            .or_insert_with(|| Histogram::new(INDEXER_QUERY_DURATION_BUCKETS));
+        hist.observe(seconds);
+    }
+
+    pub fn observe_zmq_prefix_lookup_duration(
+        &self,
+        model_id: &str,
+        outcome: &'static str,
+        seconds: f64,
+    ) {
+        if !seconds.is_finite() {
+            return;
+        }
+        let key = ZmqPrefixLookupKey {
+            model_id: model_id.to_owned(),
+            outcome,
+        };
+        let mut guard = self.zmq_prefix_lookup_duration.lock();
+        let hist = guard
+            .entry(key)
+            .or_insert_with(|| Histogram::new(ZMQ_PREFIX_LOOKUP_DURATION_BUCKETS));
         hist.observe(seconds);
     }
 
@@ -644,6 +709,50 @@ impl MetricsRegistry {
             let hist = guard.get(model_id).unwrap();
             let label_body = format!("model_id=\"{}\"", escape_label(model_id));
             render_histogram(&mut out, "sgl_router_ttft_seconds", &label_body, hist);
+        }
+        drop(guard);
+
+        out.push_str(
+            "# HELP sgl_router_kv_indexer_query_duration_seconds KV Indexer prefix-query latency, by result.\n",
+        );
+        out.push_str("# TYPE sgl_router_kv_indexer_query_duration_seconds histogram\n");
+        let guard = self.kv_indexer_query_duration.lock();
+        let mut entries: Vec<(&IndexerQueryKey, &Histogram)> = guard.iter().collect();
+        entries.sort_by(|a, b| (&a.0.model_id, a.0.outcome).cmp(&(&b.0.model_id, b.0.outcome)));
+        for (key, hist) in entries {
+            let label_body = format!(
+                "model_id=\"{}\",outcome=\"{}\"",
+                escape_label(&key.model_id),
+                key.outcome,
+            );
+            render_histogram(
+                &mut out,
+                "sgl_router_kv_indexer_query_duration_seconds",
+                &label_body,
+                hist,
+            );
+        }
+        drop(guard);
+
+        out.push_str(
+            "# HELP sgl_router_zmq_prefix_lookup_duration_seconds Router-local prefix lookup latency for cache-aware-zmq.\n",
+        );
+        out.push_str("# TYPE sgl_router_zmq_prefix_lookup_duration_seconds histogram\n");
+        let guard = self.zmq_prefix_lookup_duration.lock();
+        let mut entries: Vec<(&ZmqPrefixLookupKey, &Histogram)> = guard.iter().collect();
+        entries.sort_by(|a, b| (&a.0.model_id, a.0.outcome).cmp(&(&b.0.model_id, b.0.outcome)));
+        for (key, hist) in entries {
+            let label_body = format!(
+                "model_id=\"{}\",outcome=\"{}\"",
+                escape_label(&key.model_id),
+                key.outcome,
+            );
+            render_histogram(
+                &mut out,
+                "sgl_router_zmq_prefix_lookup_duration_seconds",
+                &label_body,
+                hist,
+            );
         }
         drop(guard);
 
@@ -1060,6 +1169,36 @@ mod tests {
         );
         // le=0.2 (an engine-aligned edge) is cumulative over both observations.
         assert!(out.contains(r#"sgl_router_ttft_seconds_bucket{model_id="tiny",le="0.2"} 2"#));
+    }
+
+    #[test]
+    fn observe_kv_indexer_query_duration_labels_the_outcome() {
+        let reg = MetricsRegistry::new();
+        reg.observe_kv_indexer_query_duration("tiny", "success", 0.04);
+        reg.observe_kv_indexer_query_duration("tiny", "timeout", 2.0);
+        let out = reg.render();
+
+        assert!(out.contains(
+            r#"sgl_router_kv_indexer_query_duration_seconds_count{model_id="tiny",outcome="success"} 1"#
+        ));
+        assert!(out.contains(
+            r#"sgl_router_kv_indexer_query_duration_seconds_count{model_id="tiny",outcome="timeout"} 1"#
+        ));
+    }
+
+    #[test]
+    fn observe_zmq_prefix_lookup_duration_labels_the_result() {
+        let reg = MetricsRegistry::new();
+        reg.observe_zmq_prefix_lookup_duration("tiny", "matched", 0.0004);
+        reg.observe_zmq_prefix_lookup_duration("tiny", "empty", 0.0001);
+        let out = reg.render();
+
+        assert!(out.contains(
+            r#"sgl_router_zmq_prefix_lookup_duration_seconds_count{model_id="tiny",outcome="matched"} 1"#
+        ));
+        assert!(out.contains(
+            r#"sgl_router_zmq_prefix_lookup_duration_seconds_count{model_id="tiny",outcome="empty"} 1"#
+        ));
     }
 
     #[test]

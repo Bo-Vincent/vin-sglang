@@ -322,7 +322,11 @@ def indexer_query_concurrency(endpoint_count: int) -> int:
 
 
 def policy_args(
-    policy: str, indexer_endpoint: str, *, indexer_query_max_inflight: int = 32
+    policy: str,
+    indexer_endpoint: str,
+    *,
+    indexer_query_timeout_ms: int = 100,
+    indexer_query_max_inflight: int = 32,
 ) -> list[str]:
     if policy == "power_of_two":
         return ["--policy", policy]
@@ -344,7 +348,7 @@ def policy_args(
             "--kv-indexer-endpoint",
             indexer_endpoint,
             "--kv-indexer-query-timeout-ms",
-            "100",
+            str(indexer_query_timeout_ms),
             "--kv-indexer-query-max-inflight",
             str(indexer_query_max_inflight),
             "--cache-affinity-min-matched-tokens",
@@ -369,7 +373,7 @@ def policy_args(
             "--kv-indexer-endpoint",
             indexer_endpoint,
             "--kv-indexer-query-timeout-ms",
-            "100",
+            str(indexer_query_timeout_ms),
             "--kv-indexer-query-max-inflight",
             str(indexer_query_max_inflight),
         ]

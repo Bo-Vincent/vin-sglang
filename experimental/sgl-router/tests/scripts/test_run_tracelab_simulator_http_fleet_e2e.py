@@ -72,13 +72,92 @@ class TraceLabSimulatorHttpFleetContractTest(unittest.TestCase):
         with self.assertRaises(SystemExit):
             runner.parse_args(["--worker-count", "128"])
 
-    def test_native_cache_policy_scales_indexer_query_concurrency_to_fleet_size(self):
+    def test_native_cache_policy_uses_explicit_indexer_budget(self):
         runner = load_runner()
 
-        arguments = runner.policy_args("cache_aware", "http://127.0.0.1:50551")
+        arguments = runner.policy_args(
+            "cache_aware",
+            "http://127.0.0.1:50551",
+            query_timeout_ms=10_000,
+            query_max_inflight=256,
+        )
 
-        position = arguments.index("--kv-indexer-query-max-inflight")
-        self.assertEqual(arguments[position + 1], "256")
+        timeout_position = arguments.index("--kv-indexer-query-timeout-ms")
+        inflight_position = arguments.index("--kv-indexer-query-max-inflight")
+        self.assertEqual(arguments[timeout_position + 1], "10000")
+        self.assertEqual(arguments[inflight_position + 1], "256")
+
+    def test_runner_defaults_to_audited_indexer_budget(self):
+        runner = load_runner()
+
+        arguments = runner.parse_args([])
+
+        self.assertEqual(arguments.kv_indexer_query_timeout_ms, 10_000)
+        self.assertEqual(arguments.kv_indexer_query_max_inflight, 256)
+        self.assertEqual(arguments.kv_indexer_max_concurrent_streams, 512)
+        self.assertFalse(arguments.require_indexer_success)
+
+    def test_indexer_query_summary_reports_latency_and_failures(self):
+        runner = load_runner()
+        before = ""
+        after = "\n".join(
+            [
+                'sgl_router_kv_indexer_query_duration_seconds_bucket{model_id="m",outcome="success",le="0.01"} 1',
+                'sgl_router_kv_indexer_query_duration_seconds_bucket{model_id="m",outcome="success",le="0.1"} 3',
+                'sgl_router_kv_indexer_query_duration_seconds_bucket{model_id="m",outcome="success",le="+Inf"} 3',
+                'sgl_router_kv_indexer_query_duration_seconds_sum{model_id="m",outcome="success"} 0.13',
+                'sgl_router_kv_indexer_query_duration_seconds_count{model_id="m",outcome="success"} 3',
+                'sgl_router_kv_indexer_query_duration_seconds_bucket{model_id="m",outcome="timeout",le="2"} 1',
+                'sgl_router_kv_indexer_query_duration_seconds_bucket{model_id="m",outcome="timeout",le="+Inf"} 1',
+                'sgl_router_kv_indexer_query_duration_seconds_sum{model_id="m",outcome="timeout"} 2.0',
+                'sgl_router_kv_indexer_query_duration_seconds_count{model_id="m",outcome="timeout"} 1',
+            ]
+        )
+
+        summary = runner.indexer_query_summary(before, after)
+
+        self.assertEqual(summary["query_count"], 4)
+        self.assertEqual(summary["success_count"], 3)
+        self.assertEqual(summary["failure_count"], 1)
+        self.assertEqual(summary["outcomes"]["success"]["p95_ms"], 100.0)
+        self.assertEqual(summary["outcomes"]["timeout"]["mean_ms"], 2_000.0)
+
+    def test_indexer_query_success_gate_rejects_any_fail_open_outcome(self):
+        runner = load_runner()
+
+        with self.assertRaisesRegex(RuntimeError, "failed"):
+            runner.require_indexer_query_success(
+                {
+                    "query_count": 256,
+                    "success_count": 255,
+                    "failure_count": 1,
+                    "outcomes": {"success": {"count": 255}, "timeout": {"count": 1}},
+                },
+                expected_queries=256,
+                phase="warmup",
+            )
+
+    def test_zmq_lookup_summary_distinguishes_matched_and_empty(self):
+        runner = load_runner()
+        after = "\n".join(
+            [
+                'sgl_router_zmq_prefix_lookup_duration_seconds_bucket{model_id="m",outcome="matched",le="0.001"} 1',
+                'sgl_router_zmq_prefix_lookup_duration_seconds_bucket{model_id="m",outcome="matched",le="+Inf"} 1',
+                'sgl_router_zmq_prefix_lookup_duration_seconds_sum{model_id="m",outcome="matched"} 0.001',
+                'sgl_router_zmq_prefix_lookup_duration_seconds_count{model_id="m",outcome="matched"} 1',
+                'sgl_router_zmq_prefix_lookup_duration_seconds_bucket{model_id="m",outcome="empty",le="0.0001"} 1',
+                'sgl_router_zmq_prefix_lookup_duration_seconds_bucket{model_id="m",outcome="empty",le="+Inf"} 1',
+                'sgl_router_zmq_prefix_lookup_duration_seconds_sum{model_id="m",outcome="empty"} 0.0001',
+                'sgl_router_zmq_prefix_lookup_duration_seconds_count{model_id="m",outcome="empty"} 1',
+            ]
+        )
+
+        summary = runner.zmq_prefix_lookup_summary("", after)
+
+        self.assertEqual(summary["lookup_count"], 2)
+        self.assertEqual(summary["matched_count"], 1)
+        self.assertEqual(summary["empty_count"], 1)
+        self.assertEqual(summary["outcomes"]["matched"]["p95_ms"], 1.0)
 
     def test_router_command_serializes_integer_timeout_flags(self):
         runner = load_runner()
@@ -89,6 +168,8 @@ class TraceLabSimulatorHttpFleetContractTest(unittest.TestCase):
             tokenizer_path=Path("/tokenizer"),
             request_timeout_seconds=360.0,
             stale_request_timeout_seconds=420.0,
+            kv_indexer_query_timeout_ms=2_000,
+            kv_indexer_query_max_inflight=32,
         )
         case = runner.TraceLabCase(policy="power_of_two", repeat=0)
 

@@ -161,12 +161,122 @@ def max_tokens_for_round(round_: ReplayRound, *, max_total_tokens: int) -> int:
     return round_.output_tokens
 
 
-def policy_args(policy: str, indexer_endpoint: str) -> list[str]:
+INDEXER_QUERY_DURATION_METRIC = "sgl_router_kv_indexer_query_duration_seconds"
+ZMQ_PREFIX_LOOKUP_DURATION_METRIC = "sgl_router_zmq_prefix_lookup_duration_seconds"
+
+
+def policy_args(
+    policy: str,
+    indexer_endpoint: str,
+    *,
+    query_timeout_ms: int,
+    query_max_inflight: int,
+) -> list[str]:
     return fleet.policy_args(
         policy,
         indexer_endpoint,
-        indexer_query_max_inflight=WORKER_COUNT,
+        indexer_query_timeout_ms=query_timeout_ms,
+        indexer_query_max_inflight=query_max_inflight,
     )
+
+
+def indexer_query_summary(
+    before: str,
+    after: str,
+    *,
+    metric: str = INDEXER_QUERY_DURATION_METRIC,
+) -> dict[str, object]:
+    def aggregate(metric: str, snapshot: str) -> dict[str, float]:
+        values: dict[str, float] = {}
+        for labels, value in fleet.metric_samples(snapshot, metric):
+            outcome = labels.get("outcome")
+            if outcome:
+                values[outcome] = values.get(outcome, 0.0) + value
+        return values
+
+    def buckets(snapshot: str) -> dict[tuple[str, str], float]:
+        values: dict[tuple[str, str], float] = {}
+        for labels, value in fleet.metric_samples(snapshot, f"{metric}_bucket"):
+            outcome = labels.get("outcome")
+            bound = labels.get("le")
+            if outcome and bound:
+                key = (outcome, bound)
+                values[key] = values.get(key, 0.0) + value
+        return values
+
+    counts = fleet.metric_delta(
+        aggregate(f"{metric}_count", before),
+        aggregate(f"{metric}_count", after),
+    )
+    sums = fleet.metric_delta(
+        aggregate(f"{metric}_sum", before),
+        aggregate(f"{metric}_sum", after),
+    )
+    before_buckets = buckets(before)
+    after_buckets = buckets(after)
+    bucket_delta = {
+        key: after_buckets.get(key, 0.0) - before_buckets.get(key, 0.0)
+        for key in set(before_buckets) | set(after_buckets)
+    }
+
+    outcomes: dict[str, dict[str, float | int | None]] = {}
+    for outcome, count in sorted(counts.items()):
+        if count <= 0.0:
+            continue
+        finite_bounds = sorted(
+            (float(bound), value)
+            for (bucket_outcome, bound), value in bucket_delta.items()
+            if bucket_outcome == outcome and bound != "+Inf" and value >= 0.0
+        )
+
+        def quantile_ms(quantile: float) -> float | None:
+            target = count * quantile
+            for bound, cumulative in finite_bounds:
+                if cumulative >= target:
+                    return bound * 1_000.0
+            return None
+
+        outcomes[outcome] = {
+            "count": int(round(count)),
+            "mean_ms": 1_000.0 * sums.get(outcome, 0.0) / count,
+            "p50_ms": quantile_ms(0.50),
+            "p95_ms": quantile_ms(0.95),
+        }
+
+    query_count = sum(int(values["count"]) for values in outcomes.values())
+    success_count = int(outcomes.get("success", {}).get("count", 0))
+    return {
+        "query_count": query_count,
+        "success_count": success_count,
+        "failure_count": query_count - success_count,
+        "outcomes": outcomes,
+    }
+
+
+def zmq_prefix_lookup_summary(before: str, after: str) -> dict[str, object]:
+    summary = indexer_query_summary(before, after, metric=ZMQ_PREFIX_LOOKUP_DURATION_METRIC)
+    return {
+        "lookup_count": summary["query_count"],
+        "matched_count": int(summary["outcomes"].get("matched", {}).get("count", 0)),
+        "empty_count": int(summary["outcomes"].get("empty", {}).get("count", 0)),
+        "outcomes": summary["outcomes"],
+    }
+
+
+def require_indexer_query_success(
+    summary: Mapping[str, object], *, expected_queries: int, phase: str
+) -> None:
+    query_count = int(summary["query_count"])
+    success_count = int(summary["success_count"])
+    failure_count = int(summary["failure_count"])
+    if query_count != expected_queries:
+        raise RuntimeError(
+            f"Indexer {phase} query count was {query_count}, expected {expected_queries}"
+        )
+    if failure_count != 0 or success_count != expected_queries:
+        raise RuntimeError(
+            f"Indexer {phase} queries failed: success={success_count} failure={failure_count}"
+        )
 
 
 def router_command(
@@ -192,7 +302,12 @@ def router_command(
         "--stale-request-timeout-secs",
         str(int(args.stale_request_timeout_seconds)),
         "--load-monitor",
-        *policy_args(case.policy, indexer_endpoint),
+        *policy_args(
+            case.policy,
+            indexer_endpoint,
+            query_timeout_ms=args.kv_indexer_query_timeout_ms,
+            query_max_inflight=args.kv_indexer_query_max_inflight,
+        ),
     ]
 
 
@@ -213,8 +328,12 @@ def start_case_control_plane(
                 cwd=args.router_cwd,
                 env={
                     "KV_INDEXER_LISTEN_ADDR": f"127.0.0.1:{args.indexer_port}",
-                    "KV_INDEXER_PREFIX_QUERY_MAX_INFLIGHT": str(WORKER_COUNT),
-                    "KV_INDEXER_MAX_CONCURRENT_STREAMS": str(WORKER_COUNT),
+                    "KV_INDEXER_PREFIX_QUERY_MAX_INFLIGHT": str(
+                        args.kv_indexer_query_max_inflight
+                    ),
+                    "KV_INDEXER_MAX_CONCURRENT_STREAMS": str(
+                        args.kv_indexer_max_concurrent_streams
+                    ),
                 },
             )
             managed.append(indexer)
@@ -479,6 +598,10 @@ def run_case(
         time.sleep(args.indexer_settle_seconds)
 
         warmups, measurements = partition_replay_rounds(rounds)
+        router_warmup_before = asyncio.run(
+            fleet.fetch_texts((f"http://127.0.0.1:{args.router_port}/metrics",))
+        )[0]
+        fleet.atomic_write_text(directory / "router.warmup_before.prom", router_warmup_before)
         asyncio.run(
             replay_phase(
                 warmups,
@@ -501,6 +624,7 @@ def run_case(
         router_log = directory / "router.log"
         log_offset = router_log.stat().st_size
         fleet.atomic_write_text(directory / "router.measurement_before.prom", router_before)
+        warmup_indexer_query = indexer_query_summary(router_warmup_before, router_before)
 
         started = time.monotonic()
         requests = asyncio.run(
@@ -533,6 +657,19 @@ def run_case(
             fleet.policy_reason_counts(router_before, case.policy),
             fleet.policy_reason_counts(router_after, case.policy),
         )
+        measurement_indexer_query = indexer_query_summary(router_before, router_after)
+        measurement_zmq_lookup = zmq_prefix_lookup_summary(router_before, router_after)
+        if args.require_indexer_success and fleet.needs_external_indexer(case.policy):
+            require_indexer_query_success(
+                warmup_indexer_query,
+                expected_queries=sum(len(turns) for turns in warmups.values()),
+                phase="warmup",
+            )
+            require_indexer_query_success(
+                measurement_indexer_query,
+                expected_queries=expected,
+                phase="measurement",
+            )
         audit: dict[str, int] | None = None
         if case.policy == "cache_aware":
             audit = fleet.cache_monitor_usage(router_log.read_text(errors="replace")[log_offset:])
@@ -550,6 +687,17 @@ def run_case(
             policy_reasons=reasons,
         )
         summary["native_cache_audit"] = audit
+        summary["indexer_query"] = (
+            {
+                "warmup": warmup_indexer_query,
+                "measurement": measurement_indexer_query,
+            }
+            if fleet.needs_external_indexer(case.policy)
+            else None
+        )
+        summary["zmq_prefix_lookup"] = (
+            measurement_zmq_lookup if case.policy == "cache_aware_zmq" else None
+        )
         summary["trace_measurement_count"] = expected
         fleet.atomic_write_text(
             directory / "requests.jsonl",
@@ -626,6 +774,10 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--control-plane-quiesce-seconds", type=float, default=16.0)
     parser.add_argument("--request-timeout-seconds", type=int, default=360)
     parser.add_argument("--stale-request-timeout-seconds", type=int, default=420)
+    parser.add_argument("--kv-indexer-query-timeout-ms", type=int, default=10_000)
+    parser.add_argument("--kv-indexer-query-max-inflight", type=int, default=256)
+    parser.add_argument("--kv-indexer-max-concurrent-streams", type=int, default=512)
+    parser.add_argument("--require-indexer-success", action="store_true")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--execute", action="store_true")
     args = parser.parse_args(argv)
@@ -654,6 +806,9 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         or args.control_plane_quiesce_seconds < 0.0
         or args.request_timeout_seconds <= 0.0
         or args.stale_request_timeout_seconds <= 0.0
+        or args.kv_indexer_query_timeout_ms <= 0
+        or args.kv_indexer_query_max_inflight <= 0
+        or args.kv_indexer_max_concurrent_streams <= 0
     ):
         parser.error("timeout values are invalid")
     try:
@@ -723,7 +878,7 @@ def main(argv: Iterable[str] | None = None) -> int:
     tokenizer = TokenizersAdapter(args.tokenizer_path)
     prompts = build_virtual_prompts(rounds, tokenizer)
     contract = {
-        "schema_version": 1,
+        "schema_version": 2,
         "source_commit": fleet.read_source_commit(args.source_root),
         "router_binary_sha256": fleet.sha256_file(args.router_binary),
         "indexer_server_sha256": fleet.sha256_file(args.indexer_server),
@@ -742,6 +897,10 @@ def main(argv: Iterable[str] | None = None) -> int:
         ),
         "output_tokens": "per TraceLab round",
         "control_plane_quiesce_seconds": args.control_plane_quiesce_seconds,
+        "kv_indexer_query_timeout_ms": args.kv_indexer_query_timeout_ms,
+        "kv_indexer_query_max_inflight": args.kv_indexer_query_max_inflight,
+        "kv_indexer_max_concurrent_streams": args.kv_indexer_max_concurrent_streams,
+        "require_indexer_success": args.require_indexer_success,
         "simulator_config": str(args.simulator_config),
         "cases": [asdict(case) | {"name": case.name} for case in cases],
     }

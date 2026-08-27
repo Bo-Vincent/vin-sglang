@@ -30,6 +30,7 @@ use serde::de::IgnoredAny;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 /// Observability header carrying the final decode-pool URL for a
 /// PD-disaggregated request. The router fans the
@@ -161,7 +162,7 @@ fn projected_decode_kv_tokens(input_tokens: u64, max_output_tokens: Option<u64>)
 struct RecordDurationOnDrop {
     metrics: Arc<MetricsRegistry>,
     model: String,
-    start: std::time::Instant,
+    start: Instant,
 }
 
 impl Drop for RecordDurationOnDrop {
@@ -180,7 +181,7 @@ pub async fn chat_completions(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response<Body>, ApiError> {
-    let start = std::time::Instant::now();
+    let start = Instant::now();
     let probe = parse_probe(&body)?;
     let streaming = probe.stream.unwrap_or(false);
     let requested_max_output_tokens = probe.requested_max_output_tokens();
@@ -276,12 +277,19 @@ pub async fn chat_completions(
             if hashes.is_empty() {
                 None
             } else {
-                resolve_prefix_query(index.match_prefix(hashes).await, &model_str)?.map(
-                    |outcome| ExternalPrefixSignal {
+                let query_started = Instant::now();
+                let query_result = index.match_prefix(hashes).await;
+                ctx.metrics.observe_kv_indexer_query_duration(
+                    &model_str,
+                    indexer_query_outcome(&query_result),
+                    query_started.elapsed().as_secs_f64(),
+                );
+                resolve_prefix_query(query_result, &model_str)?.map(|outcome| {
+                    ExternalPrefixSignal {
                         outcome,
                         query_blocks,
-                    },
-                )
+                    }
+                })
             }
         }
         _ => None,
@@ -1040,6 +1048,20 @@ pub async fn chat_completions(
     }
 }
 
+fn indexer_query_outcome(
+    result: &Result<sgl_kv_indexer::PrefixOutcome, sgl_kv_indexer::PrefixIndexError>,
+) -> &'static str {
+    use sgl_kv_indexer::PrefixIndexError;
+    match result {
+        Ok(_) => "success",
+        Err(PrefixIndexError::Unreachable) => "unreachable",
+        Err(PrefixIndexError::Timeout) => "timeout",
+        Err(PrefixIndexError::Overloaded) => "overloaded",
+        Err(PrefixIndexError::QueryTooLarge) => "query_too_large",
+        Err(PrefixIndexError::Rejected(_)) => "rejected",
+    }
+}
+
 fn resolve_prefix_query(
     result: Result<sgl_kv_indexer::PrefixOutcome, sgl_kv_indexer::PrefixIndexError>,
     model: &str,
@@ -1452,6 +1474,22 @@ mod tests {
             ),
             Err(ApiError::PolicySelectionFailed { .. })
         ));
+    }
+
+    #[test]
+    fn indexer_query_outcome_preserves_success_and_fail_open_causes() {
+        assert_eq!(
+            indexer_query_outcome(&Ok(sgl_kv_indexer::PrefixOutcome::Empty)),
+            "success"
+        );
+        assert_eq!(
+            indexer_query_outcome(&Err(sgl_kv_indexer::PrefixIndexError::Timeout)),
+            "timeout"
+        );
+        assert_eq!(
+            indexer_query_outcome(&Err(sgl_kv_indexer::PrefixIndexError::Overloaded)),
+            "overloaded"
+        );
     }
 
     #[test]
