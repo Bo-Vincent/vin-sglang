@@ -136,13 +136,9 @@ fn build_kind(
             ))
         }
         PolicyKind::Sticky => build_sticky(model),
-        PolicyKind::FusedScore => build_fused(
-            model,
-            &tree,
-            &tokenizers,
-            &block_size_oracle,
-            engine_load,
-        )?,
+        PolicyKind::FusedScore => {
+            build_fused(model, &tree, &tokenizers, &block_size_oracle, engine_load)?
+        }
         PolicyKind::PrefixCache => {
             let p = PrefixCachePolicy::new(tree, block_size_oracle, prefix_cache::DEFAULT_WEIGHT);
             // From the eligibility config even for a `--fuse` term, so the two
@@ -444,6 +440,7 @@ mod tests {
             Arc::new(HashTree::new()),
             Arc::new(TokenizerRegistry::default()),
             BlockSizeOracle::new(),
+            EngineLoadTable::new(),
         )
         .expect("--policy prefix_cache must build");
         // Not decoration: a `--fuse prefix_cache=W` term is admitted by
