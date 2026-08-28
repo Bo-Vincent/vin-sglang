@@ -120,6 +120,9 @@ event bridge 的四策略（三轮主矩阵 + Shortest-TTFT 独立确认轮）�
 该结果是 `simulator_predicted_relative` 控制面规模验证：可比较相同合同下的策略相对行为，
 不替代真实 GPU TTFT、E2E 和吞吐结论。
 
+复现实验的代码入口、固定合同、rsync 部署、运行、分析与验收步骤见
+[TraceLab 256-worker HTTP Simulator 复现 SOP](docs/sop/router-tracelab-256-http-simulator-sop.md)。
+
 ## Router Policy 真实 LoadMonitor E2E
 
 真实 8×L20 worker reporter、Router outbound LoadMonitor session、Indexer Cache-Aware
