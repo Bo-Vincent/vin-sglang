@@ -456,6 +456,11 @@ class SimulatorHttpFleetContractTest(unittest.TestCase):
         )
         runner.require_power_of_two_audit(audit, expected_decisions=2)
 
+        native_queue = runner.power_of_two_monitor_usage(
+            'prefill policy decision policy=PowerOfTwo prefill_pressure_source="native_queue_tokens" load_snapshot_version=43\n'
+        )
+        runner.require_power_of_two_audit(native_queue, expected_decisions=1)
+
         broken = dict(audit)
         broken["zero_snapshot_decisions"] = 1
         with self.assertRaisesRegex(RuntimeError, "zero snapshot"):
