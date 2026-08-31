@@ -55,11 +55,6 @@ async fn two_independent_subscribers_converge_to_same_tree_state() {
     router_a.add_worker(worker_url, Some(cfg.clone())).await;
     router_b.add_worker(worker_url, Some(cfg.clone())).await;
 
-    // SUB-side handshake settle. Publishing before the subscribers
-    // finish their initial connect loses messages in PUB/SUB semantics;
-    // the polling loop below would then never converge.
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
     // 3. Publish a deterministic, multi-block event chain.
     let tokens: Vec<u32> = (0..16).collect();
     let hashes = compute_block_hashes(&tokens, block_size as usize);
@@ -70,11 +65,6 @@ async fn two_independent_subscribers_converge_to_same_tree_state() {
     );
     let event_bytes = encode_block_stored_event(&hashes, None, &tokens, block_size);
     let payload = encode_event_batch(0.0, vec![event_bytes], Some(0));
-    publisher
-        .send(build_multipart(1, payload))
-        .await
-        .expect("publish BlockStored");
-
     // 4. Poll both trees until both report the FULL chain matched. The
     //    SUB→mpsc→pump→tree pipeline is async; loopback delivery is
     //    reliable but not instantaneous.
@@ -114,6 +104,12 @@ async fn two_independent_subscribers_converge_to_same_tree_state() {
                 ma.matched_blocks, ma.workers, mb.matched_blocks, mb.workers,
             );
         }
+        // 固定睡眠不能证明 SUBSCRIBE 已抵达 PUB；重复发送同一幂等序号，
+        // 直到两个独立 tree 都观测到事件，隔离握手时序与合并语义。
+        publisher
+            .send(build_multipart(1, payload.clone()))
+            .await
+            .expect("publish BlockStored");
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
@@ -199,10 +195,6 @@ async fn two_subscribers_merge_events_from_two_publishers() {
     router_b.add_worker(worker_x, Some(cfg_x.clone())).await;
     router_b.add_worker(worker_y, Some(cfg_y.clone())).await;
 
-    // Four SUB→PUB handshakes need to settle before publishing; missed
-    // SUBSCRIBE frames lose messages forever in PUB/SUB semantics.
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
     // Two non-overlapping token streams → two distinct hash chains. The
     // gap between them (0..16 vs 1000..1016) keeps `compute_block_hashes`
     // outputs disjoint so a cross-attribution bug can't be masked by
@@ -227,15 +219,6 @@ async fn two_subscribers_merge_events_from_two_publishers() {
         )],
         Some(0),
     );
-    pub_x
-        .send(build_multipart(1, payload_x))
-        .await
-        .expect("publish on pub_x");
-    pub_y
-        .send(build_multipart(1, payload_y))
-        .await
-        .expect("publish on pub_y");
-
     let key_x = KvWorkerId {
         url: worker_x.into(),
         dp_rank: 0,
@@ -304,6 +287,16 @@ async fn two_subscribers_merge_events_from_two_publishers() {
                 by.workers,
             );
         }
+        // 让四条订阅各自在握手完成后收到同一幂等事件，而不是依赖固定
+        // 等待时间；重复 delivery 由 per-worker sequence 去重。
+        pub_x
+            .send(build_multipart(1, payload_x.clone()))
+            .await
+            .expect("publish on pub_x");
+        pub_y
+            .send(build_multipart(1, payload_y.clone()))
+            .await
+            .expect("publish on pub_y");
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
