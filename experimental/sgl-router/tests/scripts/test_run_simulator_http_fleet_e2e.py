@@ -1,9 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 # SPDX-License-Identifier: Apache-2.0
 
+import asyncio
 import importlib.util
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -27,6 +31,42 @@ def load_runner():
 
 
 class SimulatorHttpFleetContractTest(unittest.TestCase):
+    def test_health_probe_retries_a_single_client_timeout_within_global_window(self):
+        runner = load_runner()
+
+        class SlowThenReadyHandler(BaseHTTPRequestHandler):
+            request_count = 0
+
+            def do_GET(self):
+                type(self).request_count += 1
+                if type(self).request_count == 1:
+                    time.sleep(3.1)
+                self.send_response(200)
+                self.end_headers()
+                try:
+                    self.wfile.write(b"ok")
+                except BrokenPipeError:
+                    pass
+
+            def log_message(self, _format, *_args):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), SlowThenReadyHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            asyncio.run(
+                runner.wait_http_urls(
+                    (f"http://127.0.0.1:{server.server_port}/health",), timeout=5.0
+                )
+            )
+        finally:
+            server.shutdown()
+            thread.join(timeout=2.0)
+            server.server_close()
+
+        self.assertGreaterEqual(SlowThenReadyHandler.request_count, 2)
+
     def test_default_matrix_covers_requested_endpoint_counts_and_policies(self):
         runner = load_runner()
 
