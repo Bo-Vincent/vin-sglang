@@ -369,6 +369,39 @@ fn decode_seq(bytes: &[u8]) -> Result<u64, BridgeError> {
     Ok(u64::from_be_bytes(seq_bytes))
 }
 
+/// 一个 apply RPC 的变更形状，用于观测写路径压力且不记录具体 block hash。
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ApplyRequestStats {
+    report_actions: usize,
+    report_hashes: usize,
+    revoke_actions: usize,
+    revoke_hashes: usize,
+    clear_actions: usize,
+}
+
+impl ApplyRequestStats {
+    fn from_request(request: &ApplyExternalKvBatchRequest) -> Self {
+        let mut stats = Self::default();
+        for action in &request.actions {
+            match ExternalKvActionType::try_from(action.r#type) {
+                Ok(ExternalKvActionType::ActionReport) => {
+                    stats.report_actions += 1;
+                    stats.report_hashes += action.hashes.len();
+                }
+                Ok(ExternalKvActionType::ActionRevoke) => {
+                    stats.revoke_actions += 1;
+                    stats.revoke_hashes += action.hashes.len();
+                }
+                Ok(ExternalKvActionType::ActionClearAllAtTier) => {
+                    stats.clear_actions += 1;
+                }
+                Ok(ExternalKvActionType::ActionUnknown) | Err(_) => {}
+            }
+        }
+        stats
+    }
+}
+
 /// Decodes one raw batch and forwards it. A batch that cannot be decoded, or
 /// that carries no supported mutation, is skipped without an RPC.
 async fn forward_raw_batch(
@@ -390,10 +423,21 @@ async fn forward_raw_batch(
     // send the parts in order. A later failure leaves an applied prefix, which
     // beats rejecting and losing the whole event batch.
     for request in split_apply_request(request) {
+        let stats = ApplyRequestStats::from_request(&request);
         client
             .apply_external_kv_batch(request)
             .await
             .map_err(classify_rpc)?;
+        debug!(
+            seq,
+            worker_id = %config.worker_id,
+            report_actions = stats.report_actions,
+            report_hashes = stats.report_hashes,
+            revoke_actions = stats.revoke_actions,
+            revoke_hashes = stats.revoke_hashes,
+            clear_actions = stats.clear_actions,
+            "applied KV event batch to Indexer"
+        );
     }
     Ok(())
 }
@@ -1023,6 +1067,32 @@ mod tests {
             block_sizes: Vec::new(),
             parent_block_hash: None,
         }
+    }
+
+    #[test]
+    fn apply_request_stats_counts_mutation_kinds_and_hashes() {
+        let request = ApplyExternalKvBatchRequest {
+            worker_id: "worker-1".into(),
+            seq: 7,
+            actions: vec![
+                report(hbm(), &["1", "2"]),
+                revoke(dram(), &["3", "4", "5"]),
+                clear_at(hbm()),
+            ],
+            worker_address: "http://worker-1".into(),
+            cache_spec: None,
+        };
+
+        assert_eq!(
+            ApplyRequestStats::from_request(&request),
+            ApplyRequestStats {
+                report_actions: 1,
+                report_hashes: 2,
+                revoke_actions: 1,
+                revoke_hashes: 3,
+                clear_actions: 1,
+            }
+        );
     }
 
     #[test]

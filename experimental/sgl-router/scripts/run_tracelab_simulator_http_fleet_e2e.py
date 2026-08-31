@@ -37,6 +37,7 @@ from tracelab_replay import (
 WORKER_COUNT = 256
 ROUNDS_PER_SESSION = 4
 DEFAULT_REQUEST_RATE = 64.0
+DEFAULT_WARMUP_REQUEST_RATE = 1.0
 DEFAULT_POLICIES = fleet.DEFAULT_POLICIES
 TRACE_PROVIDER = "codex"
 TRACE_SELECTION_SEED = 20260822
@@ -45,6 +46,8 @@ TRACE_MAX_INPUT_TOKENS = 16384
 TRACE_MIN_PREFIX_TOKENS = 1024
 TRACE_MAX_APPEND_TOKENS = 4096
 MAX_HTTP_REQUEST_CONCURRENCY = fleet.MAX_HTTP_REQUEST_CONCURRENCY
+BRIDGE_APPLY_LOG_MARKER = "applied KV event batch to Indexer"
+BRIDGE_FAILURE_LOG_MARKER = "bridge session lost; reconnecting"
 
 
 @dataclass(frozen=True)
@@ -147,6 +150,52 @@ def partition_replay_rounds(
 
 def expected_measurement_count(rounds: Sequence[ReplayRound]) -> int:
     return sum(not round_.is_warmup for round_ in rounds)
+
+
+def bridge_log_progress(log_paths: Sequence[Path]) -> tuple[int, int]:
+    applied_batches = 0
+    bridge_failures = 0
+    for path in log_paths:
+        text = path.read_text(errors="replace") if path.exists() else ""
+        applied_batches += text.count(BRIDGE_APPLY_LOG_MARKER)
+        bridge_failures += text.count(BRIDGE_FAILURE_LOG_MARKER)
+    return applied_batches, bridge_failures
+
+
+def wait_for_indexer_bridge_drain(
+    log_paths: Sequence[Path],
+    *,
+    quiet_seconds: float,
+    timeout_seconds: float,
+    poll_seconds: float,
+    sleep=time.sleep,
+    monotonic=time.monotonic,
+) -> dict[str, int | float]:
+    deadline = monotonic() + timeout_seconds
+    applied_batches, bridge_failures = bridge_log_progress(log_paths)
+    if bridge_failures:
+        raise RuntimeError(f"bridge failure before Indexer drain: {bridge_failures}")
+    last_change = monotonic()
+    while True:
+        applied_now, bridge_failures = bridge_log_progress(log_paths)
+        if bridge_failures:
+            raise RuntimeError(f"bridge failure before Indexer drain: {bridge_failures}")
+        now = monotonic()
+        if applied_now != applied_batches:
+            applied_batches = applied_now
+            last_change = now
+        if applied_batches and now - last_change >= quiet_seconds:
+            return {
+                "applied_batches": applied_batches,
+                "bridge_failures": bridge_failures,
+                "quiet_seconds": quiet_seconds,
+            }
+        if now >= deadline:
+            raise RuntimeError(
+                "Indexer bridge did not reach a successful apply quiet window "
+                f"within {timeout_seconds}s"
+            )
+        sleep(min(poll_seconds, deadline - now))
 
 
 def max_tokens_for_round(round_: ReplayRound, *, max_total_tokens: int) -> int:
@@ -356,6 +405,7 @@ def start_case_control_plane(
                             "SGLANG_KV_EVENT_ENDPOINT": f"tcp://127.0.0.1:{spec.kv_port}",
                             "SGLANG_KV_EVENT_TOPIC": "kv",
                             "KV_INDEXER_CLEAR_TIERS": "HBM,DRAM,SSD",
+                            "RUST_LOG": "info,sgl_kv_indexer::bridge=debug",
                         },
                     )
                 )
@@ -632,12 +682,24 @@ def run_case(
                 prompts=prompts,
                 router_url=f"http://127.0.0.1:{args.router_port}",
                 model=str(args.model_path),
-                request_rate=args.request_rate,
+                request_rate=args.warmup_request_rate,
                 timeout_seconds=args.request_timeout_seconds,
                 max_total_tokens=args.max_total_tokens,
             )
         )
-        time.sleep(args.indexer_settle_seconds)
+        if fleet.needs_external_indexer(case.policy):
+            drain = wait_for_indexer_bridge_drain(
+                tuple(directory / "bridges" / f"{spec.index}.log" for spec in specs),
+                quiet_seconds=args.indexer_drain_quiet_seconds,
+                timeout_seconds=args.indexer_drain_timeout_seconds,
+                poll_seconds=args.indexer_drain_poll_seconds,
+            )
+            fleet.atomic_write_text(
+                directory / "indexer_drain.json",
+                json.dumps(drain, indent=2, sort_keys=True) + "\n",
+            )
+        else:
+            time.sleep(args.indexer_settle_seconds)
 
         worker_before = asyncio.run(
             fleet.fetch_texts(tuple(f"{url}/metrics" for url in worker_urls))
@@ -821,6 +883,9 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--policies", default=",".join(DEFAULT_POLICIES))
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--request-rate", type=float, default=DEFAULT_REQUEST_RATE)
+    parser.add_argument(
+        "--warmup-request-rate", type=float, default=DEFAULT_WARMUP_REQUEST_RATE
+    )
     parser.add_argument("--http-base-port", type=int)
     parser.add_argument("--kv-base-port", type=int)
     parser.add_argument("--dist-base-port", type=int)
@@ -835,6 +900,9 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--router-start-timeout", type=float, default=180.0)
     parser.add_argument("--router-settle-seconds", type=float, default=35.0)
     parser.add_argument("--indexer-settle-seconds", type=float, default=4.0)
+    parser.add_argument("--indexer-drain-quiet-seconds", type=float, default=5.0)
+    parser.add_argument("--indexer-drain-timeout-seconds", type=float, default=180.0)
+    parser.add_argument("--indexer-drain-poll-seconds", type=float, default=0.5)
     parser.add_argument("--control-plane-quiesce-seconds", type=float, default=16.0)
     parser.add_argument("--request-timeout-seconds", type=int, default=360)
     parser.add_argument("--stale-request-timeout-seconds", type=int, default=420)
@@ -855,8 +923,12 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         parser.error(f"--sessions must be {WORKER_COUNT} for this contract")
     if args.rounds_per_session != ROUNDS_PER_SESSION:
         parser.error(f"--rounds-per-session must be {ROUNDS_PER_SESSION}")
-    if args.repeats <= 0 or args.request_rate <= 0.0:
-        parser.error("--repeats and --request-rate must be positive")
+    if (
+        args.repeats <= 0
+        or args.request_rate <= 0.0
+        or args.warmup_request_rate <= 0.0
+    ):
+        parser.error("--repeats, --request-rate, and --warmup-request-rate must be positive")
     if (
         args.max_total_tokens <= 0
         or args.max_running_requests <= 0
@@ -867,6 +939,9 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         args.worker_port_layout_wait_timeout < 0.0
         or args.router_settle_seconds < 0.0
         or args.indexer_settle_seconds < 0.0
+        or args.indexer_drain_quiet_seconds <= 0.0
+        or args.indexer_drain_timeout_seconds <= 0.0
+        or args.indexer_drain_poll_seconds <= 0.0
         or args.control_plane_quiesce_seconds < 0.0
         or args.request_timeout_seconds <= 0.0
         or args.stale_request_timeout_seconds <= 0.0
@@ -954,6 +1029,9 @@ def main(argv: Iterable[str] | None = None) -> int:
         "policies": list(args.policies),
         "repeats": args.repeats,
         "request_rate": args.request_rate,
+        "warmup_request_rate": args.warmup_request_rate,
+        "indexer_drain_quiet_seconds": args.indexer_drain_quiet_seconds,
+        "indexer_drain_timeout_seconds": args.indexer_drain_timeout_seconds,
         "max_total_tokens": args.max_total_tokens,
         "max_running_requests": args.max_running_requests,
         "trace": str(args.trace),
