@@ -652,7 +652,10 @@ async def wait_http_urls(urls: Sequence[str], *, timeout: float) -> None:
                 try:
                     async with session.get(url) as response:
                         return url, response.status < 500
-                except aiohttp.ClientError:
+                # 单次探针允许在全局健康窗口内超时后重试。256-worker
+                # CPU Simulator 启动时，router 可能短暂拿不到调度时间；
+                # 不能把这一轮 3 秒 client timeout 误判为整体启动失败。
+                except (aiohttp.ClientError, asyncio.TimeoutError):
                     return url, False
 
             for url, ready in await asyncio.gather(*(probe(url) for url in batch)):
