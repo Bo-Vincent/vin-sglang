@@ -362,6 +362,9 @@ pub struct SelectionProposal {
     pub primary: Arc<Worker>,
     pub backup: Option<Arc<Worker>>,
     pub kind: ProposalKind,
+    /// Pair proposal 的可选 pressure-guard 参数。仅在 complete fresh native
+    /// monitor 覆盖 primary/backup 时生效；否则 admission 统一回退本地负载。
+    pub guard_hints: GuardHints,
     /// EligibilityFilter 之后可用于 fallback 的 worker。
     pub eligible_workers: Option<Vec<Arc<Worker>>>,
 }
@@ -379,10 +382,14 @@ pub struct CacheCandidate {
 }
 
 /// 有界 Cache-Aware 候选集。
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct CacheCandidateProposal {
     pub candidates: Vec<CacheCandidate>,
     pub cache_switch_margin_tokens: u64,
+    pub enable_pressure_guard: bool,
+    pub pressure_abs_threshold_tokens: u64,
+    pub pressure_abs_threshold_ms: Option<f64>,
+    pub pressure_rel_threshold: f64,
 }
 
 /// Prefill policy 返回 pair 或 Cache-Aware 候选集。
@@ -416,6 +423,7 @@ impl SelectionProposal {
             primary,
             backup: None,
             kind: ProposalKind::Generic,
+            guard_hints: GuardHints::default(),
             eligible_workers: None,
         }
     }
@@ -426,12 +434,18 @@ impl SelectionProposal {
             primary,
             backup: Some(backup),
             kind: ProposalKind::PowerOfTwo,
+            guard_hints: GuardHints::default(),
             eligible_workers: None,
         }
     }
 
     pub fn with_kind(mut self, kind: ProposalKind) -> Self {
         self.kind = kind;
+        self
+    }
+
+    pub fn with_guard_hints(mut self, guard_hints: GuardHints) -> Self {
+        self.guard_hints = guard_hints;
         self
     }
 
@@ -449,6 +463,26 @@ pub enum ProposalKind {
     SessionAffinity,
     CacheAffinity,
     Score,
+}
+
+/// Pair proposal 的可选 Guard 参数。
+#[derive(Debug, Clone)]
+pub struct GuardHints {
+    pub enable_pressure_guard: bool,
+    pub pressure_abs_threshold_tokens: u64,
+    pub pressure_abs_threshold_ms: Option<f64>,
+    pub pressure_rel_threshold: f64,
+}
+
+impl Default for GuardHints {
+    fn default() -> Self {
+        Self {
+            enable_pressure_guard: false,
+            pressure_abs_threshold_tokens: 0,
+            pressure_abs_threshold_ms: None,
+            pressure_rel_threshold: 1.0,
+        }
+    }
 }
 
 pub trait Policy: Send + Sync + std::fmt::Debug {
@@ -571,7 +605,7 @@ mod tests {
         resolve_cache_candidates, resolve_prefill, CandidateRange, DecisionReason, FreshLoadLookup,
     };
     use crate::policies::cache_aware::CacheAwarePolicy;
-    use crate::policies::engine_load::{EngineLoadSnapshot, EngineWorkerLoad};
+    use crate::policies::engine_load::{EngineLoadSnapshot, NativeCacheWorkerLoad};
     use crate::policies::power_of_two::PowerOfTwoChoicesPolicy;
     use crate::policies::round_robin::RoundRobinPolicy;
     use crate::policies::session_aware::SessionAwarePolicy;
@@ -585,6 +619,9 @@ mod tests {
         num_waiting_reqs: u64,
         num_tokens: u64,
         max_total_num_tokens: u64,
+        num_waiting_uncached_tokens: Option<u64>,
+        num_total_tokens: Option<u64>,
+        max_running_requests: Option<u64>,
     }
 
     fn worker(id: &str) -> Arc<Worker> {
@@ -665,6 +702,7 @@ mod tests {
                 max_pending_prefill_tokens: None,
             }],
             cache_switch_margin_tokens: 8,
+            ..Default::default()
         };
 
         assert_eq!(proposal.candidates[0].worker.id, hot.id);
@@ -1182,18 +1220,27 @@ mod tests {
     }
 
     fn snapshot(entries: &[(&Arc<Worker>, TestEngineLoad)]) -> EngineLoadSnapshot {
-        EngineLoadSnapshot::from_workers(
+        EngineLoadSnapshot::from_native_cache_workers(
             1,
             entries
                 .iter()
                 .map(|(worker, aggregate)| {
                     (
                         worker.url.clone(),
-                        EngineWorkerLoad {
+                        NativeCacheWorkerLoad {
                             num_running_reqs: aggregate.num_running_reqs,
                             num_waiting_reqs: aggregate.num_waiting_reqs,
-                            num_tokens: aggregate.num_tokens,
+                            num_waiting_uncached_tokens: aggregate
+                                .num_waiting_uncached_tokens
+                                .unwrap_or(aggregate.num_waiting_reqs),
+                            num_used_tokens: aggregate.num_tokens,
+                            num_total_tokens: aggregate
+                                .num_total_tokens
+                                .unwrap_or(aggregate.num_tokens),
                             max_total_num_tokens: aggregate.max_total_num_tokens,
+                            max_running_requests: aggregate.max_running_requests.unwrap_or(64),
+                            prefill_throughput_tokens_per_s: None,
+                            estimated_prefill_queue_ms: None,
                             captured_at: Instant::now(),
                         },
                     )
@@ -1266,6 +1313,7 @@ mod tests {
                 cache_candidate(&winner, 70, 30, None),
             ],
             cache_switch_margin_tokens: 16,
+            ..Default::default()
         };
         let loads = snapshot(&[
             (
@@ -1307,6 +1355,7 @@ mod tests {
                 cache_candidate(&final_winner, 80, 20, None),
             ],
             cache_switch_margin_tokens: 0,
+            ..Default::default()
         };
         let loads = snapshot(&[
             (
@@ -1346,6 +1395,7 @@ mod tests {
         let proposal = CacheCandidateProposal {
             candidates: vec![cache_candidate(&candidate, 80, 20, Some(30))],
             cache_switch_margin_tokens: 16,
+            ..Default::default()
         };
         let pending_allows = snapshot(&[(
             &candidate,
@@ -1385,6 +1435,7 @@ mod tests {
                 cache_candidate(&idle, 80, 20, None),
             ],
             cache_switch_margin_tokens: 32,
+            ..Default::default()
         };
         let loads = snapshot(&[
             (
@@ -1419,6 +1470,7 @@ mod tests {
                 cache_candidate(&idle, 20, 80, None),
             ],
             cache_switch_margin_tokens: 32,
+            ..Default::default()
         };
         let loads = snapshot(&[
             (
@@ -1461,6 +1513,7 @@ mod tests {
                 cache_candidate(&beyond_margin, 60, 40, None),
             ],
             cache_switch_margin_tokens: 32,
+            ..Default::default()
         };
         let loads = snapshot(&[
             (
