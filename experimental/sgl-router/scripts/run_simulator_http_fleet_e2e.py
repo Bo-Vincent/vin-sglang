@@ -319,6 +319,7 @@ def simulator_worker_command(
         "--max-running-requests",
         str(max_running_requests),
         "--disable-overlap-schedule",
+        "--sleep-on-idle",
         "--load-publish-endpoint",
         "auto",
         "--load-snapshot-publish-interval",

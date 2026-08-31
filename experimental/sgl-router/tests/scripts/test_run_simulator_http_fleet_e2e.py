@@ -118,6 +118,7 @@ class SimulatorHttpFleetContractTest(unittest.TestCase):
         self.assertIn("sglang_simulator.simulation.sglang.launch_server", command)
         self.assertIn("--enable-cache-report", command)
         self.assertIn("--enable-metrics", command)
+        self.assertIn("--sleep-on-idle", command)
         self.assertIn("--load-publish-endpoint", command)
         self.assertEqual(command[command.index("--load-publish-endpoint") + 1], "auto")
         self.assertEqual(
