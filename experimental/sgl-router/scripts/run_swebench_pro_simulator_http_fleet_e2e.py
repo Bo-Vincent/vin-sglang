@@ -92,34 +92,12 @@ def replay_request(
 
 
 def simulator_runtime_probe_command(python: str) -> list[str]:
-    return [
-        python,
-        "-c",
-        "import aiconfigurator.sdk.models, transformers.image_processing_backends, sglang_simulator",
-    ]
+    return fleet.simulator_runtime_probe_command(python)
 
 
 def validate_simulator_runtime(args: argparse.Namespace) -> None:
-    """在启动 256 个 worker 前确认 Python 依赖组合可以加载。"""
-    environment = os.environ.copy()
-    environment.update(
-        fleet.simulator_environment(
-            simulator_site=args.simulator_site,
-            source_root=args.source_root,
-            simulator_config=args.simulator_config,
-        )
-    )
-    completed = subprocess.run(
-        simulator_runtime_probe_command(args.python),
-        cwd=args.source_root,
-        env=environment,
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    if completed.returncode != 0:
-        detail = (completed.stderr or completed.stdout).strip().splitlines()
-        raise RuntimeError("Simulator runtime preflight failed: " + (detail[-1] if detail else "unknown error"))
+    """兼容 SWE-bench runner 的现有入口，实际复用共享的运行时预检。"""
+    fleet.validate_simulator_runtime(args)
 
 
 def validate_agent_context_prefix(
@@ -395,6 +373,7 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--indexer-bridge", type=Path)
     parser.add_argument("--python")
     parser.add_argument("--simulator-site", type=Path)
+    parser.add_argument("--simulator-dependency-root", type=Path)
     parser.add_argument("--simulator-config", type=Path)
     parser.add_argument("--model-path", type=Path)
     parser.add_argument("--tokenizer-path", type=Path)
@@ -473,7 +452,7 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     if args.execute:
         required = (
             "source_root", "router_binary", "router_cwd", "indexer_server", "indexer_bridge",
-            "python", "simulator_site", "simulator_config", "model_path", "tokenizer_path",
+            "python", "simulator_site", "simulator_dependency_root", "simulator_config", "model_path", "tokenizer_path",
             "dataset_cache", "results_dir",
         )
         missing = [name for name in required if getattr(args, name) is None]
@@ -567,11 +546,13 @@ def main(argv: Iterable[str] | None = None) -> int:
             runner_script=Path(__file__),
             python=args.python,
             simulator_config=args.simulator_config,
+            simulator_dependency_root=args.simulator_dependency_root,
             argv=invocation,
         ),
         "python": args.python,
         "simulator_pythonpath": os.environ.get("PYTHONPATH", ""),
         "simulator_site": str(args.simulator_site),
+        "simulator_dependency_root": str(args.simulator_dependency_root),
         "simulator_config": str(args.simulator_config),
         "cases": [asdict(case) | {"name": case.name} for case in cases],
     }
