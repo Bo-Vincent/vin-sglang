@@ -474,7 +474,7 @@ mod tests {
     use crate::config::AffinityConfig;
     use crate::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
     use crate::policies::admission::{resolve_prefill, CandidateRange};
-    use crate::policies::engine_load::{EngineLoadSnapshot, EngineWorkerLoad};
+    use crate::policies::engine_load::{EngineLoadSnapshot, NativeCacheWorkerLoad};
     use crate::policies::power_of_two::PowerOfTwoChoicesPolicy;
     use crate::policies::round_robin::RoundRobinPolicy;
     use crate::policies::session_aware::SessionAwarePolicy;
@@ -496,18 +496,23 @@ mod tests {
     }
 
     fn snapshot(entries: &[(&Arc<Worker>, u64, u64, u64, u64)]) -> EngineLoadSnapshot {
-        EngineLoadSnapshot::from_workers(
+        EngineLoadSnapshot::from_native_cache_workers(
             1,
             entries
                 .iter()
                 .map(|(worker, running, waiting, used, capacity)| {
                     (
                         worker.url.clone(),
-                        EngineWorkerLoad {
+                        NativeCacheWorkerLoad {
                             num_running_reqs: *running,
                             num_waiting_reqs: *waiting,
-                            num_tokens: *used,
+                            num_waiting_uncached_tokens: *waiting,
+                            num_used_tokens: *used,
+                            num_total_tokens: *used,
                             max_total_num_tokens: *capacity,
+                            max_running_requests: 64,
+                            prefill_throughput_tokens_per_s: None,
+                            estimated_prefill_queue_ms: None,
                             captured_at: Instant::now(),
                         },
                     )

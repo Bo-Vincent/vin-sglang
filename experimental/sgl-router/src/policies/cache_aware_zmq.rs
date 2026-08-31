@@ -547,6 +547,7 @@ mod tests {
             num_waiting_reqs: waiting,
             num_tokens: 0,
             max_total_num_tokens: 0,
+            native_cache: None,
         }
     }
 

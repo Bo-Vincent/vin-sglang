@@ -112,6 +112,18 @@ pub struct Cli {
     /// Session affinity primary 的查找与 fallback 行为。
     #[arg(long, value_enum)]
     pub session_affinity_mode: Option<SessionAffinityMode>,
+    /// 关闭 Session/Cache-Aware 的 pressure guard。
+    #[arg(long)]
+    pub disable_pressure_guard: bool,
+    /// Pressure guard 所需的 waiting-uncached-token 绝对差。
+    #[arg(long)]
+    pub pressure_abs_threshold_tokens: Option<u64>,
+    /// 有可靠 Prefill queue estimate 时使用的毫秒绝对差。
+    #[arg(long)]
+    pub pressure_abs_threshold_ms: Option<f64>,
+    /// Pressure guard 所需的 waiting-uncached-token 相对倍率。
+    #[arg(long)]
+    pub pressure_rel_threshold: Option<f64>,
     /// Cache-Aware 候选必须至少命中的 token 数；默认 1024。
     #[arg(long)]
     pub cache_affinity_min_matched_tokens: Option<u64>,
@@ -303,6 +315,11 @@ impl Cli {
                  --session-affinity-mode require --policy session_aware"
             ));
         }
+        if self.disable_pressure_guard && !affinity_policy {
+            return Err(anyhow!(
+                "--disable-pressure-guard requires --policy session_aware or cache_aware"
+            ));
+        }
         let tuned_cache_candidates = self.cache_affinity_min_matched_tokens.is_some()
             || self.cache_affinity_min_match_ratio.is_some()
             || self.cache_candidate_min_workers.is_some()
@@ -312,6 +329,15 @@ impl Cli {
         if tuned_cache_candidates && self.policy != PolicyKind::CacheAware {
             return Err(anyhow!(
                 "cache candidate tuning flags require --policy cache_aware"
+            ));
+        }
+        if (self.pressure_abs_threshold_tokens.is_some()
+            || self.pressure_abs_threshold_ms.is_some()
+            || self.pressure_rel_threshold.is_some())
+            && !affinity_policy
+        {
+            return Err(anyhow!(
+                "pressure guard tuning requires --policy session_aware or cache_aware"
             ));
         }
         let is_score_composition = matches!(
@@ -469,6 +495,22 @@ impl Cli {
             axum::http::HeaderName::try_from(session_id_header.as_str()).map_err(|e| {
                 anyhow!("--session-id-header {session_id_header:?} is not a valid HTTP header name: {e}")
             })?;
+            let pressure_rel_threshold = self
+                .pressure_rel_threshold
+                .unwrap_or(d.pressure_rel_threshold);
+            if !pressure_rel_threshold.is_finite() || pressure_rel_threshold <= 1.0 {
+                return Err(anyhow!(
+                    "--pressure-rel-threshold must be finite and greater than 1"
+                ));
+            }
+            if self
+                .pressure_abs_threshold_ms
+                .is_some_and(|threshold| !threshold.is_finite() || threshold < 0.0)
+            {
+                return Err(anyhow!(
+                    "--pressure-abs-threshold-ms must be finite and non-negative"
+                ));
+            }
             let cache_affinity_min_match_ratio = self
                 .cache_affinity_min_match_ratio
                 .or(d.cache_affinity_min_match_ratio);
@@ -523,6 +565,14 @@ impl Cli {
                 session_affinity_mode: self
                     .session_affinity_mode
                     .unwrap_or(d.session_affinity_mode),
+                pressure_guard: !self.disable_pressure_guard && d.pressure_guard,
+                pressure_abs_threshold_tokens: self
+                    .pressure_abs_threshold_tokens
+                    .unwrap_or(d.pressure_abs_threshold_tokens),
+                pressure_abs_threshold_ms: self
+                    .pressure_abs_threshold_ms
+                    .or(d.pressure_abs_threshold_ms),
+                pressure_rel_threshold,
                 cache_affinity_min_matched_tokens: self
                     .cache_affinity_min_matched_tokens
                     .or(d.cache_affinity_min_matched_tokens),
@@ -1617,17 +1667,18 @@ mod tests {
     }
 
     #[test]
-    fn rejects_removed_token_pressure_flags() {
-        for flag in [
-            "--disable-pressure-guard",
-            "--pressure-abs-threshold-tokens 2048",
-            "--pressure-rel-threshold 2.0",
-        ] {
-            let error = cfg_of(&format!("--policy session_aware {flag}"))
-                .unwrap_err()
-                .to_string();
-            assert!(error.contains("unexpected argument"), "{flag}: {error}");
-        }
+    fn native_cache_pressure_flags_build_the_guard_contract() {
+        let config = cfg_of(
+            "--policy cache_aware --kv-indexer-endpoint http://indexer:50051 \
+             --disable-pressure-guard --pressure-abs-threshold-tokens 2048 \
+             --pressure-abs-threshold-ms 3.5 --pressure-rel-threshold 2.0",
+        )
+        .unwrap();
+        let affinity = config.model.affinity.expect("cache-aware needs affinity config");
+        assert!(!affinity.pressure_guard);
+        assert_eq!(affinity.pressure_abs_threshold_tokens, 2_048);
+        assert_eq!(affinity.pressure_abs_threshold_ms, Some(3.5));
+        assert_eq!(affinity.pressure_rel_threshold, 2.0);
     }
 
     #[test]
