@@ -777,6 +777,7 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--indexer-bridge", type=Path)
     parser.add_argument("--python")
     parser.add_argument("--simulator-site", type=Path)
+    parser.add_argument("--simulator-dependency-root", type=Path)
     parser.add_argument("--simulator-config", type=Path)
     parser.add_argument("--model-path", type=Path)
     parser.add_argument("--tokenizer-path", type=Path)
@@ -859,6 +860,7 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
             "indexer_bridge",
             "python",
             "simulator_site",
+            "simulator_dependency_root",
             "simulator_config",
             "model_path",
             "tokenizer_path",
@@ -879,7 +881,8 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
 
 
 def main(argv: Iterable[str] | None = None) -> int:
-    args = parse_args(argv)
+    invocation = tuple(argv) if argv is not None else tuple(sys.argv[1:])
+    args = parse_args(invocation)
     cases = build_cases(args.policies, repeats=args.repeats)
     if not args.execute:
         print(
@@ -898,6 +901,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         return 0
     assert args.results_dir is not None
     assert args.trace is not None
+    fleet.validate_simulator_runtime(args)
     rounds = create_or_verify_replay_manifest(
         args.results_dir, trace=args.trace, selection=default_selection_config()
     )
@@ -909,7 +913,7 @@ def main(argv: Iterable[str] | None = None) -> int:
     tokenizer = TokenizersAdapter(args.tokenizer_path)
     prompts = build_virtual_prompts(rounds, tokenizer)
     contract = {
-        "schema_version": 2,
+        "schema_version": 3,
         "source_commit": fleet.read_source_commit(args.source_root),
         "router_binary_sha256": fleet.sha256_file(args.router_binary),
         "indexer_server_sha256": fleet.sha256_file(args.indexer_server),
@@ -937,6 +941,14 @@ def main(argv: Iterable[str] | None = None) -> int:
         "kv_indexer_query_max_inflight": args.kv_indexer_query_max_inflight,
         "kv_indexer_max_concurrent_streams": args.kv_indexer_max_concurrent_streams,
         "require_indexer_success": args.require_indexer_success,
+        "execution_artifacts": fleet.execution_artifact_contract(
+            runner_script=Path(__file__),
+            python=args.python,
+            simulator_config=args.simulator_config,
+            simulator_dependency_root=args.simulator_dependency_root,
+            argv=invocation,
+        ),
+        "simulator_dependency_root": str(args.simulator_dependency_root),
         "simulator_config": str(args.simulator_config),
         "cases": [asdict(case) | {"name": case.name} for case in cases],
     }

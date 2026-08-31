@@ -257,11 +257,13 @@ class SimulatorHttpFleetContractTest(unittest.TestCase):
             runner_script=SCRIPT,
             python=sys.executable,
             simulator_config=SCRIPT,
+            simulator_dependency_root=SCRIPT.parent,
             argv=("--policies", "cache_aware"),
         )
 
         self.assertEqual(contract["runner_script_sha256"], runner.sha256_file(SCRIPT))
         self.assertEqual(contract["simulator_config_sha256"], runner.sha256_file(SCRIPT))
+        self.assertEqual(contract["simulator_dependency_root_sha256"], runner.sha256_tree(SCRIPT.parent))
         self.assertEqual(contract["runner_argv"], ["--policies", "cache_aware"])
         self.assertTrue(Path(contract["python_executable"]).is_file())
 
@@ -339,6 +341,7 @@ class SimulatorHttpFleetContractTest(unittest.TestCase):
 
         environment = runner.simulator_environment(
             simulator_site=Path("/sim/site"),
+            simulator_dependency_root=Path("/sim/deps"),
             source_root=Path("/sim/source"),
             simulator_config=Path("/sim/replay.json"),
         )
@@ -347,6 +350,7 @@ class SimulatorHttpFleetContractTest(unittest.TestCase):
         self.assertEqual(environment["SGLANG_USE_CPU_ENGINE"], "1")
         self.assertEqual(environment["SGLANG_SIMULATOR_OUTPUT_MODE"], "BLOCKING")
         self.assertTrue(environment["PYTHONPATH"].startswith("/sim/site:"))
+        self.assertIn("/sim/deps", environment["PYTHONPATH"])
 
     def test_zero_cache_holders_selects_router_seeded_cache(self):
         runner = load_runner()
