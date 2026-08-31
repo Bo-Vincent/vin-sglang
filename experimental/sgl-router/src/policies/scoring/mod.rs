@@ -333,6 +333,10 @@ impl Policy for Pipeline {
                 let selected = proposal.candidates.into_iter().next()?.worker;
                 (crate::policies::ProposalKind::CacheAffinity, selected)
             }
+            PrefillProposal::ShortestTtftCandidates(proposal) => {
+                let selected = proposal.candidates.into_iter().next()?.worker;
+                (crate::policies::ProposalKind::Generic, selected)
+            }
         };
         self.inner
             .commit_prefill_selection(ctx, proposal_kind, &selected);
@@ -353,6 +357,10 @@ impl Policy for Pipeline {
                     SelectionProposal::primary(candidate.worker)
                         .with_kind(crate::policies::ProposalKind::CacheAffinity),
                 )
+            }
+            PrefillProposal::ShortestTtftCandidates(proposal) => {
+                let candidate = proposal.candidates.into_iter().next()?;
+                Some(SelectionProposal::primary(candidate.worker))
             }
         }
     }
@@ -377,6 +385,10 @@ impl Policy for Pipeline {
     ) {
         self.inner
             .commit_prefill_selection(ctx, proposal_kind, selected);
+    }
+
+    fn try_claim_shortest_ttft(&self, worker_id: &crate::discovery::WorkerId) -> bool {
+        self.inner.try_claim_shortest_ttft(worker_id)
     }
 
     /// 透传 inner policy 的 Bucket affinity 语义。

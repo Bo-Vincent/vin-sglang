@@ -7,8 +7,8 @@ use crate::config::AffinityConfig;
 use crate::policies::admission::FreshLoadLookup;
 use crate::policies::power_of_two::PowerOfTwoChoicesPolicy;
 use crate::policies::{
-    CacheCandidate, CacheCandidateProposal, Policy, PrefillProposal, ProposalKind,
-    SelectionContext, SelectionProposal,
+    estimate_matched_prefix_tokens, CacheCandidate, CacheCandidateProposal, Policy,
+    PrefillProposal, ProposalKind, SelectionContext, SelectionProposal,
 };
 use crate::workers::Worker;
 use std::cmp::Ordering;
@@ -157,6 +157,7 @@ impl Policy for CacheAwarePolicy {
                         .with_kind(ProposalKind::CacheAffinity),
                 )
             }
+            PrefillProposal::ShortestTtftCandidates(_) => None,
         }
     }
 
@@ -182,16 +183,6 @@ impl Policy for CacheAwarePolicy {
     fn uses_shared_prefill_admission(&self) -> bool {
         true
     }
-}
-
-fn estimate_matched_prefix_tokens(
-    input_tokens: u64,
-    query_blocks: usize,
-    matched_prefix_blocks: u32,
-) -> u64 {
-    let query_blocks = u64::try_from(query_blocks).unwrap_or(u64::MAX).max(1);
-    let matched_prefix_blocks = u64::from(matched_prefix_blocks).min(query_blocks);
-    input_tokens.saturating_mul(matched_prefix_blocks) / query_blocks
 }
 
 #[cfg(test)]
