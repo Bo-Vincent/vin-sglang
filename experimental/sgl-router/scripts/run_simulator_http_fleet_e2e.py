@@ -338,13 +338,15 @@ def simulator_worker_command(
 def simulator_environment(
     *,
     simulator_site: Path,
+    simulator_dependency_root: Path,
     source_root: Path,
     simulator_config: Path,
 ) -> dict[str, str]:
-    """返回只覆盖 Simulator worker 的运行时环境。"""
+    """返回只覆盖 Simulator worker 的运行时环境及其显式依赖根目录。"""
     inherited = os.environ.get("PYTHONPATH")
     paths = [
         str(simulator_site),
+        str(simulator_dependency_root),
         str(source_root / "tools" / "sglang-simulator" / "src"),
         str(source_root / "python"),
     ]
@@ -357,6 +359,42 @@ def simulator_environment(
         "SGLANG_SIMULATOR_OUTPUT_MODE": "BLOCKING",
         "SGLANG_USE_CPU_ENGINE": "1",
     }
+
+
+def simulator_runtime_probe_command(python: str) -> list[str]:
+    """返回可在启动 worker 前验证 Simulator 依赖闭包的命令。"""
+    return [
+        python,
+        "-c",
+        "import aiconfigurator.sdk.models, transformers.image_processing_backends, sglang_simulator",
+    ]
+
+
+def validate_simulator_runtime(args: argparse.Namespace) -> None:
+    """在创建 fleet 或结果目录前验证显式 PYTHONPATH 中的 Simulator 依赖。"""
+    environment = os.environ.copy()
+    environment.update(
+        simulator_environment(
+            simulator_site=args.simulator_site,
+            simulator_dependency_root=args.simulator_dependency_root,
+            source_root=args.source_root,
+            simulator_config=args.simulator_config,
+        )
+    )
+    completed = subprocess.run(
+        simulator_runtime_probe_command(args.python),
+        cwd=args.source_root,
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout).strip().splitlines()
+        raise RuntimeError(
+            "Simulator runtime preflight failed: "
+            + (detail[-1] if detail else "unknown error")
+        )
 
 
 def indexer_query_concurrency(endpoint_count: int) -> int:
@@ -845,6 +883,7 @@ def start_worker_fleet(
     managed: list[ManagedProcess] = []
     environment = simulator_environment(
         simulator_site=args.simulator_site,
+        simulator_dependency_root=args.simulator_dependency_root,
         source_root=args.source_root,
         simulator_config=args.simulator_config,
     )
@@ -1396,11 +1435,27 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def sha256_tree(path: Path) -> str:
+    """锁定依赖目录的路径和内容，防止容器 PYTHONPATH 静默漂移。"""
+    if not path.is_dir():
+        raise ValueError(f"dependency root is not a directory: {path}")
+    digest = hashlib.sha256()
+    for child in sorted(path.rglob("*")):
+        if not child.is_file():
+            continue
+        digest.update(str(child.relative_to(path)).encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(sha256_file(child).encode("ascii"))
+        digest.update(b"\n")
+    return digest.hexdigest()
+
+
 def execution_artifact_contract(
     *,
     runner_script: Path,
     python: str,
     simulator_config: Path,
+    simulator_dependency_root: Path,
     argv: Sequence[str],
 ) -> dict[str, object]:
     """锁定一次 Simulator 执行真正消费的脚本、解释器和配置文件。"""
@@ -1413,6 +1468,8 @@ def execution_artifact_contract(
         "python_executable": str(python_path),
         "python_sha256": sha256_file(python_path),
         "simulator_config_sha256": sha256_file(simulator_config),
+        "simulator_dependency_root": str(simulator_dependency_root),
+        "simulator_dependency_root_sha256": sha256_tree(simulator_dependency_root),
     }
 
 
@@ -1623,6 +1680,7 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--indexer-bridge", type=Path)
     parser.add_argument("--python")
     parser.add_argument("--simulator-site", type=Path)
+    parser.add_argument("--simulator-dependency-root", type=Path)
     parser.add_argument("--simulator-config", type=Path)
     parser.add_argument("--model-path", type=Path)
     parser.add_argument("--tokenizer-path", type=Path)
@@ -1709,6 +1767,7 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
             "indexer_bridge",
             "python",
             "simulator_site",
+            "simulator_dependency_root",
             "simulator_config",
             "model_path",
             "tokenizer_path",
