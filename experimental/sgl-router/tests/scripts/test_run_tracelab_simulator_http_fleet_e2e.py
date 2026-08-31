@@ -113,7 +113,50 @@ class TraceLabSimulatorHttpFleetContractTest(unittest.TestCase):
         self.assertEqual(arguments.kv_indexer_query_timeout_ms, 10_000)
         self.assertEqual(arguments.kv_indexer_query_max_inflight, 256)
         self.assertEqual(arguments.kv_indexer_max_concurrent_streams, 512)
+        self.assertEqual(arguments.warmup_request_rate, 1.0)
+        self.assertEqual(arguments.indexer_drain_quiet_seconds, 5.0)
         self.assertFalse(arguments.require_indexer_success)
+
+    def test_runner_rejects_non_positive_warmup_request_rate(self):
+        runner = load_runner()
+
+        with self.assertRaises(SystemExit):
+            runner.parse_args(["--warmup-request-rate", "0"])
+
+    def test_indexer_bridge_drain_requires_a_quiet_successful_apply_window(self):
+        runner = load_runner()
+        with tempfile.TemporaryDirectory() as directory:
+            bridge_log = Path(directory) / "bridge.log"
+            bridge_log.write_text(runner.BRIDGE_APPLY_LOG_MARKER + "\n")
+            clock = iter((0.0, 0.0, 5.0))
+
+            result = runner.wait_for_indexer_bridge_drain(
+                (bridge_log,),
+                quiet_seconds=5.0,
+                timeout_seconds=10.0,
+                poll_seconds=0.1,
+                sleep=lambda _: None,
+                monotonic=lambda: next(clock),
+            )
+
+        self.assertEqual(result["applied_batches"], 1)
+        self.assertEqual(result["bridge_failures"], 0)
+
+    def test_indexer_bridge_drain_rejects_bridge_reconnect(self):
+        runner = load_runner()
+        with tempfile.TemporaryDirectory() as directory:
+            bridge_log = Path(directory) / "bridge.log"
+            bridge_log.write_text(runner.BRIDGE_FAILURE_LOG_MARKER + "\n")
+
+            with self.assertRaisesRegex(RuntimeError, "bridge failure"):
+                runner.wait_for_indexer_bridge_drain(
+                    (bridge_log,),
+                    quiet_seconds=1.0,
+                    timeout_seconds=2.0,
+                    poll_seconds=0.1,
+                    sleep=lambda _: None,
+                    monotonic=lambda: 0.0,
+                )
 
     def test_indexer_query_summary_reports_latency_and_failures(self):
         runner = load_runner()
