@@ -4,16 +4,17 @@
 use crate::config::{PolicyKind, SessionAffinityMode};
 use crate::discovery::{ModelId, WorkerMode};
 use crate::policies::admission::{
-    resolve_cache_candidates, resolve_decode, resolve_prefill, CandidateDomain, CandidateRange,
-    DecisionReason,
+    CandidateDomain, CandidateRange, DecisionReason, resolve_cache_candidates, resolve_decode,
+    resolve_prefill, resolve_shortest_ttft_candidates,
 };
 use crate::policies::buckets::BucketRequest;
-use crate::policies::decode::{build_decode_policy, DecodeSelectionContext};
+use crate::policies::decode::{DecodeSelectionContext, build_decode_policy};
+use crate::policies::engine_load::EngineLoadSnapshot;
 use crate::policies::kv_events::{compute_block_hashes, compute_block_hashes_bigram};
 use crate::policies::registry::{PdPoolResolver, PdResolveError};
 use crate::policies::{
-    request_tokens_for, ExternalPrefixSignal, PrefillProposal, ProposalKind, RequestTokens,
-    SelectionContext,
+    ExternalPrefixSignal, PrefillProposal, ProposalKind, RequestTokens, SelectionContext,
+    request_tokens_for,
 };
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
@@ -25,8 +26,8 @@ use axum::body::Body;
 use axum::extract::State;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Response};
 use bytes::Bytes;
-use serde::de::IgnoredAny;
 use serde::Deserialize;
+use serde::de::IgnoredAny;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -88,6 +89,10 @@ fn prefill_policy_reason(
             (_, DecisionReason::BackupPressureGuard) => "no_cache_candidate_pressure_backup",
             (_, DecisionReason::RangeFallback) => "no_cache_candidate_range_fallback",
         },
+        PolicyKind::ShortestTtft => match proposal {
+            ProposalKind::PowerOfTwo => "shortest_ttft_p2_fallback",
+            _ => "shortest_ttft",
+        },
         _ => match decision {
             DecisionReason::Primary => "primary",
             DecisionReason::CacheCandidate => "cache_candidate",
@@ -95,6 +100,34 @@ fn prefill_policy_reason(
             DecisionReason::BackupPressureGuard => "pressure_backup",
             DecisionReason::RangeFallback => "range_fallback",
         },
+    }
+}
+
+/// 标记 Pair admission 实际消费的负载层。该字段仅作审计；选择本身仍由
+/// `resolve_prefill` 使用同一请求入口冻结的 snapshot 完成。
+fn prefill_pressure_source(
+    snapshot: &EngineLoadSnapshot,
+    primary: &Arc<Worker>,
+    backup: Option<&Arc<Worker>>,
+) -> &'static str {
+    let mut workers = vec![primary];
+    if let Some(backup) = backup {
+        workers.push(backup);
+    }
+    let loads = workers
+        .into_iter()
+        .map(|worker| snapshot.fresh_native_cache_load_for_url(&worker.url))
+        .collect::<Option<Vec<_>>>();
+    match loads {
+        Some(loads)
+            if loads
+                .iter()
+                .all(|load| load.estimated_prefill_queue_ms.is_some()) =>
+        {
+            "estimated_prefill_queue_ms"
+        }
+        Some(_) => "native_queue_tokens",
+        None => "router_local",
     }
 }
 
@@ -268,15 +301,16 @@ pub async fn chat_completions(
                 compute_block_hashes(&tokens.ids, block_size as usize)
             };
             let query_blocks = hashes.len();
-            let outcome = if hashes.is_empty() {
-                sgl_kv_indexer::PrefixOutcome::Empty
+            if hashes.is_empty() {
+                None
             } else {
-                resolve_prefix_query(index.match_prefix(hashes).await, &model_str)?
-            };
-            Some(ExternalPrefixSignal {
-                outcome,
-                query_blocks,
-            })
+                resolve_prefix_query(index.match_prefix(hashes).await, &model_str)?.map(|outcome| {
+                    ExternalPrefixSignal {
+                        outcome,
+                        query_blocks,
+                    }
+                })
+            }
         }
         _ => None,
     };
@@ -393,6 +427,11 @@ pub async fn chat_completions(
                 selected = %decision.selected.url,
                 reason = ?decision.reason,
                 load_snapshot_version = decision.load_snapshot_version,
+                prefill_pressure_source = prefill_pressure_source(
+                    &load_snapshot,
+                    &decision.primary,
+                    decision.backup.as_ref(),
+                ),
                 "prefill policy decision",
             );
             Some(decision.selected)
@@ -428,12 +467,10 @@ pub async fn chat_completions(
             let bounded_candidate_count = proposal.candidates.len();
             let cache_decision =
                 resolve_cache_candidates(&proposal, request_input_tokens, &load_snapshot);
-            ctx.metrics.record_cache_admission_evaluations(
-                cache_decision.admission_evaluated_candidates,
-            );
-            ctx.metrics.record_cache_admission_rejections(
-                cache_decision.admission_rejected_candidates,
-            );
+            ctx.metrics
+                .record_cache_admission_evaluations(cache_decision.admission_evaluated_candidates);
+            ctx.metrics
+                .record_cache_admission_rejections(cache_decision.admission_rejected_candidates);
             ctx.metrics.record_cache_pressure_guard(
                 cache_decision.pressure_guard_compared_pairs,
                 cache_decision.pressure_guard_overrides,
@@ -462,6 +499,63 @@ pub async fn chat_completions(
             ctx.metrics
                 .record_policy_decision("cache_aware", "cache_candidate");
             Some(decision.selected)
+        })
+        .flatten();
+
+    // Shortest-TTFT 是独立 baseline，不是 Cache-Aware mode：一次 ingress
+    // Indexer 查询后仍保留 H=0 worker，复用 hard admission，再按图中的
+    // score / guard / CAS 规则决定；无法决策时才退化普通 P2。
+    let shortest_ttft_winner = (ctx.config.model.policy == PolicyKind::ShortestTtft)
+        .then(|| {
+            let global_range = CandidateRange::global(&workers);
+            let shortest_ctx =
+                SelectionContext::with_routing_key(&model_id, Some(&body), routing_key)
+                    .with_session_id(session_id)
+                    .with_candidate_range_id(global_range.id)
+                    .with_input_tokens(request_input_tokens)
+                    .with_request_tokens(
+                        request_tokens.as_ref().map(|tokens| tokens.ids.as_slice()),
+                    )
+                    .with_external_prefix(external_prefix.as_ref())
+                    .with_load_snapshot(&load_snapshot)
+                    .with_prefill_cache_bucket(&ctx.bucket_selector, prefill_bucket_request);
+            let PrefillProposal::ShortestTtftCandidates(proposal) =
+                policy.propose_prefill(global_range.workers, &shortest_ctx)?
+            else {
+                return None;
+            };
+            let candidate_count = proposal.candidates.len();
+            let final_decision = resolve_shortest_ttft_candidates(
+                &proposal,
+                request_input_tokens,
+                &load_snapshot,
+                |worker_id| policy.try_claim_shortest_ttft(worker_id),
+            )?;
+            let reason = if final_decision.outstanding_guard_fallback {
+                "shortest_ttft_guard_fallback"
+            } else if final_decision.cas_retries > 0 {
+                "shortest_ttft_cas_retry"
+            } else if final_decision.matched_prefix_tokens > 0 {
+                "shortest_ttft_cache"
+            } else {
+                "shortest_ttft"
+            };
+            tracing::debug!(
+                model = %model_str,
+                range = %final_decision.decision.candidate_range_id,
+                selected = %final_decision.decision.selected.url,
+                candidates = candidate_count,
+                input_tokens = request_input_tokens,
+                matched_prefix_tokens = final_decision.matched_prefix_tokens,
+                uncached_tokens = final_decision.uncached_tokens,
+                cas_retries = final_decision.cas_retries,
+                outstanding_guard_fallback = final_decision.outstanding_guard_fallback,
+                load_snapshot_version = final_decision.decision.load_snapshot_version,
+                prefill_pressure_source = "estimated_prefill_queue_ms",
+                "shortest TTFT candidate winner",
+            );
+            ctx.metrics.record_policy_decision("shortest_ttft", reason);
+            Some(final_decision.decision.selected)
         })
         .flatten();
 
@@ -494,13 +588,18 @@ pub async fn chat_completions(
         // Rebuild the backup inside the primary's own Bucket.
         .and_then(|domain| select_prefill_in_domain(&domain, true, false));
     let worker = cache_winner
+        .or(shortest_ttft_winner)
         .or_else(|| {
             // Materialize normal domains only when Cache-Aware has no winner.
             let prefill_domains = ctx
                 .bucket_selector
                 .prefill_domains(&workers, prefill_bucket_request);
-            if ctx.config.model.policy == PolicyKind::CacheAware {
-                // Cache miss or failure retries ordered domains with ordinary P2.
+            if matches!(
+                ctx.config.model.policy,
+                PolicyKind::CacheAware | PolicyKind::ShortestTtft
+            ) {
+                // 外部 Indexer 无信号或没有 hard-admitted candidate 时，按
+                // domain 顺序用普通 P2 重试。
                 return prefill_domains
                     .iter()
                     .find_map(|domain| select_prefill_in_domain(domain, false, false));
@@ -975,10 +1074,10 @@ pub async fn chat_completions(
 fn resolve_prefix_query(
     result: Result<sgl_kv_indexer::PrefixOutcome, sgl_kv_indexer::PrefixIndexError>,
     model: &str,
-) -> Result<sgl_kv_indexer::PrefixOutcome, ApiError> {
+) -> Result<Option<sgl_kv_indexer::PrefixOutcome>, ApiError> {
     use sgl_kv_indexer::PrefixIndexError;
     match result {
-        Ok(outcome) => Ok(outcome),
+        Ok(outcome) => Ok(Some(outcome)),
         // The prefix hit only improves worker choice, so an indexer that is
         // shedding, slow, or down costs cache affinity — not availability.
         Err(
@@ -987,7 +1086,7 @@ fn resolve_prefix_query(
             | PrefixIndexError::Unreachable),
         ) => {
             tracing::warn!(%model, error = %error, "KV Indexer unavailable; falling back to min-load routing");
-            Ok(sgl_kv_indexer::PrefixOutcome::Empty)
+            Ok(None)
         }
         // A prompt too long to fit one gRPC message is still a prompt a worker
         // can serve, so it costs cache affinity like the cases above. Logged
@@ -995,7 +1094,7 @@ fn resolve_prefix_query(
         // message limit — rather than waiting for the indexer to recover.
         Err(error @ PrefixIndexError::QueryTooLarge) => {
             tracing::warn!(%model, error = %error, "prompt exceeds the KV Indexer query size limit; falling back to min-load routing");
-            Ok(sgl_kv_indexer::PrefixOutcome::Empty)
+            Ok(None)
         }
         // A rejection means the router and the indexer disagree on the request
         // contract; degrading would hide that from every request.
@@ -1143,7 +1242,7 @@ fn build_outgoing_body(
         _ => {
             return Err(ApiError::BadRequest(
                 "invalid request: body must be a JSON object".to_string(),
-            ))
+            ));
         }
     };
     if let Some(ids) = input_ids {
@@ -1347,11 +1446,10 @@ fn parse_probe(body: &Bytes) -> Result<RequestProbe, ApiError> {
 mod tests {
     use super::*;
 
-    /// An unavailable indexer must never fail a request that min-load routing
-    /// can still serve. `QueryTooLarge` belongs here too: a prompt that outgrows
-    /// the query's message limit loses cache affinity, not availability.
+    /// 不可用的 Indexer 不能让本可由普通路由服务的请求失败。`QueryTooLarge`
+    /// 也同理：它失去 cache signal，而不是被伪装成真实的空命中。
     #[test]
-    fn unavailable_indexer_degrades_to_empty_prefix_signal() {
+    fn unavailable_indexer_degrades_to_no_prefix_signal() {
         for error in [
             sgl_kv_indexer::PrefixIndexError::Overloaded,
             sgl_kv_indexer::PrefixIndexError::Timeout,
@@ -1360,7 +1458,7 @@ mod tests {
         ] {
             assert_eq!(
                 resolve_prefix_query(Err(error.clone()), "tiny").unwrap(),
-                sgl_kv_indexer::PrefixOutcome::Empty,
+                None,
                 "{error} should degrade"
             );
         }
@@ -1466,6 +1564,21 @@ mod tests {
             "cache_candidate"
         );
     }
+
+    #[test]
+    fn shortest_ttft_p2_fallback_is_observable() {
+        assert_eq!(
+            prefill_policy_reason(
+                PolicyKind::ShortestTtft,
+                ProposalKind::PowerOfTwo,
+                DecisionReason::Primary,
+                false,
+                false,
+            ),
+            "shortest_ttft_p2_fallback"
+        );
+    }
+
     /// `generate_room_id` MUST return values in `[0, i64::MAX]`. The
     /// SGLang prefill stores `bootstrap_room` as `torch.int64`; a u64
     /// with the top bit set would wrap negative on the engine side.

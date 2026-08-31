@@ -8,7 +8,11 @@
 //! 样本统一退化为 router-local load，不能被误认为 monitor-backed 决策。
 
 use crate::policies::engine_load::{EngineLoadSnapshot, NativeCacheWorkerLoad};
-use crate::policies::{CacheCandidate, CacheCandidateProposal, GuardHints, SelectionProposal};
+use crate::policies::shortest_ttft::{select_shortest_ttft, ShortestTtftCandidate};
+use crate::policies::{
+    CacheCandidate, CacheCandidateProposal, GuardHints, SelectionProposal,
+    ShortestTtftCandidateProposal,
+};
 use crate::workers::Worker;
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -166,7 +170,8 @@ pub fn resolve_cache_candidates(
         .iter()
         .filter(|candidate| is_cache_candidate_admitted(candidate, request_input_tokens, &loads))
         .collect();
-    let admission_rejected_candidates = proposal.candidates.len().saturating_sub(admitted.len()) as u64;
+    let admission_rejected_candidates =
+        proposal.candidates.len().saturating_sub(admitted.len()) as u64;
     let Some(work_floor) = admitted
         .iter()
         .copied()
@@ -225,6 +230,91 @@ pub fn resolve_cache_candidates(
     }
 }
 
+/// Shortest-TTFT 的最终解析结果，附带 baseline 内部 guard/CAS 原因。
+pub struct ShortestTtftFinalDecision {
+    pub decision: FinalDecision,
+    pub outstanding_guard_fallback: bool,
+    pub cas_retries: u32,
+    pub matched_prefix_tokens: u64,
+    pub uncached_tokens: u64,
+}
+
+/// Shortest-TTFT 只在完整、fresh 的 native ZMQ monitor 上排名。任意候选缺
+/// native 字段或还未形成相邻 sample 的 queue-time 时返回 `None`，使调用点
+/// 显式走 P2 fallback；基准门禁会把这种 fallback 判为无效结果。
+pub fn resolve_shortest_ttft_candidates(
+    proposal: &ShortestTtftCandidateProposal,
+    request_input_tokens: u64,
+    snapshot: &EngineLoadSnapshot,
+    mut try_claim: impl FnMut(&crate::discovery::WorkerId) -> bool,
+) -> Option<ShortestTtftFinalDecision> {
+    let admission_loads = FreshLoadLookup::new(
+        Some(snapshot),
+        proposal
+            .candidates
+            .iter()
+            .map(|candidate| &candidate.worker),
+    );
+    if proposal.candidates.iter().any(|candidate| {
+        admission_loads
+            .get(&candidate.worker.id)
+            .and_then(|load| load.estimated_prefill_queue_ms)
+            .is_none()
+    }) {
+        return None;
+    }
+    let admitted = proposal
+        .candidates
+        .iter()
+        .filter(|candidate| {
+            is_cache_candidate_admitted(candidate, request_input_tokens, &admission_loads)
+        })
+        .collect::<Vec<_>>();
+    let scored = admitted
+        .iter()
+        .map(|candidate| {
+            let load = admission_loads
+                .get(&candidate.worker.id)
+                .expect("native monitor coverage was checked above");
+            ShortestTtftCandidate {
+                worker_id: candidate.worker.id.0.clone(),
+                matched_prefix_tokens: candidate.matched_prefix_tokens,
+                uncached_tokens: candidate.uncached_tokens,
+                queue_ms: load
+                    .estimated_prefill_queue_ms
+                    .expect("native queue-time coverage was checked above"),
+                outstanding_uncached_tokens: load.num_waiting_uncached_tokens,
+            }
+        })
+        .collect::<Vec<_>>();
+    let selected = select_shortest_ttft(
+        &scored,
+        proposal.outstanding_uncached_tokens_threshold,
+        |worker_id| {
+            admitted
+                .iter()
+                .find(|candidate| candidate.worker.id.0 == worker_id)
+                .is_some_and(|candidate| try_claim(&candidate.worker.id))
+        },
+    )?;
+    let candidate = admitted
+        .iter()
+        .find(|candidate| candidate.worker.id.0 == selected.worker_id)?;
+    Some(ShortestTtftFinalDecision {
+        decision: FinalDecision {
+            selected: Arc::clone(&candidate.worker),
+            primary: Arc::clone(&candidate.worker),
+            backup: None,
+            reason: DecisionReason::CacheCandidate,
+            candidate_range_id: candidate.candidate_range_id.clone(),
+            load_snapshot_version: snapshot.version,
+        },
+        outstanding_guard_fallback: selected.outstanding_guard_fallback,
+        cas_retries: selected.cas_retries,
+        matched_prefix_tokens: candidate.matched_prefix_tokens,
+        uncached_tokens: candidate.uncached_tokens,
+    })
+}
 pub fn resolve_prefill(
     range: &CandidateRange<'_>,
     proposal: &SelectionProposal,
@@ -248,7 +338,12 @@ pub fn resolve_prefill(
 
     let (selected, reason) = match (primary_admitted, backup.as_ref(), backup_admitted) {
         (true, Some(backup), true) => {
-            if pressure_guard_prefers_backup(&proposal.primary, backup, &proposal.guard_hints, snapshot) {
+            if pressure_guard_prefers_backup(
+                &proposal.primary,
+                backup,
+                &proposal.guard_hints,
+                snapshot,
+            ) {
                 (Arc::clone(backup), DecisionReason::BackupPressureGuard)
             } else {
                 (Arc::clone(&proposal.primary), DecisionReason::Primary)
@@ -604,7 +699,6 @@ impl<'a> FreshLoadLookup<'a> {
                     .unwrap_or(usize::MAX)
             })
     }
-
     fn min_by_pressure_key(
         &self,
         candidates: Vec<Arc<Worker>>,
@@ -695,10 +789,7 @@ fn prefill_pressure_key(load: &NativeCacheWorkerLoad) -> (u64, u64, u64) {
     )
 }
 
-fn compare_prefill_load(
-    left: &NativeCacheWorkerLoad,
-    right: &NativeCacheWorkerLoad,
-) -> Ordering {
+fn compare_prefill_load(left: &NativeCacheWorkerLoad, right: &NativeCacheWorkerLoad) -> Ordering {
     match (
         left.estimated_prefill_queue_ms,
         right.estimated_prefill_queue_ms,
@@ -861,6 +952,80 @@ mod tests {
     }
 
     #[test]
+    fn shortest_ttft_requires_complete_native_queue_time() {
+        let slow = worker("slow");
+        let fast = worker("fast");
+        let proposal = ShortestTtftCandidateProposal {
+            candidates: vec![
+                CacheCandidate {
+                    worker: Arc::clone(&slow),
+                    matched_prefix_tokens: 0,
+                    uncached_tokens: 1_024,
+                    candidate_range_id: "global".into(),
+                    max_pending_prefill_tokens: None,
+                },
+                CacheCandidate {
+                    worker: Arc::clone(&fast),
+                    matched_prefix_tokens: 0,
+                    uncached_tokens: 1_024,
+                    candidate_range_id: "global".into(),
+                    max_pending_prefill_tokens: None,
+                },
+            ],
+            outstanding_uncached_tokens_threshold: 16_384,
+        };
+        let loads = EngineLoadSnapshot::from_native_cache_workers(
+            9,
+            HashMap::from([
+                (
+                    slow.url.clone(),
+                    NativeCacheWorkerLoad {
+                        num_running_reqs: 1,
+                        num_waiting_reqs: 1,
+                        num_waiting_uncached_tokens: 1_000,
+                        num_used_tokens: 10,
+                        num_total_tokens: 10,
+                        max_total_num_tokens: 10_000,
+                        max_running_requests: 64,
+                        prefill_throughput_tokens_per_s: Some(1_000.0),
+                        estimated_prefill_queue_ms: Some(100.0),
+                        captured_at: Instant::now(),
+                    },
+                ),
+                (
+                    fast.url.clone(),
+                    NativeCacheWorkerLoad {
+                        num_running_reqs: 1,
+                        num_waiting_reqs: 1,
+                        num_waiting_uncached_tokens: 10,
+                        num_used_tokens: 10,
+                        num_total_tokens: 10,
+                        max_total_num_tokens: 10_000,
+                        max_running_requests: 64,
+                        prefill_throughput_tokens_per_s: Some(1_000.0),
+                        estimated_prefill_queue_ms: Some(1.0),
+                        captured_at: Instant::now(),
+                    },
+                ),
+            ]),
+        );
+
+        let selected = resolve_shortest_ttft_candidates(&proposal, 1_024, &loads, |_| true)
+            .expect("complete native monitor must produce a Shortest-TTFT winner");
+        assert_eq!(selected.decision.selected.id, fast.id);
+        assert!(
+            resolve_shortest_ttft_candidates(
+                &proposal,
+                1_024,
+                &EngineLoadSnapshot::default(),
+                |_| true,
+            )
+            .is_none(),
+            "missing native queue-time must not fall back to router-local load"
+        );
+    }
+
+    #[test]
     fn complete_monitor_pressure_guard_overrides_a_near_cache_gain() {
         let congested = worker("congested");
         let idle = worker("idle");
@@ -887,7 +1052,10 @@ mod tests {
             pressure_abs_threshold_ms: None,
             pressure_rel_threshold: 1.5,
         };
-        let loads = snapshot(&[(&congested, 1, 1_000, 10, 10_000), (&idle, 1, 10, 10, 10_000)]);
+        let loads = snapshot(&[
+            (&congested, 1, 1_000, 10, 10_000),
+            (&idle, 1, 10, 10, 10_000),
+        ]);
 
         let resolution = resolve_cache_candidates(&proposal, 100, &loads);
         assert_eq!(
