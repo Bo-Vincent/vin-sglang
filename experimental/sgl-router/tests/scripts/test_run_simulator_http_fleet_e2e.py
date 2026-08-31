@@ -120,6 +120,9 @@ class SimulatorHttpFleetContractTest(unittest.TestCase):
         self.assertIn("--enable-metrics", command)
         self.assertIn("--load-publish-endpoint", command)
         self.assertEqual(command[command.index("--load-publish-endpoint") + 1], "auto")
+        self.assertEqual(
+            command[command.index("--load-snapshot-publish-interval") + 1], "1"
+        )
         self.assertIn("--dist-init-addr", command)
         self.assertIn("127.0.0.1:53000", command)
         self.assertIn("--chat-template", command)
