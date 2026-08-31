@@ -288,14 +288,18 @@ impl Cli {
                 "--kv-indexer-query-max-inflight requires --kv-indexer-endpoint"
             ));
         }
-        if self.kv_indexer_endpoint.is_some() && self.policy != PolicyKind::CacheAware {
+        let external_index_policy = matches!(
+            self.policy,
+            PolicyKind::CacheAware | PolicyKind::ShortestTtft
+        );
+        if self.kv_indexer_endpoint.is_some() && !external_index_policy {
             return Err(anyhow!(
-                "--kv-indexer-endpoint requires --policy cache_aware"
+                "--kv-indexer-endpoint requires --policy cache_aware or shortest_ttft"
             ));
         }
-        if self.policy == PolicyKind::CacheAware && self.kv_indexer_endpoint.is_none() {
+        if external_index_policy && self.kv_indexer_endpoint.is_none() {
             return Err(anyhow!(
-                "--policy cache_aware requires --kv-indexer-endpoint"
+                "--policy cache_aware or shortest_ttft requires --kv-indexer-endpoint"
             ));
         }
         let tuned_cache_aware = tuned_legacy_cache_aware || self.kv_indexer_endpoint.is_some();
@@ -593,9 +597,8 @@ impl Cli {
             cool_down_secs: self.cb_cool_down_secs.unwrap_or_else(default_cb_cool_down),
         });
 
-        // Only build a CacheAwareConfig when the operator tuned at least
-        // one knob; otherwise leave it None so the policy uses its own
-        // defaults. Unset knobs fall back to the per-field defaults.
+        // 旧 ZMQ tuning 与外部 Indexer transport 共用这一进程级配置载体；
+        // 后者由 Cache-Aware 和 Shortest-TTFT 共同消费，未设置的 knob 仍用默认值。
         let cache_aware = if tuned_cache_aware {
             let d = CacheAwareConfig::default();
             let kv_indexer_endpoint = self.kv_indexer_endpoint.map(|url| KvIndexerEndpointConfig {
@@ -1172,6 +1175,59 @@ mod tests {
             DEFAULT_KV_INDEXER_QUERY_TIMEOUT_MS
         );
         assert_eq!(indexer.query_max_inflight, 32);
+    }
+
+    #[test]
+    fn shortest_ttft_requires_and_accepts_external_indexer() {
+        let err = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--policy",
+            "shortest_ttft",
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("shortest_ttft requires --kv-indexer-endpoint"));
+
+        let config = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--policy",
+            "shortest_ttft",
+            "--kv-indexer-endpoint",
+            "http://indexer:50051",
+            "--kv-indexer-query-timeout-ms",
+            "100",
+        ]))
+        .unwrap();
+        assert_eq!(config.model.policy, PolicyKind::ShortestTtft);
+        assert_eq!(
+            config
+                .model
+                .cache_aware
+                .as_ref()
+                .and_then(|cache| cache.kv_indexer_endpoint.as_ref())
+                .map(|indexer| indexer.query_timeout_ms),
+            Some(100)
+        );
+        assert!(config.model.affinity.is_none());
+    }
+
+    #[test]
+    fn shortest_ttft_rejects_cache_aware_only_knobs() {
+        let err = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--policy",
+            "shortest_ttft",
+            "--kv-indexer-endpoint",
+            "http://indexer:50051",
+            "--cache-affinity-min-matched-tokens",
+            "1024",
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("cache candidate tuning flags require --policy cache_aware"));
     }
 
     #[test]

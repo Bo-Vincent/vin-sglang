@@ -73,7 +73,7 @@ impl Default for ActiveLoadConfig {
 /// Accepted on the CLI (`--policy`) as `round_robin` / `random` /
 /// `power_of_two` / `load_based` / `prefix_cache` / `fused_score` /
 /// `score_policy` / `session_aware` / `cache_aware` / `cache_aware_zmq` /
-/// `sticky`.
+/// `sticky` / `shortest_ttft`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 pub enum PolicyKind {
     #[default]
@@ -106,6 +106,10 @@ pub enum PolicyKind {
     /// 使用外部 Indexer 信号的 Cache affinity policy。
     #[value(name = "cache_aware")]
     CacheAware,
+    /// 图中 Shortest-TTFT baseline：在全部 hard-admitted worker 上比较
+    /// `uncached prefill work + queue`，并以 cache hit 做相似 TTFT 破局。
+    #[value(name = "shortest_ttft")]
+    ShortestTtft,
     /// Capacity as a hard constraint: reject any worker already carrying
     /// `--max-in-flight` requests. A `--filter` entry, not a `--policy`:
     /// standalone it can only fall back on the selector's load tiebreak.
@@ -352,7 +356,7 @@ pub struct KvIndexerEndpointConfig {
     pub query_max_inflight: usize,
 }
 
-/// Per-model cache-aware tuning.
+/// Per-model legacy Cache-Aware-ZMQ tuning and shared external Indexer setup.
 #[derive(Debug, Clone)]
 pub struct CacheAwareConfig {
     /// Lower bound on `matched_blocks / total_blocks` for the tree match
@@ -369,8 +373,9 @@ pub struct CacheAwareConfig {
     /// that the absolute check is gated on. Default 1.1 — 10 % relative
     /// difference triggers re-balancing.
     pub balance_rel_threshold: f32,
-    /// Optional external KV Indexer client configuration. When configured, it
-    /// replaces the local ZMQ radix tree as the cache signal.
+    /// Optional external KV Indexer client configuration. Cache-Aware 和
+    /// Shortest-TTFT 都以它作为 ingress cache signal；配置后本地 ZMQ
+    /// radix tree 不再承担外部 cache 匹配。
     pub kv_indexer_endpoint: Option<KvIndexerEndpointConfig>,
 }
 
