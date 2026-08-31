@@ -30,6 +30,7 @@ DEFAULT_POLICIES = (
 )
 DEFAULT_WORKLOADS = ("tracelab_multiturn", "multi_holder_pressure")
 MAX_HTTP_REQUEST_CONCURRENCY = 256
+LOAD_SNAPSHOT_PUBLISH_INTERVAL_SECONDS = 1
 ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 
 
@@ -319,6 +320,8 @@ def simulator_worker_command(
         "--disable-overlap-schedule",
         "--load-publish-endpoint",
         "auto",
+        "--load-snapshot-publish-interval",
+        str(LOAD_SNAPSHOT_PUBLISH_INTERVAL_SECONDS),
         "--dist-init-addr",
         f"127.0.0.1:{spec.dist_port}",
         "--enable-cache-report",
