@@ -569,6 +569,27 @@ def case_complete(directory: Path, case: TraceLabCase) -> bool:
         return False
 
 
+def measurement_decision_log(
+    router_log: Path, *, policy_marker: str, expected_decisions: int
+) -> str:
+    """从完整 router 日志取测量阶段最后的策略决策。
+
+    Router 子进程的 stdout 可能在 warmup/measurement 边界后才批量 flush，
+    因此文件 offset 不能作为阶段边界。请求按阶段串行执行，最后
+    ``expected_decisions`` 条指定策略决策就是 measurement 的审计输入。
+    """
+    lines = []
+    for line in router_log.read_text(errors="replace").splitlines():
+        normalized = fleet.ANSI_ESCAPE_RE.sub("", line)
+        if policy_marker in normalized:
+            lines.append(line)
+    if len(lines) < expected_decisions:
+        raise RuntimeError(
+            f"{policy_marker} audit has {len(lines)} decisions, expected at least {expected_decisions}"
+        )
+    return "\n".join(lines[-expected_decisions:]) + "\n"
+
+
 def run_case(
     args: argparse.Namespace,
     case: TraceLabCase,
@@ -684,24 +705,35 @@ def run_case(
         shortest_ttft_audit: dict[str, int] | None = None
         power_of_two_audit: dict[str, int] | None = None
         zmq_policy_audit: dict[str, int] | None = None
-        decision_log = router_log.read_text(errors="replace")[log_offset:]
         if case.policy == "cache_aware":
+            decision_log = measurement_decision_log(
+                router_log, policy_marker="cache candidate winner", expected_decisions=expected
+            )
             audit = fleet.cache_monitor_usage(decision_log)
             audit["actual_cache_metrics"] = int(
                 float(cache["total_effective_tokens"]) > 0.0
             )
             fleet.require_native_cache_audit(audit, expected_decisions=expected)
         elif case.policy == "shortest_ttft":
+            decision_log = measurement_decision_log(
+                router_log, policy_marker="shortest TTFT candidate winner", expected_decisions=expected
+            )
             shortest_ttft_audit = fleet.shortest_ttft_monitor_usage(decision_log)
             fleet.require_shortest_ttft_audit(
                 shortest_ttft_audit, expected_decisions=expected
             )
         elif case.policy == "power_of_two":
+            decision_log = measurement_decision_log(
+                router_log, policy_marker="policy=PowerOfTwo", expected_decisions=expected
+            )
             power_of_two_audit = fleet.power_of_two_monitor_usage(decision_log)
             fleet.require_power_of_two_audit(
                 power_of_two_audit, expected_decisions=expected
             )
         elif case.policy == "cache_aware_zmq":
+            decision_log = measurement_decision_log(
+                router_log, policy_marker="cache-aware-zmq", expected_decisions=expected
+            )
             zmq_policy_audit = fleet.zmq_policy_usage(decision_log)
             fleet.require_zmq_policy_audit(zmq_policy_audit, expected_decisions=expected)
 
