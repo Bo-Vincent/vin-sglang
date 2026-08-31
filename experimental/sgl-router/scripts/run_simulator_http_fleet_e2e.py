@@ -13,6 +13,7 @@ import math
 import os
 from pathlib import Path
 import re
+import resource
 import shutil
 import signal
 import socket
@@ -1473,6 +1474,7 @@ def execution_artifact_contract(
         "runner_argv": list(argv),
         "python_executable": str(python_path),
         "python_sha256": sha256_file(python_path),
+        "process_nofile_limit": list(resource.getrlimit(resource.RLIMIT_NOFILE)),
         "simulator_config_sha256": sha256_file(simulator_config),
         "simulator_dependency_root": str(simulator_dependency_root),
         "simulator_dependency_root_sha256": sha256_tree(simulator_dependency_root),
