@@ -3,6 +3,7 @@
 
 import importlib.util
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -26,6 +27,23 @@ def load_runner():
 
 
 class TraceLabSimulatorHttpFleetContractTest(unittest.TestCase):
+    def test_measurement_audit_uses_last_policy_decisions_when_router_log_flushes_late(self):
+        runner = load_runner()
+        with tempfile.TemporaryDirectory() as directory:
+            router_log = Path(directory) / "router.log"
+            router_log.write_text(
+                "\n".join(
+                    ["prefill policy decision policy=PowerOfTwo warmup"] * 2
+                    + ["prefill policy decision policy=PowerOfTwo measurement"] * 3
+                )
+                + "\n"
+            )
+            decisions = runner.measurement_decision_log(
+                router_log, policy_marker="policy=PowerOfTwo", expected_decisions=3
+            )
+        self.assertEqual(decisions.count("measurement"), 3)
+        self.assertNotIn("warmup", decisions)
+
     def test_fixed_256_worker_matrix_has_four_policies_and_three_repeats(self):
         runner = load_runner()
 
