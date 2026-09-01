@@ -4,16 +4,16 @@
 use crate::config::{PolicyKind, SessionAffinityMode};
 use crate::discovery::{ModelId, WorkerMode};
 use crate::policies::admission::{
-    CandidateDomain, CandidateRange, DecisionReason, resolve_cache_candidates, resolve_decode,
-    resolve_prefill, resolve_shortest_ttft_candidates,
+    resolve_cache_candidates, resolve_decode, resolve_prefill, resolve_shortest_ttft_candidates,
+    CandidateDomain, CandidateRange, DecisionReason,
 };
 use crate::policies::buckets::BucketRequest;
-use crate::policies::decode::{DecodeSelectionContext, build_decode_policy};
+use crate::policies::decode::{build_decode_policy, DecodeSelectionContext};
 use crate::policies::engine_load::EngineLoadSnapshot;
 use crate::policies::power_of_two::PowerOfTwoChoicesPolicy;
 use crate::policies::registry::{PdPoolResolver, PdResolveError};
 use crate::policies::{
-    Policy, PrefillProposal, ProposalKind, RequestTokens, SelectionContext, request_tokens_for,
+    request_tokens_for, Policy, PrefillProposal, ProposalKind, RequestTokens, SelectionContext,
 };
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
@@ -25,8 +25,8 @@ use axum::body::Body;
 use axum::extract::State;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Response};
 use bytes::Bytes;
-use serde::Deserialize;
 use serde::de::IgnoredAny;
+use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -561,8 +561,9 @@ pub async fn chat_completions(
                 admission_rejected_candidates = final_decision.admission_rejected_candidates,
                 outstanding_guard_evaluated_candidates = final_decision.outstanding_guard_evaluated_candidates,
                 outstanding_guard_rejected_candidates = final_decision.outstanding_guard_rejected_candidates,
+                native_admission_guard_coverage = final_decision.native_admission_guard_coverage,
                 load_snapshot_version = final_decision.decision.load_snapshot_version,
-                prefill_pressure_source = "estimated_prefill_queue_ms",
+                prefill_pressure_source = final_decision.prefill_pressure_source,
                 "shortest TTFT candidate winner",
             );
             ctx.metrics.record_policy_decision(policy_name, reason);

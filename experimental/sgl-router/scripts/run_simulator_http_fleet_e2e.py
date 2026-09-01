@@ -597,6 +597,7 @@ def require_shortest_ttft_audit(
     required_positive = (
         "shortest_ttft_decisions",
         "monitor_decisions",
+        "native_admission_guard_covered_decisions",
         "admission_evaluated_candidates",
         "outstanding_guard_evaluated_candidates",
     )
@@ -605,6 +606,12 @@ def require_shortest_ttft_audit(
             raise RuntimeError(f"{key} must be positive for Shortest-TTFT")
     if audit.get("monitor_decisions") != audit.get("shortest_ttft_decisions"):
         raise RuntimeError("monitor_decisions must cover every Shortest-TTFT decision")
+    if audit.get("native_admission_guard_covered_decisions") != audit.get(
+        "shortest_ttft_decisions"
+    ):
+        raise RuntimeError(
+            "native_admission_guard_covered_decisions must cover every Shortest-TTFT decision"
+        )
     if audit.get("shortest_ttft_decisions") != expected_decisions:
         raise RuntimeError("Shortest-TTFT audit does not cover every request")
     for key in ("router_local_decisions", "zero_snapshot_decisions"):
@@ -1163,6 +1170,7 @@ def shortest_ttft_monitor_usage(router_log: str) -> dict[str, int]:
         "monitor_fallback_decisions": 0,
         "router_local_decisions": 0,
         "zero_snapshot_decisions": 0,
+        "native_admission_guard_covered_decisions": 0,
         "admission_evaluated_candidates": 0,
         "admission_rejected_candidates": 0,
         "outstanding_guard_evaluated_candidates": 0,
@@ -1174,24 +1182,37 @@ def shortest_ttft_monitor_usage(router_log: str) -> dict[str, int]:
         "outstanding_guard_evaluated_candidates": "outstanding_guard_evaluated_candidates=",
         "outstanding_guard_rejected_candidates": "outstanding_guard_rejected_candidates=",
     }
+    native_guard_marker = "native_admission_guard_coverage="
     for line in router_log.splitlines():
         normalized = ANSI_ESCAPE_RE.sub("", line)
         if "shortest TTFT candidate winner" not in normalized:
             continue
         source_marker = "prefill_pressure_source="
         version_marker = "load_snapshot_version="
-        required_markers = (source_marker, version_marker, *integer_markers.values())
+        required_markers = (
+            source_marker,
+            version_marker,
+            native_guard_marker,
+            *integer_markers.values(),
+        )
         if any(marker not in normalized for marker in required_markers):
             raise RuntimeError("shortest TTFT candidate winner has no admission/guard audit fields")
         source = normalized.split(source_marker, 1)[1].split()[0].strip('"')
         version = normalized.split(version_marker, 1)[1].split()[0].strip('"')
+        native_guard_coverage = normalized.split(native_guard_marker, 1)[1].split()[0].strip('"')
         counts["shortest_ttft_decisions"] += 1
-        if source == "estimated_prefill_queue_ms":
+        if source in ("estimated_prefill_queue_ms", "engine_request_queue"):
             counts["monitor_decisions"] += 1
         elif source == "router_local":
             counts["router_local_decisions"] += 1
         else:
             raise RuntimeError(f"unknown Shortest-TTFT pressure source: {source}")
+        if native_guard_coverage == "true":
+            counts["native_admission_guard_covered_decisions"] += 1
+        elif native_guard_coverage != "false":
+            raise RuntimeError(
+                f"invalid Shortest-TTFT native admission/guard coverage: {native_guard_coverage}"
+            )
         if version == "0":
             counts["zero_snapshot_decisions"] += 1
         for field, marker in integer_markers.items():

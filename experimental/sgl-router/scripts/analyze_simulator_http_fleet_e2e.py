@@ -47,6 +47,7 @@ SHORTEST_TTFT_AUDIT_FIELDS = (
     "monitor_fallback_decisions",
     "router_local_decisions",
     "zero_snapshot_decisions",
+    "native_admission_guard_covered_decisions",
     "admission_evaluated_candidates",
     "admission_rejected_candidates",
     "outstanding_guard_evaluated_candidates",
@@ -168,6 +169,8 @@ def validate_summary(case: Mapping[str, object], summary: Mapping[str, object]) 
             raise RuntimeError("Shortest-TTFT admission or outstanding guard was not exercised")
         if audit["monitor_decisions"] != audit["shortest_ttft_decisions"]:
             raise RuntimeError("Shortest-TTFT monitor does not cover every decision")
+        if audit["native_admission_guard_covered_decisions"] != audit["shortest_ttft_decisions"]:
+            raise RuntimeError("Shortest-TTFT admission/guard does not cover every decision")
         if audit["shortest_ttft_decisions"] != request_count:
             raise RuntimeError("Shortest-TTFT audit does not cover every request")
         if audit["router_local_decisions"] != 0 or audit["zero_snapshot_decisions"] != 0:

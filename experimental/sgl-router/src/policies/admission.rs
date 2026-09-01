@@ -7,7 +7,7 @@
 //! 上使用 V3 等价的 hard admission 与 pressure guard；短帧、缺 rank 或 stale
 //! 样本统一退化为 router-local load，不能被误认为 monitor-backed 决策。
 
-use crate::policies::engine_load::{EngineLoadSnapshot, NativeCacheWorkerLoad};
+use crate::policies::engine_load::{EngineLoadSnapshot, EngineWorkerLoad, NativeCacheWorkerLoad};
 use crate::policies::shortest_ttft::{
     select_original_shortest_ttft, select_shortest_ttft, ShortestTtftCandidate,
 };
@@ -239,15 +239,17 @@ pub struct ShortestTtftFinalDecision {
     pub cas_retries: u32,
     pub matched_prefix_tokens: u64,
     pub uncached_tokens: u64,
+    pub prefill_pressure_source: &'static str,
+    pub native_admission_guard_coverage: bool,
     pub admission_evaluated_candidates: u64,
     pub admission_rejected_candidates: u64,
     pub outstanding_guard_evaluated_candidates: u64,
     pub outstanding_guard_rejected_candidates: u64,
 }
-
-/// Shortest-TTFT 只在完整、fresh 的 native ZMQ monitor 上排名。任意候选缺
-/// native 字段或还未形成相邻 sample 的 queue-time 时返回 `None`，使调用点
-/// 显式走 P2 fallback；基准门禁会把这种 fallback 判为无效结果。
+/// V4 Shortest-TTFT 需要完整、fresh native ZMQ monitor 的 queue-time；任一候选
+/// 缺 native 字段或还未形成相邻 sample 时显式走 P2 fallback。Original 变体
+/// 忠实消费同一快照里的 fresh running + waiting 请求压力，并继续复用 V4
+/// admission 与 outstanding guard；审计字段明确记录实际负载来源。
 pub fn resolve_shortest_ttft_candidates(
     proposal: &ShortestTtftCandidateProposal,
     request_input_tokens: u64,
@@ -261,14 +263,21 @@ pub fn resolve_shortest_ttft_candidates(
             .iter()
             .map(|candidate| &candidate.worker),
     );
-    if proposal.candidates.iter().any(|candidate| {
-        admission_loads
-            .get(&candidate.worker.id)
-            .and_then(|load| load.estimated_prefill_queue_ms)
-            .is_none()
-    }) {
+    if proposal.ranking_mode == ShortestTtftRankingMode::V4
+        && proposal.candidates.iter().any(|candidate| {
+            admission_loads
+                .get(&candidate.worker.id)
+                .and_then(|load| load.estimated_prefill_queue_ms)
+                .is_none()
+        })
+    {
         return None;
     }
+    let prefill_pressure_source = match proposal.ranking_mode {
+        ShortestTtftRankingMode::V4 => "estimated_prefill_queue_ms",
+        ShortestTtftRankingMode::Original => admission_loads.score_load_source(),
+    };
+    let native_admission_guard_coverage = admission_loads.has_complete_native_coverage();
     let admitted = proposal
         .candidates
         .iter()
@@ -282,17 +291,31 @@ pub fn resolve_shortest_ttft_candidates(
     let scored = admitted
         .iter()
         .map(|candidate| {
-            let load = admission_loads
-                .get(&candidate.worker.id)
-                .expect("native monitor coverage was checked above");
+            let (queue_ms, outstanding_uncached_tokens) = match proposal.ranking_mode {
+                ShortestTtftRankingMode::V4 => {
+                    let load = admission_loads
+                        .get(&candidate.worker.id)
+                        .expect("native monitor coverage was checked above");
+                    (
+                        load.estimated_prefill_queue_ms
+                            .expect("native queue-time coverage was checked above"),
+                        load.num_waiting_uncached_tokens,
+                    )
+                }
+                ShortestTtftRankingMode::Original => (
+                    admission_loads.score_load(&candidate.worker) as f64,
+                    admission_loads
+                        .get(&candidate.worker.id)
+                        .map(|load| load.num_waiting_uncached_tokens)
+                        .unwrap_or(0),
+                ),
+            };
             ShortestTtftCandidate {
                 worker_id: candidate.worker.id.0.clone(),
                 matched_prefix_tokens: candidate.matched_prefix_tokens,
                 uncached_tokens: candidate.uncached_tokens,
-                queue_ms: load
-                    .estimated_prefill_queue_ms
-                    .expect("native queue-time coverage was checked above"),
-                outstanding_uncached_tokens: load.num_waiting_uncached_tokens,
+                queue_ms,
+                outstanding_uncached_tokens,
             }
         })
         .collect::<Vec<_>>();
@@ -327,6 +350,8 @@ pub fn resolve_shortest_ttft_candidates(
             candidate_range_id: candidate.candidate_range_id.clone(),
             load_snapshot_version: snapshot.version,
         },
+        native_admission_guard_coverage,
+        prefill_pressure_source,
         outstanding_guard_fallback: selected.outstanding_guard_fallback,
         cas_retries: selected.cas_retries,
         matched_prefix_tokens: candidate.matched_prefix_tokens,
@@ -588,7 +613,7 @@ fn materially_more_pressured(
 /// 快照时比较外部数值；混合集保持本地 active-load 排序，从而保证传递性。
 pub(crate) struct FreshLoadLookup<'a> {
     by_worker_id: HashMap<String, &'a NativeCacheWorkerLoad>,
-    basic_by_worker_id: HashMap<String, &'a crate::policies::engine_load::EngineWorkerLoad>,
+    basic_by_worker_id: HashMap<String, &'a EngineWorkerLoad>,
     local_active_by_worker_id: HashMap<String, usize>,
     compare_engine: bool,
     compare_basic_engine: bool,
@@ -701,6 +726,17 @@ impl<'a> FreshLoadLookup<'a> {
         }
     }
 
+    pub(crate) fn score_load_source(&self) -> &'static str {
+        if self.compare_basic_engine {
+            "engine_request_queue"
+        } else {
+            "router_local"
+        }
+    }
+
+    pub(crate) fn has_complete_native_coverage(&self) -> bool {
+        self.compare_engine
+    }
     /// 为纯评分项提供与同一请求 admission 一致的队列深度：当候选集合完整
     /// 覆盖在入口冻结的 Engine Load 快照中时，使用 `waiting + running`；否则
     /// 整个集合一致回退到 Router 本地 active-load，避免部分新旧视图混排。
@@ -1047,6 +1083,108 @@ mod tests {
             .is_none(),
             "missing native queue-time must not fall back to router-local load"
         );
+    }
+
+    #[test]
+    fn original_shortest_ttft_uses_fresh_request_queue_without_native_queue_time() {
+        let busy = worker("busy");
+        let idle = worker("idle");
+        let proposal = ShortestTtftCandidateProposal {
+            candidates: vec![
+                CacheCandidate {
+                    worker: Arc::clone(&busy),
+                    matched_prefix_tokens: 0,
+                    uncached_tokens: 1_024,
+                    candidate_range_id: "global".into(),
+                    max_pending_prefill_tokens: None,
+                },
+                CacheCandidate {
+                    worker: Arc::clone(&idle),
+                    matched_prefix_tokens: 0,
+                    uncached_tokens: 1_024,
+                    candidate_range_id: "global".into(),
+                    max_pending_prefill_tokens: None,
+                },
+            ],
+            outstanding_uncached_tokens_threshold: 16_384,
+            ranking_mode: ShortestTtftRankingMode::Original,
+            last_selected: HashMap::new(),
+        };
+        let loads = EngineLoadSnapshot::from_native_cache_workers(
+            10,
+            HashMap::from([
+                (
+                    busy.url.clone(),
+                    NativeCacheWorkerLoad {
+                        num_running_reqs: 30,
+                        num_waiting_reqs: 10,
+                        num_waiting_uncached_tokens: 1_000,
+                        num_used_tokens: 10,
+                        num_total_tokens: 10,
+                        max_total_num_tokens: 10_000,
+                        max_running_requests: 64,
+                        prefill_throughput_tokens_per_s: None,
+                        estimated_prefill_queue_ms: None,
+                        captured_at: Instant::now(),
+                    },
+                ),
+                (
+                    idle.url.clone(),
+                    NativeCacheWorkerLoad {
+                        num_running_reqs: 1,
+                        num_waiting_reqs: 1,
+                        num_waiting_uncached_tokens: 10,
+                        num_used_tokens: 10,
+                        num_total_tokens: 10,
+                        max_total_num_tokens: 10_000,
+                        max_running_requests: 64,
+                        prefill_throughput_tokens_per_s: None,
+                        estimated_prefill_queue_ms: None,
+                        captured_at: Instant::now(),
+                    },
+                ),
+            ]),
+        );
+
+        let selected = resolve_shortest_ttft_candidates(&proposal, 1_024, &loads, |_| true)
+            .expect("original ranking accepts fresh request queues");
+
+        assert_eq!(selected.decision.selected.id, idle.id);
+    }
+
+    #[test]
+    fn original_shortest_ttft_marks_basic_only_monitor_as_not_guard_covered() {
+        let worker = worker("basic-only");
+        let proposal = ShortestTtftCandidateProposal {
+            candidates: vec![CacheCandidate {
+                worker: Arc::clone(&worker),
+                matched_prefix_tokens: 0,
+                uncached_tokens: 1_024,
+                candidate_range_id: "global".into(),
+                max_pending_prefill_tokens: None,
+            }],
+            outstanding_uncached_tokens_threshold: 16_384,
+            ranking_mode: ShortestTtftRankingMode::Original,
+            last_selected: HashMap::new(),
+        };
+        let loads = EngineLoadSnapshot::from_workers(
+            11,
+            HashMap::from([(
+                worker.url.clone(),
+                EngineWorkerLoad {
+                    num_running_reqs: 2,
+                    num_waiting_reqs: 3,
+                    num_tokens: 10,
+                    max_total_num_tokens: 10_000,
+                    captured_at: Instant::now(),
+                },
+            )]),
+        );
+
+        let selected = resolve_shortest_ttft_candidates(&proposal, 1_024, &loads, |_| true)
+            .expect("original ranking accepts a fresh basic monitor");
+        assert_eq!(selected.prefill_pressure_source, "engine_request_queue");
+        assert!(!selected.native_admission_guard_coverage);
     }
 
     #[test]

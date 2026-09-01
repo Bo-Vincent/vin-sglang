@@ -589,10 +589,10 @@ class SimulatorHttpFleetContractTest(unittest.TestCase):
         runner = load_runner()
         log = (
             "shortest TTFT candidate winner "
-            "prefill_pressure_source=\"estimated_prefill_queue_ms\" "
+            "prefill_pressure_source=\"estimated_prefill_queue_ms\" native_admission_guard_coverage=true "
             "load_snapshot_version=41 admission_evaluated_candidates=1 admission_rejected_candidates=0 outstanding_guard_evaluated_candidates=1 outstanding_guard_rejected_candidates=0\n"
             "shortest TTFT candidate winner "
-            "prefill_pressure_source\x1b[0m\x1b[2m=\x1b[0m\"estimated_prefill_queue_ms\" "
+            "prefill_pressure_source\x1b[0m\x1b[2m=\x1b[0m\"estimated_prefill_queue_ms\" native_admission_guard_coverage=true "
             "load_snapshot_version=42 admission_evaluated_candidates=1 admission_rejected_candidates=0 outstanding_guard_evaluated_candidates=1 outstanding_guard_rejected_candidates=0\n"
         )
 
@@ -604,6 +604,7 @@ class SimulatorHttpFleetContractTest(unittest.TestCase):
                 "shortest_ttft_decisions": 2,
                 "monitor_decisions": 2,
                 "monitor_fallback_decisions": 0,
+                "native_admission_guard_covered_decisions": 2,
                 "router_local_decisions": 0,
                 "zero_snapshot_decisions": 0,
                 "admission_evaluated_candidates": 2,
@@ -614,12 +615,39 @@ class SimulatorHttpFleetContractTest(unittest.TestCase):
         )
         runner.require_shortest_ttft_audit(audit, expected_decisions=2)
 
+    def test_shortest_ttft_audit_accepts_original_fresh_request_queue(self):
+        runner = load_runner()
+        log = (
+            "shortest TTFT candidate winner "
+            "prefill_pressure_source=\"engine_request_queue\" "
+            "native_admission_guard_coverage=true "
+            "load_snapshot_version=43 admission_evaluated_candidates=2 admission_rejected_candidates=0 outstanding_guard_evaluated_candidates=2 outstanding_guard_rejected_candidates=0\n"
+        )
+        audit = runner.shortest_ttft_monitor_usage(log)
+        self.assertEqual(audit["monitor_decisions"], 1)
+        self.assertEqual(audit["native_admission_guard_covered_decisions"], 1)
+        runner.require_shortest_ttft_audit(audit, expected_decisions=1)
+
+    def test_shortest_ttft_audit_rejects_missing_native_guard_coverage(self):
+        runner = load_runner()
+        log = (
+            "shortest TTFT candidate winner "
+            "prefill_pressure_source=\"engine_request_queue\" "
+            "native_admission_guard_coverage=false "
+            "load_snapshot_version=43 admission_evaluated_candidates=2 admission_rejected_candidates=0 outstanding_guard_evaluated_candidates=2 outstanding_guard_rejected_candidates=0\n"
+        )
+        audit = runner.shortest_ttft_monitor_usage(log)
+        with self.assertRaisesRegex(
+            RuntimeError, "native_admission_guard_covered_decisions"
+        ):
+            runner.require_shortest_ttft_audit(audit, expected_decisions=1)
+
 
     def test_shortest_ttft_audit_requires_admission_and_guard_evidence(self):
         runner = load_runner()
         log = (
             "shortest TTFT candidate winner "
-            "prefill_pressure_source=\"estimated_prefill_queue_ms\" "
+            "prefill_pressure_source=\"estimated_prefill_queue_ms\" native_admission_guard_coverage=true "
             "load_snapshot_version=41 "
             "admission_evaluated_candidates=3 "
             "admission_rejected_candidates=1 "
@@ -645,6 +673,7 @@ class SimulatorHttpFleetContractTest(unittest.TestCase):
         good = {
             "shortest_ttft_decisions": 1,
             "monitor_decisions": 1,
+            "native_admission_guard_covered_decisions": 1,
             "monitor_fallback_decisions": 0,
             "router_local_decisions": 0,
             "zero_snapshot_decisions": 0,
@@ -655,7 +684,11 @@ class SimulatorHttpFleetContractTest(unittest.TestCase):
         }
         runner.require_shortest_ttft_audit(good, expected_decisions=1)
 
-        for key in ("shortest_ttft_decisions", "monitor_decisions"):
+        for key in (
+            "shortest_ttft_decisions",
+            "monitor_decisions",
+            "native_admission_guard_covered_decisions",
+        ):
             broken = dict(good)
             broken[key] = 0
             with self.assertRaisesRegex(RuntimeError, key):

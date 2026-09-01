@@ -242,6 +242,7 @@ class SimulatorHttpFleetAnalyzerTest(unittest.TestCase):
                     "shortest_ttft_decisions": 32,
                     "monitor_decisions": 32,
                     "monitor_fallback_decisions": 8,
+                    "native_admission_guard_covered_decisions": 32,
                     "router_local_decisions": 0,
                     "zero_snapshot_decisions": 0,
                     "admission_evaluated_candidates": 64,
@@ -257,6 +258,7 @@ class SimulatorHttpFleetAnalyzerTest(unittest.TestCase):
         self.assertEqual(group["shortest_ttft_audit"]["shortest_ttft_decisions"], 96)
         self.assertEqual(group["shortest_ttft_audit"]["monitor_decisions"], 96)
         self.assertEqual(group["shortest_ttft_audit"]["monitor_fallback_decisions"], 24)
+        self.assertEqual(group["shortest_ttft_audit"]["native_admission_guard_covered_decisions"], 96)
 
     def test_analyzer_rejects_shortest_ttft_without_fresh_monitor_audit(self):
         analyzer = load_analyzer()
@@ -276,6 +278,7 @@ class SimulatorHttpFleetAnalyzerTest(unittest.TestCase):
                 "shortest_ttft_decisions": 32,
                 "monitor_decisions": 31,
                 "monitor_fallback_decisions": 0,
+                "native_admission_guard_covered_decisions": 32,
                 "router_local_decisions": 1,
                 "zero_snapshot_decisions": 0,
                 "admission_evaluated_candidates": 64,
