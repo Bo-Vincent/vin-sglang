@@ -288,6 +288,7 @@ def simulator_worker_command(
     tokenizer_path: Path,
     max_total_tokens: int,
     max_running_requests: int,
+    page_size: int = 1,
 ) -> tuple[list[str], dict[str, str]]:
     kv_events = json.dumps(
         {
@@ -318,6 +319,8 @@ def simulator_worker_command(
         str(max_total_tokens),
         "--max-running-requests",
         str(max_running_requests),
+        "--page-size",
+        str(page_size),
         "--disable-overlap-schedule",
         "--sleep-on-idle",
         "--load-publish-endpoint",
@@ -957,6 +960,7 @@ def start_worker_fleet(
                     tokenizer_path=args.tokenizer_path,
                     max_total_tokens=args.max_total_tokens,
                     max_running_requests=args.max_running_requests,
+                    page_size=args.worker_page_size,
                 )
                 worker_environment.update(environment)
                 worker = start_process(
@@ -1771,6 +1775,7 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--indexer-port", type=int, default=50_551)
     parser.add_argument("--max-total-tokens", type=int, default=8192)
     parser.add_argument("--max-running-requests", type=int, default=32)
+    parser.add_argument("--worker-page-size", type=int, default=1)
     parser.add_argument("--worker-start-batch-size", type=int, default=16)
     parser.add_argument("--worker-port-layout-wait-timeout", type=float, default=90.0)
     parser.add_argument(
@@ -1802,6 +1807,7 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     if (
         args.max_total_tokens <= 0
         or args.max_running_requests <= 0
+        or args.worker_page_size <= 0
         or args.worker_start_batch_size <= 0
     ):
         parser.error("worker capacity arguments must be positive")
@@ -1877,6 +1883,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         "repeats": args.repeats,
         "max_total_tokens": args.max_total_tokens,
         "max_running_requests": args.max_running_requests,
+        "worker_page_size": args.worker_page_size,
         "output_tokens": args.output_tokens,
         "qps_per_worker": args.qps_per_worker,
         "kv_indexer_query_timeout_ms": args.kv_indexer_query_timeout_ms,

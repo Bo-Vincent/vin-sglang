@@ -128,6 +128,8 @@ class SimulatorHttpFleetContractTest(unittest.TestCase):
         self.assertIn("127.0.0.1:53000", command)
         self.assertIn("--chat-template", command)
         self.assertIn("chatml", command)
+        self.assertIn("--page-size", command)
+        self.assertEqual(command[command.index("--page-size") + 1], "1")
         self.assertEqual(environment["SGLANG_USE_CPU_ENGINE"], "1")
         self.assertEqual(environment["SGLANG_SIMULATOR_OUTPUT_MODE"], "BLOCKING")
 
