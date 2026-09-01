@@ -214,6 +214,13 @@ class TraceLabSimulatorHttpFleetContractTest(unittest.TestCase):
         with self.assertRaises(SystemExit):
             runner.parse_args(["--warmup-request-rate", "0"])
 
+    def test_runner_accepts_explicit_worker_page_size(self):
+        runner = load_runner()
+
+        args = runner.parse_args(["--worker-page-size", "1"])
+
+        self.assertEqual(args.worker_page_size, 1)
+
     def test_indexer_bridge_drain_requires_a_quiet_successful_apply_window(self):
         runner = load_runner()
         with tempfile.TemporaryDirectory() as directory:
