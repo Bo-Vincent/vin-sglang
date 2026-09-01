@@ -1085,7 +1085,7 @@ def cache_monitor_usage(router_log: str) -> dict[str, int]:
         source = normalized.split(source_marker, 1)[1].split()[0].strip('"')
         version = normalized.split(version_marker, 1)[1].split()[0].strip('"')
         counts["cache_candidate_decisions"] += 1
-        if source == "estimated_prefill_queue_ms":
+        if source in ("estimated_prefill_queue_ms", "native_queue_tokens"):
             counts["monitor_decisions"] += 1
         elif source == "router_local":
             counts["router_local_decisions"] += 1
