@@ -77,7 +77,14 @@ class TokenizersAdapter:
         tokenizer_json = tokenizer_path / "tokenizer.json"
         if not tokenizer_json.is_file():
             raise RuntimeError(f"tokenizer.json does not exist: {tokenizer_json}")
+        tokenizer_config = tokenizer_path / "tokenizer_config.json"
+        if not tokenizer_config.is_file():
+            raise RuntimeError(f"tokenizer_config.json does not exist: {tokenizer_config}")
         self._tokenizer = Tokenizer.from_file(str(tokenizer_json))
+        try:
+            self._tokenizer_config = json.loads(tokenizer_config.read_text())
+        except json.JSONDecodeError as error:
+            raise RuntimeError(f"invalid tokenizer_config.json: {tokenizer_config}") from error
         self.vocab_size = self._tokenizer.get_vocab_size()
 
     def decode(
@@ -92,6 +99,79 @@ class TokenizersAdapter:
 
     def encode(self, text: str, *, add_special_tokens: bool) -> list[int]:
         return self._tokenizer.encode(text, add_special_tokens=add_special_tokens).ids
+
+    def engine_equivalent_chat_input_ids(self, prompt: str) -> list[int]:
+        """生成与 Router chat ingress 一致、可直接交给 worker 的 ``input_ids``。"""
+        rendered = render_seed_chat_prompt(self._tokenizer_config, prompt)
+        input_ids = self.encode(rendered, add_special_tokens=False)
+        if not input_ids:
+            raise RuntimeError("engine-equivalent seed input_ids are empty")
+        return input_ids
+
+
+def chat_template_source(tokenizer_config: Mapping[str, object]) -> str:
+    """按 Router 的默认模板选择规则读取 HuggingFace chat template。"""
+    value = tokenizer_config.get("chat_template")
+    if isinstance(value, str) and value:
+        return value
+    if isinstance(value, list):
+        templates = [entry for entry in value if isinstance(entry, Mapping)]
+        default = next(
+            (
+                entry.get("template")
+                for entry in templates
+                if entry.get("name") == "default" and isinstance(entry.get("template"), str)
+            ),
+            None,
+        )
+        if isinstance(default, str) and default:
+            return default
+        first = templates[0].get("template") if templates else None
+        if isinstance(first, str) and first:
+            return first
+    raise RuntimeError("pressure-guard seed requires a non-empty tokenizer chat_template")
+
+
+def tokenizer_special_token(tokenizer_config: Mapping[str, object], name: str) -> str:
+    """兼容 HuggingFace string 与 AddedToken 两种特殊 token 配置。"""
+    value = tokenizer_config.get(name)
+    if isinstance(value, str):
+        return value
+    if isinstance(value, Mapping):
+        content = value.get("content")
+        if isinstance(content, str):
+            return content
+    return ""
+
+
+def render_seed_chat_prompt(tokenizer_config: Mapping[str, object], prompt: str) -> str:
+    """复刻 Router chat-template ingress，供直连 worker seed 使用。"""
+    try:
+        from jinja2 import Environment
+    except ImportError as error:
+        raise RuntimeError("pressure-guard seed requires the Python jinja2 package") from error
+    special_tokens = {
+        name: tokenizer_special_token(tokenizer_config, name)
+        for name in (
+            "bos_token",
+            "eos_token",
+            "unk_token",
+            "sep_token",
+            "pad_token",
+            "cls_token",
+            "mask_token",
+        )
+    }
+    template = Environment(trim_blocks=True, lstrip_blocks=True).from_string(
+        chat_template_source(tokenizer_config)
+    )
+    return template.render(
+        messages=[{"role": "user", "content": prompt}],
+        add_generation_prompt=True,
+        tools=None,
+        documents=None,
+        **special_tokens,
+    )
 
 
 def parse_csv(value: str) -> tuple[str, ...]:
@@ -448,19 +528,19 @@ async def stream_chat_request(
     round_: ReplayRound,
     timeout_seconds: float,
     max_total_tokens: int,
+    input_ids: Sequence[int] | None = None,
 ) -> dict[str, object]:
     try:
         import aiohttp
     except ImportError as error:
         raise RuntimeError("TraceLab Simulator runner requires aiohttp") from error
-    payload = {
-        "model": model,
-        "messages": [{"role": "user", "content": prompt}],
-        "max_tokens": max_tokens_for_round(round_, max_total_tokens=max_total_tokens),
-        "temperature": 0,
-        "stream": True,
-        "stream_options": {"include_usage": True},
-    }
+    payload = chat_request_payload(
+        model=model,
+        prompt=prompt,
+        round_=round_,
+        max_total_tokens=max_total_tokens,
+        input_ids=input_ids,
+    )
     started = time.monotonic()
     first_token_at: float | None = None
     completion_tokens: int | None = None
@@ -516,6 +596,30 @@ async def stream_chat_request(
         "e2e_ms": (finished - started) * 1000.0,
         "completion_tokens": completion_tokens,
     }
+
+
+def chat_request_payload(
+    *,
+    model: str,
+    prompt: str,
+    round_: ReplayRound,
+    max_total_tokens: int,
+    input_ids: Sequence[int] | None = None,
+) -> dict[str, object]:
+    """构造 TraceLab 请求；直连 seed 可显式携带 Router 等价 token。"""
+    payload: dict[str, object] = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": max_tokens_for_round(round_, max_total_tokens=max_total_tokens),
+        "temperature": 0,
+        "stream": True,
+        "stream_options": {"include_usage": True},
+    }
+    if input_ids is not None:
+        if not input_ids:
+            raise ValueError("input_ids must be non-empty when supplied")
+        payload["input_ids"] = list(input_ids)
+    return payload
 
 
 async def replay_phase(
@@ -605,6 +709,7 @@ async def seed_pressure_guard_replicas(
     warmups: Mapping[str, Sequence[ReplayRound]],
     *,
     prompts: Mapping[tuple[str, int, int], str],
+    tokenizer: TokenizersAdapter,
     worker_urls: Sequence[str],
     model: str,
     request_rate: float,
@@ -612,7 +717,7 @@ async def seed_pressure_guard_replicas(
     max_total_tokens: int,
     holders_per_session: int,
 ) -> int:
-    """在 router warmup 前为每个 session 预置两个同前缀的 worker。"""
+    """在 router warmup 后为选定 session 预置可被 ingress 命中的双副本。"""
     try:
         import aiohttp
     except ImportError as error:
@@ -632,6 +737,7 @@ async def seed_pressure_guard_replicas(
                 prompt = prompts[key]
             except KeyError as error:
                 raise RuntimeError(f"missing virtual prompt for {key}") from error
+            input_ids = tokenizer.engine_equivalent_chat_input_ids(prompt)
             async with semaphore:
                 await stream_chat_request(
                     session=session,
@@ -641,6 +747,7 @@ async def seed_pressure_guard_replicas(
                     round_=round_,
                     timeout_seconds=timeout_seconds,
                     max_total_tokens=max_total_tokens,
+                    input_ids=input_ids,
                 )
 
         await asyncio.gather(
@@ -754,6 +861,7 @@ def run_case(
     case: TraceLabCase,
     rounds: Sequence[ReplayRound],
     prompts: Mapping[tuple[str, int, int], str],
+    tokenizer: TokenizersAdapter,
     worker_fleet: tuple[Sequence[fleet.WorkerSpec], Sequence[fleet.ManagedProcess]],
 ) -> None:
     directory = args.results_dir / case.name
@@ -815,6 +923,7 @@ def run_case(
             seed_pressure_guard_replicas(
                 guard_seed_warmups,
                 prompts=prompts,
+                tokenizer=tokenizer,
                 worker_urls=worker_urls,
                 model=str(args.model_path),
                 request_rate=args.pressure_guard_seed_request_rate,
@@ -979,6 +1088,7 @@ def run_cases(
     cases: Sequence[TraceLabCase],
     rounds: Sequence[ReplayRound],
     prompts: Mapping[tuple[str, int, int], str],
+    tokenizer: TokenizersAdapter,
 ) -> None:
     pending = [
         case
@@ -992,7 +1102,7 @@ def run_cases(
         fleet_directory = args.results_dir / "worker-fleets" / case.name
         specs, workers = fleet.start_worker_fleet(args, WORKER_COUNT, fleet_directory)
         try:
-            run_case(args, case, rounds, prompts, (specs, workers))
+            run_case(args, case, rounds, prompts, tokenizer, (specs, workers))
         finally:
             fleet.stop_processes(workers)
             fleet.wait_for_control_plane_quiescence(args)
@@ -1218,7 +1328,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         "cases": [asdict(case) | {"name": case.name} for case in cases],
     }
     fleet.write_or_verify_manifest(args.results_dir, contract, resume=args.resume)
-    run_cases(args, cases, rounds, prompts)
+    run_cases(args, cases, rounds, prompts, tokenizer)
     fleet.atomic_write_text(args.results_dir / "RUN_COMPLETE", "ok\n")
     fleet.atomic_write_text(args.results_dir / "CURRENT", "complete\n")
     return 0

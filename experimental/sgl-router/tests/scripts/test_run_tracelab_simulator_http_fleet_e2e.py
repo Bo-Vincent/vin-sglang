@@ -170,6 +170,44 @@ class TraceLabSimulatorHttpFleetContractTest(unittest.TestCase):
 
         self.assertEqual(selected, {"session-a": ("a-warmup",)})
 
+    def test_pressure_guard_seed_renders_router_equivalent_chat_template(self):
+        runner = load_runner()
+
+        rendered = runner.render_seed_chat_prompt(
+            {
+                "chat_template": (
+                    "{{ bos_token }}{% for message in messages %}"
+                    "<|{{ message.role }}|>{{ message.content }}{% endfor %}"
+                    "{% if add_generation_prompt %}<|assistant|>{% endif %}"
+                ),
+                "bos_token": {"content": "<s>"},
+            },
+            "seed-prompt",
+        )
+
+        self.assertEqual(rendered, "<s><|user|>seed-prompt<|assistant|>")
+
+    def test_pressure_guard_seed_rejects_missing_chat_template(self):
+        runner = load_runner()
+
+        with self.assertRaisesRegex(RuntimeError, "chat_template"):
+            runner.render_seed_chat_prompt({}, "seed-prompt")
+
+    def test_direct_seed_request_carries_router_equivalent_input_ids(self):
+        runner = load_runner()
+        round_ = runner.ReplayRound("session-a", 0, 1024, 0, 1024, 8, 1, True)
+
+        payload = runner.chat_request_payload(
+            model="model",
+            prompt="seed-prompt",
+            round_=round_,
+            max_total_tokens=4096,
+            input_ids=(1, 2, 3),
+        )
+
+        self.assertEqual(payload["input_ids"], [1, 2, 3])
+        self.assertEqual(payload["messages"], [{"role": "user", "content": "seed-prompt"}])
+
     def test_runner_rejects_non_positive_warmup_request_rate(self):
         runner = load_runner()
 
