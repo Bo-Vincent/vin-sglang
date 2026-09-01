@@ -1,10 +1,13 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! 基于 ingress KV Indexer 结果生成有界 Cache-Aware 候选集。
+//! 基于本地 ZMQ KV radix tree 结果生成有界 Cache-Aware 候选集。
 
 use crate::config::AffinityConfig;
 use crate::policies::admission::FreshLoadLookup;
+use crate::policies::kv_events::{
+    compute_block_hashes, compute_block_hashes_bigram, BlockSizeOracle, HashTree,
+};
 use crate::policies::power_of_two::PowerOfTwoChoicesPolicy;
 use crate::policies::{
     estimate_matched_prefix_tokens, CacheCandidate, CacheCandidateProposal, Policy,
@@ -12,17 +15,56 @@ use crate::policies::{
 };
 use crate::workers::Worker;
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 #[derive(Debug)]
 pub struct CacheAwarePolicy {
     config: AffinityConfig,
+    tree: Arc<HashTree>,
+    block_size_oracle: Arc<BlockSizeOracle>,
 }
 
 impl CacheAwarePolicy {
-    pub fn new(config: AffinityConfig) -> Self {
-        Self { config }
+    pub fn new(
+        config: AffinityConfig,
+        tree: Arc<HashTree>,
+        block_size_oracle: Arc<BlockSizeOracle>,
+    ) -> Self {
+        Self {
+            config,
+            tree,
+            block_size_oracle,
+        }
+    }
+
+    /// One local-tree descent returns the deepest contiguous cache prefix per
+    /// worker URL. DP ranks of a worker collapse to their best depth, matching
+    /// the established ZMQ radix-tree policy.
+    fn local_prefix_depths(
+        &self,
+        ctx: &SelectionContext<'_>,
+    ) -> Option<(usize, HashMap<String, u32>)> {
+        let tokens = ctx.request_tokens().filter(|tokens| !tokens.is_empty())?;
+        let block_size = self.block_size_oracle.get()?;
+        let hashes = if self.block_size_oracle.is_bigram() {
+            compute_block_hashes_bigram(tokens, block_size as usize)
+        } else {
+            compute_block_hashes(tokens, block_size as usize)
+        };
+        if hashes.is_empty() {
+            return None;
+        }
+
+        let mut depths: HashMap<String, u32> = HashMap::new();
+        for (worker, depth) in self.tree.prefix_depths(None, &hashes) {
+            let depth = u32::try_from(depth).unwrap_or(u32::MAX);
+            depths
+                .entry(worker.url)
+                .and_modify(|current| *current = (*current).max(depth))
+                .or_insert(depth);
+        }
+        Some((hashes.len(), depths))
     }
 
     fn cache_candidate_proposal(
@@ -31,35 +73,21 @@ impl CacheAwarePolicy {
         ctx: &SelectionContext<'_>,
     ) -> Option<CacheCandidateProposal> {
         let input_tokens = ctx.input_tokens()?;
-        let signal = ctx.external_prefix()?;
-        let sgl_kv_indexer::PrefixOutcome::Matched { matches, .. } = &signal.outcome else {
-            return None;
-        };
-        if signal.query_blocks == 0 || workers.is_empty() {
+        let (query_blocks, matched_by_url) = self.local_prefix_depths(ctx)?;
+        if workers.is_empty() {
             return None;
         }
 
-        // The #33370 indexer contract routes on the worker address (matched
-        // byte-for-byte against registered worker URLs); worker_id is for
-        // logs only.
-        let by_url: HashMap<&str, &Arc<Worker>> = workers
-            .iter()
-            .map(|worker| (worker.url.as_str(), worker))
-            .collect();
-        let mut seen = HashSet::new();
         let mut candidates = Vec::new();
-        for entry in matches {
-            let Some(worker) = by_url.get(entry.address.as_str()) else {
+        for worker in workers {
+            let Some(matched_prefix_blocks) = matched_by_url.get(&worker.url).copied() else {
                 continue;
             };
-            if entry.matched_prefix_blocks == 0 || !seen.insert(worker.id.clone()) {
+            if matched_prefix_blocks == 0 {
                 continue;
             }
-            let matched_prefix_tokens = estimate_matched_prefix_tokens(
-                input_tokens,
-                signal.query_blocks,
-                entry.matched_prefix_blocks,
-            );
+            let matched_prefix_tokens =
+                estimate_matched_prefix_tokens(input_tokens, query_blocks, matched_prefix_blocks);
             if !self.passes_cache_gate(input_tokens, matched_prefix_tokens) {
                 continue;
             }

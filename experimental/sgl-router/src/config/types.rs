@@ -103,7 +103,7 @@ pub enum PolicyKind {
     /// 基于 Session-ID 的 affinity policy。
     #[value(name = "session_aware")]
     SessionAware,
-    /// 使用外部 Indexer 信号的 Cache affinity policy。
+    /// 使用本地 ZMQ KV radix tree 信号的 Cache affinity policy。
     #[value(name = "cache_aware")]
     CacheAware,
     /// 图中 Shortest-TTFT baseline：在全部 hard-admitted worker 上比较
@@ -258,7 +258,7 @@ pub struct ModelConfig {
     /// 可选静态 Bucket 配置；`None` 使用全局 domain。
     pub bucket_config: Option<BucketConfig>,
     pub circuit_breaker: Option<CircuitBreakerConfig>,
-    /// Cache-Aware ZMQ tuning and optional external Indexer endpoint.
+    /// Cache-Aware ZMQ tuning and optional Shortest-TTFT external Indexer endpoint.
     pub cache_aware: Option<CacheAwareConfig>,
     /// Tuning for the sticky-session policy. `Some` exactly when
     /// `policy = "sticky"` (built by [`crate::config::cli::Cli::into_config`]).
@@ -373,9 +373,9 @@ pub struct CacheAwareConfig {
     /// that the absolute check is gated on. Default 1.1 — 10 % relative
     /// difference triggers re-balancing.
     pub balance_rel_threshold: f32,
-    /// Optional external KV Indexer client configuration. Cache-Aware 和
-    /// Shortest-TTFT 都以它作为 ingress cache signal；配置后本地 ZMQ
-    /// radix tree 不再承担外部 cache 匹配。
+    /// Optional external KV Indexer client configuration. Only Shortest-TTFT
+    /// uses it as the ingress cache signal; Cache-Aware always queries the
+    /// local ZMQ radix tree.
     pub kv_indexer_endpoint: Option<KvIndexerEndpointConfig>,
 }
 
