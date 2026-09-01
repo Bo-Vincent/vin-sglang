@@ -38,6 +38,7 @@
 //! | `sgl_router_cache_pressure_guard_compared_total` | Counter | — |
 //! | `sgl_router_cache_pressure_guard_override_total` | Counter | — |
 //! | `sgl_router_cache_monitor_decisions_total` | Counter | `source` |
+//! | `sgl_router_kv_indexer_query_duration_seconds` | Histogram | `outcome` |
 //! | `sgl_router_ingress_tokenize_errors_total` | Counter | `model_id` |
 //!
 //! The four `sgl_router_worker*` gauges and `sgl_router_workers` are sampled
@@ -71,6 +72,10 @@ const REQUEST_DURATION_BUCKETS: &[f64] = &[
     0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0,
 ];
 
+/// 外部 KV Indexer RPC 耗时边界（秒）。复用请求延迟的覆盖范围：正常查询可
+/// 分辨毫秒级开销，超时/拥塞查询也会保留在同一 `+Inf` 合同里。
+const KV_INDEXER_QUERY_DURATION_BUCKETS: &[f64] = REQUEST_DURATION_BUCKETS;
+
 /// Histogram bucket upper bounds (seconds) for `sgl_router_ttft_seconds`.
 ///
 /// From 0.1 s up these edges are IDENTICAL to the SGLang engine's
@@ -101,6 +106,31 @@ pub enum RequestOutcome {
     Success,
     Error,
     Cancelled,
+}
+
+/// KV Indexer prefix-query 的实际结果。每次发起 RPC 恰记录一次，因而
+/// `success` 以外的 series 可以作为 benchmark 的 fail-closed 依据。
+#[derive(Debug, Clone, Copy)]
+pub enum KvIndexerQueryOutcome {
+    Success,
+    Overloaded,
+    Timeout,
+    Unreachable,
+    TooLarge,
+    Rejected,
+}
+
+impl KvIndexerQueryOutcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::Overloaded => "overloaded",
+            Self::Timeout => "timeout",
+            Self::Unreachable => "unreachable",
+            Self::TooLarge => "too_large",
+            Self::Rejected => "rejected",
+        }
+    }
 }
 
 impl RequestOutcome {
@@ -236,6 +266,7 @@ pub struct MetricsRegistry {
     cache_pressure_guard_compared_total: AtomicU64,
     cache_pressure_guard_override_total: AtomicU64,
     cache_monitor_decisions_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
+    kv_indexer_query_duration: Mutex<HashMap<&'static str, Histogram>>,
     ingress_tokenize_errors_total: Mutex<HashMap<String, Arc<AtomicU64>>>,
 }
 
@@ -429,6 +460,20 @@ impl MetricsRegistry {
         let hist = guard
             .entry(model_id.to_owned())
             .or_insert_with(|| Histogram::new(TTFT_BUCKETS));
+        hist.observe(seconds);
+    }
+
+    /// 记录一次外部 KV Indexer prefix-query 的端到端 RPC 耗时与结果。
+    /// 此处位于 Router 的真实 client 调用边界，不能由 policy 日志或请求
+    /// 成功状态替代；它明确区分 query 成功和 fail-open 降级。
+    pub fn observe_kv_indexer_query(&self, outcome: KvIndexerQueryOutcome, seconds: f64) {
+        if !seconds.is_finite() {
+            return;
+        }
+        let mut guard = self.kv_indexer_query_duration.lock();
+        let hist = guard
+            .entry(outcome.as_str())
+            .or_insert_with(|| Histogram::new(KV_INDEXER_QUERY_DURATION_BUCKETS));
         hist.observe(seconds);
     }
 
@@ -648,6 +693,26 @@ impl MetricsRegistry {
             render_histogram(
                 &mut out,
                 "sgl_router_request_duration_seconds",
+                &label_body,
+                hist,
+            );
+        }
+        drop(guard);
+
+        // kv_indexer_query_duration histogram
+        out.push_str(
+            "# HELP sgl_router_kv_indexer_query_duration_seconds End-to-end external KV Indexer prefix-query latency, by actual RPC outcome.\n",
+        );
+        out.push_str("# TYPE sgl_router_kv_indexer_query_duration_seconds histogram\n");
+        let guard = self.kv_indexer_query_duration.lock();
+        let mut outcomes: Vec<&str> = guard.keys().copied().collect();
+        outcomes.sort();
+        for outcome in outcomes {
+            let hist = guard.get(outcome).unwrap();
+            let label_body = format!("outcome=\"{outcome}\"");
+            render_histogram(
+                &mut out,
+                "sgl_router_kv_indexer_query_duration_seconds",
                 &label_body,
                 hist,
             );
@@ -997,6 +1062,7 @@ mod tests {
         // Should at least carry HELP / TYPE for every metric family.
         assert!(out.contains("# TYPE sgl_router_requests_total counter"));
         assert!(out.contains("# TYPE sgl_router_request_duration_seconds histogram"));
+        assert!(out.contains("# TYPE sgl_router_kv_indexer_query_duration_seconds histogram"));
         assert!(out.contains("# TYPE sgl_router_ttft_seconds histogram"));
         assert!(out.contains("# TYPE sgl_router_responses_total counter"));
         assert!(out.contains("# TYPE sgl_router_overlap_blocks histogram"));
@@ -1015,6 +1081,20 @@ mod tests {
         assert!(out.contains(r#"sgl_router_workers{mode="plain"} 0"#));
         assert!(out.contains(r#"sgl_router_workers{mode="prefill"} 0"#));
         assert!(out.contains(r#"sgl_router_workers{mode="decode"} 0"#));
+    }
+
+    #[test]
+    fn kv_indexer_query_histogram_keeps_success_and_fail_open_outcomes_separate() {
+        let reg = MetricsRegistry::new();
+        reg.observe_kv_indexer_query(KvIndexerQueryOutcome::Success, 0.012);
+        reg.observe_kv_indexer_query(KvIndexerQueryOutcome::Timeout, 2.0);
+
+        let out = reg.render();
+
+        assert!(out
+            .contains("sgl_router_kv_indexer_query_duration_seconds_count{outcome=\"success\"} 1"));
+        assert!(out
+            .contains("sgl_router_kv_indexer_query_duration_seconds_count{outcome=\"timeout\"} 1"));
     }
 
     #[test]
