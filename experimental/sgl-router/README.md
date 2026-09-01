@@ -70,6 +70,29 @@ timeouts, local admission rejection, and server rejection fail the Router
 request with `503` rather than silently switching signals. The timeout and local
 concurrency bound default to 100ms and 32 respectively.
 
+## 独立 Shortest-TTFT 策略
+
+`--policy shortest_ttft` 实现 RTP-LLM 相近的 Shortest-TTFT 选择：对每个
+worker 计算 `floor((10 * input_tokens - 7 * hit_tokens) / 10)`，再加上该
+engine 的 queue pressure；随后取 TTFT 最小的前 30%（至少一个）并在相近
+候选中优先最久未被调度的 worker。
+
+```bash
+sgl-router \
+  --model-id qwen3 \
+  --tokenizer-path /models/qwen3/tokenizer.json \
+  --worker-urls http://10.0.0.1:30000 http://10.0.0.2:30000 \
+  --policy shortest_ttft
+```
+
+缓存命中仅读取 router 的基础 KV-event tree；engine load 则通过一个独立的
+`LoadStat` SUB monitor 读取 worker `/server_info` 中声明的
+`kv_events.load_endpoint_port_base` 和 `load_topic`。它不启用或复用
+`cache_aware_zmq` 的策略/游标/admission 逻辑，也不使用 cache-aware 的
+调优参数。当前 #34608 的发布负载是 running/waiting request gauge，不含
+RTP-LLM 的毫秒级 `runningQueueTime`；某个 DP rank 缺失或过期时，策略会
+回退到 router 的本地 in-flight 计数，而不是聚合不完整的远端数据。
+
 ## License
 
 Apache-2.0.

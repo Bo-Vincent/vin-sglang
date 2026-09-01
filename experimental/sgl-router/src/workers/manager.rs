@@ -6,6 +6,7 @@ use crate::discovery::{DiscoveryEvent, ModelId, WorkerId, WorkerMode, WorkerSpec
 use crate::health::circuit_breaker::CircuitBreakerConfig;
 use crate::policies::active_load::ActiveLoadRegistry;
 use crate::policies::kv_events::KvEventIndex;
+use crate::policies::shortest_ttft::EngineLoadMonitor;
 use crate::workers::introspect::{DisaggregationRole, WorkerIntrospector};
 use crate::workers::WorkerRegistry;
 use std::collections::HashMap;
@@ -69,12 +70,26 @@ pub async fn run_with_config(
     kv_index: Option<Arc<KvEventIndex>>,
     active_load: Option<Arc<ActiveLoadRegistry>>,
 ) {
-    run_with_introspector(
+    run_with_config_and_monitor(rx, registry, cfg, kv_index, active_load, None).await;
+}
+
+/// 与 [`run_with_config`] 相同，但额外接入 Shortest-TTFT 私有的 engine
+/// load monitor。传入 `None` 时保持既有 worker-manager 行为。
+pub async fn run_with_config_and_monitor(
+    rx: mpsc::Receiver<DiscoveryEvent>,
+    registry: Arc<WorkerRegistry>,
+    cfg: Option<Arc<Config>>,
+    kv_index: Option<Arc<KvEventIndex>>,
+    active_load: Option<Arc<ActiveLoadRegistry>>,
+    load_monitor: Option<Arc<EngineLoadMonitor>>,
+) {
+    run_with_introspector_and_monitor(
         rx,
         registry,
         cfg,
         kv_index,
         active_load,
+        load_monitor,
         Arc::new(WorkerIntrospector::default()),
     )
     .await
@@ -93,12 +108,28 @@ pub async fn run_with_introspector(
     active_load: Option<Arc<ActiveLoadRegistry>>,
     introspector: Arc<WorkerIntrospector>,
 ) {
-    run_with_introspector_and_reconcile(
+    run_with_introspector_and_monitor(rx, registry, cfg, kv_index, active_load, None, introspector)
+        .await
+}
+
+/// 测试和生产接线共用的 monitor-aware 入口。monitor 只服务
+/// Shortest-TTFT；它与 KV event index 完全独立，不能共享订阅状态。
+async fn run_with_introspector_and_monitor(
+    rx: mpsc::Receiver<DiscoveryEvent>,
+    registry: Arc<WorkerRegistry>,
+    cfg: Option<Arc<Config>>,
+    kv_index: Option<Arc<KvEventIndex>>,
+    active_load: Option<Arc<ActiveLoadRegistry>>,
+    load_monitor: Option<Arc<EngineLoadMonitor>>,
+    introspector: Arc<WorkerIntrospector>,
+) {
+    run_with_introspector_and_reconcile_and_monitor(
         rx,
         registry,
         cfg,
         kv_index,
         active_load,
+        load_monitor,
         introspector,
         RECONCILE_INTERVAL,
     )
@@ -126,11 +157,36 @@ pub async fn run_with_introspector(
 ///   `pending` with the discovery events so re-registrations stay
 ///   serialized per id against concurrent `Added` / `Removed`.
 pub async fn run_with_introspector_and_reconcile(
+    rx: mpsc::Receiver<DiscoveryEvent>,
+    registry: Arc<WorkerRegistry>,
+    cfg: Option<Arc<Config>>,
+    kv_index: Option<Arc<KvEventIndex>>,
+    active_load: Option<Arc<ActiveLoadRegistry>>,
+    introspector: Arc<WorkerIntrospector>,
+    reconcile_interval: Duration,
+) {
+    run_with_introspector_and_reconcile_and_monitor(
+        rx,
+        registry,
+        cfg,
+        kv_index,
+        active_load,
+        None,
+        introspector,
+        reconcile_interval,
+    )
+    .await
+}
+
+/// 带 Shortest-TTFT monitor 的完整 worker 生命周期。已有调用方仍走上面的
+/// `None` 包装器，从而不改变 cache-aware 或普通策略的注册路径。
+async fn run_with_introspector_and_reconcile_and_monitor(
     mut rx: mpsc::Receiver<DiscoveryEvent>,
     registry: Arc<WorkerRegistry>,
     cfg: Option<Arc<Config>>,
     kv_index: Option<Arc<KvEventIndex>>,
     active_load: Option<Arc<ActiveLoadRegistry>>,
+    load_monitor: Option<Arc<EngineLoadMonitor>>,
     introspector: Arc<WorkerIntrospector>,
     reconcile_interval: Duration,
 ) {
@@ -171,6 +227,7 @@ pub async fn run_with_introspector_and_reconcile(
                     &cfg,
                     &kv_index,
                     &active_load,
+                    &load_monitor,
                     &introspector,
                     &mut pending,
                 )
@@ -182,6 +239,7 @@ pub async fn run_with_introspector_and_reconcile(
                     &registry,
                     &cfg,
                     &kv_index,
+                    &load_monitor,
                     &introspector,
                     &mut pending,
                 );
@@ -209,6 +267,7 @@ async fn handle_discovery_event(
     cfg: &Option<Arc<Config>>,
     kv_index: &Option<Arc<KvEventIndex>>,
     active_load: &Option<Arc<ActiveLoadRegistry>>,
+    load_monitor: &Option<Arc<EngineLoadMonitor>>,
     introspector: &Arc<WorkerIntrospector>,
     pending: &mut HashMap<WorkerId, JoinHandle<()>>,
 ) {
@@ -226,9 +285,18 @@ async fn handle_discovery_event(
             let registry_t = registry.clone();
             let cfg_t = cfg.clone();
             let kv_index_t = kv_index.clone();
+            let load_monitor_t = load_monitor.clone();
             let introspector_t = introspector.clone();
             let handle = tokio::spawn(async move {
-                register_one(spec, registry_t, cfg_t, kv_index_t, introspector_t).await;
+                register_one(
+                    spec,
+                    registry_t,
+                    cfg_t,
+                    kv_index_t,
+                    load_monitor_t,
+                    introspector_t,
+                )
+                .await;
             });
             pending.insert(id, handle);
         }
@@ -245,9 +313,9 @@ async fn handle_discovery_event(
             // KV-event index can clear its per-(url, dp_rank) state.
             let worker_url = registry.get(&id).map(|w| w.url.clone());
             registry.remove(&id);
-            match (kv_index, worker_url) {
+            match (kv_index, worker_url.as_deref()) {
                 (Some(idx), Some(url)) => {
-                    idx.remove_worker(&url).await;
+                    idx.remove_worker(url).await;
                 }
                 (Some(_), None) => {
                     // Registry didn't know this worker but kv-events
@@ -261,6 +329,16 @@ async fn handle_discovery_event(
                     );
                 }
                 (None, _) => {}
+            }
+            // 先 await 匹配的 Added，再取消并 join 所有 subscriber，最后清表。
+            // 这个顺序保证已移除 worker 的迟到 gauge 无法重新写回。
+            if let (Some(monitor), Some(url)) = (load_monitor, worker_url.as_deref()) {
+                monitor.remove_worker(url).await;
+            } else if load_monitor.is_some() && worker_url.is_none() {
+                tracing::warn!(
+                    id = %id,
+                    "discovery: Removed without a known URL; shortest-ttft monitor state (if any) not cleared",
+                );
             }
             // Drop the active-load per-worker counters slot.
             // Idempotent on the registry side, so we call it
@@ -336,6 +414,7 @@ fn reconcile_unresolved_workers(
     registry: &Arc<WorkerRegistry>,
     cfg: &Option<Arc<Config>>,
     kv_index: &Option<Arc<KvEventIndex>>,
+    load_monitor: &Option<Arc<EngineLoadMonitor>>,
     introspector: &Arc<WorkerIntrospector>,
     pending: &mut HashMap<WorkerId, JoinHandle<()>>,
 ) {
@@ -373,9 +452,18 @@ fn reconcile_unresolved_workers(
         let registry_t = registry.clone();
         let cfg_t = cfg.clone();
         let kv_index_t = kv_index.clone();
+        let load_monitor_t = load_monitor.clone();
         let introspector_t = introspector.clone();
         let handle = tokio::spawn(async move {
-            register_one(spec, registry_t, cfg_t, kv_index_t, introspector_t).await;
+            register_one(
+                spec,
+                registry_t,
+                cfg_t,
+                kv_index_t,
+                load_monitor_t,
+                introspector_t,
+            )
+            .await;
         });
         pending.insert(id, handle);
     }
@@ -391,6 +479,7 @@ async fn register_one(
     registry: Arc<WorkerRegistry>,
     cfg: Option<Arc<Config>>,
     kv_index: Option<Arc<KvEventIndex>>,
+    load_monitor: Option<Arc<EngineLoadMonitor>>,
     introspector: Arc<WorkerIntrospector>,
 ) {
     let worker_url = spec.url.clone();
@@ -447,6 +536,11 @@ async fn register_one(
         // Pass the pre-resolved EventConfig so the KvEventIndex does
         // not issue a second `/server_info` round-trip.
         idx.add_worker(&worker_url, info.event_config).await;
+    }
+    if let (Some(monitor), Some(load_config)) = (load_monitor, info.load_config) {
+        // 此调用只管理 Shortest-TTFT 自己的 gauge subscriber，不接触
+        // cache-aware 的 KV-event 任务、游标或 replay 语义。
+        monitor.add_worker(&worker_url, load_config).await;
     }
 }
 
@@ -763,6 +857,121 @@ mod tests {
         drop(tx);
         let _ = manager_handle.await;
         kv_index.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn manager_drives_shortest_ttft_monitor_lifecycle() {
+        use bytes::Bytes;
+        use tokio::time::timeout;
+        use zeromq::{Endpoint, PubSocket, Socket, SocketSend, ZmqMessage};
+
+        use crate::policies::shortest_ttft::{EngineLoadMonitor, EngineLoadTable};
+
+        fn load_message(seq: i64, running: u64, waiting: u64) -> ZmqMessage {
+            let mut payload = Vec::new();
+            rmp::encode::write_array_len(&mut payload, 6).unwrap();
+            rmp::encode::write_str(&mut payload, "LoadStat").unwrap();
+            rmp::encode::write_uint(&mut payload, running).unwrap();
+            rmp::encode::write_uint(&mut payload, waiting).unwrap();
+            rmp::encode::write_uint(&mut payload, 0).unwrap();
+            rmp::encode::write_uint(&mut payload, 0).unwrap();
+            rmp::encode::write_nil(&mut payload).unwrap();
+            let mut message = ZmqMessage::from(Bytes::from_static(b"load"));
+            message.push_back(Bytes::copy_from_slice(&seq.to_be_bytes()));
+            message.push_back(Bytes::from(payload));
+            message
+        }
+
+        let mut publisher = PubSocket::new();
+        let endpoint = publisher.bind("tcp://127.0.0.1:0").await.unwrap();
+        let port = match endpoint {
+            Endpoint::Tcp(_, port) => port,
+            other => panic!("unexpected endpoint: {other:?}"),
+        };
+        let body = json!({
+            "served_model_name": "m",
+            "kv_events": {
+                "publisher": "zmq",
+                "endpoint_host": "127.0.0.1",
+                "endpoint_port_base": 5557,
+                "topic": "",
+                "block_size": 64,
+                "dp_size": 1,
+                "load_endpoint_port_base": port,
+                "load_topic": "load",
+            }
+        });
+        let (worker_url, _shutdown) = spawn_fake_server_info_worker(body).await;
+        let registry = Arc::new(WorkerRegistry::default());
+        let table = EngineLoadTable::with_freshness(Duration::from_secs(1));
+        let monitor = EngineLoadMonitor::new(Arc::clone(&table));
+        let (tx, rx) = mpsc::channel::<DiscoveryEvent>(8);
+        let manager_handle = tokio::spawn(run_with_config_and_monitor(
+            rx,
+            Arc::clone(&registry),
+            None,
+            None,
+            None,
+            Some(Arc::clone(&monitor)),
+        ));
+        let spec = WorkerSpec {
+            id: WorkerId("shortest-ttft-worker".into()),
+            url: worker_url.clone(),
+            mode: WorkerMode::Plain,
+            model_ids: Vec::new(),
+            bootstrap_port: None,
+        };
+        tx.send(DiscoveryEvent::Added(spec.clone())).await.unwrap();
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if registry.get(&spec.id).is_some() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("manager must register the worker");
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        publisher
+            .send(load_message(1, 2, 5))
+            .await
+            .expect("publish LoadStat");
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if table.queue_pressure(&worker_url, std::time::Instant::now()) == Some(7) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("manager must attach the load monitor on Added");
+
+        tx.send(DiscoveryEvent::Removed {
+            id: spec.id.clone(),
+        })
+        .await
+        .unwrap();
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if registry.get(&spec.id).is_none()
+                    && table
+                        .queue_pressure(&worker_url, std::time::Instant::now())
+                        .is_none()
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("manager must remove monitor state on Removed");
+
+        drop(tx);
+        let _ = manager_handle.await;
+        monitor.shutdown().await;
     }
 
     /// `Removed` for an unknown id with kv-events enabled must not panic.

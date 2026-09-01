@@ -31,6 +31,7 @@ use tracing::warn;
 use url::Url;
 
 use crate::policies::kv_events::EventConfig;
+use crate::policies::shortest_ttft::LoadEndpointConfig;
 
 /// Default timeout for `/server_info`. Conservative for a small JSON
 /// payload served by SGLang's HTTP server.
@@ -55,6 +56,9 @@ const FETCH_BACKOFF_BASE: Duration = Duration::from_millis(100);
 pub struct ServerInfo {
     pub served_model_name: Option<String>,
     pub event_config: Option<EventConfig>,
+    /// 独立 Shortest-TTFT monitor 的 load PUB 描述。`None` 表示 worker
+    /// 未启用 #34608 load publishing，策略随后回退到 router 本地负载。
+    pub load_config: Option<LoadEndpointConfig>,
     pub disaggregation_role: Option<DisaggregationRole>,
 }
 
@@ -145,7 +149,12 @@ impl WorkerIntrospector {
         );
         let event_config = parsed
             .kv_events
-            .map(|block| resolve_event_config(block, worker_url, is_bigram));
+            .as_ref()
+            .map(|block| resolve_event_config(block.clone(), worker_url, is_bigram));
+        let load_config = parsed
+            .kv_events
+            .as_ref()
+            .and_then(|block| resolve_load_config(block, worker_url));
 
         let disaggregation_role = resolve_disaggregation_role(
             parsed.disaggregation_mode.as_deref(),
@@ -156,6 +165,7 @@ impl WorkerIntrospector {
         ServerInfo {
             served_model_name,
             event_config,
+            load_config,
             disaggregation_role,
         }
     }
@@ -294,10 +304,21 @@ pub(crate) fn resolve_event_config(
     worker_url: &str,
     is_bigram: bool,
 ) -> EventConfig {
-    let host = if matches!(
-        block.endpoint_host.as_str(),
-        "*" | "0.0.0.0" | "::" | "[::]"
-    ) {
+    let host = resolve_connect_host(&block.endpoint_host, worker_url);
+    EventConfig {
+        host,
+        port_base: block.endpoint_port_base,
+        topic: block.topic,
+        block_size: block.block_size,
+        dp_size: block.dp_size,
+        is_bigram,
+    }
+}
+
+/// Resolve an engine-advertised bind host into the address a router can
+/// connect to. KV and load publishers must use this exact derivation.
+fn resolve_connect_host(endpoint_host: &str, worker_url: &str) -> String {
+    if matches!(endpoint_host, "*" | "0.0.0.0" | "::" | "[::]") {
         match Url::parse(worker_url)
             .ok()
             .and_then(|u| u.host_str().map(|s| s.to_owned()))
@@ -308,20 +329,27 @@ pub(crate) fn resolve_event_config(
                     worker_url = %worker_url,
                     "introspect: cannot parse worker_url for wildcard substitution; keeping advertised host"
                 );
-                block.endpoint_host
+                endpoint_host.to_string()
             }
         }
     } else {
-        block.endpoint_host
-    };
-    EventConfig {
-        host,
-        port_base: block.endpoint_port_base,
-        topic: block.topic,
-        block_size: block.block_size,
-        dp_size: block.dp_size,
-        is_bigram,
+        endpoint_host.to_string()
     }
+}
+
+/// Extract the optional load PUB descriptor from the same `kv_events` block
+/// that advertises the KV-event range. The engine only exposes it when
+/// `--load-publish-endpoint` is enabled.
+fn resolve_load_config(block: &KvEventsBlock, worker_url: &str) -> Option<LoadEndpointConfig> {
+    Some(LoadEndpointConfig {
+        host: resolve_connect_host(&block.endpoint_host, worker_url),
+        port_base: block.load_endpoint_port_base?,
+        topic: block
+            .load_topic
+            .clone()
+            .unwrap_or_else(|| "load".to_string()),
+        dp_size: block.dp_size,
+    })
 }
 
 /// Projection of `/model_info` used by the introspector: the identity the
@@ -360,7 +388,7 @@ struct ServerInfoBody {
     disaggregation_bootstrap_port: Option<u16>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub(crate) struct KvEventsBlock {
     // Forward-compatibility: the only publisher implementation
     // supported on the gateway side is ZMQ. Keeping the field optional
@@ -376,6 +404,13 @@ pub(crate) struct KvEventsBlock {
     pub topic: String,
     pub block_size: u32,
     pub dp_size: u32,
+    /// #34608 load PUB rank-0 port, present only when the engine enabled it.
+    #[serde(default)]
+    pub load_endpoint_port_base: Option<u16>,
+    /// Topic filter for the dedicated load socket. Older engines may omit it;
+    /// the stable publisher default is `load`.
+    #[serde(default)]
+    pub load_topic: Option<String>,
 }
 
 #[cfg(test)]
@@ -460,6 +495,34 @@ mod tests {
             cfg.is_bigram,
             "EAGLE worker via the introspector must set is_bigram"
         );
+    }
+
+    #[tokio::test]
+    async fn fetch_resolves_shortest_ttft_load_endpoint() {
+        let (url, _shutdown) = spawn_fake_worker(json!({
+            "served_model_name": "m",
+            "kv_events": {
+                "publisher": "zmq",
+                "endpoint_host": "*",
+                "endpoint_port_base": 5557,
+                "topic": "",
+                "block_size": 64,
+                "dp_size": 2,
+                "load_endpoint_port_base": 6000,
+                "load_topic": "load",
+            }
+        }))
+        .await;
+
+        let load = fast_introspector()
+            .fetch(&url)
+            .await
+            .load_config
+            .expect("load endpoint must be available when /server_info advertises it");
+        assert_eq!(load.host, "127.0.0.1");
+        assert_eq!(load.port_base, 6000);
+        assert_eq!(load.topic, "load");
+        assert_eq!(load.dp_size, 2);
     }
 
     /// A non-speculative worker (no `speculative_algorithm`) must NOT be bigram.

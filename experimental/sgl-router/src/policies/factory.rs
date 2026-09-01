@@ -10,6 +10,7 @@ use crate::policies::{
     power_of_two::PowerOfTwoChoicesPolicy,
     random::RandomPolicy,
     round_robin::RoundRobinPolicy,
+    shortest_ttft::{EngineLoadTable, ShortestTtftPolicy},
     sticky::StickyPolicy,
     Policy, PolicyRegistry,
 };
@@ -21,14 +22,14 @@ use std::time::Duration;
 /// Build a dependency-free policy for use as the sticky-session fallback
 /// (keyless requests + initial pin of a new key). `Cli::into_config`
 /// validates `--sticky-fallback-policy` to one of these four, so the
-/// `CacheAwareZmq`/`Sticky` arms are never reached in practice.
+/// `CacheAwareZmq`/`ShortestTtft`/`Sticky` arms are never reached in practice.
 fn build_sticky_fallback(kind: PolicyKind) -> Arc<dyn Policy> {
     match kind {
         PolicyKind::RoundRobin => Arc::new(RoundRobinPolicy::new()),
         PolicyKind::Random => Arc::new(RandomPolicy::new()),
         PolicyKind::PowerOfTwo => Arc::new(PowerOfTwoChoicesPolicy::new()),
         PolicyKind::LoadBased => Arc::new(LoadBasedPolicy::new()),
-        PolicyKind::CacheAwareZmq | PolicyKind::Sticky => {
+        PolicyKind::CacheAwareZmq | PolicyKind::ShortestTtft | PolicyKind::Sticky => {
             unreachable!("sticky fallback is validated to be dependency-free in Cli::into_config")
         }
     }
@@ -47,17 +48,18 @@ fn build_sticky(model: &ModelConfig) -> Arc<dyn Policy> {
 }
 
 /// Construct a policy for a single model from its [`ModelConfig`] and the
-/// process-shared `HashTree` + `TokenizerRegistry` + `BlockSizeOracle`.
+/// process-shared `HashTree` + `TokenizerRegistry` + `BlockSizeOracle` +
+/// Shortest-TTFT load table.
 ///
-/// The tree, tokenizer registry, and oracle are only consulted by the
-/// cache-aware-zmq variant; other policies ignore them. Callers building
-/// all policies for the same process pass the same instances to every
-/// model.
+/// cache-aware-zmq 使用 tree、tokenizer 与 oracle；Shortest-TTFT 使用
+/// tree、oracle 和 load table。其他策略忽略这些依赖。调用方为同一进程的
+/// 全部模型传入相同实例。
 pub fn build_policy(
     model: &ModelConfig,
     tree: Arc<HashTree>,
     tokenizers: Arc<TokenizerRegistry>,
     block_size_oracle: Arc<BlockSizeOracle>,
+    engine_load: Arc<EngineLoadTable>,
 ) -> Arc<dyn Policy> {
     match model.policy {
         PolicyKind::RoundRobin => Arc::new(RoundRobinPolicy::new()),
@@ -73,6 +75,11 @@ pub fn build_policy(
                 block_size_oracle,
             ))
         }
+        PolicyKind::ShortestTtft => Arc::new(ShortestTtftPolicy::new(
+            tree,
+            block_size_oracle,
+            engine_load,
+        )),
         PolicyKind::Sticky => build_sticky(model),
     }
 }
@@ -100,6 +107,11 @@ pub fn build_policy_kind_only(kind: PolicyKind) -> Arc<dyn Policy> {
                 BlockSizeOracle::new(),
             ))
         }
+        PolicyKind::ShortestTtft => Arc::new(ShortestTtftPolicy::new(
+            Arc::new(HashTree::new()),
+            BlockSizeOracle::new(),
+            EngineLoadTable::new(),
+        )),
         PolicyKind::Sticky => {
             let s = crate::config::StickyConfig::default();
             Arc::new(StickyPolicy::new(
@@ -111,11 +123,12 @@ pub fn build_policy_kind_only(kind: PolicyKind) -> Arc<dyn Policy> {
     }
 }
 
-pub fn build_registry(
+pub fn build_registry_with_engine_load(
     cfg: &Config,
     tree: Arc<HashTree>,
     tokenizers: Arc<TokenizerRegistry>,
     block_size_oracle: Arc<BlockSizeOracle>,
+    engine_load: Arc<EngineLoadTable>,
 ) -> Result<PolicyRegistry> {
     let reg = PolicyRegistry::default();
     let m = &cfg.model;
@@ -126,9 +139,28 @@ pub fn build_registry(
             Arc::clone(&tree),
             Arc::clone(&tokenizers),
             Arc::clone(&block_size_oracle),
+            engine_load,
         ),
     );
     Ok(reg)
+}
+
+/// 保持已有调用点可用的默认构建入口。生产启动路径应调用
+/// [`build_registry_with_engine_load`]，确保 monitor 与 Shortest-TTFT
+/// policy 使用同一份 table。
+pub fn build_registry(
+    cfg: &Config,
+    tree: Arc<HashTree>,
+    tokenizers: Arc<TokenizerRegistry>,
+    block_size_oracle: Arc<BlockSizeOracle>,
+) -> Result<PolicyRegistry> {
+    build_registry_with_engine_load(
+        cfg,
+        tree,
+        tokenizers,
+        block_size_oracle,
+        EngineLoadTable::new(),
+    )
 }
 
 /// Convenience for tests + non-cache-aware callers: builds a registry with
@@ -189,6 +221,7 @@ mod tests {
         let _ = build_policy_kind_only(PolicyKind::PowerOfTwo);
         let _ = build_policy_kind_only(PolicyKind::LoadBased);
         let _ = build_policy_kind_only(PolicyKind::CacheAwareZmq);
+        let _ = build_policy_kind_only(PolicyKind::ShortestTtft);
         let _ = build_policy_kind_only(PolicyKind::Sticky);
     }
 
@@ -230,6 +263,19 @@ mod tests {
         assert!(
             dbg.contains("LoadBasedPolicy"),
             "expected LoadBasedPolicy debug repr, got: {dbg}",
+        );
+    }
+
+    #[test]
+    fn shortest_ttft_builds_via_factory() {
+        let cfg = cfg_with_model("modelA", PolicyKind::ShortestTtft);
+        let tree = Arc::new(HashTree::new());
+        let tokenizers = Arc::new(TokenizerRegistry::default());
+        let reg = build_registry(&cfg, tree, tokenizers, BlockSizeOracle::new()).unwrap();
+        let policy = reg.get(&ModelId("modelA".into())).unwrap();
+        assert!(
+            format!("{policy:?}").contains("ShortestTtftPolicy"),
+            "factory must construct the standalone Shortest-TTFT policy"
         );
     }
 

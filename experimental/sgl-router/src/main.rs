@@ -3,7 +3,7 @@
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use sgl_router::config::{Cli, LogFormat};
+use sgl_router::config::{Cli, LogFormat, PolicyKind};
 use std::sync::Arc;
 use tokio::signal::unix::{signal, Signal, SignalKind};
 
@@ -115,10 +115,11 @@ async fn main() -> Result<()> {
         })
         .transpose()?;
 
-    // Build the KV-event index up front so the cache-aware-zmq policy can
-    // share its `HashTree` handle + `BlockSizeOracle`. An external Indexer makes
-    // the local tree irrelevant to routing, so only discover hash metadata rather
-    // than duplicating every KV event.
+    // 构建进程共享的 KV-event tree。cache-aware-zmq 和 Shortest-TTFT 都只
+    // 读取这份基础 hash/block-size 数据；Shortest-TTFT 的 load monitor 在
+    // 下方单独创建，绝不复用 cache-aware 的订阅器、游标或 admission 路径。
+    // 外部 Indexer 存在时本地 tree 不参与 cache-aware 路由，仍只发现 hash
+    // 元数据以避免重复消费 KV event。
     let block_size_oracle = sgl_router::policies::kv_events::BlockSizeOracle::new();
     let kv_event_http = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(2))
@@ -135,12 +136,17 @@ async fn main() -> Result<()> {
             Arc::clone(&block_size_oracle),
         )
     };
+    let engine_load = sgl_router::policies::shortest_ttft::EngineLoadTable::new();
+    let shortest_ttft_monitor = (cfg.model.policy == PolicyKind::ShortestTtft).then(|| {
+        sgl_router::policies::shortest_ttft::EngineLoadMonitor::new(Arc::clone(&engine_load))
+    });
     let policies = Arc::new(
-        sgl_router::policies::factory::build_registry(
+        sgl_router::policies::factory::build_registry_with_engine_load(
             &cfg,
             kv_index.tree(),
             Arc::clone(&tokenizers),
             Arc::clone(&block_size_oracle),
+            Arc::clone(&engine_load),
         )
         .context("build policy registry")?,
     );
@@ -172,12 +178,13 @@ async fn main() -> Result<()> {
         .context("spawn discovery")?;
     let kv_index_opt: Option<Arc<sgl_router::policies::kv_events::KvEventIndex>> =
         Some(Arc::clone(&kv_index));
-    let manager_handle = tokio::spawn(sgl_router::workers::manager::run_with_config(
+    let manager_handle = tokio::spawn(sgl_router::workers::manager::run_with_config_and_monitor(
         event_rx,
         registry.clone(),
         Some(Arc::new(cfg.clone())),
         kv_index_opt,
         Some(Arc::clone(&active_load)),
+        shortest_ttft_monitor.clone(),
     ));
 
     let proxy = Arc::new(
@@ -219,6 +226,9 @@ async fn main() -> Result<()> {
     // exits — useful for tracing tail logs.
     discovery_handle.abort();
     manager_handle.abort();
+    if let Some(monitor) = shortest_ttft_monitor {
+        monitor.shutdown().await;
+    }
     janitor_handle.shutdown().await;
     server_result
 }

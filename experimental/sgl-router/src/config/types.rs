@@ -70,7 +70,8 @@ impl Default for ActiveLoadConfig {
 /// policy factory.
 ///
 /// Accepted on the CLI (`--policy`) as `round_robin` / `random` /
-/// `power_of_two` / `load_based` / `cache_aware_zmq` / `sticky`.
+/// `power_of_two` / `load_based` / `cache_aware_zmq` / `shortest_ttft` /
+/// `sticky`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 pub enum PolicyKind {
     #[default]
@@ -88,6 +89,11 @@ pub enum PolicyKind {
     /// lives on `ModelConfig::cache_aware`.
     #[value(name = "cache_aware_zmq")]
     CacheAwareZmq,
+    /// RTP-LLM 风格的独立 Shortest-TTFT 路由。它只使用 KV 前缀命中和
+    /// engine 运行/等待请求 gauge，不接入 cache-aware 或 admission
+    /// policy 框架。
+    #[value(name = "shortest_ttft")]
+    ShortestTtft,
     /// Sticky-session routing: pins a routing key (read from a
     /// configurable request header) to a worker via an in-memory map, so
     /// stateful sessions land on the same backend. Tuning — header name,
@@ -226,8 +232,8 @@ pub struct StickyConfig {
     /// to pick the initial worker when a new key is first seen. One of
     /// `round_robin` / `random` / `power_of_two` / `load_based` — the
     /// dependency-free policies the factory can build standalone (no
-    /// `HashTree` / tokenizer / ZMQ feed). `cache_aware_zmq` and `sticky`
-    /// are rejected at config-build time.
+    /// `HashTree` / tokenizer / ZMQ feed). `cache_aware_zmq`、
+    /// `shortest_ttft` 和 `sticky` 会在配置构建时被拒绝。
     pub fallback_policy: PolicyKind,
     /// Evict an assignment after it has been idle (unreferenced) this many
     /// seconds. Bounds the map against unbounded routing-key cardinality.

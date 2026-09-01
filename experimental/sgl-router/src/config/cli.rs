@@ -227,11 +227,11 @@ impl Cli {
             let fallback_policy = self.sticky_fallback_policy.unwrap_or(d.fallback_policy);
             if matches!(
                 fallback_policy,
-                PolicyKind::Sticky | PolicyKind::CacheAwareZmq
+                PolicyKind::Sticky | PolicyKind::CacheAwareZmq | PolicyKind::ShortestTtft
             ) {
                 return Err(anyhow!(
                     "--sticky-fallback-policy must be one of round_robin / random / \
-                     power_of_two / load_based; cache_aware_zmq and sticky are not allowed"
+                     power_of_two / load_based; cache_aware_zmq, shortest_ttft, and sticky are not allowed"
                 ));
             }
             let idle_secs = self.sticky_idle_secs.unwrap_or(d.idle_secs);
@@ -716,6 +716,19 @@ mod tests {
         assert_eq!(c.model.policy, PolicyKind::LoadBased);
     }
 
+    /// 独立的 Shortest-TTFT 策略必须能由公开 CLI 值选择。
+    #[test]
+    fn parses_shortest_ttft_policy() {
+        let c = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://10.0.0.1:30000",
+            "--policy",
+            "shortest_ttft",
+        ]))
+        .unwrap();
+        assert_eq!(c.model.policy, PolicyKind::ShortestTtft);
+    }
+
     /// clap rejects `--cb-threshold 0` because the field is `NonZeroU32`.
     #[test]
     fn rejects_zero_cb_threshold() {
@@ -1046,6 +1059,24 @@ mod tests {
             "sticky",
             "--sticky-fallback-policy",
             "cache_aware_zmq",
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("--sticky-fallback-policy must be one of"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_shortest_ttft_as_sticky_fallback() {
+        let err = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--policy",
+            "sticky",
+            "--sticky-fallback-policy",
+            "shortest_ttft",
         ]))
         .unwrap_err()
         .to_string();
