@@ -44,6 +44,25 @@ class TraceLabSimulatorHttpFleetContractTest(unittest.TestCase):
         self.assertEqual(decisions.count("measurement"), 3)
         self.assertNotIn("warmup", decisions)
 
+    def test_native_cache_audit_uses_measurement_candidate_delta(self):
+        runner = load_runner()
+        with tempfile.TemporaryDirectory() as directory:
+            router_log = Path(directory) / "router.log"
+            router_log.write_text(
+                "\n".join(
+                    ["cache candidate winner warmup"] * 2
+                    + ["cache candidate winner measurement"] * 3
+                )
+                + "\n"
+            )
+
+            decisions = runner.cache_candidate_audit_log(
+                router_log, {"cache_candidate": 3.0}
+            )
+
+        self.assertEqual(decisions.count("measurement"), 3)
+        self.assertNotIn("warmup", decisions)
+
     def test_fixed_256_worker_matrix_has_four_policies_and_three_repeats(self):
         runner = load_runner()
 
