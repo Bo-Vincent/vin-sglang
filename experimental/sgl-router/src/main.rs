@@ -98,11 +98,20 @@ async fn main() -> Result<()> {
     );
 
     let registry = Arc::new(sgl_router::workers::WorkerRegistry::default());
-    let prefix_index = cfg
-        .model
-        .cache_aware
-        .as_ref()
-        .and_then(|cache| cache.kv_indexer_endpoint.as_ref())
+    let indexer_endpoint = match cfg.model.policy {
+        PolicyKind::CacheAwareZmq => cfg
+            .model
+            .cache_aware
+            .as_ref()
+            .and_then(|cache| cache.kv_indexer_endpoint.as_ref()),
+        PolicyKind::ShortestTtft => cfg
+            .model
+            .shortest_ttft
+            .as_ref()
+            .and_then(|shortest_ttft| shortest_ttft.kv_indexer_endpoint.as_ref()),
+        _ => None,
+    };
+    let prefix_index = indexer_endpoint
         .map(|indexer| {
             let config = sgl_kv_indexer::PrefixIndexConfig {
                 endpoint: indexer.url.clone(),
@@ -115,11 +124,9 @@ async fn main() -> Result<()> {
         })
         .transpose()?;
 
-    // 构建进程共享的 KV-event tree。cache-aware-zmq 和 Shortest-TTFT 都只
-    // 读取这份基础 hash/block-size 数据；Shortest-TTFT 的 load monitor 在
-    // 下方单独创建，绝不复用 cache-aware 的订阅器、游标或 admission 路径。
-    // 外部 Indexer 存在时本地 tree 不参与 cache-aware 路由，仍只发现 hash
-    // 元数据以避免重复消费 KV event。
+    // 构建进程共享的 KV-event tree。Shortest-TTFT 的 load monitor 在下方单独
+    // 创建，绝不复用 cache-aware 的订阅器、游标或 admission 路径。外部
+    // Indexer 存在时 tree 仅发现 block-size 等元数据，不参与对应策略的缓存命中。
     let block_size_oracle = sgl_router::policies::kv_events::BlockSizeOracle::new();
     let kv_event_http = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(2))

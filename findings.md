@@ -30,3 +30,16 @@
 - `ServerInfo` 从 `kv_events.load_endpoint_port_base` / `load_topic` 生成 `LoadEndpointConfig`，并与 KV publisher 复用唯一的 wildcard-host 到 worker URL host 的解析规则。
 - `main` 只在 `--policy shortest_ttft` 时创建 `EngineLoadMonitor`；它与 policy 共用同一 `EngineLoadTable`，进程退出时会 cancel/join 全部独立 subscriber。
 - 组件测试还覆盖 DP rank 缺失/过期、publisher sequence 重置和 worker 移除后的迟到 gauge；这三类情况不会产生错误的远端 queue 聚合。
+
+## Shortest-TTFT Indexer 变体
+
+- V4 ingress 的 `chat.rs` 在配置 `GrpcPrefixIndex`、具备 request token 和 block
+  size 时调用 `match_prefix`，并将 `PrefixOutcome` 封装为
+  `SelectionContext::external_prefix`。
+- `PrefixOutcome::Matched` 以每个 engine address 的
+  `matched_prefix_blocks` 表示命中；同一 address 的多个匹配必须取最大值。
+- `Overloaded`、`Timeout`、`Unreachable` 与 `QueryTooLarge` 已由 ingress 转为
+  `Empty`，而 `Rejected` 仍返回请求错误。Shortest-TTFT 只消费该统一 signal，
+  不应复制或改变其异步错误语义。
+- 既有 `--kv-indexer-*` 配置存放于 `CacheAwareConfig`；Shortest-TTFT 需要
+  独立配置入口，避免从 cache-aware/admission 框架取得状态或阈值。

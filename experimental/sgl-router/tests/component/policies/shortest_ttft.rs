@@ -14,7 +14,7 @@ use sgl_router::policies::kv_events::{
 use sgl_router::policies::shortest_ttft::{
     EngineLoadMonitor, EngineLoadTable, LoadEndpointConfig, LoadStat, ShortestTtftPolicy,
 };
-use sgl_router::policies::{Policy, SelectionContext};
+use sgl_router::policies::{ExternalPrefixSignal, Policy, SelectionContext};
 use sgl_router::workers::Worker;
 use zeromq::SocketSend;
 
@@ -84,6 +84,75 @@ fn engine_queue_can_outweigh_a_better_prefix_match() {
         worker_b.url,
         "RTP-LLM 的 TTFT 估算必须把 engine 队列压力叠加到缓存命中收益上"
     );
+}
+
+#[test]
+fn external_indexer_match_overrides_the_local_tree() {
+    let model = ModelId("tiny".into());
+    let worker_a = worker("worker-a");
+    let worker_b = worker("worker-b");
+    let workers = vec![Arc::clone(&worker_a), Arc::clone(&worker_b)];
+    let tokens = [11_u32, 12, 13, 14, 15, 16, 17, 18];
+
+    let block_size = BlockSizeOracle::new();
+    block_size.try_set(2).unwrap();
+    let tree = Arc::new(HashTree::new());
+    let hashes = compute_block_hashes(&tokens, 2);
+    tree.insert(&KvWorkerId::new(worker_a.url.clone(), 0), None, &hashes);
+
+    let signal = ExternalPrefixSignal {
+        outcome: sgl_kv_indexer::PrefixOutcome::Matched {
+            matches: vec![sgl_kv_indexer::PrefixMatch {
+                address: worker_b.url.clone(),
+                matched_prefix_blocks: 4,
+                worker_id: "worker-b".into(),
+            }],
+            best_prefix_blocks: 4,
+        },
+        query_blocks: 4,
+    };
+    let policy = ShortestTtftPolicy::new(tree, block_size, EngineLoadTable::new());
+    let ctx = SelectionContext::new(&model, None)
+        .with_request_tokens(Some(&tokens))
+        .with_external_prefix(Some(&signal));
+
+    assert_eq!(
+        policy.select(&workers, &ctx).unwrap().url,
+        worker_b.url,
+        "V4 Indexer signal 存在时，Shortest-TTFT 必须忽略相反的本地 HashTree 命中"
+    );
+}
+
+#[test]
+fn external_indexer_empty_result_does_not_fall_back_to_the_local_tree() {
+    let model = ModelId("tiny".into());
+    let worker_a = worker("worker-a");
+    let worker_b = worker("worker-b");
+    let workers = vec![Arc::clone(&worker_a), Arc::clone(&worker_b)];
+    let tokens = [11_u32, 12, 13, 14, 15, 16, 17, 18];
+
+    let block_size = BlockSizeOracle::new();
+    block_size.try_set(2).unwrap();
+    let tree = Arc::new(HashTree::new());
+    let hashes = compute_block_hashes(&tokens, 2);
+    tree.insert(&KvWorkerId::new(worker_a.url.clone(), 0), None, &hashes);
+
+    let signal = ExternalPrefixSignal {
+        outcome: sgl_kv_indexer::PrefixOutcome::Empty,
+        query_blocks: 4,
+    };
+    let policy = ShortestTtftPolicy::new(tree, block_size, EngineLoadTable::new());
+    let load_guard = worker_a.load_guard();
+    let ctx = SelectionContext::new(&model, None)
+        .with_request_tokens(Some(&tokens))
+        .with_external_prefix(Some(&signal));
+
+    assert_eq!(
+        policy.select(&workers, &ctx).unwrap().url,
+        worker_b.url,
+        "authoritative 的 Empty 必须是零命中，不能回退至本地 HashTree"
+    );
+    drop(load_guard);
 }
 
 #[test]

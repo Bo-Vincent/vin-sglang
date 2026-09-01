@@ -82,10 +82,16 @@ sgl-router \
   --model-id qwen3 \
   --tokenizer-path /models/qwen3/tokenizer.json \
   --worker-urls http://10.0.0.1:30000 http://10.0.0.2:30000 \
-  --policy shortest_ttft
+  --policy shortest_ttft \
+  --shortest-ttft-indexer-endpoint http://10.0.0.10:50051 \
+  --shortest-ttft-indexer-query-timeout-ms 100 \
+  --shortest-ttft-indexer-query-max-inflight 32
 ```
 
-缓存命中仅读取 router 的基础 KV-event tree；engine load 则通过一个独立的
+上述 Shortest-TTFT 专用 endpoint 使 V4 外部 Indexer 的每 worker prefix match
+成为缓存命中的 authoritative 信号：`Empty`、超时、过载或不可达均为零命中，
+不会回读本地 `HashTree`；拒绝型协议错误仍按请求错误返回。未配置该 endpoint
+时仅保留直接单元调用与旧部署的本地 tree 兼容路径。engine load 则通过独立的
 `LoadStat` SUB monitor 读取 worker `/server_info` 中声明的
 `kv_events.load_endpoint_port_base` 和 `load_topic`。它不启用或复用
 `cache_aware_zmq` 的策略/游标/admission 逻辑，也不使用 cache-aware 的

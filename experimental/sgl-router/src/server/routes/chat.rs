@@ -142,10 +142,10 @@ pub async fn chat_completions(
     //     engine-equivalent ids we can forward as `input_ids` so the engine
     //     skips re-tokenizing. This enables the offload for EVERY policy —
     //     sticky and round-robin included — not just cache-aware.
-    //   * `needs_request_tokens()` → the cache-aware policy ALSO wants the
-    //     raw-prompt path tokenized for tree matching even on a model with no
-    //     chat encoder (`/v1/completions` / `text`), which the first gate
-    //     alone wouldn't trigger.
+    //   * `needs_request_tokens()` → cache-aware 需要 raw-prompt token 做本地
+    //     tree matching；Shortest-TTFT 则需要同一输入让 V4 Indexer 产生
+    //     external prefix signal。两者在无 chat encoder 的
+    //     `/v1/completions` / `text` 路径均不能只依赖第一个 gate。
     //
     // When neither holds, `parse_probe`'s minimal probe is enough, so we keep
     // avoiding the full `serde_json::Value` allocation over a (up to 1 MiB)

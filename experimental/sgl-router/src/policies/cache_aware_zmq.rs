@@ -348,6 +348,7 @@ mod tests {
                 policy: crate::config::PolicyKind::RoundRobin,
                 circuit_breaker: None,
                 cache_aware: None,
+                shortest_ttft: None,
                 sticky: None,
             },
             discovery: crate::config::DiscoveryBackend::StaticUrls(

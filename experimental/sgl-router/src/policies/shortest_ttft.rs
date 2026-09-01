@@ -388,7 +388,41 @@ impl ShortestTtftPolicy {
             / 10
     }
 
+    /// V4 ingress 已完成异步 Indexer 查询时，signal 是缓存命中的唯一来源。
+    /// `Some(empty)` 与 `None` 必须区分：前者代表 authoritative 的零命中，
+    /// 绝不能回读本地 HashTree；后者仅保留给未配置 Indexer 的兼容调用路径。
+    fn external_matched_tokens(&self, ctx: &SelectionContext<'_>) -> Option<HashMap<String, u64>> {
+        let signal = ctx.external_prefix()?;
+        let Some(tokens) = ctx.request_tokens() else {
+            return Some(HashMap::new());
+        };
+        let Some(block_size) = self.block_size.get() else {
+            return Some(HashMap::new());
+        };
+        let sgl_kv_indexer::PrefixOutcome::Matched { matches, .. } = &signal.outcome else {
+            return Some(HashMap::new());
+        };
+
+        let input_tokens = tokens.len() as u64;
+        let queried_blocks = signal.query_blocks as u64;
+        let mut hit_tokens: HashMap<String, u64> = HashMap::new();
+        for matched in matches {
+            let tokens = (matched.matched_prefix_blocks as u64)
+                .min(queried_blocks)
+                .saturating_mul(block_size as u64)
+                .min(input_tokens);
+            hit_tokens
+                .entry(matched.address.clone())
+                .and_modify(|current| *current = (*current).max(tokens))
+                .or_insert(tokens);
+        }
+        Some(hit_tokens)
+    }
+
     fn matched_tokens(&self, ctx: &SelectionContext<'_>) -> HashMap<String, u64> {
+        if let Some(matched_tokens) = self.external_matched_tokens(ctx) {
+            return matched_tokens;
+        }
         let Some(tokens) = ctx.request_tokens() else {
             return HashMap::new();
         };

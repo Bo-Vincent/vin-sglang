@@ -156,6 +156,10 @@ pub struct ModelConfig {
     /// `policy = "cache_aware_zmq"`. `None` falls back to defaults at
     /// policy construction time.
     pub cache_aware: Option<CacheAwareConfig>,
+    /// Shortest-TTFT 的外部 KV Indexer 配置。仅在
+    /// `policy = "shortest_ttft"` 时由启动入口读取；它不携带
+    /// cache-aware 的阈值或 admission 状态。
+    pub shortest_ttft: Option<ShortestTtftConfig>,
     /// Tuning for the sticky-session policy. `Some` exactly when
     /// `policy = "sticky"` (built by [`crate::config::cli::Cli::into_config`]).
     /// The chat handler reads `sticky.header_name` to populate
@@ -190,6 +194,14 @@ pub struct CacheAwareConfig {
     pub balance_rel_threshold: f32,
     /// Optional external KV Indexer client configuration. When configured, it
     /// replaces the local ZMQ radix tree as the cache signal.
+    pub kv_indexer_endpoint: Option<KvIndexerEndpointConfig>,
+}
+
+/// Per-model Shortest-TTFT tuning.
+#[derive(Debug, Clone)]
+pub struct ShortestTtftConfig {
+    /// Optional V4 external KV Indexer client. 配置后，ingress 产生的
+    /// authoritative prefix signal 会取代 Shortest-TTFT 的本地 tree 命中。
     pub kv_indexer_endpoint: Option<KvIndexerEndpointConfig>,
 }
 

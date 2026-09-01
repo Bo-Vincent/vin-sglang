@@ -13,8 +13,8 @@ use crate::config::{
     default_cb_cool_down, default_proxy_request_timeout_secs, default_stale_request_timeout_secs,
     resolve_mode, ActiveLoadConfig, CacheAwareConfig, CircuitBreakerConfig, Config,
     DiscoveryBackend, K8sDiscoveryConfig, KvIndexerEndpointConfig, LogFormat, ModelConfig,
-    ObservabilityConfig, PolicyKind, ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig,
-    StickyConfig,
+    ObservabilityConfig, PolicyKind, ProxyConfig, ServerConfig, ShortestTtftConfig,
+    StaticUrlsDiscoveryConfig, StickyConfig,
 };
 
 const DEFAULT_KV_INDEXER_QUERY_TIMEOUT_MS: u64 = 100;
@@ -85,6 +85,20 @@ pub struct Cli {
     /// `--kv-indexer-endpoint`; defaults to 32.
     #[arg(long)]
     pub kv_indexer_query_max_inflight: Option<usize>,
+
+    // ---- shortest-TTFT Indexer（只用于 `--policy shortest_ttft`） ----
+    /// Shortest-TTFT 的外部 KV Indexer gRPC endpoint。需要显式 scheme，
+    /// 例如 `http://10.0.0.1:50051`。
+    #[arg(long)]
+    pub shortest_ttft_indexer_endpoint: Option<String>,
+    /// Shortest-TTFT Indexer 查询超时（毫秒）。需要
+    /// `--shortest-ttft-indexer-endpoint`；默认 100。
+    #[arg(long)]
+    pub shortest_ttft_indexer_query_timeout_ms: Option<u64>,
+    /// Shortest-TTFT Indexer 的最大并发查询数。需要
+    /// `--shortest-ttft-indexer-endpoint`；默认 32。
+    #[arg(long)]
+    pub shortest_ttft_indexer_query_max_inflight: Option<usize>,
 
     // ---- sticky-session policy (only used by `--policy sticky`) ----
     /// Request header carrying the routing key for sticky-session routing.
@@ -202,6 +216,40 @@ impl Cli {
                 "--kv-indexer-query-max-inflight requires --kv-indexer-endpoint"
             ));
         }
+        let tuned_shortest_ttft = self.shortest_ttft_indexer_endpoint.is_some()
+            || self.shortest_ttft_indexer_query_timeout_ms.is_some()
+            || self.shortest_ttft_indexer_query_max_inflight.is_some();
+        if tuned_shortest_ttft && self.policy != PolicyKind::ShortestTtft {
+            return Err(anyhow!(
+                "shortest-TTFT Indexer flags require --policy shortest_ttft"
+            ));
+        }
+        if self.shortest_ttft_indexer_query_timeout_ms == Some(0) {
+            return Err(anyhow!(
+                "--shortest-ttft-indexer-query-timeout-ms must be greater than zero"
+            ));
+        }
+        if self.shortest_ttft_indexer_query_timeout_ms.is_some()
+            && self.shortest_ttft_indexer_endpoint.is_none()
+        {
+            return Err(anyhow!(
+                "--shortest-ttft-indexer-query-timeout-ms requires \
+                 --shortest-ttft-indexer-endpoint"
+            ));
+        }
+        if self.shortest_ttft_indexer_query_max_inflight == Some(0) {
+            return Err(anyhow!(
+                "--shortest-ttft-indexer-query-max-inflight must be greater than zero"
+            ));
+        }
+        if self.shortest_ttft_indexer_query_max_inflight.is_some()
+            && self.shortest_ttft_indexer_endpoint.is_none()
+        {
+            return Err(anyhow!(
+                "--shortest-ttft-indexer-query-max-inflight requires \
+                 --shortest-ttft-indexer-endpoint"
+            ));
+        }
         let tuned_sticky = self.routing_key_header.is_some()
             || self.sticky_fallback_policy.is_some()
             || self.sticky_idle_secs.is_some()
@@ -296,6 +344,23 @@ impl Cli {
         } else {
             None
         };
+        let shortest_ttft = if tuned_shortest_ttft {
+            Some(ShortestTtftConfig {
+                kv_indexer_endpoint: self.shortest_ttft_indexer_endpoint.map(|url| {
+                    KvIndexerEndpointConfig {
+                        url,
+                        query_timeout_ms: self
+                            .shortest_ttft_indexer_query_timeout_ms
+                            .unwrap_or(DEFAULT_KV_INDEXER_QUERY_TIMEOUT_MS),
+                        query_max_inflight: self
+                            .shortest_ttft_indexer_query_max_inflight
+                            .unwrap_or(DEFAULT_KV_INDEXER_QUERY_MAX_INFLIGHT),
+                    }
+                }),
+            })
+        } else {
+            None
+        };
 
         let config = Config {
             server: ServerConfig {
@@ -314,6 +379,7 @@ impl Cli {
                 policy: self.policy,
                 circuit_breaker,
                 cache_aware,
+                shortest_ttft,
                 sticky,
             },
             discovery,
@@ -727,6 +793,46 @@ mod tests {
         ]))
         .unwrap();
         assert_eq!(c.model.policy, PolicyKind::ShortestTtft);
+    }
+
+    #[test]
+    fn shortest_ttft_indexer_builds_its_own_config() {
+        let c = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--policy",
+            "shortest_ttft",
+            "--shortest-ttft-indexer-endpoint",
+            "http://indexer:50051",
+            "--shortest-ttft-indexer-query-timeout-ms",
+            "75",
+            "--shortest-ttft-indexer-query-max-inflight",
+            "17",
+        ]))
+        .unwrap();
+        let indexer = c
+            .model
+            .shortest_ttft
+            .expect("shortest-TTFT config")
+            .kv_indexer_endpoint
+            .expect("Indexer config");
+        assert_eq!(indexer.url, "http://indexer:50051");
+        assert_eq!(indexer.query_timeout_ms, 75);
+        assert_eq!(indexer.query_max_inflight, 17);
+        assert!(c.model.cache_aware.is_none());
+    }
+
+    #[test]
+    fn shortest_ttft_indexer_requires_shortest_ttft_policy() {
+        let err = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--shortest-ttft-indexer-endpoint",
+            "http://indexer:50051",
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("require --policy shortest_ttft"), "got: {err}");
     }
 
     /// clap rejects `--cb-threshold 0` because the field is `NonZeroU32`.

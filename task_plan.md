@@ -35,3 +35,26 @@
 | `run_with_config_and_monitor` 不存在 | 1 | 新增显式可选 monitor 入口，旧入口保留 `None`。 |
 | 在 `experimental/sgl-router` 子目录错误引用工作树相对路径 | 1 | 仅只读 `nl` 命令失败；改用该子目录下的 `src/...` 路径，无代码影响。 |
 | 在工作树根目录执行 Cargo 命令 | 1 | 根目录没有 `Cargo.toml`；改在 `experimental/sgl-router` 运行，未产生文件改动。 |
+
+## Indexer 变体（2026-09-01）
+
+### 目标与验收
+
+在独立分支 `vin/shortest-ttft-indexer` 上，以已提交的
+`vin/shortest-ttft` 为基线，只切换 Shortest-TTFT 的缓存命中来源到 V4 外部
+KV Indexer；LoadStat monitor、TTFT 算法、candidate window、公平性和其他
+策略不变。验收包括：external signal 覆盖 local tree，CLI 配置独立、全量
+router 测试通过，并从 `vin` 推送到 `personal` remote。
+
+| 阶段 | 状态 | 内容 |
+| --- | --- | --- |
+| 5. 分支与基线 | 完成 | 已从 `vin/shortest-ttft` 建立隔离 worktree；全量 router 测试通过。 |
+| 6. TDD 与实现 | 完成 | 外部 signal 覆盖/Empty 不回退的组件回归与独立 CLI 配置均已实现。 |
+| 7. 验证与推送 | 进行中 | 已完成本地验证与只读审查；待提交、bundle+rsync 到 vin 后 push。 |
+
+### 新错误记录
+
+| 错误 | 次数 | 处理 |
+| --- | --- | --- |
+| 在父目录 Git 根引用 SGLang 分支 | 1 | `vin/shortest-ttft` 属于嵌套 SGLang worktree；改为在 `.worktrees/shortest-ttft` 的 Git 根创建新 worktree，无文件改动。 |
+| 当前 shell 找不到 `cargo` | 1 | PATH 未包含 Rust shim；已定位固定 toolchain `/Users/gaobo/.rustup/toolchains/1.90-aarch64-apple-darwin/bin/cargo`，后续使用绝对路径。 |

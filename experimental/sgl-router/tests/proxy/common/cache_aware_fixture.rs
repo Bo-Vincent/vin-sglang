@@ -28,6 +28,7 @@ pub fn config() -> Config {
             policy: PolicyKind::CacheAwareZmq,
             circuit_breaker: None,
             cache_aware: Some(CacheAwareConfig::default()),
+            shortest_ttft: None,
             sticky: None,
         },
         discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {

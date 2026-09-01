@@ -263,11 +263,12 @@ pub trait Policy: Send + Sync + std::fmt::Debug {
     /// it routes by prompt prefix). Ingress tokenization itself is no longer
     /// gated on this — that is a model property (`has_chat_encoder`) decided at
     /// ingress via [`request_tokens_for`]. This flag is the EXTRA gate that
-    /// keeps the cache-aware policy's RAW-prompt routing path alive: a
-    /// cache-aware model with no chat encoder still wants its `/v1/completions`
-    /// /`text` prompt tokenized for tree matching, which `has_chat_encoder`
+    /// keeps the prefix-routing policies' RAW-prompt paths alive: cache-aware
+    /// needs token hashes for tree matching, while Shortest-TTFT passes the
+    /// same tokens to the V4 Indexer query. A model without chat encoder still
+    /// needs `/v1/completions` / `text` tokenized, which `has_chat_encoder`
     /// alone would not trigger. Default `false` (load-only + sticky route
-    /// without prefix tokens); only the cache-aware policy overrides it.
+    /// without prefix tokens); only prefix-routing policies override it.
     fn needs_request_tokens(&self) -> bool {
         false
     }

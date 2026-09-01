@@ -40,6 +40,7 @@ async fn failover_when_one_worker_dies() {
                 cool_down_secs: 30,
             }),
             cache_aware: None,
+            shortest_ttft: None,
             sticky: None,
         },
         discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
