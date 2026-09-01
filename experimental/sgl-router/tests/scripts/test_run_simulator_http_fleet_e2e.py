@@ -210,6 +210,19 @@ class SimulatorHttpFleetContractTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, key):
                 runner.require_native_cache_audit(broken, expected_decisions=1)
 
+    def test_cache_aware_audit_accepts_native_queue_tokens_from_v3_load_monitor(self):
+        runner = load_runner()
+
+        audit = runner.cache_monitor_usage(
+            'cache candidate winner prefill_pressure_source="native_queue_tokens" '
+            "load_snapshot_version=42\n"
+        )
+
+        self.assertEqual(audit["cache_candidate_decisions"], 1)
+        self.assertEqual(audit["monitor_decisions"], 1)
+        self.assertEqual(audit["router_local_decisions"], 0)
+        self.assertEqual(audit["zero_snapshot_decisions"], 0)
+
     def test_cache_aware_audit_requires_fresh_monitor_for_p2_fallback(self):
         runner = load_runner()
         audit = {
