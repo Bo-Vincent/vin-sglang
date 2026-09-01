@@ -97,12 +97,14 @@ class SimulatorHttpFleetContractTest(unittest.TestCase):
         runner = load_runner()
         first = runner.worker_spec(
             0,
+            endpoint_count=2,
             http_base_port=31_000,
             kv_base_port=51_000,
             dist_base_port=53_000,
         )
         second = runner.worker_spec(
             1,
+            endpoint_count=2,
             http_base_port=31_000,
             kv_base_port=51_000,
             dist_base_port=53_000,
@@ -123,6 +125,8 @@ class SimulatorHttpFleetContractTest(unittest.TestCase):
         self.assertNotEqual(first.load_port, second.load_port)
         self.assertEqual(first.load_port, first.kv_port + 1)
         self.assertNotEqual(first.dist_port, second.dist_port)
+        self.assertNotEqual(first.nccl_port, second.nccl_port)
+        self.assertEqual(first.nccl_port, 53_002)
         self.assertIn("sglang_simulator.simulation.sglang.launch_server", command)
         self.assertIn("--enable-cache-report", command)
         self.assertIn("--enable-metrics", command)
@@ -134,12 +138,29 @@ class SimulatorHttpFleetContractTest(unittest.TestCase):
         )
         self.assertIn("--dist-init-addr", command)
         self.assertIn("127.0.0.1:53000", command)
+        self.assertIn("--nccl-port", command)
+        self.assertEqual(command[command.index("--nccl-port") + 1], "53002")
         self.assertIn("--chat-template", command)
         self.assertIn("chatml", command)
         self.assertIn("--page-size", command)
         self.assertEqual(command[command.index("--page-size") + 1], "1")
         self.assertEqual(environment["SGLANG_USE_CPU_ENGINE"], "1")
         self.assertEqual(environment["SGLANG_SIMULATOR_OUTPUT_MODE"], "BLOCKING")
+
+    def test_port_layout_preflight_reserves_explicit_nccl_ports(self):
+        runner = load_runner()
+        layout = runner.WorkerPortLayout(31_000, 41_000, 51_000)
+        endpoint_count = 4
+        blocked_nccl_port = layout.dist_base_port + endpoint_count
+
+        self.assertIn(blocked_nccl_port, layout.ports(endpoint_count))
+        with self.assertRaisesRegex(RuntimeError, "no available worker port layout"):
+            runner.select_available_port_layout(
+                endpoint_count=endpoint_count,
+                candidates=(layout,),
+                reserved_ports=(),
+                port_is_available=lambda port: port != blocked_nccl_port,
+            )
 
     def test_auto_port_layout_skips_a_candidate_with_an_occupied_worker_port(self):
         runner = load_runner()

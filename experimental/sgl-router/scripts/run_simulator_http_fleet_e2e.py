@@ -88,6 +88,7 @@ class WorkerSpec:
     kv_port: int
     load_port: int
     dist_port: int
+    nccl_port: int
 
     @property
     def worker_id(self) -> str:
@@ -113,7 +114,12 @@ class WorkerPortLayout:
         return tuple(
             [*range(self.http_base_port, self.http_base_port + endpoint_count)]
             + [*range(self.kv_base_port, self.kv_base_port + 2 * endpoint_count)]
-            + [*range(self.dist_base_port, self.dist_base_port + endpoint_count)]
+            # The server creates PortArgs before the scheduler starts. Without
+            # an explicit --nccl-port, it randomly chooses a TCP port that can
+            # collide with a later worker's --dist-init-addr. Keep one
+            # deterministic NCCL port per worker immediately after the
+            # dist-init range and reserve both ranges as one isolation unit.
+            + [*range(self.dist_base_port, self.dist_base_port + 2 * endpoint_count)]
         )
 
 
@@ -206,18 +212,22 @@ def group_cases_by_endpoint_count(cases: Sequence[Case]) -> tuple[tuple[int, tup
 def worker_spec(
     index: int,
     *,
+    endpoint_count: int,
     http_base_port: int,
     kv_base_port: int,
     dist_base_port: int,
 ) -> WorkerSpec:
     if index < 0:
         raise ValueError("worker index must be non-negative")
+    if index >= endpoint_count:
+        raise ValueError("worker index must be smaller than endpoint count")
     return WorkerSpec(
         index=index,
         http_port=http_base_port + index,
         kv_port=kv_base_port + 2 * index,
         load_port=kv_base_port + 2 * index + 1,
         dist_port=dist_base_port + index,
+        nccl_port=dist_base_port + endpoint_count + index,
     )
 
 
@@ -329,6 +339,8 @@ def simulator_worker_command(
         str(LOAD_SNAPSHOT_PUBLISH_INTERVAL_SECONDS),
         "--dist-init-addr",
         f"127.0.0.1:{spec.dist_port}",
+        "--nccl-port",
+        str(spec.nccl_port),
         "--enable-cache-report",
         "--enable-metrics",
         "--kv-events-config",
@@ -897,6 +909,7 @@ def worker_specs(endpoint_count: int, layout: WorkerPortLayout) -> list[WorkerSp
     return [
         worker_spec(
             index,
+            endpoint_count=endpoint_count,
             http_base_port=layout.http_base_port,
             kv_base_port=layout.kv_base_port,
             dist_base_port=layout.dist_base_port,
