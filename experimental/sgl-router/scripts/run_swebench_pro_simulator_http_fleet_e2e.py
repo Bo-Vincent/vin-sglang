@@ -547,6 +547,7 @@ def main(argv: Iterable[str] | None = None) -> int:
             python=args.python,
             simulator_config=args.simulator_config,
             simulator_dependency_root=args.simulator_dependency_root,
+            simulator_runtime_python_root=args.source_root / "python",
             argv=invocation,
         ),
         "python": args.python,
