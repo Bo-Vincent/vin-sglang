@@ -63,15 +63,16 @@ class TraceLabSimulatorHttpFleetContractTest(unittest.TestCase):
         self.assertEqual(decisions.count("measurement"), 3)
         self.assertNotIn("warmup", decisions)
 
-    def test_fixed_256_worker_matrix_has_four_policies_and_three_repeats(self):
+    def test_fixed_256_worker_matrix_has_five_policies_and_three_repeats(self):
         runner = load_runner()
 
         cases = runner.build_cases(runner.DEFAULT_POLICIES, repeats=3)
 
         self.assertEqual(runner.WORKER_COUNT, 256)
-        self.assertEqual(len(cases), 12)
+        self.assertEqual(len(cases), 15)
         self.assertEqual({case.endpoint_count for case in cases}, {256})
         self.assertEqual({case.policy for case in cases}, set(runner.DEFAULT_POLICIES))
+        self.assertIn("original_shortest_ttft", runner.DEFAULT_POLICIES)
         self.assertEqual({case.workload for case in cases}, {"tracelab_session_local"})
 
     def test_replay_phase_partition_keeps_session_warmup_before_measurements(self):

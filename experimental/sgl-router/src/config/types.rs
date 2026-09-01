@@ -73,7 +73,7 @@ impl Default for ActiveLoadConfig {
 /// Accepted on the CLI (`--policy`) as `round_robin` / `random` /
 /// `power_of_two` / `load_based` / `prefix_cache` / `fused_score` /
 /// `score_policy` / `session_aware` / `cache_aware` / `cache_aware_zmq` /
-/// `sticky` / `shortest_ttft`.
+/// `sticky` / `shortest_ttft` / `original_shortest_ttft`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 pub enum PolicyKind {
     #[default]
@@ -110,6 +110,10 @@ pub enum PolicyKind {
     /// `uncached prefill work + queue`，并以 cache hit 做相似 TTFT 破局。
     #[value(name = "shortest_ttft")]
     ShortestTtft,
+    /// vin/shortest-ttft 的原始 ranking：`L - 0.7H + queue`、top-30% 和
+    /// least-recently-selected tie-break；运行时仍使用 V4 admission/guard。
+    #[value(name = "original_shortest_ttft")]
+    OriginalShortestTtft,
     /// Capacity as a hard constraint: reject any worker already carrying
     /// `--max-in-flight` requests. A `--filter` entry, not a `--policy`:
     /// standalone it can only fall back on the selector's load tiebreak.

@@ -41,7 +41,7 @@ from swebench_replay import (
 WORKER_COUNT = 256
 DEFAULT_REQUEST_RATE = 64.0
 DEFAULT_OUTPUT_TOKENS = 64
-DEFAULT_POLICIES = fleet.DEFAULT_POLICIES
+DEFAULT_POLICIES = (*fleet.DEFAULT_POLICIES, "original_shortest_ttft")
 CACHE_AWARE_MIN_MATCHED_TOKENS = 1024
 
 
@@ -321,7 +321,7 @@ def run_case(
                 }
             )
             fleet.require_native_cache_audit(audit, expected_decisions=len(tasks))
-        elif case.policy == "shortest_ttft":
+        elif case.policy in ("shortest_ttft", "original_shortest_ttft"):
             shortest_ttft_audit = fleet.shortest_ttft_monitor_usage(decision_log)
             fleet.require_shortest_ttft_audit(
                 shortest_ttft_audit, expected_decisions=len(tasks)

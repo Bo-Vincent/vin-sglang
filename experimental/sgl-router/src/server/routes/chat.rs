@@ -91,6 +91,10 @@ fn prefill_policy_reason(
             ProposalKind::PowerOfTwo => "shortest_ttft_p2_fallback",
             _ => "shortest_ttft",
         },
+        PolicyKind::OriginalShortestTtft => match proposal {
+            ProposalKind::PowerOfTwo => "original_shortest_ttft_p2_fallback",
+            _ => "original_shortest_ttft",
+        },
         _ => match decision {
             DecisionReason::Primary => "primary",
             DecisionReason::CacheCandidate => "cache_candidate",
@@ -475,7 +479,11 @@ pub async fn chat_completions(
     // Shortest-TTFT 是独立 baseline：本地 radix tree 命中保留 H=0 worker，
     // 复用 hard admission，再按图中的 score / guard / CAS 规则决定；无法
     // 决策时才退化普通 P2。
-    let shortest_ttft_winner = (ctx.config.model.policy == PolicyKind::ShortestTtft)
+    let original_shortest_ttft = ctx.config.model.policy == PolicyKind::OriginalShortestTtft;
+    let shortest_ttft_winner = matches!(
+        ctx.config.model.policy,
+        PolicyKind::ShortestTtft | PolicyKind::OriginalShortestTtft
+    )
         .then(|| {
             let global_range = CandidateRange::global(&workers);
             let shortest_ctx =
@@ -500,17 +508,38 @@ pub async fn chat_completions(
                 &load_snapshot,
                 |worker_id| policy.try_claim_shortest_ttft(worker_id),
             )?;
+            let policy_name = if original_shortest_ttft {
+                "original_shortest_ttft"
+            } else {
+                "shortest_ttft"
+            };
             let reason = if final_decision.outstanding_guard_fallback {
-                "shortest_ttft_guard_fallback"
+                if original_shortest_ttft {
+                    "original_shortest_ttft_guard_fallback"
+                } else {
+                    "shortest_ttft_guard_fallback"
+                }
             } else if final_decision.cas_retries > 0 {
-                "shortest_ttft_cas_retry"
+                if original_shortest_ttft {
+                    "original_shortest_ttft_cas_retry"
+                } else {
+                    "shortest_ttft_cas_retry"
+                }
             } else if final_decision.matched_prefix_tokens > 0 {
-                "shortest_ttft_cache"
+                if original_shortest_ttft {
+                    "original_shortest_ttft_cache"
+                } else {
+                    "shortest_ttft_cache"
+                }
+            } else if original_shortest_ttft {
+                "original_shortest_ttft"
             } else {
                 "shortest_ttft"
             };
             tracing::debug!(
                 model = %model_str,
+                policy = policy_name,
+                original_shortest_ttft = original_shortest_ttft,
                 range = %final_decision.decision.candidate_range_id,
                 selected = %final_decision.decision.selected.url,
                 candidates = candidate_count,
@@ -519,11 +548,15 @@ pub async fn chat_completions(
                 uncached_tokens = final_decision.uncached_tokens,
                 cas_retries = final_decision.cas_retries,
                 outstanding_guard_fallback = final_decision.outstanding_guard_fallback,
+                admission_evaluated_candidates = final_decision.admission_evaluated_candidates,
+                admission_rejected_candidates = final_decision.admission_rejected_candidates,
+                outstanding_guard_evaluated_candidates = final_decision.outstanding_guard_evaluated_candidates,
+                outstanding_guard_rejected_candidates = final_decision.outstanding_guard_rejected_candidates,
                 load_snapshot_version = final_decision.decision.load_snapshot_version,
                 prefill_pressure_source = "estimated_prefill_queue_ms",
                 "shortest TTFT candidate winner",
             );
-            ctx.metrics.record_policy_decision("shortest_ttft", reason);
+            ctx.metrics.record_policy_decision(policy_name, reason);
             Some(final_decision.decision.selected)
         })
         .flatten();
@@ -564,7 +597,9 @@ pub async fn chat_completions(
                 .prefill_domains(&workers, prefill_bucket_request);
             if matches!(
                 ctx.config.model.policy,
-                PolicyKind::CacheAware | PolicyKind::ShortestTtft
+                PolicyKind::CacheAware
+                    | PolicyKind::ShortestTtft
+                    | PolicyKind::OriginalShortestTtft
             ) {
                 // 本地树没有可 hard-admit 的 candidate 时，按 domain 顺序用
                 // 普通 P2 重试。

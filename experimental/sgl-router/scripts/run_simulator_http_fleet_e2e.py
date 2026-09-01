@@ -485,7 +485,7 @@ def policy_args(
         if cache_aware_tuning.global_backup:
             arguments.append("--cache-aware-global-backup")
         return arguments
-    if policy == "shortest_ttft":
+    if policy in ("shortest_ttft", "original_shortest_ttft"):
         return ["--policy", policy]
     raise ValueError(f"unsupported policy: {policy}")
 
@@ -594,7 +594,12 @@ def require_policy_reason_coverage(
 def require_shortest_ttft_audit(
     audit: Mapping[str, int], *, expected_decisions: int
 ) -> None:
-    required_positive = ("shortest_ttft_decisions", "monitor_decisions")
+    required_positive = (
+        "shortest_ttft_decisions",
+        "monitor_decisions",
+        "admission_evaluated_candidates",
+        "outstanding_guard_evaluated_candidates",
+    )
     for key in required_positive:
         if audit.get(key, 0) <= 0:
             raise RuntimeError(f"{key} must be positive for Shortest-TTFT")
@@ -1162,6 +1167,16 @@ def shortest_ttft_monitor_usage(router_log: str) -> dict[str, int]:
         "monitor_fallback_decisions": 0,
         "router_local_decisions": 0,
         "zero_snapshot_decisions": 0,
+        "admission_evaluated_candidates": 0,
+        "admission_rejected_candidates": 0,
+        "outstanding_guard_evaluated_candidates": 0,
+        "outstanding_guard_rejected_candidates": 0,
+    }
+    integer_markers = {
+        "admission_evaluated_candidates": "admission_evaluated_candidates=",
+        "admission_rejected_candidates": "admission_rejected_candidates=",
+        "outstanding_guard_evaluated_candidates": "outstanding_guard_evaluated_candidates=",
+        "outstanding_guard_rejected_candidates": "outstanding_guard_rejected_candidates=",
     }
     for line in router_log.splitlines():
         normalized = ANSI_ESCAPE_RE.sub("", line)
@@ -1169,8 +1184,9 @@ def shortest_ttft_monitor_usage(router_log: str) -> dict[str, int]:
             continue
         source_marker = "prefill_pressure_source="
         version_marker = "load_snapshot_version="
-        if source_marker not in normalized or version_marker not in normalized:
-            raise RuntimeError("shortest TTFT candidate winner has no load-monitor audit fields")
+        required_markers = (source_marker, version_marker, *integer_markers.values())
+        if any(marker not in normalized for marker in required_markers):
+            raise RuntimeError("shortest TTFT candidate winner has no admission/guard audit fields")
         source = normalized.split(source_marker, 1)[1].split()[0].strip('"')
         version = normalized.split(version_marker, 1)[1].split()[0].strip('"')
         counts["shortest_ttft_decisions"] += 1
@@ -1182,6 +1198,11 @@ def shortest_ttft_monitor_usage(router_log: str) -> dict[str, int]:
             raise RuntimeError(f"unknown Shortest-TTFT pressure source: {source}")
         if version == "0":
             counts["zero_snapshot_decisions"] += 1
+        for field, marker in integer_markers.items():
+            try:
+                counts[field] += int(normalized.split(marker, 1)[1].split()[0].strip('"'))
+            except ValueError as error:
+                raise RuntimeError(f"Shortest-TTFT audit has non-integer {field}") from error
     return counts
 
 
@@ -1616,7 +1637,7 @@ def run_case(
                 }
             )
             require_native_cache_audit(audit, expected_decisions=len(requests))
-        elif case.policy == "shortest_ttft":
+        elif case.policy in ("shortest_ttft", "original_shortest_ttft"):
             shortest_ttft_audit = shortest_ttft_monitor_usage(decision_log)
             require_shortest_ttft_audit(
                 shortest_ttft_audit, expected_decisions=len(requests)

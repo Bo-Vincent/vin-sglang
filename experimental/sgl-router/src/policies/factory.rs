@@ -39,6 +39,7 @@ fn build_sticky_fallback(kind: PolicyKind) -> Arc<dyn Policy> {
         PolicyKind::CacheAwareZmq
         | PolicyKind::CacheAware
         | PolicyKind::ShortestTtft
+        | PolicyKind::OriginalShortestTtft
         | PolicyKind::SessionAware
         | PolicyKind::Overloaded
         | PolicyKind::Sticky
@@ -149,6 +150,9 @@ fn build_kind(
             block_size_oracle,
         )),
         PolicyKind::ShortestTtft => Arc::new(ShortestTtftPolicy::new(tree, block_size_oracle)),
+        PolicyKind::OriginalShortestTtft => {
+            Arc::new(ShortestTtftPolicy::original(tree, block_size_oracle))
+        }
         PolicyKind::Sticky => build_sticky(model),
         PolicyKind::FusedScore => {
             build_fused(model, &tree, &tokenizers, &block_size_oracle, engine_load)?
@@ -276,6 +280,10 @@ pub fn build_policy_kind_only(kind: PolicyKind) -> Result<Arc<dyn Policy>> {
             BlockSizeOracle::new(),
         )),
         PolicyKind::ShortestTtft => Arc::new(ShortestTtftPolicy::new(
+            Arc::new(HashTree::new()),
+            BlockSizeOracle::new(),
+        )),
+        PolicyKind::OriginalShortestTtft => Arc::new(ShortestTtftPolicy::original(
             Arc::new(HashTree::new()),
             BlockSizeOracle::new(),
         )),
@@ -474,6 +482,7 @@ mod tests {
             PolicyKind::SessionAware,
             PolicyKind::CacheAware,
             PolicyKind::ShortestTtft,
+            PolicyKind::OriginalShortestTtft,
             PolicyKind::Sticky,
             // INVERTED (was asserted is_err): the `not_wired_yet` refusal it
             // pinned was a temporary state, not the contract. PLAN requires

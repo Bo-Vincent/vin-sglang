@@ -28,6 +28,7 @@ use crate::server::metrics::MetricsRegistry;
 use crate::tokenizer::{adapter, TokenizerRegistry};
 use crate::workers::Worker;
 use dashmap::DashMap;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Tokens produced once at ingress for a request. Consumed by the
@@ -384,6 +385,13 @@ pub struct CacheCandidateProposal {
     pub pressure_abs_threshold_ms: Option<f64>,
     pub pressure_rel_threshold: f64,
 }
+/// Shortest-TTFT 排名公式。`Original` 保留 vin/shortest-ttft 的 score、
+/// top-30% 和 LRU tie-break；两种模式均由 V4 的 admission/guard 包裹。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShortestTtftRankingMode {
+    V4,
+    Original,
+}
 
 /// Shortest-TTFT 在 hard admission 前提交的全量候选。
 ///
@@ -393,6 +401,9 @@ pub struct CacheCandidateProposal {
 pub struct ShortestTtftCandidateProposal {
     pub candidates: Vec<CacheCandidate>,
     pub outstanding_uncached_tokens_threshold: u64,
+    pub ranking_mode: ShortestTtftRankingMode,
+    /// 原版 ranking 的 request-start selection stamp 快照。
+    pub last_selected: HashMap<String, u64>,
 }
 
 /// Prefill policy 返回 pair 或 Cache-Aware 候选集。

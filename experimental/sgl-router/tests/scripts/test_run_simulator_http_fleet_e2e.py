@@ -85,6 +85,14 @@ class SimulatorHttpFleetContractTest(unittest.TestCase):
         self.assertEqual({case.endpoint_count for case in cases}, set(runner.DEFAULT_ENDPOINT_COUNTS))
         self.assertEqual({case.policy for case in cases}, set(runner.DEFAULT_POLICIES))
 
+    def test_original_shortest_ttft_has_its_own_router_policy_argument(self):
+        runner = load_runner()
+
+        self.assertEqual(
+            runner.policy_args("original_shortest_ttft"),
+            ["--policy", "original_shortest_ttft"],
+        )
+
     def test_simulator_worker_command_is_cpu_blocking_and_uses_unique_ports(self):
         runner = load_runner()
         first = runner.worker_spec(
@@ -584,10 +592,10 @@ class SimulatorHttpFleetContractTest(unittest.TestCase):
         log = (
             "shortest TTFT candidate winner "
             "prefill_pressure_source=\"estimated_prefill_queue_ms\" "
-            "load_snapshot_version=41\n"
+            "load_snapshot_version=41 admission_evaluated_candidates=1 admission_rejected_candidates=0 outstanding_guard_evaluated_candidates=1 outstanding_guard_rejected_candidates=0\n"
             "shortest TTFT candidate winner "
             "prefill_pressure_source\x1b[0m\x1b[2m=\x1b[0m\"estimated_prefill_queue_ms\" "
-            "load_snapshot_version=42\n"
+            "load_snapshot_version=42 admission_evaluated_candidates=1 admission_rejected_candidates=0 outstanding_guard_evaluated_candidates=1 outstanding_guard_rejected_candidates=0\n"
         )
 
         audit = runner.shortest_ttft_monitor_usage(log)
@@ -600,9 +608,39 @@ class SimulatorHttpFleetContractTest(unittest.TestCase):
                 "monitor_fallback_decisions": 0,
                 "router_local_decisions": 0,
                 "zero_snapshot_decisions": 0,
+                "admission_evaluated_candidates": 2,
+                "admission_rejected_candidates": 0,
+                "outstanding_guard_evaluated_candidates": 2,
+                "outstanding_guard_rejected_candidates": 0,
             },
         )
         runner.require_shortest_ttft_audit(audit, expected_decisions=2)
+
+
+    def test_shortest_ttft_audit_requires_admission_and_guard_evidence(self):
+        runner = load_runner()
+        log = (
+            "shortest TTFT candidate winner "
+            "prefill_pressure_source=\"estimated_prefill_queue_ms\" "
+            "load_snapshot_version=41 "
+            "admission_evaluated_candidates=3 "
+            "admission_rejected_candidates=1 "
+            "outstanding_guard_evaluated_candidates=2 "
+            "outstanding_guard_rejected_candidates=1"
+        )
+
+        audit = runner.shortest_ttft_monitor_usage(log)
+
+        self.assertEqual(audit["admission_evaluated_candidates"], 3)
+        self.assertEqual(audit["admission_rejected_candidates"], 1)
+        self.assertEqual(audit["outstanding_guard_evaluated_candidates"], 2)
+        self.assertEqual(audit["outstanding_guard_rejected_candidates"], 1)
+        runner.require_shortest_ttft_audit(audit, expected_decisions=1)
+
+        broken = dict(audit)
+        broken["outstanding_guard_evaluated_candidates"] = 0
+        with self.assertRaisesRegex(RuntimeError, "outstanding_guard_evaluated_candidates"):
+            runner.require_shortest_ttft_audit(broken, expected_decisions=1)
 
     def test_shortest_ttft_audit_rejects_missing_monitor_evidence(self):
         runner = load_runner()
@@ -612,6 +650,10 @@ class SimulatorHttpFleetContractTest(unittest.TestCase):
             "monitor_fallback_decisions": 0,
             "router_local_decisions": 0,
             "zero_snapshot_decisions": 0,
+            "admission_evaluated_candidates": 1,
+            "admission_rejected_candidates": 0,
+            "outstanding_guard_evaluated_candidates": 1,
+            "outstanding_guard_rejected_candidates": 0,
         }
         runner.require_shortest_ttft_audit(good, expected_decisions=1)
 
@@ -628,8 +670,7 @@ class SimulatorHttpFleetContractTest(unittest.TestCase):
 
     def test_shortest_ttft_audit_rejects_winner_without_load_monitor_fields(self):
         runner = load_runner()
-
-        with self.assertRaisesRegex(RuntimeError, "load-monitor audit fields"):
+        with self.assertRaisesRegex(RuntimeError, "admission/guard audit fields"):
             runner.shortest_ttft_monitor_usage("shortest TTFT candidate winner\n")
 
     def test_completed_case_records_zero_request_errors(self):

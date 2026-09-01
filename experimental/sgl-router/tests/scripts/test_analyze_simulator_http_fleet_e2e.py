@@ -244,6 +244,10 @@ class SimulatorHttpFleetAnalyzerTest(unittest.TestCase):
                     "monitor_fallback_decisions": 8,
                     "router_local_decisions": 0,
                     "zero_snapshot_decisions": 0,
+                    "admission_evaluated_candidates": 64,
+                    "admission_rejected_candidates": 4,
+                    "outstanding_guard_evaluated_candidates": 60,
+                    "outstanding_guard_rejected_candidates": 2,
                 }
                 (directory / "summary.json").write_text(json.dumps(summary))
             (root / "manifest.json").write_text(json.dumps(manifest))
@@ -274,6 +278,10 @@ class SimulatorHttpFleetAnalyzerTest(unittest.TestCase):
                 "monitor_fallback_decisions": 0,
                 "router_local_decisions": 1,
                 "zero_snapshot_decisions": 0,
+                "admission_evaluated_candidates": 64,
+                "admission_rejected_candidates": 4,
+                "outstanding_guard_evaluated_candidates": 60,
+                "outstanding_guard_rejected_candidates": 2,
             }
             (directory / "summary.json").write_text(json.dumps(summary))
             (root / "manifest.json").write_text(json.dumps(manifest))

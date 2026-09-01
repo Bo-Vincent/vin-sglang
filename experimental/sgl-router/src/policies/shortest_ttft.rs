@@ -10,7 +10,7 @@ use crate::policies::kv_events::{
 use crate::policies::power_of_two::PowerOfTwoChoicesPolicy;
 use crate::policies::{
     estimate_matched_prefix_tokens, CacheCandidate, Policy, PrefillProposal, SelectionContext,
-    ShortestTtftCandidateProposal,
+    ShortestTtftCandidateProposal, ShortestTtftRankingMode,
 };
 use crate::workers::Worker;
 use dashmap::DashMap;
@@ -55,6 +55,8 @@ pub struct ShortestTtftSelection {
     pub estimated_ttft_ms: f64,
     pub outstanding_guard_fallback: bool,
     pub cas_retries: u32,
+    pub outstanding_guard_evaluated_candidates: u64,
+    pub outstanding_guard_rejected_candidates: u64,
 }
 
 /// 独立顶层 Shortest-TTFT policy 的并发状态。
@@ -64,6 +66,7 @@ pub struct ShortestTtftPolicy {
     tree: Arc<HashTree>,
     block_size_oracle: Arc<BlockSizeOracle>,
     next_selection_stamp: AtomicU64,
+    mode: ShortestTtftRankingMode,
 }
 
 impl ShortestTtftPolicy {
@@ -73,7 +76,16 @@ impl ShortestTtftPolicy {
             block_size_oracle,
             last_selected: DashMap::new(),
             next_selection_stamp: AtomicU64::new(0),
+            mode: ShortestTtftRankingMode::V4,
         }
+    }
+
+    /// 保留 vin/shortest-ttft 的 ranking 公式，但复用 V4 的本地 tree、
+    /// fresh-monitor、hard admission 和 outstanding guard。
+    pub fn original(tree: Arc<HashTree>, block_size_oracle: Arc<BlockSizeOracle>) -> Self {
+        let mut policy = Self::new(tree, block_size_oracle);
+        policy.mode = ShortestTtftRankingMode::Original;
+        policy
     }
 
     /// 读取 ZMQ 同步的本地 radix tree；同一 URL 的 DP rank 取最深前缀。
@@ -105,26 +117,64 @@ impl ShortestTtftPolicy {
         Some((hashes.len(), depths))
     }
 
+    /// 原版策略只把全局最深的 `match_prefix` 命中记为 cache hit；深度较浅
+    /// 的 worker 是 H=0 候选。这与 V4 per-worker depth 的选择性信息不同。
+    fn original_matched_tokens(&self, ctx: &SelectionContext<'_>) -> Option<HashMap<String, u64>> {
+        let Some(tokens) = ctx.request_tokens().filter(|tokens| !tokens.is_empty()) else {
+            return Some(HashMap::new());
+        };
+        let Some(block_size) = self.block_size_oracle.get() else {
+            return Some(HashMap::new());
+        };
+        let hashes = if self.block_size_oracle.is_bigram() {
+            compute_block_hashes_bigram(tokens, block_size as usize)
+        } else {
+            compute_block_hashes(tokens, block_size as usize)
+        };
+        if hashes.is_empty() {
+            return Some(HashMap::new());
+        }
+        let matched = self.tree.match_prefix(None, &hashes);
+        let hit_tokens = (matched.matched_blocks as u64)
+            .saturating_mul(block_size as u64)
+            .min(tokens.len() as u64);
+        Some(
+            matched
+                .workers
+                .into_iter()
+                .map(|worker| (worker.url, hit_tokens))
+                .collect(),
+        )
+    }
+
     fn candidate_proposal(
         &self,
         workers: &[Arc<Worker>],
         ctx: &SelectionContext<'_>,
     ) -> Option<ShortestTtftCandidateProposal> {
         let input_tokens = ctx.input_tokens()?;
-        let (query_blocks, matched_by_url) = self.local_prefix_depths(ctx)?;
+        let matched_by_url = match self.mode {
+            ShortestTtftRankingMode::V4 => {
+                let (query_blocks, depths) = self.local_prefix_depths(ctx)?;
+                depths
+                    .into_iter()
+                    .map(|(url, blocks)| {
+                        (
+                            url,
+                            estimate_matched_prefix_tokens(input_tokens, query_blocks, blocks),
+                        )
+                    })
+                    .collect()
+            }
+            ShortestTtftRankingMode::Original => self.original_matched_tokens(ctx)?,
+        };
         if workers.is_empty() {
             return None;
         }
         let candidates = workers
             .iter()
             .filter_map(|worker| {
-                let matched_prefix_tokens = matched_by_url
-                    .get(&worker.url)
-                    .copied()
-                    .map(|blocks| {
-                        estimate_matched_prefix_tokens(input_tokens, query_blocks, blocks)
-                    })
-                    .unwrap_or(0);
+                let matched_prefix_tokens = matched_by_url.get(&worker.url).copied().unwrap_or(0);
                 let candidate = CacheCandidate {
                     worker: Arc::clone(worker),
                     matched_prefix_tokens,
@@ -136,8 +186,21 @@ impl ShortestTtftPolicy {
             })
             .collect::<Vec<_>>();
         (!candidates.is_empty()).then_some(ShortestTtftCandidateProposal {
-            candidates,
             outstanding_uncached_tokens_threshold: DEFAULT_OUTSTANDING_UNCACHED_TOKENS_THRESHOLD,
+            ranking_mode: self.mode,
+            last_selected: candidates
+                .iter()
+                .map(|candidate| {
+                    (
+                        candidate.worker.id.0.clone(),
+                        self.last_selected
+                            .get(&candidate.worker.id)
+                            .map(|stamp| stamp.load(AtomicOrdering::Acquire))
+                            .unwrap_or(0),
+                    )
+                })
+                .collect(),
+            candidates,
         })
     }
 
@@ -291,6 +354,9 @@ pub fn select_shortest_ttft(
                 .saturating_add(candidate.uncached_tokens)
                 > outstanding_threshold_tokens
         });
+    let outstanding_guard_evaluated_candidates = candidates.len() as u64;
+    let outstanding_guard_rejected_candidates =
+        candidates.len().saturating_sub(guarded.len()) as u64;
     let mut remaining = guarded;
     let mut cas_retries = 0;
     while let Some(ranking) = rank_shortest_ttft(&remaining) {
@@ -301,10 +367,90 @@ pub fn select_shortest_ttft(
                 estimated_ttft_ms: winner.estimated_ttft_ms(),
                 outstanding_guard_fallback,
                 cas_retries,
+                outstanding_guard_evaluated_candidates,
+                outstanding_guard_rejected_candidates,
             });
         }
         cas_retries = cas_retries.saturating_add(1);
         remaining.retain(|candidate| candidate.worker_id != winner.worker_id);
+    }
+    None
+}
+
+/// vin/shortest-ttft 的预填充近似：`L - 0.7H + queue`。
+fn original_estimated_ttft_ms(candidate: &ShortestTtftCandidate) -> f64 {
+    candidate.uncached_tokens as f64
+        + candidate.matched_prefix_tokens as f64 * 0.3
+        + candidate.queue_ms
+}
+
+/// 在 V4 共享 admission/guard 筛出的候选上复现原版排名规则。
+///
+/// 原版把 top-30% 中距最快值不超过 `max(mean * 10%, 0.5 * stddev)` 的
+/// worker 视为相似，再按上次选择时间打散；CAS 失败时重算余下候选。
+pub fn select_original_shortest_ttft(
+    candidates: &[ShortestTtftCandidate],
+    outstanding_threshold_tokens: u64,
+    last_selected: impl Fn(&str) -> u64,
+    mut try_claim: impl FnMut(&str) -> bool,
+) -> Option<ShortestTtftSelection> {
+    let guarded = apply_outstanding_guard(candidates, outstanding_threshold_tokens);
+    let outstanding_guard_fallback = guarded.len() == candidates.len()
+        && candidates.iter().all(|candidate| {
+            candidate
+                .outstanding_uncached_tokens
+                .saturating_add(candidate.uncached_tokens)
+                > outstanding_threshold_tokens
+        });
+    let outstanding_guard_evaluated_candidates = candidates.len() as u64;
+    let outstanding_guard_rejected_candidates =
+        candidates.len().saturating_sub(guarded.len()) as u64;
+    let mut remaining = guarded;
+    let mut cas_retries = 0;
+    while !remaining.is_empty() {
+        remaining.sort_by(|left, right| {
+            original_estimated_ttft_ms(left)
+                .total_cmp(&original_estimated_ttft_ms(right))
+                .then_with(|| left.worker_id.cmp(&right.worker_id))
+        });
+        let top_count = (remaining.len() * 3 / 10).max(1);
+        let top = &remaining[..top_count];
+        let min_ttft_ms = original_estimated_ttft_ms(&top[0]);
+        let mean = top.iter().map(original_estimated_ttft_ms).sum::<f64>() / top.len() as f64;
+        let stddev = (top
+            .iter()
+            .map(|candidate| {
+                let delta = original_estimated_ttft_ms(candidate) - mean;
+                delta * delta
+            })
+            .sum::<f64>()
+            / top.len() as f64)
+            .sqrt();
+        let similarity_margin_ms = (mean * 0.1).max(stddev * 0.5);
+        let winner = top
+            .iter()
+            .filter(|candidate| {
+                (original_estimated_ttft_ms(candidate) - min_ttft_ms).abs() <= similarity_margin_ms
+            })
+            .min_by(|left, right| {
+                last_selected(&left.worker_id)
+                    .cmp(&last_selected(&right.worker_id))
+                    .then_with(|| left.worker_id.cmp(&right.worker_id))
+            })?;
+        let winner_id = winner.worker_id.clone();
+        let estimated_ttft_ms = original_estimated_ttft_ms(winner);
+        if try_claim(&winner_id) {
+            return Some(ShortestTtftSelection {
+                worker_id: winner_id,
+                estimated_ttft_ms,
+                outstanding_guard_fallback,
+                cas_retries,
+                outstanding_guard_evaluated_candidates,
+                outstanding_guard_rejected_candidates,
+            });
+        }
+        cas_retries = cas_retries.saturating_add(1);
+        remaining.retain(|candidate| candidate.worker_id != winner_id);
     }
     None
 }
@@ -352,6 +498,42 @@ mod tests {
 
         assert_eq!(selected.worker_id, "fast");
         assert_eq!(selected.estimated_ttft_ms, 210.0);
+    }
+
+    #[test]
+    fn original_shortest_ttft_uses_its_point_seven_cache_model() {
+        let candidates = vec![
+            candidate("cache", 900, 100, 0.0, 0),
+            candidate("uncached", 0, 300, 0.0, 0),
+        ];
+
+        let selected = select_original_shortest_ttft(&candidates, 1_000, |_| 0, |_| true).unwrap();
+
+        assert_eq!(selected.worker_id, "uncached");
+        assert_eq!(selected.estimated_ttft_ms, 300.0);
+    }
+
+    #[test]
+    fn original_shortest_ttft_breaks_a_similar_band_by_least_recent_selection() {
+        let candidates = vec![
+            candidate("recent", 0, 1_000, 0.0, 0),
+            candidate("idle", 0, 1_005, 0.0, 0),
+            candidate("w2", 0, 2_000, 0.0, 0),
+            candidate("w3", 0, 2_100, 0.0, 0),
+            candidate("w4", 0, 2_200, 0.0, 0),
+            candidate("w5", 0, 2_300, 0.0, 0),
+            candidate("w6", 0, 2_400, 0.0, 0),
+        ];
+
+        let selected = select_original_shortest_ttft(
+            &candidates,
+            10_000,
+            |worker_id| if worker_id == "recent" { 8 } else { 1 },
+            |_| true,
+        )
+        .unwrap();
+
+        assert_eq!(selected.worker_id, "idle");
     }
 
     #[test]
@@ -543,5 +725,33 @@ mod tests {
         assert_eq!(proposal.candidates.len(), 1);
         assert_eq!(proposal.candidates[0].worker.id, cached.id);
         assert_eq!(proposal.candidates[0].matched_prefix_tokens, 4);
+    }
+
+    #[test]
+    fn original_shortest_ttft_only_credits_global_deepest_local_tree_match() {
+        let model = ModelId("model".into());
+        let tokens = [11u32, 12, 13, 14];
+        let hashes = compute_block_hashes(&tokens, 1);
+        let tree = Arc::new(HashTree::new());
+        let oracle = BlockSizeOracle::new();
+        oracle.try_set(1).unwrap();
+        let cached = worker("cached");
+        let partial = worker("partial");
+        tree.insert(&KvWorkerId::new(cached.url.clone(), 0), None, &hashes);
+        tree.insert(&KvWorkerId::new(partial.url.clone(), 0), None, &hashes[..2]);
+        let policy = ShortestTtftPolicy::original(Arc::clone(&tree), oracle);
+        let ctx = SelectionContext::new(&model, None)
+            .with_input_tokens(tokens.len() as u64)
+            .with_request_tokens(Some(&tokens));
+
+        let PrefillProposal::ShortestTtftCandidates(proposal) = policy
+            .propose_prefill(&[Arc::clone(&cached), Arc::clone(&partial)], &ctx)
+            .expect("original policy must build baseline candidates")
+        else {
+            panic!("expected original Shortest-TTFT candidates");
+        };
+
+        assert_eq!(proposal.candidates[0].matched_prefix_tokens, 4);
+        assert_eq!(proposal.candidates[1].matched_prefix_tokens, 0);
     }
 }

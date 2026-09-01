@@ -47,6 +47,10 @@ SHORTEST_TTFT_AUDIT_FIELDS = (
     "monitor_fallback_decisions",
     "router_local_decisions",
     "zero_snapshot_decisions",
+    "admission_evaluated_candidates",
+    "admission_rejected_candidates",
+    "outstanding_guard_evaluated_candidates",
+    "outstanding_guard_rejected_candidates",
 )
 POWER_OF_TWO_AUDIT_FIELDS = (
     "power_of_two_decisions",
@@ -148,7 +152,7 @@ def validate_summary(case: Mapping[str, object], summary: Mapping[str, object]) 
             or audit["fallback_zero_snapshot_decisions"] != 0
         ):
             raise RuntimeError("native Cache-Aware case fell back from LoadMonitor")
-    elif policy == "shortest_ttft":
+    elif policy in ("shortest_ttft", "original_shortest_ttft"):
         audit = summary.get("shortest_ttft_audit")
         if not isinstance(audit, Mapping):
             raise RuntimeError("Shortest-TTFT case has no audit")
@@ -157,6 +161,11 @@ def validate_summary(case: Mapping[str, object], summary: Mapping[str, object]) 
                 raise RuntimeError(f"Shortest-TTFT audit has no integer {field}")
         if audit["shortest_ttft_decisions"] <= 0 or audit["monitor_decisions"] <= 0:
             raise RuntimeError("Shortest-TTFT audit has no decision with fresh LoadMonitor")
+        if (
+            audit["admission_evaluated_candidates"] <= 0
+            or audit["outstanding_guard_evaluated_candidates"] <= 0
+        ):
+            raise RuntimeError("Shortest-TTFT admission or outstanding guard was not exercised")
         if audit["monitor_decisions"] != audit["shortest_ttft_decisions"]:
             raise RuntimeError("Shortest-TTFT monitor does not cover every decision")
         if audit["shortest_ttft_decisions"] != request_count:

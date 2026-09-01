@@ -40,7 +40,7 @@ DEFAULT_REQUEST_RATE = 64.0
 DEFAULT_WARMUP_REQUEST_RATE = 1.0
 DEFAULT_PRESSURE_GUARD_SEED_HOLDERS = 2
 DEFAULT_PRESSURE_GUARD_SEED_REQUEST_RATE = 64.0
-DEFAULT_POLICIES = fleet.DEFAULT_POLICIES
+DEFAULT_POLICIES = (*fleet.DEFAULT_POLICIES, "original_shortest_ttft")
 TRACE_PROVIDER = "codex"
 TRACE_SELECTION_SEED = 20260822
 TRACE_MIN_INPUT_TOKENS = 1024
@@ -863,7 +863,7 @@ def run_case(
                 float(cache["total_effective_tokens"]) > 0.0
             )
             fleet.require_native_cache_audit(audit, expected_decisions=expected)
-        elif case.policy == "shortest_ttft":
+        elif case.policy in ("shortest_ttft", "original_shortest_ttft"):
             decision_log = measurement_decision_log(
                 router_log, policy_marker="shortest TTFT candidate winner", expected_decisions=expected
             )

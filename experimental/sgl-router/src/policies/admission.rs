@@ -8,10 +8,12 @@
 //! 样本统一退化为 router-local load，不能被误认为 monitor-backed 决策。
 
 use crate::policies::engine_load::{EngineLoadSnapshot, NativeCacheWorkerLoad};
-use crate::policies::shortest_ttft::{select_shortest_ttft, ShortestTtftCandidate};
+use crate::policies::shortest_ttft::{
+    select_original_shortest_ttft, select_shortest_ttft, ShortestTtftCandidate,
+};
 use crate::policies::{
     CacheCandidate, CacheCandidateProposal, GuardHints, SelectionProposal,
-    ShortestTtftCandidateProposal,
+    ShortestTtftCandidateProposal, ShortestTtftRankingMode,
 };
 use crate::workers::Worker;
 use std::cmp::Ordering;
@@ -237,6 +239,10 @@ pub struct ShortestTtftFinalDecision {
     pub cas_retries: u32,
     pub matched_prefix_tokens: u64,
     pub uncached_tokens: u64,
+    pub admission_evaluated_candidates: u64,
+    pub admission_rejected_candidates: u64,
+    pub outstanding_guard_evaluated_candidates: u64,
+    pub outstanding_guard_rejected_candidates: u64,
 }
 
 /// Shortest-TTFT 只在完整、fresh 的 native ZMQ monitor 上排名。任意候选缺
@@ -270,6 +276,9 @@ pub fn resolve_shortest_ttft_candidates(
             is_cache_candidate_admitted(candidate, request_input_tokens, &admission_loads)
         })
         .collect::<Vec<_>>();
+    let admission_evaluated_candidates = proposal.candidates.len() as u64;
+    let admission_rejected_candidates =
+        admission_evaluated_candidates.saturating_sub(admitted.len() as u64);
     let scored = admitted
         .iter()
         .map(|candidate| {
@@ -287,16 +296,25 @@ pub fn resolve_shortest_ttft_candidates(
             }
         })
         .collect::<Vec<_>>();
-    let selected = select_shortest_ttft(
-        &scored,
-        proposal.outstanding_uncached_tokens_threshold,
-        |worker_id| {
-            admitted
-                .iter()
-                .find(|candidate| candidate.worker.id.0 == worker_id)
-                .is_some_and(|candidate| try_claim(&candidate.worker.id))
-        },
-    )?;
+    let mut try_claim = |worker_id: &str| {
+        admitted
+            .iter()
+            .find(|candidate| candidate.worker.id.0 == worker_id)
+            .is_some_and(|candidate| try_claim(&candidate.worker.id))
+    };
+    let selected = match proposal.ranking_mode {
+        ShortestTtftRankingMode::V4 => select_shortest_ttft(
+            &scored,
+            proposal.outstanding_uncached_tokens_threshold,
+            &mut try_claim,
+        ),
+        ShortestTtftRankingMode::Original => select_original_shortest_ttft(
+            &scored,
+            proposal.outstanding_uncached_tokens_threshold,
+            |worker_id| proposal.last_selected.get(worker_id).copied().unwrap_or(0),
+            &mut try_claim,
+        ),
+    }?;
     let candidate = admitted
         .iter()
         .find(|candidate| candidate.worker.id.0 == selected.worker_id)?;
@@ -313,6 +331,10 @@ pub fn resolve_shortest_ttft_candidates(
         cas_retries: selected.cas_retries,
         matched_prefix_tokens: candidate.matched_prefix_tokens,
         uncached_tokens: candidate.uncached_tokens,
+        admission_evaluated_candidates,
+        admission_rejected_candidates,
+        outstanding_guard_evaluated_candidates: selected.outstanding_guard_evaluated_candidates,
+        outstanding_guard_rejected_candidates: selected.outstanding_guard_rejected_candidates,
     })
 }
 pub fn resolve_prefill(
@@ -973,6 +995,8 @@ mod tests {
                 },
             ],
             outstanding_uncached_tokens_threshold: 16_384,
+            ranking_mode: ShortestTtftRankingMode::V4,
+            last_selected: HashMap::new(),
         };
         let loads = EngineLoadSnapshot::from_native_cache_workers(
             9,
