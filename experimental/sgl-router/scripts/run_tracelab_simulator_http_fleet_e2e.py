@@ -729,6 +729,26 @@ def measurement_decision_log(
     return "\n".join(lines[-expected_decisions:]) + "\n"
 
 
+def cache_candidate_audit_log(
+    router_log: Path, policy_reasons: Mapping[str, float]
+) -> str:
+    """按测量 metrics 的 cache-candidate 数量截取 native 策略日志。
+
+    TraceLab 的首轮 warmup 会刻意建立 cache，后续测量允许少量没有命中的
+    session 回退。metrics delta 是测量窗口内 cache candidate 的权威计数；
+    以它截取日志可避免 stdout 延迟 flush 时把 warmup 混进审计，同时不把
+    合法 fallback 误判为 native 策略未生效。
+    """
+    candidate_decisions = int(policy_reasons.get("cache_candidate", 0.0))
+    if candidate_decisions <= 0:
+        return ""
+    return measurement_decision_log(
+        router_log,
+        policy_marker="cache candidate winner",
+        expected_decisions=candidate_decisions,
+    )
+
+
 def run_case(
     args: argparse.Namespace,
     case: TraceLabCase,
@@ -886,9 +906,7 @@ def run_case(
         power_of_two_audit: dict[str, int] | None = None
         zmq_policy_audit: dict[str, int] | None = None
         if case.policy == "cache_aware":
-            decision_log = measurement_decision_log(
-                router_log, policy_marker="cache candidate winner", expected_decisions=expected
-            )
+            decision_log = cache_candidate_audit_log(router_log, reasons)
             audit = fleet.cache_monitor_usage(decision_log)
             audit["actual_cache_metrics"] = int(
                 float(cache["total_effective_tokens"]) > 0.0
