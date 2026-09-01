@@ -126,6 +126,8 @@ impl InMemoryKvIndexerBackend {
         let mut dirty_roots = Vec::new();
         let mut reported_chains = Vec::new();
         let mut revoked_hashes = Vec::new();
+        // 只有 worker 的 fast-path 身份变更才需要从所有根重算；REPORT、
+        // REVOKE 与 CLEAR 都会把受影响 hash 加入局部传播队列。
         let mut recompute_from_graph_roots = false;
         for action in req.actions {
             match ExternalKvActionType::try_from(action.r#type) {
@@ -177,7 +179,6 @@ impl InMemoryKvIndexerBackend {
                     }
                 }
                 Ok(ExternalKvActionType::ActionRevoke) => {
-                    recompute_from_graph_roots = true;
                     for hash in action.hashes {
                         revoke_one(&mut state, &worker_id, &hash, action.tier);
                         dirty_roots.push(hash);
@@ -185,7 +186,6 @@ impl InMemoryKvIndexerBackend {
                     }
                 }
                 Ok(ExternalKvActionType::ActionClearAllAtTier) => {
-                    recompute_from_graph_roots = true;
                     let hashes = state
                         .workers
                         .get(&worker_id)
