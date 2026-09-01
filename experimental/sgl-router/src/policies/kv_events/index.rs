@@ -77,7 +77,6 @@ fn subscribable_ranks(port_base: u16, dp_size: u32) -> Vec<u32> {
 /// routing path entirely.
 pub struct KvEventIndex {
     tree: Arc<HashTree>,
-    maintain_tree: bool,
     subscribers: Arc<KvEventSubscriberRegistry>,
     /// Second registry subscribing to the load topic (one per worker rank),
     /// feeding `LoadStat` snapshots into `engine_load`. Shares the pump
@@ -136,24 +135,10 @@ impl KvEventIndex {
         http: reqwest::Client,
         block_size_oracle: Arc<BlockSizeOracle>,
     ) -> Arc<Self> {
-        Self::new_with_mode(http, block_size_oracle, true)
+        Self::new_with_mode(http, block_size_oracle)
     }
 
-    /// Discovers worker hash metadata only: seeds the shared [`BlockSizeOracle`]
-    /// but neither subscribes to KV events nor maintains the local tree, because
-    /// an external Indexer is the routing signal.
-    pub fn new_metadata_only_with_http_and_oracle(
-        http: reqwest::Client,
-        block_size_oracle: Arc<BlockSizeOracle>,
-    ) -> Arc<Self> {
-        Self::new_with_mode(http, block_size_oracle, false)
-    }
-
-    fn new_with_mode(
-        http: reqwest::Client,
-        block_size_oracle: Arc<BlockSizeOracle>,
-        maintain_tree: bool,
-    ) -> Arc<Self> {
+    fn new_with_mode(http: reqwest::Client, block_size_oracle: Arc<BlockSizeOracle>) -> Arc<Self> {
         let tree = Arc::new(HashTree::new());
         let (tx, rx) = mpsc::channel::<WorkerEvent>(EVENT_CHANNEL_BUFFER);
         let subscribers = Arc::new(KvEventSubscriberRegistry::new(tx.clone()));
@@ -172,7 +157,6 @@ impl KvEventIndex {
         ));
         Arc::new(Self {
             tree,
-            maintain_tree,
             subscribers,
             load_subscribers,
             engine_load,
@@ -264,11 +248,7 @@ impl KvEventIndex {
         // hash KV blocks over token bigrams, so the policy must use the bigram
         // hasher for its query hashes to match the worker's stored hashes.
         self.block_size_oracle.set_bigram(cfg.is_bigram);
-        let kv_dp_ranks = if self.maintain_tree {
-            subscribable_ranks(cfg.port_base, cfg.dp_size)
-        } else {
-            Vec::new()
-        };
+        let kv_dp_ranks = subscribable_ranks(cfg.port_base, cfg.dp_size);
         let load_descriptor_complete = cfg.load_port_base.is_some() && cfg.load_topic.is_some();
         if cfg.load_port_base.is_some() != cfg.load_topic.is_some() {
             warn!(
@@ -296,26 +276,15 @@ impl KvEventIndex {
             );
             return;
         }
-        if self.maintain_tree {
-            info!(
-                worker_url = %worker_url,
-                dp_size = cfg.dp_size,
-                port_base = cfg.port_base,
-                load_port_base = ?cfg.load_port_base,
-                block_size = cfg.block_size,
-                is_bigram = cfg.is_bigram,
-                "kv-events: subscribing",
-            );
-        } else {
-            info!(
-                worker_url = %worker_url,
-                dp_size = cfg.dp_size,
-                load_port_base = ?cfg.load_port_base,
-                block_size = cfg.block_size,
-                is_bigram = cfg.is_bigram,
-                "kv-events: external Indexer configured; subscribing only to engine load",
-            );
-        }
+        info!(
+            worker_url = %worker_url,
+            dp_size = cfg.dp_size,
+            port_base = cfg.port_base,
+            load_port_base = ?cfg.load_port_base,
+            block_size = cfg.block_size,
+            is_bigram = cfg.is_bigram,
+            "kv-events: subscribing",
+        );
         // Mark every rank live BEFORE the subscriber starts so any event
         // it queues is accepted by the pump.
         {
@@ -333,7 +302,7 @@ impl KvEventIndex {
                 dp_ranks: dp_ranks.clone(),
             },
         );
-        if self.maintain_tree && !kv_dp_ranks.is_empty() {
+        if !kv_dp_ranks.is_empty() {
             self.subscribers.add_worker(worker_url, &cfg).await;
         }
         // Mark only the ranks that have an actual SUB socket. `EngineLoadTable`
@@ -852,33 +821,6 @@ mod tests {
             index.block_size_oracle().is_bigram(),
             "add_worker must seed the bigram flag from EventConfig"
         );
-        index.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn metadata_only_mode_keeps_the_load_subscriber() {
-        let oracle = BlockSizeOracle::new();
-        let index = KvEventIndex::new_metadata_only_with_http_and_oracle(
-            reqwest::Client::new(),
-            Arc::clone(&oracle),
-        );
-        let cfg = EventConfig {
-            host: "127.0.0.1".into(),
-            port_base: 30400,
-            topic: "kv-events".into(),
-            load_port_base: Some(30410),
-            load_topic: Some("load".into()),
-            block_size: 64,
-            dp_size: 2,
-            is_bigram: true,
-        };
-
-        index.add_worker("http://127.0.0.1:30400", Some(cfg)).await;
-
-        assert_eq!(oracle.get(), Some(64));
-        assert!(oracle.is_bigram());
-        assert_eq!(index.known_worker_count(), 1);
-        assert_eq!(index.engine_load().expected_count(), 1);
         index.shutdown().await;
     }
 

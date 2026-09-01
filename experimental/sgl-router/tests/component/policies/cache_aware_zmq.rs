@@ -56,7 +56,7 @@ fn build_worker(url: &str, model: &str) -> Arc<Worker> {
 /// same shape as the SMG e2e test. We tie-break on min-load: worker B
 /// is bumped above worker A so the matched-worker pick prefers A.
 #[tokio::test]
-async fn zmq_indexer_routes_to_publishing_worker_e2e() {
+async fn zmq_local_tree_routes_to_publishing_worker_e2e() {
     let model_id = ModelId("tiny".into());
 
     // 1. Tokenizer registry — use the in-tree tiny fixture.
@@ -115,7 +115,6 @@ async fn zmq_indexer_routes_to_publishing_worker_e2e() {
             cache_threshold: 0.0,
             balance_abs_threshold: 32,
             balance_rel_threshold: 1.1,
-            kv_indexer_endpoint: None,
         },
         kv_index.tree(),
         Arc::clone(&tokenizers),

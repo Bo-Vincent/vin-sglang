@@ -45,17 +45,10 @@ pub struct RequestTokens {
     pub engine_equivalent: bool,
 }
 
-/// External indexer answer prepared by the async ingress path for the
-/// synchronous cache-aware policy.
-pub struct ExternalPrefixSignal {
-    pub outcome: sgl_kv_indexer::PrefixOutcome,
-    pub query_blocks: usize,
-}
-
-/// 将 Indexer 报告的共享 block 深度换算为保守的 token 命中量。
+/// 将本地 radix tree 的共享 block 深度换算为保守的 token 命中量。
 ///
-/// Indexer 的匹配块数属于外部输入，先按查询长度截断；两种使用外部
-/// Indexer 的 policy 必须共享这一定义，避免把相同 `H` 算成不同 `E=L-H`。
+/// 匹配块数先按查询长度截断；所有消费本地 tree 的 policy 必须共享这一定义，
+/// 避免把相同 `H` 算成不同 `E=L-H`。
 pub(crate) fn estimate_matched_prefix_tokens(
     input_tokens: u64,
     query_blocks: usize,
@@ -208,7 +201,6 @@ pub struct SelectionContext<'a> {
     candidate_range_id: &'a str,
     input_tokens: Option<u64>,
     request_tokens: Option<&'a [u32]>,
-    external_prefix: Option<&'a ExternalPrefixSignal>,
     load_snapshot: Option<&'a EngineLoadSnapshot>,
     prefill_cache_bucket: Option<(&'a BucketSelector, BucketRequest)>,
     affinity_lookup_enabled: bool,
@@ -225,7 +217,6 @@ impl<'a> SelectionContext<'a> {
             candidate_range_id: "global",
             input_tokens: None,
             request_tokens: None,
-            external_prefix: None,
             load_snapshot: None,
             prefill_cache_bucket: None,
             affinity_lookup_enabled: true,
@@ -246,7 +237,6 @@ impl<'a> SelectionContext<'a> {
             candidate_range_id: "global",
             input_tokens: None,
             request_tokens: None,
-            external_prefix: None,
             load_snapshot: None,
             prefill_cache_bucket: None,
             affinity_lookup_enabled: true,
@@ -275,14 +265,6 @@ impl<'a> SelectionContext<'a> {
     /// 附加请求 input token 数。
     pub fn with_input_tokens(mut self, input_tokens: u64) -> Self {
         self.input_tokens = Some(input_tokens);
-        self
-    }
-
-    pub fn with_external_prefix(
-        mut self,
-        external_prefix: Option<&'a ExternalPrefixSignal>,
-    ) -> Self {
-        self.external_prefix = external_prefix;
         self
     }
 
@@ -342,10 +324,6 @@ impl<'a> SelectionContext<'a> {
     /// Ingress 预计算的 routing tokens。
     pub fn request_tokens(&self) -> Option<&[u32]> {
         self.request_tokens
-    }
-
-    pub fn external_prefix(&self) -> Option<&ExternalPrefixSignal> {
-        self.external_prefix
     }
 
     pub fn load_snapshot(&self) -> Option<&EngineLoadSnapshot> {
@@ -409,7 +387,7 @@ pub struct CacheCandidateProposal {
 
 /// Shortest-TTFT 在 hard admission 前提交的全量候选。
 ///
-/// 与 [`CacheCandidateProposal`] 不同，它保留没有命中 Indexer 的 worker：
+/// 与 [`CacheCandidateProposal`] 不同，它保留本地 tree 没有命中的 worker：
 /// baseline 需要把它们的 `H=0`、`E=L` 一起纳入 TTFT 比较。
 #[derive(Clone)]
 pub struct ShortestTtftCandidateProposal {

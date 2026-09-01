@@ -33,7 +33,6 @@ pub struct AppContext {
     pub metrics: Arc<MetricsRegistry>,
     /// #34608 Engine LoadStat 的共享表；请求入口从它捕获一次不可变快照。
     pub engine_load: Arc<EngineLoadTable>,
-    pub prefix_index: Option<Arc<dyn sgl_kv_indexer::PrefixIndex>>,
     pub block_size_oracle: Arc<BlockSizeOracle>,
     ready: AtomicBool,
 }
@@ -89,7 +88,6 @@ impl AppContext {
             bucket_selector,
             active_load,
             metrics,
-            prefix_index: None,
             block_size_oracle: BlockSizeOracle::new(),
             engine_load: EngineLoadTable::new(),
             ready: AtomicBool::new(false),
@@ -143,7 +141,6 @@ impl AppContext {
             bucket_selector: Arc::new(BucketSelector::new(None)),
             active_load: ActiveLoadRegistry::with_defaults(),
             metrics: MetricsRegistry::new(),
-            prefix_index: None,
             block_size_oracle: BlockSizeOracle::new(),
             engine_load: EngineLoadTable::new(),
             ready: AtomicBool::new(false),

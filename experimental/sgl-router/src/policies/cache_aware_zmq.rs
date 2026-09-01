@@ -71,7 +71,7 @@ use std::time::Instant;
 /// doesn't have useful signal.
 pub struct CacheAwareZmqPolicy {
     config: CacheAwareConfig,
-    /// Per-process KV-event hash tree, fed by the indexer. Cheap to
+    /// Per-process KV-event hash tree, fed by the local subscriber. Cheap to
     /// clone an `Arc`; we never write to the tree from here.
     tree: Arc<HashTree>,
     /// Tokenizer registry — selection reads `model_id` from the context
@@ -269,47 +269,6 @@ impl CacheAwareZmqPolicy {
             imbalanced,
         }
     }
-
-    fn select_external(
-        &self,
-        workers: &[Arc<Worker>],
-        ctx: &SelectionContext<'_>,
-        signal: &crate::policies::ExternalPrefixSignal,
-        loads: &WorkerLoads,
-    ) -> Option<Arc<Worker>> {
-        let sgl_kv_indexer::PrefixOutcome::Matched { matches, .. } = &signal.outcome else {
-            return None;
-        };
-        if signal.query_blocks == 0 {
-            return None;
-        }
-
-        // The index may include unhealthy workers or workers in another pool.
-        let best_routable_blocks = matches
-            .iter()
-            .filter(|m| workers.iter().any(|worker| worker.url == m.address))
-            .map(|m| m.matched_prefix_blocks)
-            .max()
-            .unwrap_or(0);
-
-        let match_rate = best_routable_blocks as f32 / signal.query_blocks as f32;
-        if let Some(metrics) = self.metrics.get() {
-            metrics.observe_overlap_blocks(ctx.model().0.as_str(), best_routable_blocks as u64);
-        }
-        if match_rate <= self.config.cache_threshold {
-            return None;
-        }
-
-        workers
-            .iter()
-            .filter(|worker| {
-                matches.iter().any(|m| {
-                    m.matched_prefix_blocks == best_routable_blocks && m.address == worker.url
-                })
-            })
-            .min_by_key(|worker| loads.load_of(worker))
-            .cloned()
-    }
 }
 
 impl Policy for CacheAwareZmqPolicy {
@@ -362,14 +321,6 @@ impl Policy for CacheAwareZmqPolicy {
                 );
             }
             return chosen;
-        }
-
-        // An external signal is authoritative: an empty/unusable result
-        // degrades only to min-load and never consults the local radix tree.
-        if let Some(signal) = ctx.external_prefix() {
-            return self
-                .select_external(workers, ctx, signal, &loads)
-                .or_else(|| Self::pick_min_load(workers, &loads));
         }
 
         // 2. Routing tokens. Prefer the ids computed once at ingress; fall
@@ -493,7 +444,6 @@ mod tests {
             cache_threshold: 0.5,
             balance_abs_threshold: 32,
             balance_rel_threshold: 1.1,
-            kv_indexer_endpoint: None,
         }
     }
 
@@ -620,151 +570,6 @@ mod tests {
         assert_eq!(chosen.url, "http://w1:30000");
     }
 
-    #[test]
-    fn external_prefix_signal_skips_unroutable_best_match() {
-        let mut config = cfg_default();
-        config.cache_threshold = 0.0;
-        let policy = CacheAwareZmqPolicy::new(
-            config,
-            Arc::new(HashTree::new()),
-            tokenizer_registry_with_tiny(),
-            oracle_for_tests(4),
-            EngineLoadTable::new(),
-        );
-        let w0 = worker("http://w0:30000", "tiny");
-        let w1 = worker("http://w1:30000", "tiny");
-        let _load = w0.load_guard();
-        let workers = vec![Arc::clone(&w0), Arc::clone(&w1)];
-        let signal = crate::policies::ExternalPrefixSignal {
-            outcome: sgl_kv_indexer::PrefixOutcome::Matched {
-                matches: vec![
-                    sgl_kv_indexer::PrefixMatch {
-                        address: "http://gone:30000".into(),
-                        matched_prefix_blocks: 4,
-                        worker_id: "gone".into(),
-                    },
-                    sgl_kv_indexer::PrefixMatch {
-                        address: w0.url.clone(),
-                        matched_prefix_blocks: 2,
-                        worker_id: "w0".into(),
-                    },
-                ],
-                best_prefix_blocks: 4,
-            },
-            query_blocks: 4,
-        };
-        let model = ModelId("tiny".into());
-        let ctx = SelectionContext::new(&model, None).with_external_prefix(Some(&signal));
-        let chosen = policy.select(&workers, &ctx).expect("must pick");
-        assert_eq!(chosen.url, w0.url);
-    }
-
-    #[test]
-    fn external_empty_result_uses_min_load_without_local_tree() {
-        let tree = Arc::new(HashTree::new());
-        let registry = tokenizer_registry_with_tiny();
-        let text = "hello world hello world hello world";
-        let tok = registry.get("tiny").unwrap();
-        let ids = adapter::encode(&tok, text).unwrap();
-        let hashes = compute_block_hashes(&ids, 4);
-        tree.insert(&KvWorkerId::new("http://w0:30000".into(), 0), None, &hashes);
-
-        let policy = CacheAwareZmqPolicy::new(
-            cfg_default(),
-            tree,
-            registry,
-            oracle_for_tests(4),
-            EngineLoadTable::new(),
-        );
-        let w0 = worker("http://w0:30000", "tiny");
-        let w1 = worker("http://w1:30000", "tiny");
-        let _load = w0.load_guard();
-        let workers = vec![Arc::clone(&w0), Arc::clone(&w1)];
-        let signal = crate::policies::ExternalPrefixSignal {
-            outcome: sgl_kv_indexer::PrefixOutcome::Empty,
-            query_blocks: 4,
-        };
-        let model = ModelId("tiny".into());
-        let body = serde_json::to_vec(&serde_json::json!({"prompt": text})).unwrap();
-        let ctx = SelectionContext::new(&model, Some(&body)).with_external_prefix(Some(&signal));
-        let chosen = policy.select(&workers, &ctx).expect("must pick");
-        assert_eq!(chosen.url, w1.url);
-    }
-
-    /// 外部 Indexer 命中的同一 cache depth 必须用入口冻结的 Engine Load 破局；
-    /// Router 本地 active-load 在该快照之后改变时，不能让同一次请求观察到不同顺序。
-    #[test]
-    fn external_match_tiebreak_uses_the_request_snapshot() {
-        let mut config = cfg_default();
-        config.cache_threshold = 0.0;
-        config.balance_abs_threshold = 100;
-        let policy = new_policy(
-            config,
-            Arc::new(HashTree::new()),
-            tokenizer_registry_with_tiny(),
-            oracle_for_tests(4),
-        );
-        let w0 = worker("http://w0:30000", "tiny");
-        let w1 = worker("http://w1:30000", "tiny");
-        // 与快照反向的本地计数：旧实现会因此选择 w0。
-        let _after_snapshot: Vec<_> = (0..10).map(|_| w1.load_guard()).collect();
-        let workers = vec![Arc::clone(&w0), Arc::clone(&w1)];
-        let snapshot_at = Instant::now();
-        let snapshot = EngineLoadSnapshot::from_workers(
-            17,
-            HashMap::from([
-                (
-                    w0.url.clone(),
-                    EngineWorkerLoad {
-                        num_running_reqs: 50,
-                        num_waiting_reqs: 0,
-                        num_tokens: 0,
-                        max_total_num_tokens: 0,
-                        captured_at: snapshot_at,
-                    },
-                ),
-                (
-                    w1.url.clone(),
-                    EngineWorkerLoad {
-                        num_running_reqs: 1,
-                        num_waiting_reqs: 0,
-                        num_tokens: 0,
-                        max_total_num_tokens: 0,
-                        captured_at: snapshot_at,
-                    },
-                ),
-            ]),
-        );
-        let signal = crate::policies::ExternalPrefixSignal {
-            outcome: sgl_kv_indexer::PrefixOutcome::Matched {
-                matches: vec![
-                    sgl_kv_indexer::PrefixMatch {
-                        address: w0.url.clone(),
-                        matched_prefix_blocks: 4,
-                        worker_id: w0.id.0.clone(),
-                    },
-                    sgl_kv_indexer::PrefixMatch {
-                        address: w1.url.clone(),
-                        matched_prefix_blocks: 4,
-                        worker_id: w1.id.0.clone(),
-                    },
-                ],
-                best_prefix_blocks: 4,
-            },
-            query_blocks: 4,
-        };
-        let model = ModelId("tiny".into());
-        let ctx = SelectionContext::new(&model, None)
-            .with_external_prefix(Some(&signal))
-            .with_load_snapshot(&snapshot);
-
-        assert_eq!(
-            policy.select(&workers, &ctx).expect("must select").url,
-            w1.url,
-            "external-match tiebreak must use the request snapshot, not later active load"
-        );
-    }
-
     /// Tree contains w0's prefix; cache-aware selection picks w0 even
     /// though w1 has lower load (the load skew is below the imbalance
     /// threshold, so cache wins).
@@ -792,7 +597,6 @@ mod tests {
                 cache_threshold: 0.0, // any match counts
                 balance_abs_threshold: 32,
                 balance_rel_threshold: 1.1,
-                kv_indexer_endpoint: None,
             },
             tree,
             registry,
@@ -830,7 +634,6 @@ mod tests {
                 cache_threshold: 0.0,
                 balance_abs_threshold: 32,
                 balance_rel_threshold: 1.1,
-                kv_indexer_endpoint: None,
             },
             tree,
             registry,
@@ -876,7 +679,6 @@ mod tests {
                 cache_threshold: 0.0,
                 balance_abs_threshold: 32,
                 balance_rel_threshold: 1.1,
-                kv_indexer_endpoint: None,
             },
             tree,
             toks,
@@ -928,7 +730,6 @@ mod tests {
                 cache_threshold: 1.0, // match_rate <= 1.0 always -> always fall back
                 balance_abs_threshold: 32,
                 balance_rel_threshold: 1.1,
-                kv_indexer_endpoint: None,
             },
             tree,
             toks,
@@ -1012,7 +813,6 @@ mod tests {
                     cache_threshold: 0.0,
                     balance_abs_threshold: 32,
                     balance_rel_threshold: 1.1,
-                    kv_indexer_endpoint: None,
                 },
                 tree,
                 Arc::clone(&registry),
@@ -1052,7 +852,6 @@ mod tests {
                     cache_threshold: 0.0,
                     balance_abs_threshold: 32,
                     balance_rel_threshold: 1.1,
-                    kv_indexer_endpoint: None,
                 },
                 tree,
                 Arc::clone(&registry),
@@ -1111,7 +910,6 @@ mod tests {
                 cache_threshold: 0.0,
                 balance_abs_threshold: 32,
                 balance_rel_threshold: 1.1,
-                kv_indexer_endpoint: None,
             },
             tree,
             registry,
@@ -1184,7 +982,6 @@ mod tests {
                 cache_threshold: 0.0,
                 balance_abs_threshold: 32,
                 balance_rel_threshold: 1.1,
-                kv_indexer_endpoint: None,
             },
             tree,
             registry,
@@ -1223,7 +1020,6 @@ mod tests {
                 cache_threshold: 0.0,
                 balance_abs_threshold: 32,
                 balance_rel_threshold: 1.1,
-                kv_indexer_endpoint: None,
             },
             tree,
             registry,
@@ -1327,7 +1123,6 @@ mod tests {
                 cache_threshold: 0.0,
                 balance_abs_threshold: 32,
                 balance_rel_threshold: 1.1,
-                kv_indexer_endpoint: None,
             },
             tree,
             registry,
@@ -1363,7 +1158,6 @@ mod tests {
                 cache_threshold: 0.0, // would normally always match
                 balance_abs_threshold: 5,
                 balance_rel_threshold: 2.0,
-                kv_indexer_endpoint: None,
             },
             tree,
             registry,
@@ -1410,7 +1204,6 @@ mod tests {
                 cache_threshold: 0.0,
                 balance_abs_threshold: 5,
                 balance_rel_threshold: 2.0,
-                kv_indexer_endpoint: None,
             },
             tree,
             registry,
@@ -1512,7 +1305,6 @@ mod tests {
                 // 2) and selection reaches the matched-set tiebreak.
                 balance_abs_threshold: 100,
                 balance_rel_threshold: 100.0,
-                kv_indexer_endpoint: None,
             },
             tree,
             registry,
@@ -1563,7 +1355,6 @@ mod tests {
                 // matched-set tiebreak, which also uses `load_of`.
                 balance_abs_threshold: 100,
                 balance_rel_threshold: 100.0,
-                kv_indexer_endpoint: None,
             },
             tree,
             registry,
@@ -1670,7 +1461,6 @@ mod tests {
                 cache_threshold: 0.0,
                 balance_abs_threshold: 32,
                 balance_rel_threshold: 1.1,
-                kv_indexer_endpoint: None,
             },
             tree,
             registry,
@@ -1797,7 +1587,6 @@ mod tests {
                 cache_threshold: 0.99,
                 balance_abs_threshold: 32,
                 balance_rel_threshold: 1.1,
-                kv_indexer_endpoint: None,
             },
             tree,
             tokenizer_registry_with_tiny(),
@@ -1881,7 +1670,6 @@ mod tests {
                 cache_threshold: 0.0,
                 balance_abs_threshold: 32,
                 balance_rel_threshold: 1.1,
-                kv_indexer_endpoint: None,
             },
             tree.clone(),
             registry,
@@ -1979,7 +1767,6 @@ mod tests {
                 cache_threshold: 0.0,
                 balance_abs_threshold: 32,
                 balance_rel_threshold: 1.1,
-                kv_indexer_endpoint: None,
             },
             tree,
             registry,

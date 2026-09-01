@@ -10,16 +10,14 @@ use crate::policies::admission::{
 use crate::policies::buckets::BucketRequest;
 use crate::policies::decode::{build_decode_policy, DecodeSelectionContext};
 use crate::policies::engine_load::EngineLoadSnapshot;
-use crate::policies::kv_events::{compute_block_hashes, compute_block_hashes_bigram};
 use crate::policies::registry::{PdPoolResolver, PdResolveError};
 use crate::policies::{
-    request_tokens_for, ExternalPrefixSignal, PrefillProposal, ProposalKind, RequestTokens,
-    SelectionContext,
+    request_tokens_for, PrefillProposal, ProposalKind, RequestTokens, SelectionContext,
 };
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
 use crate::server::metrics::{
-    KvIndexerQueryOutcome, MetricsRegistry, RequestOutcome, StaleRequestOutcome, WorkerModeLabel,
+    MetricsRegistry, RequestOutcome, StaleRequestOutcome, WorkerModeLabel,
 };
 use crate::workers::{LoadGuard, Worker};
 use axum::body::Body;
@@ -289,38 +287,6 @@ pub async fn chat_completions(
     let request_tokens = request_value
         .as_ref()
         .and_then(|v| request_tokens_for(&ctx.tokenizers, &model_id, v));
-    let external_prefix = match (
-        ctx.prefix_index.as_ref(),
-        request_tokens.as_ref(),
-        ctx.block_size_oracle.get(),
-    ) {
-        (Some(index), Some(tokens), Some(block_size)) => {
-            let hashes = if ctx.block_size_oracle.is_bigram() {
-                compute_block_hashes_bigram(&tokens.ids, block_size as usize)
-            } else {
-                compute_block_hashes(&tokens.ids, block_size as usize)
-            };
-            let query_blocks = hashes.len();
-            if hashes.is_empty() {
-                None
-            } else {
-                let query_started = std::time::Instant::now();
-                let query_result = index.match_prefix(hashes).await;
-                ctx.metrics.observe_kv_indexer_query(
-                    kv_indexer_query_outcome(&query_result),
-                    query_started.elapsed().as_secs_f64(),
-                );
-                resolve_prefix_query(query_result, &model_str)?.map(|outcome| {
-                    ExternalPrefixSignal {
-                        outcome,
-                        query_blocks,
-                    }
-                })
-            }
-        }
-        _ => None,
-    };
-
     // Prefer exact ingress tokens; otherwise use the conservative estimate.
     let prefill_load = request_tokens
         .as_ref()
@@ -392,7 +358,6 @@ pub async fn chat_completions(
             .with_candidate_range_id(candidate_range.id)
             .with_input_tokens(request_input_tokens)
             .with_request_tokens(request_tokens.as_ref().map(|tokens| tokens.ids.as_slice()))
-            .with_external_prefix(external_prefix.as_ref())
             .with_load_snapshot(&load_snapshot);
         let selection_ctx = if !affinity_lookup_enabled {
             selection_ctx.without_affinity_lookup()
@@ -462,7 +427,6 @@ pub async fn chat_completions(
                 .with_candidate_range_id(global_range.id)
                 .with_input_tokens(request_input_tokens)
                 .with_request_tokens(request_tokens.as_ref().map(|tokens| tokens.ids.as_slice()))
-                .with_external_prefix(external_prefix.as_ref())
                 .with_load_snapshot(&load_snapshot)
                 .with_prefill_cache_bucket(&ctx.bucket_selector, prefill_bucket_request);
             let PrefillProposal::CacheCandidates(proposal) =
@@ -508,9 +472,9 @@ pub async fn chat_completions(
         })
         .flatten();
 
-    // Shortest-TTFT 是独立 baseline，不是 Cache-Aware mode：一次 ingress
-    // Indexer 查询后仍保留 H=0 worker，复用 hard admission，再按图中的
-    // score / guard / CAS 规则决定；无法决策时才退化普通 P2。
+    // Shortest-TTFT 是独立 baseline：本地 radix tree 命中保留 H=0 worker，
+    // 复用 hard admission，再按图中的 score / guard / CAS 规则决定；无法
+    // 决策时才退化普通 P2。
     let shortest_ttft_winner = (ctx.config.model.policy == PolicyKind::ShortestTtft)
         .then(|| {
             let global_range = CandidateRange::global(&workers);
@@ -522,7 +486,6 @@ pub async fn chat_completions(
                     .with_request_tokens(
                         request_tokens.as_ref().map(|tokens| tokens.ids.as_slice()),
                     )
-                    .with_external_prefix(external_prefix.as_ref())
                     .with_load_snapshot(&load_snapshot)
                     .with_prefill_cache_bucket(&ctx.bucket_selector, prefill_bucket_request);
             let PrefillProposal::ShortestTtftCandidates(proposal) =
@@ -573,7 +536,6 @@ pub async fn chat_completions(
                 .with_candidate_range_id(global_range.id)
                 .with_input_tokens(request_input_tokens)
                 .with_request_tokens(request_tokens.as_ref().map(|tokens| tokens.ids.as_slice()))
-                .with_external_prefix(external_prefix.as_ref())
                 .with_load_snapshot(&load_snapshot)
                 .without_affinity_assignment();
             policy.propose(global_range.workers, &probe_ctx)
@@ -604,8 +566,8 @@ pub async fn chat_completions(
                 ctx.config.model.policy,
                 PolicyKind::CacheAware | PolicyKind::ShortestTtft
             ) {
-                // 外部 Indexer 无信号或没有 hard-admitted candidate 时，按
-                // domain 顺序用普通 P2 重试。
+                // 本地树没有可 hard-admit 的 candidate 时，按 domain 顺序用
+                // 普通 P2 重试。
                 return prefill_domains
                     .iter()
                     .find_map(|domain| select_prefill_in_domain(domain, false, false));
@@ -1077,58 +1039,6 @@ pub async fn chat_completions(
     }
 }
 
-fn resolve_prefix_query(
-    result: Result<sgl_kv_indexer::PrefixOutcome, sgl_kv_indexer::PrefixIndexError>,
-    model: &str,
-) -> Result<Option<sgl_kv_indexer::PrefixOutcome>, ApiError> {
-    use sgl_kv_indexer::PrefixIndexError;
-    match result {
-        Ok(outcome) => Ok(Some(outcome)),
-        // The prefix hit only improves worker choice, so an indexer that is
-        // shedding, slow, or down costs cache affinity — not availability.
-        Err(
-            error @ (PrefixIndexError::Overloaded
-            | PrefixIndexError::Timeout
-            | PrefixIndexError::Unreachable),
-        ) => {
-            tracing::warn!(%model, error = %error, "KV Indexer unavailable; falling back to min-load routing");
-            Ok(None)
-        }
-        // A prompt too long to fit one gRPC message is still a prompt a worker
-        // can serve, so it costs cache affinity like the cases above. Logged
-        // separately because the remedy is operational — raise the indexer's
-        // message limit — rather than waiting for the indexer to recover.
-        Err(error @ PrefixIndexError::QueryTooLarge) => {
-            tracing::warn!(%model, error = %error, "prompt exceeds the KV Indexer query size limit; falling back to min-load routing");
-            Ok(None)
-        }
-        // A rejection means the router and the indexer disagree on the request
-        // contract; degrading would hide that from every request.
-        Err(error) => {
-            tracing::warn!(%model, error = %error, "KV Indexer rejected the query");
-            Err(ApiError::PolicySelectionFailed {
-                model: model.to_string(),
-            })
-        }
-    }
-}
-
-/// 将真实 KV Indexer RPC 结果映射为低基数观测标签。该映射位于
-/// fail-open 决策之前，因此 timeout/unreachable 不会被请求成功掩盖。
-fn kv_indexer_query_outcome(
-    result: &Result<sgl_kv_indexer::PrefixOutcome, sgl_kv_indexer::PrefixIndexError>,
-) -> KvIndexerQueryOutcome {
-    use sgl_kv_indexer::PrefixIndexError;
-    match result {
-        Ok(_) => KvIndexerQueryOutcome::Success,
-        Err(PrefixIndexError::Overloaded) => KvIndexerQueryOutcome::Overloaded,
-        Err(PrefixIndexError::Timeout) => KvIndexerQueryOutcome::Timeout,
-        Err(PrefixIndexError::Unreachable) => KvIndexerQueryOutcome::Unreachable,
-        Err(PrefixIndexError::QueryTooLarge) => KvIndexerQueryOutcome::TooLarge,
-        Err(PrefixIndexError::Rejected(_)) => KvIndexerQueryOutcome::Rejected,
-    }
-}
-
 fn parse_optional_positive_u64_header(
     headers: &HeaderMap,
     name: &HeaderName,
@@ -1467,59 +1377,6 @@ fn parse_probe(body: &Bytes) -> Result<RequestProbe, ApiError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// 不可用的 Indexer 不能让本可由普通路由服务的请求失败。`QueryTooLarge`
-    /// 也同理：它失去 cache signal，而不是被伪装成真实的空命中。
-    #[test]
-    fn unavailable_indexer_degrades_to_no_prefix_signal() {
-        for error in [
-            sgl_kv_indexer::PrefixIndexError::Overloaded,
-            sgl_kv_indexer::PrefixIndexError::Timeout,
-            sgl_kv_indexer::PrefixIndexError::Unreachable,
-            sgl_kv_indexer::PrefixIndexError::QueryTooLarge,
-        ] {
-            assert_eq!(
-                resolve_prefix_query(Err(error.clone()), "tiny").unwrap(),
-                None,
-                "{error} should degrade"
-            );
-        }
-    }
-
-    #[test]
-    fn kv_indexer_query_outcome_keeps_fail_open_categories_visible() {
-        use sgl_kv_indexer::{PrefixIndexError, PrefixOutcome, RpcCode};
-
-        assert!(matches!(
-            kv_indexer_query_outcome(&Ok(PrefixOutcome::Empty)),
-            KvIndexerQueryOutcome::Success
-        ));
-        assert!(matches!(
-            kv_indexer_query_outcome(&Err(PrefixIndexError::Timeout)),
-            KvIndexerQueryOutcome::Timeout
-        ));
-        assert!(matches!(
-            kv_indexer_query_outcome(&Err(PrefixIndexError::Unreachable)),
-            KvIndexerQueryOutcome::Unreachable
-        ));
-        assert!(matches!(
-            kv_indexer_query_outcome(&Err(PrefixIndexError::Rejected(RpcCode::InvalidArgument))),
-            KvIndexerQueryOutcome::Rejected
-        ));
-    }
-
-    #[test]
-    fn rejected_indexer_query_still_fails_selection() {
-        assert!(matches!(
-            resolve_prefix_query(
-                Err(sgl_kv_indexer::PrefixIndexError::Rejected(
-                    sgl_kv_indexer::RpcCode::InvalidArgument
-                )),
-                "tiny"
-            ),
-            Err(ApiError::PolicySelectionFailed { .. })
-        ));
-    }
 
     #[test]
     fn bucket_routing_requests_tokens_even_for_a_non_token_policy() {

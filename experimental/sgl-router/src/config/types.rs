@@ -258,7 +258,7 @@ pub struct ModelConfig {
     /// 可选静态 Bucket 配置；`None` 使用全局 domain。
     pub bucket_config: Option<BucketConfig>,
     pub circuit_breaker: Option<CircuitBreakerConfig>,
-    /// Cache-Aware ZMQ tuning and optional Shortest-TTFT external Indexer endpoint.
+    /// Cache-Aware ZMQ tuning.
     pub cache_aware: Option<CacheAwareConfig>,
     /// Tuning for the sticky-session policy. `Some` exactly when
     /// `policy = "sticky"` (built by [`crate::config::cli::Cli::into_config`]).
@@ -348,15 +348,6 @@ fn parse_fuse_weight(name: &str, raw: &str) -> Result<f32, String> {
     Ok(w)
 }
 
-/// External KV Indexer client settings.
-#[derive(Debug, Clone)]
-pub struct KvIndexerEndpointConfig {
-    pub url: String,
-    pub query_timeout_ms: u64,
-    pub query_max_inflight: usize,
-}
-
-/// Per-model legacy Cache-Aware-ZMQ tuning and shared external Indexer setup.
 #[derive(Debug, Clone)]
 pub struct CacheAwareConfig {
     /// Lower bound on `matched_blocks / total_blocks` for the tree match
@@ -373,10 +364,6 @@ pub struct CacheAwareConfig {
     /// that the absolute check is gated on. Default 1.1 — 10 % relative
     /// difference triggers re-balancing.
     pub balance_rel_threshold: f32,
-    /// Optional external KV Indexer client configuration. Only Shortest-TTFT
-    /// uses it as the ingress cache signal; Cache-Aware always queries the
-    /// local ZMQ radix tree.
-    pub kv_indexer_endpoint: Option<KvIndexerEndpointConfig>,
 }
 
 impl Default for CacheAwareConfig {
@@ -385,7 +372,6 @@ impl Default for CacheAwareConfig {
             cache_threshold: default_cache_threshold(),
             balance_abs_threshold: default_balance_abs(),
             balance_rel_threshold: default_balance_rel(),
-            kv_indexer_endpoint: None,
         }
     }
 }
@@ -407,11 +393,6 @@ pub const DEFAULT_STICKY_HEADER: &str = "x-sgl-routing-key";
 
 /// Session-Aware 默认请求 header。
 pub const DEFAULT_SESSION_ID_HEADER: &str = "x-session-id";
-
-/// External Indexer 查询的默认 deadline。
-pub const DEFAULT_KV_INDEXER_QUERY_TIMEOUT_MS: u64 = 25;
-pub const DEFAULT_KV_INDEXER_QUERY_MAX_INFLIGHT: usize = 32;
-
 /// Session affinity 是否允许 Pressure Guard 选择 backup。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
 pub enum AffinityMode {
@@ -473,7 +454,7 @@ impl Default for AffinityConfig {
             pressure_abs_threshold_tokens: 1_024,
             pressure_abs_threshold_ms: None,
             pressure_rel_threshold: 1.5,
-            // Indexer 会截断 prefix scan，默认使用绝对 token 下限。
+            // 本地 radix tree 会截断 prefix scan，默认使用绝对 token 下限。
             cache_affinity_min_matched_tokens: Some(1_024),
             cache_affinity_min_match_ratio: None,
             cache_candidate_min_workers: 8,
@@ -616,9 +597,13 @@ pub enum K8sDiscoveryMode {
 /// invalid.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
-    #[error("discovery.k8s requires either `label_selector` (plain) or both `prefill_selector` and `decode_selector` (PD); none were set")]
+    #[error(
+        "discovery.k8s requires either `label_selector` (plain) or both `prefill_selector` and `decode_selector` (PD); none were set"
+    )]
     NoSelector,
-    #[error("discovery.k8s: `label_selector` (plain) and `prefill_selector`/`decode_selector` (PD) are mutually exclusive — set one or the other, not both")]
+    #[error(
+        "discovery.k8s: `label_selector` (plain) and `prefill_selector`/`decode_selector` (PD) are mutually exclusive — set one or the other, not both"
+    )]
     MixedModes,
     #[error("discovery.k8s: PD mode requires BOTH `prefill_selector` and `decode_selector`")]
     PartialPdSelectors,

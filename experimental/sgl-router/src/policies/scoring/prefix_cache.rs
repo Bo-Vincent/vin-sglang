@@ -34,7 +34,7 @@ const NO_HOLDING: f32 = 0.0;
 pub const DEFAULT_WEIGHT: f32 = 1.0;
 
 pub struct PrefixCachePolicy {
-    /// Per-process KV-event tree, fed by the indexer. Read-only from here.
+    /// Per-process KV-event tree, fed by the local subscriber. Read-only from here.
     tree: Arc<HashTree>,
     /// Worker-published block size. Without it the router cannot hash a prompt
     /// the way the workers did, so every score would be a false miss.

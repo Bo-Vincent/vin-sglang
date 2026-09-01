@@ -438,18 +438,9 @@ def validate_simulator_runtime(args: argparse.Namespace) -> None:
         )
 
 
-def indexer_query_concurrency(endpoint_count: int) -> int:
-    if endpoint_count <= 0:
-        raise ValueError("endpoint count must be positive")
-    return min(endpoint_count, MAX_HTTP_REQUEST_CONCURRENCY)
-
-
 def policy_args(
     policy: str,
-    indexer_endpoint: str,
     *,
-    indexer_query_timeout_ms: int = 100,
-    indexer_query_max_inflight: int = 32,
     cache_aware_tuning: CacheAwareTuning = DEFAULT_CACHE_AWARE_TUNING,
 ) -> list[str]:
     if policy == "power_of_two":
@@ -469,12 +460,6 @@ def policy_args(
         arguments = [
             "--policy",
             policy,
-            "--kv-indexer-endpoint",
-            indexer_endpoint,
-            "--kv-indexer-query-timeout-ms",
-            str(indexer_query_timeout_ms),
-            "--kv-indexer-query-max-inflight",
-            str(indexer_query_max_inflight),
             "--cache-affinity-min-matched-tokens",
             str(cache_aware_tuning.min_matched_tokens),
             "--cache-candidate-min-workers",
@@ -501,16 +486,7 @@ def policy_args(
             arguments.append("--cache-aware-global-backup")
         return arguments
     if policy == "shortest_ttft":
-        return [
-            "--policy",
-            policy,
-            "--kv-indexer-endpoint",
-            indexer_endpoint,
-            "--kv-indexer-query-timeout-ms",
-            str(indexer_query_timeout_ms),
-            "--kv-indexer-query-max-inflight",
-            str(indexer_query_max_inflight),
-        ]
+        return ["--policy", policy]
     raise ValueError(f"unsupported policy: {policy}")
 
 
@@ -866,7 +842,6 @@ def router_command(
     args: argparse.Namespace,
     case: Case,
     worker_urls: Sequence[str],
-    indexer_endpoint: str,
 ) -> list[str]:
     return [
         str(args.router_binary),
@@ -886,9 +861,6 @@ def router_command(
         "240",
         *policy_args(
             case.policy,
-            indexer_endpoint,
-            indexer_query_timeout_ms=args.kv_indexer_query_timeout_ms,
-            indexer_query_max_inflight=indexer_query_concurrency(case.endpoint_count),
             cache_aware_tuning=getattr(
                 args, "cache_aware_tuning", DEFAULT_CACHE_AWARE_TUNING
             ),
@@ -921,10 +893,6 @@ def worker_specs(endpoint_count: int, layout: WorkerPortLayout) -> list[WorkerSp
     ]
 
 
-def needs_external_indexer(policy: str) -> bool:
-    return policy in {"cache_aware", "shortest_ttft"}
-
-
 def start_worker_fleet(
     args: argparse.Namespace, endpoint_count: int, directory: Path
 ) -> tuple[list[WorkerSpec], list[ManagedProcess]]:
@@ -932,7 +900,7 @@ def start_worker_fleet(
     layout = wait_for_available_port_layout(
         endpoint_count=endpoint_count,
         candidates=(configured,) if configured is not None else auto_port_layout_candidates(endpoint_count),
-        reserved_ports=(args.router_port, args.indexer_port),
+        reserved_ports=(args.router_port,),
         timeout=args.worker_port_layout_wait_timeout,
     )
     atomic_write_text(
@@ -996,48 +964,8 @@ def ensure_worker_fleet_healthy(specs: Sequence[WorkerSpec], workers: Sequence[M
 def start_case_control_plane(
     args: argparse.Namespace, case: Case, directory: Path, specs: Sequence[WorkerSpec]
 ) -> list[ManagedProcess]:
-    indexer_endpoint = f"http://127.0.0.1:{args.indexer_port}"
-    indexer_query_max_inflight = indexer_query_concurrency(case.endpoint_count)
     managed: list[ManagedProcess] = []
     try:
-        if needs_external_indexer(case.policy):
-            indexer = start_process(
-                "kv-indexer-server",
-                [str(args.indexer_server)],
-                directory / "kv-indexer-server.log",
-                cwd=args.router_cwd,
-                env={
-                    "KV_INDEXER_LISTEN_ADDR": f"127.0.0.1:{args.indexer_port}",
-                    "KV_INDEXER_PREFIX_QUERY_MAX_INFLIGHT": str(indexer_query_max_inflight),
-                    "KV_INDEXER_MAX_CONCURRENT_STREAMS": str(
-                        max(64, indexer_query_max_inflight)
-                    ),
-                },
-            )
-            managed.append(indexer)
-            wait_tcp(
-                "127.0.0.1",
-                args.indexer_port,
-                timeout=args.indexer_start_timeout,
-                process=indexer.process,
-            )
-            for spec in specs:
-                managed.append(
-                    start_process(
-                        f"kv-indexer-bridge-{spec.index}",
-                        [str(args.indexer_bridge)],
-                        directory / "bridges" / f"{spec.index}.log",
-                        cwd=args.router_cwd,
-                        env={
-                            "KV_INDEXER_WORKER_ID": spec.worker_id,
-                            "KV_INDEXER_WORKER_ADDRESS": spec.url,
-                            "KV_INDEXER_ENDPOINT": indexer_endpoint,
-                            "SGLANG_KV_EVENT_ENDPOINT": f"tcp://127.0.0.1:{spec.kv_port}",
-                            "SGLANG_KV_EVENT_TOPIC": "kv",
-                            "KV_INDEXER_CLEAR_TIERS": "HBM,DRAM,SSD",
-                        },
-                    )
-                )
         # 每个策略都必须有同等强度的正向审计日志；不可观察的 fallback
         # 不能进入结果矩阵。
         router_environment = {
@@ -1047,7 +975,7 @@ def start_case_control_plane(
                 "sgl_router::policies::cache_aware_zmq=debug"
             )
         }
-        command = router_command(args, case, [spec.url for spec in specs], indexer_endpoint)
+        command = router_command(args, case, [spec.url for spec in specs])
         if router_environment:
             command = [
                 "/usr/bin/env",
@@ -1286,7 +1214,7 @@ def worker_cache_flush_urls(worker_urls: Sequence[str]) -> tuple[str, ...]:
 
 
 async def flush_worker_caches(worker_urls: Sequence[str]) -> None:
-    """丢弃 Simulator 启动 warmup 留下、且早于 bridge 订阅的 KV 状态。"""
+    """丢弃 Simulator 启动 warmup 留下的 KV 状态。"""
     try:
         import aiohttp
     except ImportError as error:
@@ -1615,7 +1543,7 @@ def run_case(
         worker_urls = [spec.url for spec in specs]
         holder_count = min(args.max_cache_holders, case.endpoint_count)
         asyncio.run(flush_worker_caches(worker_urls))
-        time.sleep(args.indexer_settle_seconds)
+        time.sleep(args.control_plane_quiesce_seconds)
         asyncio.run(
             post_direct_warmups(
                 worker_urls,
@@ -1624,7 +1552,7 @@ def run_case(
                 holder_count=holder_count,
             )
         )
-        time.sleep(args.indexer_settle_seconds)
+        time.sleep(args.control_plane_quiesce_seconds)
         worker_before = asyncio.run(fetch_texts(tuple(f"{url}/metrics" for url in worker_urls)))
         router_before = asyncio.run(fetch_texts((f"http://127.0.0.1:{args.router_port}/metrics",)))[0]
         worker_loads = asyncio.run(fetch_texts(tuple(f"{url}/v1/loads" for url in worker_urls)))
@@ -1733,8 +1661,8 @@ def run_case(
 def wait_for_control_plane_quiescence(args: argparse.Namespace) -> None:
     if args.control_plane_quiesce_seconds <= 0.0:
         return
-    # 每个 case 停止 Router、Indexer、bridge 和 worker 后才复用端口；该等待
-    # 给 ZMQ socket 释放与订阅清理一个有界窗口，避免下一个 case 接到旧快照。
+    # 每个 case 停止 Router 和 worker 后才复用端口；该等待给 ZMQ socket
+    # 释放与订阅清理一个有界窗口，避免下一个 case 接到旧快照。
     time.sleep(args.control_plane_quiesce_seconds)
 
 
@@ -1751,8 +1679,6 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--source-root", type=Path)
     parser.add_argument("--router-binary", type=Path)
     parser.add_argument("--router-cwd", type=Path)
-    parser.add_argument("--indexer-server", type=Path)
-    parser.add_argument("--indexer-bridge", type=Path)
     parser.add_argument("--python")
     parser.add_argument("--simulator-site", type=Path)
     parser.add_argument("--simulator-dependency-root", type=Path)
@@ -1772,7 +1698,6 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--kv-base-port", type=int)
     parser.add_argument("--dist-base-port", type=int)
     parser.add_argument("--router-port", type=int, default=30_380)
-    parser.add_argument("--indexer-port", type=int, default=50_551)
     parser.add_argument("--max-total-tokens", type=int, default=8192)
     parser.add_argument("--max-running-requests", type=int, default=32)
     parser.add_argument("--worker-page-size", type=int, default=1)
@@ -1786,12 +1711,9 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--output-tokens", type=int, default=16)
     parser.add_argument("--qps-per-worker", type=float, default=0.25)
-    parser.add_argument("--kv-indexer-query-timeout-ms", type=int, default=100)
-    parser.add_argument("--indexer-start-timeout", type=float, default=60.0)
     parser.add_argument("--worker-start-timeout", type=float, default=300.0)
     parser.add_argument("--router-start-timeout", type=float, default=180.0)
     parser.add_argument("--router-settle-seconds", type=float, default=35.0)
-    parser.add_argument("--indexer-settle-seconds", type=float, default=4.0)
     parser.add_argument("--control-plane-quiesce-seconds", type=float, default=16.0)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--execute", action="store_true")
@@ -1813,11 +1735,8 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         parser.error("worker capacity arguments must be positive")
     if args.max_cache_holders < 0 or args.output_tokens <= 0 or args.qps_per_worker <= 0.0:
         parser.error("cache holders must be non-negative; output and QPS must be positive")
-    if args.kv_indexer_query_timeout_ms <= 0:
-        parser.error("--kv-indexer-query-timeout-ms must be positive")
     if (
         args.router_settle_seconds < 0.0
-        or args.indexer_settle_seconds < 0.0
         or args.control_plane_quiesce_seconds < 0.0
     ):
         parser.error("settle durations must be non-negative")
@@ -1840,8 +1759,6 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
             "source_root",
             "router_binary",
             "router_cwd",
-            "indexer_server",
-            "indexer_bridge",
             "python",
             "simulator_site",
             "simulator_dependency_root",
@@ -1875,8 +1792,6 @@ def main(argv: Iterable[str] | None = None) -> int:
         "schema_version": 1,
         "source_commit": read_source_commit(args.source_root),
         "router_binary_sha256": sha256_file(args.router_binary),
-        "indexer_server_sha256": sha256_file(args.indexer_server),
-        "indexer_bridge_sha256": sha256_file(args.indexer_bridge),
         "endpoint_counts": list(args.endpoint_counts),
         "policies": list(args.policies),
         "workloads": list(args.workloads),
@@ -1886,7 +1801,6 @@ def main(argv: Iterable[str] | None = None) -> int:
         "worker_page_size": args.worker_page_size,
         "output_tokens": args.output_tokens,
         "qps_per_worker": args.qps_per_worker,
-        "kv_indexer_query_timeout_ms": args.kv_indexer_query_timeout_ms,
         "max_cache_holders": args.max_cache_holders,
         "worker_port_layout_wait_timeout": args.worker_port_layout_wait_timeout,
         "control_plane_quiesce_seconds": args.control_plane_quiesce_seconds,

@@ -48,8 +48,6 @@ TRACE_MAX_INPUT_TOKENS = 16384
 TRACE_MIN_PREFIX_TOKENS = 1024
 TRACE_MAX_APPEND_TOKENS = 4096
 MAX_HTTP_REQUEST_CONCURRENCY = fleet.MAX_HTTP_REQUEST_CONCURRENCY
-BRIDGE_APPLY_LOG_MARKER = "applied KV event batch to Indexer"
-BRIDGE_FAILURE_LOG_MARKER = "bridge session lost; reconnecting"
 
 
 @dataclass(frozen=True)
@@ -234,52 +232,6 @@ def expected_measurement_count(rounds: Sequence[ReplayRound]) -> int:
     return sum(not round_.is_warmup for round_ in rounds)
 
 
-def bridge_log_progress(log_paths: Sequence[Path]) -> tuple[int, int]:
-    applied_batches = 0
-    bridge_failures = 0
-    for path in log_paths:
-        text = path.read_text(errors="replace") if path.exists() else ""
-        applied_batches += text.count(BRIDGE_APPLY_LOG_MARKER)
-        bridge_failures += text.count(BRIDGE_FAILURE_LOG_MARKER)
-    return applied_batches, bridge_failures
-
-
-def wait_for_indexer_bridge_drain(
-    log_paths: Sequence[Path],
-    *,
-    quiet_seconds: float,
-    timeout_seconds: float,
-    poll_seconds: float,
-    sleep=time.sleep,
-    monotonic=time.monotonic,
-) -> dict[str, int | float]:
-    deadline = monotonic() + timeout_seconds
-    applied_batches, bridge_failures = bridge_log_progress(log_paths)
-    if bridge_failures:
-        raise RuntimeError(f"bridge failure before Indexer drain: {bridge_failures}")
-    last_change = monotonic()
-    while True:
-        applied_now, bridge_failures = bridge_log_progress(log_paths)
-        if bridge_failures:
-            raise RuntimeError(f"bridge failure before Indexer drain: {bridge_failures}")
-        now = monotonic()
-        if applied_now != applied_batches:
-            applied_batches = applied_now
-            last_change = now
-        if applied_batches and now - last_change >= quiet_seconds:
-            return {
-                "applied_batches": applied_batches,
-                "bridge_failures": bridge_failures,
-                "quiet_seconds": quiet_seconds,
-            }
-        if now >= deadline:
-            raise RuntimeError(
-                "Indexer bridge did not reach a successful apply quiet window "
-                f"within {timeout_seconds}s"
-            )
-        sleep(min(poll_seconds, deadline - now))
-
-
 def max_tokens_for_round(round_: ReplayRound, *, max_total_tokens: int) -> int:
     if round_.output_tokens <= 0:
         raise ValueError(f"TraceLab round has no output tokens: {round_.source_line}")
@@ -292,30 +244,20 @@ def max_tokens_for_round(round_: ReplayRound, *, max_total_tokens: int) -> int:
     return round_.output_tokens
 
 
-INDEXER_QUERY_DURATION_METRIC = "sgl_router_kv_indexer_query_duration_seconds"
 ZMQ_PREFIX_LOOKUP_DURATION_METRIC = "sgl_router_zmq_prefix_lookup_duration_seconds"
 
 
 def policy_args(
     policy: str,
-    indexer_endpoint: str,
-    *,
-    query_timeout_ms: int,
-    query_max_inflight: int,
 ) -> list[str]:
-    return fleet.policy_args(
-        policy,
-        indexer_endpoint,
-        indexer_query_timeout_ms=query_timeout_ms,
-        indexer_query_max_inflight=query_max_inflight,
-    )
+    return fleet.policy_args(policy)
 
 
-def indexer_query_summary(
+def outcome_latency_summary(
     before: str,
     after: str,
     *,
-    metric: str = INDEXER_QUERY_DURATION_METRIC,
+    metric: str,
 ) -> dict[str, object]:
     def aggregate(metric: str, snapshot: str) -> dict[str, float]:
         values: dict[str, float] = {}
@@ -385,7 +327,7 @@ def indexer_query_summary(
 
 
 def zmq_prefix_lookup_summary(before: str, after: str) -> dict[str, object]:
-    summary = indexer_query_summary(before, after, metric=ZMQ_PREFIX_LOOKUP_DURATION_METRIC)
+    summary = outcome_latency_summary(before, after, metric=ZMQ_PREFIX_LOOKUP_DURATION_METRIC)
     return {
         "lookup_count": summary["query_count"],
         "matched_count": int(summary["outcomes"].get("matched", {}).get("count", 0)),
@@ -394,27 +336,10 @@ def zmq_prefix_lookup_summary(before: str, after: str) -> dict[str, object]:
     }
 
 
-def require_indexer_query_success(
-    summary: Mapping[str, object], *, expected_queries: int, phase: str
-) -> None:
-    query_count = int(summary["query_count"])
-    success_count = int(summary["success_count"])
-    failure_count = int(summary["failure_count"])
-    if query_count != expected_queries:
-        raise RuntimeError(
-            f"Indexer {phase} query count was {query_count}, expected {expected_queries}"
-        )
-    if failure_count != 0 or success_count != expected_queries:
-        raise RuntimeError(
-            f"Indexer {phase} queries failed: success={success_count} failure={failure_count}"
-        )
-
-
 def router_command(
     args: argparse.Namespace,
     case: TraceLabCase,
     worker_urls: Sequence[str],
-    indexer_endpoint: str,
 ) -> list[str]:
     return [
         str(args.router_binary),
@@ -434,9 +359,6 @@ def router_command(
         str(int(args.stale_request_timeout_seconds)),
         *policy_args(
             case.policy,
-            indexer_endpoint,
-            query_timeout_ms=args.kv_indexer_query_timeout_ms,
-            query_max_inflight=args.kv_indexer_query_max_inflight,
         ),
     ]
 
@@ -447,50 +369,8 @@ def start_case_control_plane(
     directory: Path,
     specs: Sequence[fleet.WorkerSpec],
 ) -> list[fleet.ManagedProcess]:
-    indexer_endpoint = f"http://127.0.0.1:{args.indexer_port}"
     managed: list[fleet.ManagedProcess] = []
     try:
-        if fleet.needs_external_indexer(case.policy):
-            indexer = fleet.start_process(
-                "kv-indexer-server",
-                [str(args.indexer_server)],
-                directory / "kv-indexer-server.log",
-                cwd=args.router_cwd,
-                env={
-                    "KV_INDEXER_LISTEN_ADDR": f"127.0.0.1:{args.indexer_port}",
-                    "KV_INDEXER_PREFIX_QUERY_MAX_INFLIGHT": str(
-                        args.kv_indexer_query_max_inflight
-                    ),
-                    "KV_INDEXER_MAX_CONCURRENT_STREAMS": str(
-                        args.kv_indexer_max_concurrent_streams
-                    ),
-                },
-            )
-            managed.append(indexer)
-            fleet.wait_tcp(
-                "127.0.0.1",
-                args.indexer_port,
-                timeout=args.indexer_start_timeout,
-                process=indexer.process,
-            )
-            for spec in specs:
-                managed.append(
-                    fleet.start_process(
-                        f"kv-indexer-bridge-{spec.index}",
-                        [str(args.indexer_bridge)],
-                        directory / "bridges" / f"{spec.index}.log",
-                        cwd=args.router_cwd,
-                        env={
-                            "KV_INDEXER_WORKER_ID": spec.worker_id,
-                            "KV_INDEXER_WORKER_ADDRESS": spec.url,
-                            "KV_INDEXER_ENDPOINT": indexer_endpoint,
-                            "SGLANG_KV_EVENT_ENDPOINT": f"tcp://127.0.0.1:{spec.kv_port}",
-                            "SGLANG_KV_EVENT_TOPIC": "kv",
-                            "KV_INDEXER_CLEAR_TIERS": "HBM,DRAM,SSD",
-                            "RUST_LOG": "info,sgl_kv_indexer::bridge=debug",
-                        },
-                    )
-                )
         router_environment = {
             "RUST_LOG": (
                 "info,sgl_router::server::routes::chat=debug,"
@@ -500,7 +380,7 @@ def start_case_control_plane(
         }
         router = fleet.start_process(
             f"router-{case.policy}",
-            router_command(args, case, [spec.url for spec in specs], indexer_endpoint),
+            router_command(args, case, [spec.url for spec in specs]),
             directory / "router.log",
             cwd=args.router_cwd,
             env=router_environment,
@@ -886,7 +766,7 @@ def run_case(
         managed = start_case_control_plane(args, case, directory, specs)
         worker_urls = [spec.url for spec in specs]
         asyncio.run(fleet.flush_worker_caches(worker_urls))
-        time.sleep(args.indexer_settle_seconds)
+        time.sleep(args.control_plane_quiesce_seconds)
 
         warmups, measurements = partition_replay_rounds(rounds)
         router_warmup_before = asyncio.run(
@@ -904,19 +784,7 @@ def run_case(
                 max_total_tokens=args.max_total_tokens,
             )
         )
-        if fleet.needs_external_indexer(case.policy):
-            drain = wait_for_indexer_bridge_drain(
-                tuple(directory / "bridges" / f"{spec.index}.log" for spec in specs),
-                quiet_seconds=args.indexer_drain_quiet_seconds,
-                timeout_seconds=args.indexer_drain_timeout_seconds,
-                poll_seconds=args.indexer_drain_poll_seconds,
-            )
-            fleet.atomic_write_text(
-                directory / "indexer_drain.json",
-                json.dumps(drain, indent=2, sort_keys=True) + "\n",
-            )
-        else:
-            time.sleep(args.indexer_settle_seconds)
+        time.sleep(args.control_plane_quiesce_seconds)
 
         guard_seed_warmups = pressure_guard_seed_warmups(warmups)
         seeded_requests = asyncio.run(
@@ -932,21 +800,7 @@ def run_case(
                 holders_per_session=args.pressure_guard_seed_holders,
             )
         )
-        if fleet.needs_external_indexer(case.policy):
-            seed_drain = wait_for_indexer_bridge_drain(
-                tuple(directory / "bridges" / f"{spec.index}.log" for spec in specs),
-                quiet_seconds=args.indexer_drain_quiet_seconds,
-                timeout_seconds=args.indexer_drain_timeout_seconds,
-                poll_seconds=args.indexer_drain_poll_seconds,
-            )
-            seed_drain["seeded_requests"] = seeded_requests
-            seed_drain["seeded_sessions"] = len(guard_seed_warmups)
-            fleet.atomic_write_text(
-                directory / "pressure_guard_seed_drain.json",
-                json.dumps(seed_drain, indent=2, sort_keys=True) + "\n",
-            )
-        else:
-            time.sleep(args.indexer_settle_seconds)
+        time.sleep(args.control_plane_quiesce_seconds)
 
         worker_before = asyncio.run(
             fleet.fetch_texts(tuple(f"{url}/metrics" for url in worker_urls))
@@ -957,7 +811,6 @@ def run_case(
         router_log = directory / "router.log"
         log_offset = router_log.stat().st_size
         fleet.atomic_write_text(directory / "router.measurement_before.prom", router_before)
-        warmup_indexer_query = indexer_query_summary(router_warmup_before, router_before)
 
         started = time.monotonic()
         requests = asyncio.run(
@@ -998,19 +851,7 @@ def run_case(
             fleet.policy_reason_counts(router_after, case.policy),
         )
         fleet.require_policy_reason_coverage(reasons, expected_decisions=expected)
-        measurement_indexer_query = indexer_query_summary(router_before, router_after)
         measurement_zmq_lookup = zmq_prefix_lookup_summary(router_before, router_after)
-        if args.require_indexer_success and fleet.needs_external_indexer(case.policy):
-            require_indexer_query_success(
-                warmup_indexer_query,
-                expected_queries=sum(len(turns) for turns in warmups.values()),
-                phase="warmup",
-            )
-            require_indexer_query_success(
-                measurement_indexer_query,
-                expected_queries=expected,
-                phase="measurement",
-            )
         audit: dict[str, int] | None = None
         shortest_ttft_audit: dict[str, int] | None = None
         power_of_two_audit: dict[str, int] | None = None
@@ -1058,14 +899,6 @@ def run_case(
         summary["shortest_ttft_audit"] = shortest_ttft_audit
         summary["power_of_two_audit"] = power_of_two_audit
         summary["zmq_policy_audit"] = zmq_policy_audit
-        summary["indexer_query"] = (
-            {
-                "warmup": warmup_indexer_query,
-                "measurement": measurement_indexer_query,
-            }
-            if fleet.needs_external_indexer(case.policy)
-            else None
-        )
         summary["zmq_prefix_lookup"] = (
             measurement_zmq_lookup if case.policy == "cache_aware_zmq" else None
         )
@@ -1114,8 +947,6 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--source-root", type=Path)
     parser.add_argument("--router-binary", type=Path)
     parser.add_argument("--router-cwd", type=Path)
-    parser.add_argument("--indexer-server", type=Path)
-    parser.add_argument("--indexer-bridge", type=Path)
     parser.add_argument("--python")
     parser.add_argument("--simulator-site", type=Path)
     parser.add_argument("--simulator-dependency-root", type=Path)
@@ -1147,27 +978,17 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--kv-base-port", type=int)
     parser.add_argument("--dist-base-port", type=int)
     parser.add_argument("--router-port", type=int, default=30_380)
-    parser.add_argument("--indexer-port", type=int, default=50_551)
     parser.add_argument("--max-total-tokens", type=int, default=32_768)
     parser.add_argument("--max-running-requests", type=int, default=32)
     parser.add_argument("--worker-page-size", type=int, default=1)
     parser.add_argument("--worker-start-batch-size", type=int, default=16)
     parser.add_argument("--worker-port-layout-wait-timeout", type=float, default=90.0)
-    parser.add_argument("--indexer-start-timeout", type=float, default=60.0)
     parser.add_argument("--worker-start-timeout", type=float, default=300.0)
     parser.add_argument("--router-start-timeout", type=float, default=180.0)
     parser.add_argument("--router-settle-seconds", type=float, default=35.0)
-    parser.add_argument("--indexer-settle-seconds", type=float, default=4.0)
-    parser.add_argument("--indexer-drain-quiet-seconds", type=float, default=5.0)
-    parser.add_argument("--indexer-drain-timeout-seconds", type=float, default=180.0)
-    parser.add_argument("--indexer-drain-poll-seconds", type=float, default=0.5)
     parser.add_argument("--control-plane-quiesce-seconds", type=float, default=16.0)
     parser.add_argument("--request-timeout-seconds", type=int, default=360)
     parser.add_argument("--stale-request-timeout-seconds", type=int, default=420)
-    parser.add_argument("--kv-indexer-query-timeout-ms", type=int, default=10_000)
-    parser.add_argument("--kv-indexer-query-max-inflight", type=int, default=256)
-    parser.add_argument("--kv-indexer-max-concurrent-streams", type=int, default=512)
-    parser.add_argument("--require-indexer-success", action="store_true")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--execute", action="store_true")
     args = parser.parse_args(argv)
@@ -1203,16 +1024,9 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     if (
         args.worker_port_layout_wait_timeout < 0.0
         or args.router_settle_seconds < 0.0
-        or args.indexer_settle_seconds < 0.0
-        or args.indexer_drain_quiet_seconds <= 0.0
-        or args.indexer_drain_timeout_seconds <= 0.0
-        or args.indexer_drain_poll_seconds <= 0.0
         or args.control_plane_quiesce_seconds < 0.0
         or args.request_timeout_seconds <= 0.0
         or args.stale_request_timeout_seconds <= 0.0
-        or args.kv_indexer_query_timeout_ms <= 0
-        or args.kv_indexer_query_max_inflight <= 0
-        or args.kv_indexer_max_concurrent_streams <= 0
     ):
         parser.error("timeout values are invalid")
     try:
@@ -1228,8 +1042,6 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
             "source_root",
             "router_binary",
             "router_cwd",
-            "indexer_server",
-            "indexer_bridge",
             "python",
             "simulator_site",
             "simulator_dependency_root",
@@ -1288,8 +1100,6 @@ def main(argv: Iterable[str] | None = None) -> int:
         "schema_version": 3,
         "source_commit": fleet.read_source_commit(args.source_root),
         "router_binary_sha256": fleet.sha256_file(args.router_binary),
-        "indexer_server_sha256": fleet.sha256_file(args.indexer_server),
-        "indexer_bridge_sha256": fleet.sha256_file(args.indexer_bridge),
         "worker_count": WORKER_COUNT,
         "policies": list(args.policies),
         "repeats": args.repeats,
@@ -1297,8 +1107,6 @@ def main(argv: Iterable[str] | None = None) -> int:
         "warmup_request_rate": args.warmup_request_rate,
         "pressure_guard_seed_holders": args.pressure_guard_seed_holders,
         "pressure_guard_seed_request_rate": args.pressure_guard_seed_request_rate,
-        "indexer_drain_quiet_seconds": args.indexer_drain_quiet_seconds,
-        "indexer_drain_timeout_seconds": args.indexer_drain_timeout_seconds,
         "max_total_tokens": args.max_total_tokens,
         "max_running_requests": args.max_running_requests,
         "worker_page_size": args.worker_page_size,
@@ -1315,10 +1123,6 @@ def main(argv: Iterable[str] | None = None) -> int:
             "cache_reset": "flush_before_warmup",
             "control_plane": "stop_all_then_quiesce",
         },
-        "kv_indexer_query_timeout_ms": args.kv_indexer_query_timeout_ms,
-        "kv_indexer_query_max_inflight": args.kv_indexer_query_max_inflight,
-        "kv_indexer_max_concurrent_streams": args.kv_indexer_max_concurrent_streams,
-        "require_indexer_success": args.require_indexer_success,
         "execution_artifacts": fleet.execution_artifact_contract(
             runner_script=Path(__file__),
             python=args.python,

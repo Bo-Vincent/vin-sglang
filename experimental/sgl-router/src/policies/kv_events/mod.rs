@@ -1,9 +1,9 @@
-//! ZMQ-based KV-cache event indexer for cache-aware routing.
+//! ZMQ-based local KV-cache event tree for cache-aware routing.
 //!
 //! Decodes the msgpack wire format emitted by SGLang's `ZmqEventPublisher`
 //! (`python/sglang/srt/utils/event_publisher.py`; KV event types in
 //! `python/sglang/srt/disaggregation/kv_events.py`) and maintains the
-//! router-side index used for cache-aware request routing.
+//! router-side tree used for cache-aware request routing.
 //!
 //! # Submodules
 //!

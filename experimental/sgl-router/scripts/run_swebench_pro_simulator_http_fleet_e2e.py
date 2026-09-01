@@ -226,7 +226,7 @@ def run_case(
         managed = tracelab.start_case_control_plane(args, case, directory, specs)
         worker_urls = [spec.url for spec in specs]
         asyncio.run(fleet.flush_worker_caches(worker_urls))
-        time.sleep(args.indexer_settle_seconds)
+        time.sleep(args.control_plane_quiesce_seconds)
 
         worker_before = asyncio.run(fleet.fetch_texts(tuple(f"{url}/metrics" for url in worker_urls)))
         router_before = asyncio.run(
@@ -270,12 +270,7 @@ def run_case(
             fleet.policy_reason_counts(router_before, case.policy),
             fleet.policy_reason_counts(router_after, case.policy),
         )
-        indexer_query = tracelab.indexer_query_summary(router_before, router_after)
         zmq_lookup = tracelab.zmq_prefix_lookup_summary(router_before, router_after)
-        if args.require_indexer_success and fleet.needs_external_indexer(case.policy):
-            tracelab.require_indexer_query_success(
-                indexer_query, expected_queries=len(tasks), phase="measurement"
-            )
 
         audit: dict[str, int] | None = None
         shortest_ttft_audit: dict[str, int] | None = None
@@ -330,7 +325,6 @@ def run_case(
         summary["shortest_ttft_audit"] = shortest_ttft_audit
         summary["power_of_two_audit"] = power_of_two_audit
         summary["zmq_policy_audit"] = zmq_policy_audit
-        summary["indexer_query"] = indexer_query if fleet.needs_external_indexer(case.policy) else None
         summary["zmq_prefix_lookup"] = zmq_lookup if case.policy == "cache_aware_zmq" else None
         summary["swebench_pro_measurement_count"] = len(tasks)
         fleet.atomic_write_text(
@@ -369,8 +363,6 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--source-root", type=Path)
     parser.add_argument("--router-binary", type=Path)
     parser.add_argument("--router-cwd", type=Path)
-    parser.add_argument("--indexer-server", type=Path)
-    parser.add_argument("--indexer-bridge", type=Path)
     parser.add_argument("--python")
     parser.add_argument("--simulator-site", type=Path)
     parser.add_argument("--simulator-dependency-root", type=Path)
@@ -392,27 +384,17 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--kv-base-port", type=int)
     parser.add_argument("--dist-base-port", type=int)
     parser.add_argument("--router-port", type=int, default=30_380)
-    parser.add_argument("--indexer-port", type=int, default=50_551)
     parser.add_argument("--max-total-tokens", type=int, default=32_768)
     parser.add_argument("--max-running-requests", type=int, default=32)
+    parser.add_argument("--worker-page-size", type=int, default=1)
     parser.add_argument("--worker-start-batch-size", type=int, default=16)
     parser.add_argument("--worker-port-layout-wait-timeout", type=float, default=90.0)
-    parser.add_argument("--indexer-start-timeout", type=float, default=60.0)
     parser.add_argument("--worker-start-timeout", type=float, default=300.0)
     parser.add_argument("--router-start-timeout", type=float, default=180.0)
     parser.add_argument("--router-settle-seconds", type=float, default=35.0)
-    parser.add_argument("--indexer-settle-seconds", type=float, default=4.0)
     parser.add_argument("--control-plane-quiesce-seconds", type=float, default=16.0)
     parser.add_argument("--request-timeout-seconds", type=int, default=360)
     parser.add_argument("--stale-request-timeout-seconds", type=int, default=420)
-    parser.add_argument("--kv-indexer-query-timeout-ms", type=int, default=10_000)
-    parser.add_argument("--kv-indexer-query-max-inflight", type=int, default=256)
-    parser.add_argument("--kv-indexer-max-concurrent-streams", type=int, default=512)
-    parser.add_argument(
-        "--require-indexer-success",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-    )
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--execute", action="store_true")
     args = parser.parse_args(argv)
@@ -431,12 +413,10 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     if (
         args.max_total_tokens <= 0
         or args.max_running_requests <= 0
+        or args.worker_page_size <= 0
         or args.worker_start_batch_size <= 0
         or args.request_timeout_seconds <= 0
         or args.stale_request_timeout_seconds <= 0
-        or args.kv_indexer_query_timeout_ms <= 0
-        or args.kv_indexer_query_max_inflight <= 0
-        or args.kv_indexer_max_concurrent_streams <= 0
     ):
         parser.error("capacity and timeout arguments must be positive")
     try:
@@ -451,7 +431,7 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         parser.error("every worker port range must fit in 1..65535")
     if args.execute:
         required = (
-            "source_root", "router_binary", "router_cwd", "indexer_server", "indexer_bridge",
+            "source_root", "router_binary", "router_cwd",
             "python", "simulator_site", "simulator_dependency_root", "simulator_config", "model_path", "tokenizer_path",
             "dataset_cache", "results_dir",
         )
@@ -515,8 +495,6 @@ def main(argv: Iterable[str] | None = None) -> int:
         "schema_version": 2,
         "source_commit": fleet.read_source_commit(args.source_root),
         "router_binary_sha256": fleet.sha256_file(args.router_binary),
-        "indexer_server_sha256": fleet.sha256_file(args.indexer_server),
-        "indexer_bridge_sha256": fleet.sha256_file(args.indexer_bridge),
         "worker_count": WORKER_COUNT,
         "policies": list(args.policies),
         "repeats": args.repeats,
@@ -524,6 +502,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         "output_tokens": args.output_tokens,
         "max_total_tokens": args.max_total_tokens,
         "max_running_requests": args.max_running_requests,
+        "worker_page_size": args.worker_page_size,
         "dataset_cache": str(args.dataset_cache),
         "dataset_cache_sha256": dataset_sha256_file(args.dataset_cache),
         "task_count": len(tasks),
@@ -537,10 +516,6 @@ def main(argv: Iterable[str] | None = None) -> int:
             "cache_reset": "flush_before_measurement",
             "control_plane": "stop_all_then_quiesce",
         },
-        "kv_indexer_query_timeout_ms": args.kv_indexer_query_timeout_ms,
-        "kv_indexer_query_max_inflight": args.kv_indexer_query_max_inflight,
-        "kv_indexer_max_concurrent_streams": args.kv_indexer_max_concurrent_streams,
-        "require_indexer_success": args.require_indexer_success,
         "cache_aware_tuning": asdict(args.cache_aware_tuning),
         "execution_artifacts": fleet.execution_artifact_contract(
             runner_script=Path(__file__),

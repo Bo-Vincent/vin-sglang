@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Full HTTP routing path backed by a real in-memory Indexer gRPC server.
+//! Full HTTP routing paths backed by the local ZMQ radix tree.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -9,13 +9,6 @@ use std::time::{Duration, Instant};
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::json;
-use sgl_kv_indexer::pb::kv_indexer_client::KvIndexerClient;
-use sgl_kv_indexer::pb::{
-    ApplyExternalKvBatchRequest, ExternalKvAction, ExternalKvActionType, TierType,
-};
-use sgl_kv_indexer::{
-    server_builder, GrpcPrefixIndex, InMemoryKvIndexerBackend, KvIndexerService, PrefixIndexConfig,
-};
 use sgl_router::config::{AffinityConfig, PolicyKind};
 use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
 use sgl_router::policies::engine_load::{EngineLoadTable, LoadStat, NativeCacheRankLoad};
@@ -29,7 +22,6 @@ use sgl_router::server::app::build_router;
 use sgl_router::server::app_context::AppContext;
 use sgl_router::tokenizer::TokenizerRegistry;
 use sgl_router::workers::WorkerRegistry;
-use tokio_stream::wrappers::TcpListenerStream;
 use tower::ServiceExt;
 
 use crate::common::cache_aware_fixture::{config, MODEL};
@@ -52,7 +44,7 @@ fn monitored_load(total_prefill_uncached_tokens: u64, total_prefill_busy_us: u64
 use crate::common::mock_worker::MockWorker;
 
 #[tokio::test]
-async fn external_indexer_routes_shortest_ttft_to_the_cached_worker() {
+async fn shortest_ttft_routes_from_the_local_radix_tree() {
     let cached = MockWorker::start(vec![]).await;
     let uncached = MockWorker::start(vec![]).await;
     let mut cfg = config();
@@ -66,36 +58,8 @@ async fn external_indexer_routes_shortest_ttft_to_the_cached_worker() {
         .expect("test prompt tokenizes");
     let hashes = compute_block_hashes(&tokens.ids, 1);
     assert!(!hashes.is_empty());
-
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let endpoint = format!("http://{}", listener.local_addr().unwrap());
-    let server = tokio::spawn(async move {
-        server_builder()
-            .add_service(KvIndexerService::new(InMemoryKvIndexerBackend::new()).into_server())
-            .serve_with_incoming(TcpListenerStream::new(listener))
-            .await
-            .unwrap();
-    });
-
-    let mut indexer = KvIndexerClient::connect(endpoint.clone()).await.unwrap();
-    indexer
-        .apply_external_kv_batch(ApplyExternalKvBatchRequest {
-            worker_id: "cached-worker".into(),
-            seq: 1,
-            actions: vec![ExternalKvAction {
-                r#type: ExternalKvActionType::ActionReport as i32,
-                tier: TierType::TierHbm as i32,
-                hashes: hashes.clone(),
-                component_masks: Vec::new(),
-                block_sizes: Vec::new(),
-                parent_block_hash: None,
-            }],
-            worker_address: cached.url.clone(),
-            cache_spec: None,
-        })
-        .await
-        .unwrap();
-
+    let tree = Arc::new(HashTree::new());
+    tree.insert(&KvWorkerId::new(cached.url.clone(), 0), None, &hashes);
     let registry = Arc::new(WorkerRegistry::default());
     for url in [&cached.url, &uncached.url] {
         registry
@@ -120,7 +84,7 @@ async fn external_indexer_routes_shortest_ttft_to_the_cached_worker() {
     let policies = Arc::new(
         build_registry(
             &cfg,
-            Arc::new(HashTree::new()),
+            tree,
             Arc::clone(&tokenizers),
             Arc::clone(&oracle),
             Arc::clone(&engine_load),
@@ -134,14 +98,6 @@ async fn external_indexer_routes_shortest_ttft_to_the_cached_worker() {
         registry,
         policies,
     );
-    ctx.prefix_index = Some(Arc::new(
-        GrpcPrefixIndex::new(PrefixIndexConfig {
-            endpoint,
-            query_deadline: Duration::from_secs(1),
-            max_inflight: 4,
-        })
-        .unwrap(),
-    ));
     ctx.block_size_oracle = oracle;
     ctx.engine_load = engine_load;
 
@@ -161,8 +117,6 @@ async fn external_indexer_routes_shortest_ttft_to_the_cached_worker() {
     assert_eq!(response.status(), StatusCode::OK);
     assert!(cached.captured.lock().unwrap().last_body.is_some());
     assert!(uncached.captured.lock().unwrap().last_body.is_none());
-
-    server.abort();
 }
 
 #[tokio::test]
