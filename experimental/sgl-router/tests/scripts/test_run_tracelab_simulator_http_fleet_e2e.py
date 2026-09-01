@@ -139,6 +139,18 @@ class TraceLabSimulatorHttpFleetContractTest(unittest.TestCase):
         )
         self.assertTrue(all(len(set(urls)) == 2 for urls in targets.values()))
 
+    def test_pressure_guard_seed_uses_one_deterministic_warmup_session(self):
+        runner = load_runner()
+        warmups = {
+            "session-c": ("c-warmup",),
+            "session-a": ("a-warmup",),
+            "session-b": ("b-warmup",),
+        }
+
+        selected = runner.pressure_guard_seed_warmups(warmups)
+
+        self.assertEqual(selected, {"session-a": ("a-warmup",)})
+
     def test_runner_rejects_non_positive_warmup_request_rate(self):
         runner = load_runner()
 
