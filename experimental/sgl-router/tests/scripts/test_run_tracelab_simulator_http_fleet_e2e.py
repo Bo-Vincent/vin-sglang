@@ -114,8 +114,30 @@ class TraceLabSimulatorHttpFleetContractTest(unittest.TestCase):
         self.assertEqual(arguments.kv_indexer_query_max_inflight, 256)
         self.assertEqual(arguments.kv_indexer_max_concurrent_streams, 512)
         self.assertEqual(arguments.warmup_request_rate, 1.0)
+        self.assertEqual(arguments.pressure_guard_seed_holders, 2)
+        self.assertEqual(arguments.pressure_guard_seed_request_rate, 64.0)
         self.assertEqual(arguments.indexer_drain_quiet_seconds, 5.0)
         self.assertFalse(arguments.require_indexer_success)
+
+    def test_pressure_guard_seed_assigns_two_distinct_replicas_per_session(self):
+        runner = load_runner()
+
+        targets = runner.pressure_guard_seed_targets(
+            ("session-a", "session-b", "session-c"),
+            ("http://worker-0", "http://worker-1", "http://worker-2", "http://worker-3"),
+            holders_per_session=2,
+        )
+
+        self.assertEqual(
+            targets["session-a"], ("http://worker-0", "http://worker-1")
+        )
+        self.assertEqual(
+            targets["session-b"], ("http://worker-2", "http://worker-3")
+        )
+        self.assertEqual(
+            targets["session-c"], ("http://worker-0", "http://worker-1")
+        )
+        self.assertTrue(all(len(set(urls)) == 2 for urls in targets.values()))
 
     def test_runner_rejects_non_positive_warmup_request_rate(self):
         runner = load_runner()

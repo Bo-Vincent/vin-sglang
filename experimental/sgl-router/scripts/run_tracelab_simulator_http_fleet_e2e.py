@@ -38,6 +38,8 @@ WORKER_COUNT = 256
 ROUNDS_PER_SESSION = 4
 DEFAULT_REQUEST_RATE = 64.0
 DEFAULT_WARMUP_REQUEST_RATE = 1.0
+DEFAULT_PRESSURE_GUARD_SEED_HOLDERS = 2
+DEFAULT_PRESSURE_GUARD_SEED_REQUEST_RATE = 64.0
 DEFAULT_POLICIES = fleet.DEFAULT_POLICIES
 TRACE_PROVIDER = "codex"
 TRACE_SELECTION_SEED = 20260822
@@ -564,6 +566,78 @@ async def replay_phase(
     return [value for values in nested for value in values]
 
 
+def pressure_guard_seed_targets(
+    session_ids: Sequence[str],
+    worker_urls: Sequence[str],
+    *,
+    holders_per_session: int,
+) -> dict[str, tuple[str, ...]]:
+    """为每个 TraceLab session 固定分配多个独立 cache replica。"""
+    if holders_per_session < 2:
+        raise ValueError("pressure-guard seed requires at least two holders")
+    if len(worker_urls) < holders_per_session:
+        raise ValueError("worker fleet cannot satisfy pressure-guard replica count")
+    return {
+        session_id: tuple(
+            worker_urls[(index * holders_per_session + offset) % len(worker_urls)]
+            for offset in range(holders_per_session)
+        )
+        for index, session_id in enumerate(sorted(session_ids))
+    }
+
+
+async def seed_pressure_guard_replicas(
+    warmups: Mapping[str, Sequence[ReplayRound]],
+    *,
+    prompts: Mapping[tuple[str, int, int], str],
+    worker_urls: Sequence[str],
+    model: str,
+    request_rate: float,
+    timeout_seconds: float,
+    max_total_tokens: int,
+    holders_per_session: int,
+) -> int:
+    """在 router warmup 前为每个 session 预置两个同前缀的 worker。"""
+    try:
+        import aiohttp
+    except ImportError as error:
+        raise RuntimeError("TraceLab Simulator runner requires aiohttp") from error
+    targets = pressure_guard_seed_targets(
+        tuple(warmups), worker_urls, holders_per_session=holders_per_session
+    )
+    gate = fleet.RateGate(request_rate)
+    semaphore = asyncio.Semaphore(MAX_HTTP_REQUEST_CONCURRENCY)
+    timeout = aiohttp.ClientTimeout(total=timeout_seconds)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+
+        async def seed_one(round_: ReplayRound, worker_url: str) -> None:
+            await gate.wait_turn()
+            key = (round_.session_id, round_.round_index, round_.source_line)
+            try:
+                prompt = prompts[key]
+            except KeyError as error:
+                raise RuntimeError(f"missing virtual prompt for {key}") from error
+            async with semaphore:
+                await stream_chat_request(
+                    session=session,
+                    router_url=worker_url,
+                    model=model,
+                    prompt=prompt,
+                    round_=round_,
+                    timeout_seconds=timeout_seconds,
+                    max_total_tokens=max_total_tokens,
+                )
+
+        await asyncio.gather(
+            *(
+                seed_one(turns[0], worker_url)
+                for session_id, turns in sorted(warmups.items())
+                for worker_url in targets[session_id]
+            )
+        )
+    return sum(len(urls) for urls in targets.values())
+
+
 def build_virtual_prompts(
     rounds: Sequence[ReplayRound], tokenizer: TokenizersAdapter
 ) -> dict[tuple[str, int, int], str]:
@@ -672,6 +746,32 @@ def run_case(
         time.sleep(args.indexer_settle_seconds)
 
         warmups, measurements = partition_replay_rounds(rounds)
+        seeded_requests = asyncio.run(
+            seed_pressure_guard_replicas(
+                warmups,
+                prompts=prompts,
+                worker_urls=worker_urls,
+                model=str(args.model_path),
+                request_rate=args.pressure_guard_seed_request_rate,
+                timeout_seconds=args.request_timeout_seconds,
+                max_total_tokens=args.max_total_tokens,
+                holders_per_session=args.pressure_guard_seed_holders,
+            )
+        )
+        if fleet.needs_external_indexer(case.policy):
+            seed_drain = wait_for_indexer_bridge_drain(
+                tuple(directory / "bridges" / f"{spec.index}.log" for spec in specs),
+                quiet_seconds=args.indexer_drain_quiet_seconds,
+                timeout_seconds=args.indexer_drain_timeout_seconds,
+                poll_seconds=args.indexer_drain_poll_seconds,
+            )
+            seed_drain["seeded_requests"] = seeded_requests
+            fleet.atomic_write_text(
+                directory / "pressure_guard_seed_drain.json",
+                json.dumps(seed_drain, indent=2, sort_keys=True) + "\n",
+            )
+        else:
+            time.sleep(args.indexer_settle_seconds)
         router_warmup_before = asyncio.run(
             fleet.fetch_texts((f"http://127.0.0.1:{args.router_port}/metrics",))
         )[0]
@@ -886,6 +986,16 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--warmup-request-rate", type=float, default=DEFAULT_WARMUP_REQUEST_RATE
     )
+    parser.add_argument(
+        "--pressure-guard-seed-holders",
+        type=int,
+        default=DEFAULT_PRESSURE_GUARD_SEED_HOLDERS,
+    )
+    parser.add_argument(
+        "--pressure-guard-seed-request-rate",
+        type=float,
+        default=DEFAULT_PRESSURE_GUARD_SEED_REQUEST_RATE,
+    )
     parser.add_argument("--http-base-port", type=int)
     parser.add_argument("--kv-base-port", type=int)
     parser.add_argument("--dist-base-port", type=int)
@@ -927,8 +1037,14 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         args.repeats <= 0
         or args.request_rate <= 0.0
         or args.warmup_request_rate <= 0.0
+        or args.pressure_guard_seed_request_rate <= 0.0
     ):
-        parser.error("--repeats, --request-rate, and --warmup-request-rate must be positive")
+        parser.error(
+            "--repeats, --request-rate, --warmup-request-rate, and "
+            "--pressure-guard-seed-request-rate must be positive"
+        )
+    if args.pressure_guard_seed_holders < 2:
+        parser.error("--pressure-guard-seed-holders must be at least two")
     if (
         args.max_total_tokens <= 0
         or args.max_running_requests <= 0
@@ -1030,6 +1146,8 @@ def main(argv: Iterable[str] | None = None) -> int:
         "repeats": args.repeats,
         "request_rate": args.request_rate,
         "warmup_request_rate": args.warmup_request_rate,
+        "pressure_guard_seed_holders": args.pressure_guard_seed_holders,
+        "pressure_guard_seed_request_rate": args.pressure_guard_seed_request_rate,
         "indexer_drain_quiet_seconds": args.indexer_drain_quiet_seconds,
         "indexer_drain_timeout_seconds": args.indexer_drain_timeout_seconds,
         "max_total_tokens": args.max_total_tokens,
