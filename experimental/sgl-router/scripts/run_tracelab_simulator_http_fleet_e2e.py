@@ -586,6 +586,21 @@ def pressure_guard_seed_targets(
     }
 
 
+def pressure_guard_seed_warmups(
+    warmups: Mapping[str, Sequence[ReplayRound]],
+) -> dict[str, Sequence[ReplayRound]]:
+    """选择一个确定 session 作为 pressure guard 的双副本预条件。
+
+    正常 router warmup 先按 V3 语义为整条 TraceLab slice 建立单副本 cache。
+    仅对一个 session 补两个直接 worker replica，既可让 guard 观察到完整 pair，
+    又避免预条件本身挤掉整支 fleet 的正常 warmup cache。
+    """
+    if not warmups:
+        raise ValueError("pressure-guard seed requires at least one warmup session")
+    session_id = min(warmups)
+    return {session_id: warmups[session_id]}
+
+
 async def seed_pressure_guard_replicas(
     warmups: Mapping[str, Sequence[ReplayRound]],
     *,
@@ -746,32 +761,6 @@ def run_case(
         time.sleep(args.indexer_settle_seconds)
 
         warmups, measurements = partition_replay_rounds(rounds)
-        seeded_requests = asyncio.run(
-            seed_pressure_guard_replicas(
-                warmups,
-                prompts=prompts,
-                worker_urls=worker_urls,
-                model=str(args.model_path),
-                request_rate=args.pressure_guard_seed_request_rate,
-                timeout_seconds=args.request_timeout_seconds,
-                max_total_tokens=args.max_total_tokens,
-                holders_per_session=args.pressure_guard_seed_holders,
-            )
-        )
-        if fleet.needs_external_indexer(case.policy):
-            seed_drain = wait_for_indexer_bridge_drain(
-                tuple(directory / "bridges" / f"{spec.index}.log" for spec in specs),
-                quiet_seconds=args.indexer_drain_quiet_seconds,
-                timeout_seconds=args.indexer_drain_timeout_seconds,
-                poll_seconds=args.indexer_drain_poll_seconds,
-            )
-            seed_drain["seeded_requests"] = seeded_requests
-            fleet.atomic_write_text(
-                directory / "pressure_guard_seed_drain.json",
-                json.dumps(seed_drain, indent=2, sort_keys=True) + "\n",
-            )
-        else:
-            time.sleep(args.indexer_settle_seconds)
         router_warmup_before = asyncio.run(
             fleet.fetch_texts((f"http://127.0.0.1:{args.router_port}/metrics",))
         )[0]
@@ -797,6 +786,35 @@ def run_case(
             fleet.atomic_write_text(
                 directory / "indexer_drain.json",
                 json.dumps(drain, indent=2, sort_keys=True) + "\n",
+            )
+        else:
+            time.sleep(args.indexer_settle_seconds)
+
+        guard_seed_warmups = pressure_guard_seed_warmups(warmups)
+        seeded_requests = asyncio.run(
+            seed_pressure_guard_replicas(
+                guard_seed_warmups,
+                prompts=prompts,
+                worker_urls=worker_urls,
+                model=str(args.model_path),
+                request_rate=args.pressure_guard_seed_request_rate,
+                timeout_seconds=args.request_timeout_seconds,
+                max_total_tokens=args.max_total_tokens,
+                holders_per_session=args.pressure_guard_seed_holders,
+            )
+        )
+        if fleet.needs_external_indexer(case.policy):
+            seed_drain = wait_for_indexer_bridge_drain(
+                tuple(directory / "bridges" / f"{spec.index}.log" for spec in specs),
+                quiet_seconds=args.indexer_drain_quiet_seconds,
+                timeout_seconds=args.indexer_drain_timeout_seconds,
+                poll_seconds=args.indexer_drain_poll_seconds,
+            )
+            seed_drain["seeded_requests"] = seeded_requests
+            seed_drain["seeded_sessions"] = len(guard_seed_warmups)
+            fleet.atomic_write_text(
+                directory / "pressure_guard_seed_drain.json",
+                json.dumps(seed_drain, indent=2, sort_keys=True) + "\n",
             )
         else:
             time.sleep(args.indexer_settle_seconds)
