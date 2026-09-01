@@ -210,6 +210,31 @@ class SimulatorHttpFleetContractTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, key):
                 runner.require_native_cache_audit(broken, expected_decisions=1)
 
+    def test_cache_aware_audit_allows_legal_no_cache_candidate_requests(self):
+        runner = load_runner()
+        audit = {
+            "cache_candidate_decisions": 1,
+            "monitor_decisions": 1,
+            "router_local_decisions": 0,
+            "zero_snapshot_decisions": 0,
+            "actual_cache_metrics": 1,
+        }
+
+        runner.require_native_cache_audit(audit, expected_decisions=2)
+
+    def test_policy_reason_coverage_includes_native_no_cache_candidates(self):
+        runner = load_runner()
+
+        runner.require_policy_reason_coverage(
+            {"cache_candidate": 760.0, "no_cache_candidate": 8.0},
+            expected_decisions=768,
+        )
+        with self.assertRaisesRegex(RuntimeError, "coverage"):
+            runner.require_policy_reason_coverage(
+                {"cache_candidate": 760.0, "no_cache_candidate": 7.0},
+                expected_decisions=768,
+            )
+
     def test_cache_aware_audit_accepts_native_queue_tokens_from_v3_load_monitor(self):
         runner = load_runner()
 

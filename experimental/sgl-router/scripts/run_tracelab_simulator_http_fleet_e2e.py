@@ -997,6 +997,7 @@ def run_case(
             fleet.policy_reason_counts(router_before, case.policy),
             fleet.policy_reason_counts(router_after, case.policy),
         )
+        fleet.require_policy_reason_coverage(reasons, expected_decisions=expected)
         measurement_indexer_query = indexer_query_summary(router_before, router_after)
         measurement_zmq_lookup = zmq_prefix_lookup_summary(router_before, router_after)
         if args.require_indexer_success and fleet.needs_external_indexer(case.policy):
