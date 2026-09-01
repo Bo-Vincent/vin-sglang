@@ -1150,6 +1150,7 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--indexer-port", type=int, default=50_551)
     parser.add_argument("--max-total-tokens", type=int, default=32_768)
     parser.add_argument("--max-running-requests", type=int, default=32)
+    parser.add_argument("--worker-page-size", type=int, default=1)
     parser.add_argument("--worker-start-batch-size", type=int, default=16)
     parser.add_argument("--worker-port-layout-wait-timeout", type=float, default=90.0)
     parser.add_argument("--indexer-start-timeout", type=float, default=60.0)
@@ -1195,6 +1196,7 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     if (
         args.max_total_tokens <= 0
         or args.max_running_requests <= 0
+        or args.worker_page_size <= 0
         or args.worker_start_batch_size <= 0
     ):
         parser.error("worker capacity arguments must be positive")
@@ -1299,6 +1301,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         "indexer_drain_timeout_seconds": args.indexer_drain_timeout_seconds,
         "max_total_tokens": args.max_total_tokens,
         "max_running_requests": args.max_running_requests,
+        "worker_page_size": args.worker_page_size,
         "trace": str(args.trace),
         "trace_sha256": replay_sha256_file(args.trace),
         "trace_selection": asdict(default_selection_config()),
