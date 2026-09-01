@@ -4,15 +4,16 @@
 use crate::config::{PolicyKind, SessionAffinityMode};
 use crate::discovery::{ModelId, WorkerMode};
 use crate::policies::admission::{
-    resolve_cache_candidates, resolve_decode, resolve_prefill, resolve_shortest_ttft_candidates,
-    CandidateDomain, CandidateRange, DecisionReason,
+    CandidateDomain, CandidateRange, DecisionReason, resolve_cache_candidates, resolve_decode,
+    resolve_prefill, resolve_shortest_ttft_candidates,
 };
 use crate::policies::buckets::BucketRequest;
-use crate::policies::decode::{build_decode_policy, DecodeSelectionContext};
+use crate::policies::decode::{DecodeSelectionContext, build_decode_policy};
 use crate::policies::engine_load::EngineLoadSnapshot;
+use crate::policies::power_of_two::PowerOfTwoChoicesPolicy;
 use crate::policies::registry::{PdPoolResolver, PdResolveError};
 use crate::policies::{
-    request_tokens_for, PrefillProposal, ProposalKind, RequestTokens, SelectionContext,
+    Policy, PrefillProposal, ProposalKind, RequestTokens, SelectionContext, request_tokens_for,
 };
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
@@ -24,8 +25,8 @@ use axum::body::Body;
 use axum::extract::State;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Response};
 use bytes::Bytes;
-use serde::de::IgnoredAny;
 use serde::Deserialize;
+use serde::de::IgnoredAny;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -354,7 +355,8 @@ pub async fn chat_completions(
         && session_affinity_mode != SessionAffinityMode::Bucket;
     let select_prefill_in_domain = |domain: &CandidateDomain,
                                     affinity_lookup_enabled: bool,
-                                    affinity_assignment_enabled: bool|
+                                    affinity_assignment_enabled: bool,
+                                    force_power_of_two: bool|
      -> Option<Arc<Worker>> {
         let candidate_range = domain.prefill_range()?;
         let selection_ctx = SelectionContext::with_routing_key(&model_id, Some(&body), routing_key)
@@ -370,9 +372,13 @@ pub async fn chat_completions(
         } else {
             selection_ctx
         };
-        let PrefillProposal::Pair(proposal) =
+        let proposal = if force_power_of_two {
+            PowerOfTwoChoicesPolicy::new()
+                .propose_prefill(candidate_range.workers, &selection_ctx)?
+        } else {
             policy.propose_prefill(candidate_range.workers, &selection_ctx)?
-        else {
+        };
+        let PrefillProposal::Pair(proposal) = proposal else {
             // Domain retries are ordinary pair proposals.
             return None;
         };
@@ -401,6 +407,9 @@ pub async fn chat_completions(
                 backup = ?decision.backup.as_ref().map(|worker| worker.url.as_str()),
                 selected = %decision.selected.url,
                 reason = ?decision.reason,
+                shared_prefill_admission = true,
+                admission_evaluated_candidates = 1 + u64::from(decision.backup.is_some()),
+                pressure_guard_enabled = proposal.guard_hints.enable_pressure_guard && decision.backup.is_some(),
                 load_snapshot_version = decision.load_snapshot_version,
                 prefill_pressure_source = prefill_pressure_source(
                     &load_snapshot,
@@ -587,7 +596,7 @@ pub async fn chat_completions(
                 .prefill_affinity_domain(&workers, &primary, prefill_bucket_request)
         })
         // Rebuild the backup inside the primary's own Bucket.
-        .and_then(|domain| select_prefill_in_domain(&domain, true, false));
+        .and_then(|domain| select_prefill_in_domain(&domain, true, false, false));
     let worker = cache_winner
         .or(shortest_ttft_winner)
         .or_else(|| {
@@ -603,20 +612,26 @@ pub async fn chat_completions(
             ) {
                 // 本地树没有可 hard-admit 的 candidate 时，按 domain 顺序用
                 // 普通 P2 重试。
-                return prefill_domains
-                    .iter()
-                    .find_map(|domain| select_prefill_in_domain(domain, false, false));
+                return prefill_domains.iter().find_map(|domain| {
+                    // Shortest-TTFT 已经返回 candidate proposal；这里必须
+                    // 显式构造 P2 pair，不能再次调用同一个 candidate policy。
+                    let force_power_of_two = matches!(
+                        ctx.config.model.policy,
+                        PolicyKind::ShortestTtft | PolicyKind::OriginalShortestTtft
+                    );
+                    select_prefill_in_domain(domain, false, false, force_power_of_two)
+                });
             }
             global_affinity_worker.or_else(|| match session_affinity_mode {
                 SessionAffinityMode::GlobalPreserve if global_affinity_missed => prefill_domains
                     .iter()
-                    .find_map(|domain| select_prefill_in_domain(domain, true, true)),
+                    .find_map(|domain| select_prefill_in_domain(domain, true, true, false)),
                 SessionAffinityMode::GlobalPreserve => prefill_domains
                     .iter()
-                    .find_map(|domain| select_prefill_in_domain(domain, false, false)),
+                    .find_map(|domain| select_prefill_in_domain(domain, false, false, false)),
                 SessionAffinityMode::Bucket | SessionAffinityMode::GlobalRebind => prefill_domains
                     .iter()
-                    .find_map(|domain| select_prefill_in_domain(domain, true, true)),
+                    .find_map(|domain| select_prefill_in_domain(domain, true, true, false)),
             })
         })
         .ok_or_else(|| ApiError::PolicySelectionFailed {

@@ -261,6 +261,8 @@ const DEFAULT_FRESHNESS: Duration = Duration::from_secs(5);
 struct LoadEntry {
     load: LoadStat,
     previous_native_cache: Option<NativeCacheRankLoad>,
+    prefill_throughput_tokens_per_s: Option<f64>,
+    prefill_throughput_at: Option<Instant>,
     at: Instant,
 }
 
@@ -301,19 +303,47 @@ impl EngineLoadTable {
     /// Record the latest load for one `(worker_url, dp_rank)`.
     pub fn set(&self, url: &str, dp_rank: u32, load: LoadStat, at: Instant) {
         let key = (url.to_string(), dp_rank);
-        let previous_native_cache = self
-            .by_rank
-            .get(&key)
+        let previous = self.by_rank.get(&key);
+        let previous_native_cache = previous
+            .as_ref()
             .and_then(|entry| entry.load.native_cache.clone());
-        self.by_rank
-            .insert(
-                key,
-                LoadEntry {
-                    load,
-                    previous_native_cache,
-                    at,
-                },
-            );
+        let previous_rate = previous.as_ref().and_then(|entry| {
+            entry
+                .prefill_throughput_tokens_per_s
+                .zip(entry.prefill_throughput_at)
+        });
+        let next_rate = match (load.native_cache.as_ref(), previous_native_cache.as_ref()) {
+            (Some(current), Some(previous))
+                if current.total_prefill_uncached_tokens > previous.total_prefill_uncached_tokens
+                    && current.total_prefill_busy_us > previous.total_prefill_busy_us =>
+            {
+                let tokens =
+                    current.total_prefill_uncached_tokens - previous.total_prefill_uncached_tokens;
+                let busy_us = current.total_prefill_busy_us - previous.total_prefill_busy_us;
+                let rate = 1_000_000.0 * tokens as f64 / busy_us as f64;
+                (rate.is_finite() && rate > 0.0).then_some((rate, at))
+            }
+            (Some(current), Some(previous))
+                if current.total_prefill_uncached_tokens < previous.total_prefill_uncached_tokens
+                    || current.total_prefill_busy_us < previous.total_prefill_busy_us =>
+            {
+                None
+            }
+            _ => previous_rate,
+        };
+        drop(previous);
+        let (prefill_throughput_tokens_per_s, prefill_throughput_at) =
+            next_rate.map_or((None, None), |(rate, sampled_at)| (Some(rate), Some(sampled_at)));
+        self.by_rank.insert(
+            key,
+            LoadEntry {
+                load,
+                previous_native_cache,
+                prefill_throughput_tokens_per_s,
+                prefill_throughput_at,
+                at,
+            },
+        );
         self.version.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -431,8 +461,20 @@ impl EngineLoadTable {
         &self,
         now: Instant,
     ) -> HashMap<String, NativeCacheWorkerLoad> {
-        let mut observed: HashMap<String, HashMap<u32, (LoadStat, Option<NativeCacheRankLoad>, bool, Instant)>> =
-            HashMap::new();
+        let mut observed: HashMap<
+            String,
+            HashMap<
+                u32,
+                (
+                    LoadStat,
+                    Option<NativeCacheRankLoad>,
+                    Option<f64>,
+                    Option<Instant>,
+                    bool,
+                    Instant,
+                ),
+            >,
+        > = HashMap::new();
         for entry in self.by_rank.iter() {
             let at = entry.value().at;
             let fresh = now.saturating_duration_since(at) <= self.freshness;
@@ -441,6 +483,8 @@ impl EngineLoadTable {
                 (
                     entry.value().load.clone(),
                     entry.value().previous_native_cache.clone(),
+                    entry.value().prefill_throughput_tokens_per_s,
+                    entry.value().prefill_throughput_at,
                     fresh,
                     at,
                 ),
@@ -474,7 +518,7 @@ impl EngineLoadTable {
                 let mut complete_prefill_sample = !required.is_empty();
 
                 for rank in required {
-                    let (load, previous, fresh, at) = ranks.get(&rank)?;
+                    let (load, _previous, rate, rate_at, fresh, at) = ranks.get(&rank)?;
                     let native = load.native_cache.as_ref()?;
                     if !fresh || load.max_total_num_tokens == 0 || native.max_running_requests == 0 {
                         return None;
@@ -491,30 +535,32 @@ impl EngineLoadTable {
                         .saturating_add(native.max_running_requests);
                     oldest_at = Some(oldest_at.map_or(*at, |oldest: Instant| oldest.min(*at)));
 
-                    match previous {
-                        Some(previous)
-                            if native.total_prefill_uncached_tokens
-                                > previous.total_prefill_uncached_tokens
-                                && native.total_prefill_busy_us > previous.total_prefill_busy_us =>
-                        {
-                            let tokens = native.total_prefill_uncached_tokens
-                                - previous.total_prefill_uncached_tokens;
-                            let busy_us = native.total_prefill_busy_us - previous.total_prefill_busy_us;
-                            let rate = 1_000_000.0 * tokens as f64 / busy_us as f64;
-                            if rate.is_finite() && rate > 0.0 {
-                                prefill_throughput_tokens_per_s += rate;
-                            } else {
-                                complete_prefill_sample = false;
-                            }
-                        }
-                        _ => complete_prefill_sample = false,
+                    let rate_is_fresh = rate_at.is_some_and(|sample_at| {
+                        now.saturating_duration_since(sample_at) <= self.freshness
+                    });
+                    let fresh_rate = rate
+                        .filter(|rate| rate.is_finite() && *rate > 0.0 && rate_is_fresh);
+                    let cumulative_rate = (native.total_prefill_uncached_tokens > 0
+                        && native.total_prefill_busy_us > 0)
+                        .then(|| {
+                            1_000_000.0 * native.total_prefill_uncached_tokens as f64
+                                / native.total_prefill_busy_us as f64
+                        })
+                        .filter(|rate| rate.is_finite() && *rate > 0.0);
+                    match fresh_rate.or(cumulative_rate) {
+                        Some(rate) => prefill_throughput_tokens_per_s += rate,
+                        None => complete_prefill_sample = false,
                     }
                 }
                 let prefill_throughput_tokens_per_s = complete_prefill_sample
                     .then_some(prefill_throughput_tokens_per_s);
-                let estimated_prefill_queue_ms = prefill_throughput_tokens_per_s.map(|rate| {
-                    1_000.0 * num_waiting_uncached_tokens as f64 / rate
-                });
+                let estimated_prefill_queue_ms = if num_waiting_uncached_tokens == 0 {
+                    Some(0.0)
+                } else {
+                    prefill_throughput_tokens_per_s.map(|rate| {
+                        1_000.0 * num_waiting_uncached_tokens as f64 / rate
+                    })
+                };
                 oldest_at.map(|captured_at| {
                     (
                         url,
@@ -807,8 +853,103 @@ mod tests {
             .expect("complete fresh rank must be usable");
         assert_eq!(worker.num_waiting_uncached_tokens, 4_000);
         assert_eq!(worker.num_total_tokens, 24_000);
+
         assert_eq!(worker.max_running_requests, 64);
         assert_eq!(worker.prefill_throughput_tokens_per_s, Some(6_000.0));
         assert_eq!(worker.estimated_prefill_queue_ms, Some(666.666_666_666_666_6));
     }
+    #[test]
+    fn idle_native_sample_has_zero_queue_time_without_prefill_history() {
+        let t = EngineLoadTable::new();
+        let now = Instant::now();
+        let mut idle = load(0, 0);
+        idle.max_total_num_tokens = 32_000;
+        idle.native_cache = Some(NativeCacheRankLoad {
+            num_waiting_uncached_tokens: 0,
+            num_total_tokens: 0,
+            max_running_requests: 64,
+            total_prefill_uncached_tokens: 0,
+            total_prefill_busy_us: 0,
+        });
+
+        t.mark_expected_rank("http://idle:30000", 0);
+        t.set("http://idle:30000", 0, idle, now);
+
+        let snapshot = t.capture_snapshot(now);
+        let worker = snapshot
+            .fresh_native_cache_load_for_url("http://idle:30000")
+            .expect("an idle complete monitor must remain usable");
+        assert_eq!(worker.prefill_throughput_tokens_per_s, None);
+        assert_eq!(worker.estimated_prefill_queue_ms, Some(0.0));
+    }
+    #[test]
+    fn native_queue_time_uses_fresh_cumulative_rate_after_cached_rate_stales() {
+        let t = EngineLoadTable::with_freshness(Duration::from_secs(5));
+        let first = Instant::now();
+        let second = first + Duration::from_secs(1);
+        let later = second + Duration::from_secs(6);
+        let mut old = load(0, 0);
+        old.max_total_num_tokens = 32_000;
+        old.native_cache = Some(NativeCacheRankLoad {
+            num_waiting_uncached_tokens: 0,
+            num_total_tokens: 0,
+            max_running_requests: 64,
+            total_prefill_uncached_tokens: 1_000,
+            total_prefill_busy_us: 1_000_000,
+        });
+        let mut active = old.clone();
+        let native = active.native_cache.as_mut().expect("native fields");
+        native.num_waiting_uncached_tokens = 2_000;
+        native.total_prefill_uncached_tokens = 7_000;
+        native.total_prefill_busy_us = 2_000_000;
+        let stalled = active.clone();
+
+        t.mark_expected_rank("http://w:30000", 0);
+        t.set("http://w:30000", 0, old, first);
+        t.set("http://w:30000", 0, active, second);
+        t.set("http://w:30000", 0, stalled, later);
+
+        let snapshot = t.capture_snapshot(later);
+        let worker = snapshot
+            .fresh_native_cache_load_for_url("http://w:30000")
+            .expect("latest monitor sample remains fresh");
+        assert_eq!(worker.prefill_throughput_tokens_per_s, Some(3_500.0));
+        assert_eq!(worker.estimated_prefill_queue_ms, Some(571.428_571_428_571_4));
+    }
+
+    #[test]
+    fn native_queue_time_keeps_the_last_fresh_prefill_rate() {
+        let t = EngineLoadTable::new();
+        let first = Instant::now();
+        let second = first + Duration::from_secs(1);
+        let third = second + Duration::from_secs(1);
+        let mut old = load(0, 0);
+        old.max_total_num_tokens = 32_000;
+        old.native_cache = Some(NativeCacheRankLoad {
+            num_waiting_uncached_tokens: 0,
+            num_total_tokens: 0,
+            max_running_requests: 64,
+            total_prefill_uncached_tokens: 1_000,
+            total_prefill_busy_us: 1_000_000,
+        });
+        let mut active = old.clone();
+        let active_native = active.native_cache.as_mut().expect("native fields");
+        active_native.num_waiting_uncached_tokens = 2_000;
+        active_native.total_prefill_uncached_tokens = 7_000;
+        active_native.total_prefill_busy_us = 2_000_000;
+        let stalled = active.clone();
+
+        t.mark_expected_rank("http://w:30000", 0);
+        t.set("http://w:30000", 0, old, first);
+        t.set("http://w:30000", 0, active, second);
+        t.set("http://w:30000", 0, stalled, third);
+
+        let snapshot = t.capture_snapshot(third);
+        let worker = snapshot
+            .fresh_native_cache_load_for_url("http://w:30000")
+            .expect("latest monitor sample remains fresh");
+        assert_eq!(worker.prefill_throughput_tokens_per_s, Some(6_000.0));
+        assert_eq!(worker.estimated_prefill_queue_ms, Some(333.333_333_333_333_3));
+    }
+
 }

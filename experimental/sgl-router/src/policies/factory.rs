@@ -1,9 +1,10 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::config::{Config, ModelConfig, PolicyKind};
+use crate::config::{AffinityConfig, Config, ModelConfig, PolicyKind};
 use crate::discovery::ModelId;
 use crate::policies::{
+    GuardHints, Policy, PolicyRegistry,
     cache_aware::CacheAwarePolicy,
     cache_aware_zmq::CacheAwareZmqPolicy,
     engine_load::EngineLoadTable,
@@ -13,18 +14,26 @@ use crate::policies::{
     random::RandomPolicy,
     round_robin::RoundRobinPolicy,
     scoring::{
-        admission::Overloaded, prefix_cache, prefix_cache::PrefixCachePolicy, FusedScorePolicy,
-        Pipeline, ScorePolicy,
+        FusedScorePolicy, Pipeline, ScorePolicy, admission::Overloaded, prefix_cache,
+        prefix_cache::PrefixCachePolicy,
     },
     session_aware::SessionAwarePolicy,
     shortest_ttft::ShortestTtftPolicy,
     sticky::StickyPolicy,
-    Policy, PolicyRegistry,
 };
 use crate::tokenizer::TokenizerRegistry;
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use std::sync::Arc;
 use std::time::Duration;
+
+fn cache_guard_hints(config: &AffinityConfig) -> GuardHints {
+    GuardHints {
+        enable_pressure_guard: config.pressure_guard,
+        pressure_abs_threshold_tokens: config.pressure_abs_threshold_tokens,
+        pressure_abs_threshold_ms: config.pressure_abs_threshold_ms,
+        pressure_rel_threshold: config.pressure_rel_threshold,
+    }
+}
 
 /// Build a dependency-free policy for use as the sticky-session fallback
 /// (keyless requests + initial pin of a new key). `Cli::into_config`
@@ -133,12 +142,14 @@ fn build_kind(
         PolicyKind::LoadBased => Arc::new(LoadBasedPolicy::new()),
         PolicyKind::CacheAwareZmq => {
             let cache_cfg = model.cache_aware.clone().unwrap_or_default();
+            let affinity_cfg = model.affinity.clone().unwrap_or_default();
             Arc::new(CacheAwareZmqPolicy::new(
                 cache_cfg,
                 tree,
                 tokenizers,
                 block_size_oracle,
                 Arc::clone(engine_load),
+                cache_guard_hints(&affinity_cfg),
             ))
         }
         PolicyKind::SessionAware => Arc::new(SessionAwarePolicy::new(
@@ -269,13 +280,12 @@ pub fn build_policy_kind_only(kind: PolicyKind) -> Result<Arc<dyn Policy>> {
                 Arc::new(TokenizerRegistry::default()),
                 BlockSizeOracle::new(),
                 EngineLoadTable::new(),
+                cache_guard_hints(&AffinityConfig::default()),
             ))
         }
-        PolicyKind::SessionAware => Arc::new(SessionAwarePolicy::new(
-            crate::config::AffinityConfig::default(),
-        )),
+        PolicyKind::SessionAware => Arc::new(SessionAwarePolicy::new(AffinityConfig::default())),
         PolicyKind::CacheAware => Arc::new(CacheAwarePolicy::new(
-            crate::config::AffinityConfig::default(),
+            AffinityConfig::default(),
             Arc::new(HashTree::new()),
             BlockSizeOracle::new(),
         )),
@@ -537,10 +547,12 @@ mod tests {
 
         // And an empty spec is refused too, rather than summing nothing.
         cfg.model.fused = Some(vec![]);
-        assert!(build_registry_with_defaults(&cfg)
-            .unwrap_err()
-            .to_string()
-            .contains("at least one --fuse term"));
+        assert!(
+            build_registry_with_defaults(&cfg)
+                .unwrap_err()
+                .to_string()
+                .contains("at least one --fuse term")
+        );
     }
 
     /// `score_policy` 使用独立的顶层 factory 分支。

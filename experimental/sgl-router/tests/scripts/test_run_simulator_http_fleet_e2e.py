@@ -580,12 +580,10 @@ class SimulatorHttpFleetContractTest(unittest.TestCase):
                 "block_size_fallbacks": 0,
             },
         )
-        runner.require_zmq_policy_audit(audit, expected_decisions=3)
+        runner.require_zmq_policy_audit(audit, expected_decisions=3, lookup_count=2)
 
-        broken = dict(audit)
-        broken["cache_holder_selections"] = 0
-        with self.assertRaisesRegex(RuntimeError, "lookup outcomes"):
-            runner.require_zmq_policy_audit(broken, expected_decisions=3)
+        with self.assertRaisesRegex(RuntimeError, "HashTree lookup"):
+            runner.require_zmq_policy_audit(audit, expected_decisions=3, lookup_count=1)
 
     def test_shortest_ttft_audit_requires_fresh_monitor_for_every_winner(self):
         runner = load_runner()

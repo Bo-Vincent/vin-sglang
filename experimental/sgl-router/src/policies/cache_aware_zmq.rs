@@ -56,9 +56,11 @@ use crate::config::CacheAwareConfig;
 
 use crate::policies::engine_load::{EngineLoadSnapshot, EngineLoadTable};
 use crate::policies::kv_events::{
-    compute_block_hashes, compute_block_hashes_bigram, BlockSizeOracle, HashTree,
+    BlockSizeOracle, HashTree, compute_block_hashes, compute_block_hashes_bigram,
 };
-use crate::policies::{request_tokens_for, Policy, SelectionContext};
+use crate::policies::{
+    GuardHints, Policy, ProposalKind, SelectionContext, SelectionProposal, request_tokens_for,
+};
 use crate::server::metrics::MetricsRegistry;
 use crate::tokenizer::TokenizerRegistry;
 use crate::workers::Worker;
@@ -71,6 +73,8 @@ use std::time::Instant;
 /// doesn't have useful signal.
 pub struct CacheAwareZmqPolicy {
     config: CacheAwareConfig,
+    /// 共享 V4 admission/pressure guard 的配置；ZMQ policy 只负责 KV 命中查询。
+    guard_hints: GuardHints,
     /// Per-process KV-event hash tree, fed by the local subscriber. Cheap to
     /// clone an `Arc`; we never write to the tree from here.
     tree: Arc<HashTree>,
@@ -210,9 +214,11 @@ impl CacheAwareZmqPolicy {
         tokenizers: Arc<TokenizerRegistry>,
         block_size_oracle: Arc<BlockSizeOracle>,
         engine_load: Arc<EngineLoadTable>,
+        guard_hints: GuardHints,
     ) -> Self {
         Self {
             config,
+            guard_hints,
             tree,
             tokenizers,
             block_size_oracle,
@@ -272,6 +278,34 @@ impl CacheAwareZmqPolicy {
 }
 
 impl Policy for CacheAwareZmqPolicy {
+    fn propose(
+        &self,
+        workers: &[Arc<Worker>],
+        ctx: &SelectionContext<'_>,
+    ) -> Option<SelectionProposal> {
+        let primary = self.select(workers, ctx)?;
+        // 保留 ZMQ HashTree 选择的 primary；second candidate 只供共享的 V4
+        // admission/pressure guard 做同请求快照下的逃逸比较。
+        let backup = workers
+            .iter()
+            .filter(|worker| worker.id != primary.id)
+            .min_by_key(|worker| worker.active_load())
+            .map(Arc::clone);
+        let proposal = match backup {
+            Some(backup) => SelectionProposal::with_backup(primary, backup),
+            None => SelectionProposal::primary(primary),
+        };
+        Some(
+            proposal
+                .with_kind(ProposalKind::CacheAffinity)
+                .with_guard_hints(self.guard_hints.clone()),
+        )
+    }
+
+    fn uses_shared_prefill_admission(&self) -> bool {
+        true
+    }
+
     fn select(&self, workers: &[Arc<Worker>], ctx: &SelectionContext<'_>) -> Option<Arc<Worker>> {
         if workers.is_empty() {
             return None;
@@ -434,8 +468,8 @@ mod tests {
     use crate::config::CacheAwareConfig;
     use crate::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
     use crate::policies::engine_load::{EngineWorkerLoad, LoadStat};
-    use crate::policies::kv_events::tree::KvWorkerId;
     use crate::policies::kv_events::HashTree;
+    use crate::policies::kv_events::tree::KvWorkerId;
     use crate::tokenizer::adapter;
     use std::time::Duration;
 
@@ -476,7 +510,19 @@ mod tests {
         tokenizers: Arc<TokenizerRegistry>,
         oracle: Arc<BlockSizeOracle>,
     ) -> CacheAwareZmqPolicy {
-        CacheAwareZmqPolicy::new(config, tree, tokenizers, oracle, EngineLoadTable::new())
+        CacheAwareZmqPolicy::new(
+            config,
+            tree,
+            tokenizers,
+            oracle,
+            EngineLoadTable::new(),
+            GuardHints {
+                enable_pressure_guard: true,
+                pressure_abs_threshold_tokens: 1_024,
+                pressure_abs_threshold_ms: None,
+                pressure_rel_threshold: 1.5,
+            },
+        )
     }
 
     /// Build a policy with an explicit engine-load table, for tests that
@@ -488,7 +534,19 @@ mod tests {
         oracle: Arc<BlockSizeOracle>,
         engine_load: Arc<EngineLoadTable>,
     ) -> CacheAwareZmqPolicy {
-        CacheAwareZmqPolicy::new(config, tree, tokenizers, oracle, engine_load)
+        CacheAwareZmqPolicy::new(
+            config,
+            tree,
+            tokenizers,
+            oracle,
+            engine_load,
+            GuardHints {
+                enable_pressure_guard: true,
+                pressure_abs_threshold_tokens: 1_024,
+                pressure_abs_threshold_ms: None,
+                pressure_rel_threshold: 1.5,
+            },
+        )
     }
 
     fn load_stat(running: u64, waiting: u64) -> LoadStat {
@@ -530,6 +588,28 @@ mod tests {
             active_load: crate::config::ActiveLoadConfig::default(),
         };
         Arc::new(TokenizerRegistry::load_from_config(&cfg).expect("load tiny tokenizer"))
+    }
+
+    #[test]
+    fn zmq_prefill_uses_shared_admission_and_guarded_backup() {
+        let policy = new_policy(
+            cfg_default(),
+            Arc::new(HashTree::new()),
+            tokenizer_registry_with_tiny(),
+            oracle_for_tests(4),
+        );
+        let workers = vec![
+            worker("http://w0:30000", "tiny"),
+            worker("http://w1:30000", "tiny"),
+        ];
+        let model = ModelId("tiny".into());
+        let proposal = policy
+            .propose(&workers, &SelectionContext::new(&model, None))
+            .expect("non-empty workers must produce a proposal");
+        assert!(policy.uses_shared_prefill_admission());
+        assert_eq!(proposal.kind, ProposalKind::CacheAffinity);
+        assert!(proposal.backup.is_some());
+        assert!(proposal.guard_hints.enable_pressure_guard);
     }
 
     /// Empty workers list returns None (parity with other policies).

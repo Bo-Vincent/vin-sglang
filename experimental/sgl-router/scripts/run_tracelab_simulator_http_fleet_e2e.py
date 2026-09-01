@@ -767,6 +767,19 @@ def run_case(
         worker_urls = [spec.url for spec in specs]
         asyncio.run(fleet.flush_worker_caches(worker_urls))
         time.sleep(args.control_plane_quiesce_seconds)
+        # 每个隔离 case 直接触发一次所有 worker 的 prefill，建立完整 native
+        # monitor 的累计吞吐样本；随后立即 flush KV，保证它不是测量预热。
+        asyncio.run(
+            fleet.post_direct_warmups(
+                worker_urls,
+                model=str(args.model_path),
+                prefix="router-monitor-prime",
+                holder_count=len(worker_urls),
+            )
+        )
+        asyncio.run(fleet.flush_worker_caches(worker_urls))
+        time.sleep(args.control_plane_quiesce_seconds)
+
 
         warmups, measurements = partition_replay_rounds(rounds)
         router_warmup_before = asyncio.run(
@@ -864,8 +877,15 @@ def run_case(
             )
             fleet.require_native_cache_audit(audit, expected_decisions=expected)
         elif case.policy in ("shortest_ttft", "original_shortest_ttft"):
+            policy_decisions = sum(
+                count
+                for reason, count in reasons.items()
+                if not reason.endswith("_p2_fallback")
+            )
             decision_log = measurement_decision_log(
-                router_log, policy_marker="shortest TTFT candidate winner", expected_decisions=expected
+                router_log,
+                policy_marker="shortest TTFT candidate winner",
+                expected_decisions=int(policy_decisions),
             )
             shortest_ttft_audit = fleet.shortest_ttft_monitor_usage(decision_log)
             fleet.require_shortest_ttft_audit(
@@ -880,11 +900,22 @@ def run_case(
                 power_of_two_audit, expected_decisions=expected
             )
         elif case.policy == "cache_aware_zmq":
-            decision_log = measurement_decision_log(
-                router_log, policy_marker="cache-aware-zmq", expected_decisions=expected
+            load_balance_log = measurement_decision_log(
+                router_log,
+                policy_marker="cache-aware-zmq: load-balance check considered",
+                expected_decisions=expected,
             )
-            zmq_policy_audit = fleet.zmq_policy_usage(decision_log)
-            fleet.require_zmq_policy_audit(zmq_policy_audit, expected_decisions=expected)
+            lookup_log = measurement_decision_log(
+                router_log,
+                policy_marker="cache-aware-zmq match_prefix",
+                expected_decisions=expected,
+            )
+            zmq_policy_audit = fleet.zmq_policy_usage(load_balance_log + lookup_log)
+            fleet.require_zmq_policy_audit(
+                zmq_policy_audit,
+                expected_decisions=expected,
+                lookup_count=zmq_policy_audit["lookup_decisions"],
+            )
 
         summary = fleet.summarize_case(
             requests,

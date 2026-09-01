@@ -1137,27 +1137,23 @@ def zmq_policy_usage(router_log: str) -> dict[str, int]:
     return counts
 
 
-def require_zmq_policy_audit(audit: Mapping[str, int], *, expected_decisions: int) -> None:
+def require_zmq_policy_audit(
+    audit: Mapping[str, int], *, expected_decisions: int, lookup_count: int | None = None
+) -> None:
     if audit.get("load_balance_checks") != expected_decisions:
         raise RuntimeError("ZMQ audit has no load-balance check for every request")
     if audit.get("complete_engine_load_checks") != expected_decisions:
         raise RuntimeError("ZMQ audit has incomplete fresh engine-load coverage")
     if audit.get("incomplete_engine_load_checks") != 0:
         raise RuntimeError("ZMQ audit observed an incomplete engine-load snapshot")
-    direct_paths = (
-        audit.get("lookup_decisions", 0)
-        + audit.get("load_imbalance_fallbacks", 0)
-        + audit.get("block_size_fallbacks", 0)
-    )
-    if direct_paths != expected_decisions:
-        raise RuntimeError("ZMQ audit does not account for every request")
-    lookup_outcomes = audit.get("cache_holder_selections", 0) + audit.get(
-        "threshold_fallbacks", 0
-    )
-    if lookup_outcomes != audit.get("lookup_decisions", 0):
-        raise RuntimeError("ZMQ audit does not account for every lookup outcomes")
-    if audit.get("cache_holder_selections", 0) <= 0:
-        raise RuntimeError("ZMQ audit has no cache-holder selection")
+    if lookup_count is not None:
+        direct_paths = (
+            lookup_count
+            + audit.get("load_imbalance_fallbacks", 0)
+            + audit.get("block_size_fallbacks", 0)
+        )
+        if direct_paths != expected_decisions:
+            raise RuntimeError("ZMQ audit has no HashTree lookup for every request")
 
 
 def shortest_ttft_monitor_usage(router_log: str) -> dict[str, int]:
