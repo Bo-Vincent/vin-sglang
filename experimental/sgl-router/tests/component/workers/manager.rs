@@ -48,6 +48,28 @@ fn spec_for(id: &str, url: &str, mode: WorkerMode) -> WorkerSpec {
     }
 }
 
+/// 等待后台 introspection 将 worker 注册到目标 mode。固定 sleep 在 component
+/// suite 并行执行时会把调度延迟误报成 manager 回归。
+async fn wait_for_mode_count(
+    registry: &WorkerRegistry,
+    model: &ModelId,
+    mode: WorkerMode,
+    expected: usize,
+) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let observed = registry.workers_for_mode(model, mode).len();
+        if observed == expected {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {expected} {mode:?} workers for {model}; observed {observed}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 #[tokio::test]
 async fn manager_processes_added_then_removed() {
     let (url_a, _s_a) = spawn_fake_worker(json!({"served_model_name": "m"})).await;
@@ -103,13 +125,8 @@ async fn manager_handles_mode_changed() {
     )))
     .await
     .unwrap();
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    assert_eq!(
-        registry
-            .workers_for_mode(&ModelId("m".into()), WorkerMode::Prefill)
-            .len(),
-        1
-    );
+    let model = ModelId("m".into());
+    wait_for_mode_count(&registry, &model, WorkerMode::Prefill, 1).await;
 
     tx.send(DiscoveryEvent::ModeChanged {
         id: WorkerId("w1".into()),
@@ -117,19 +134,8 @@ async fn manager_handles_mode_changed() {
     })
     .await
     .unwrap();
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    assert_eq!(
-        registry
-            .workers_for_mode(&ModelId("m".into()), WorkerMode::Prefill)
-            .len(),
-        0
-    );
-    assert_eq!(
-        registry
-            .workers_for_mode(&ModelId("m".into()), WorkerMode::Decode)
-            .len(),
-        1
-    );
+    wait_for_mode_count(&registry, &model, WorkerMode::Prefill, 0).await;
+    wait_for_mode_count(&registry, &model, WorkerMode::Decode, 1).await;
 
     drop(tx);
     h.await.unwrap();
@@ -319,6 +325,43 @@ async fn spawn_slow_worker(body: Value, delay: Duration) -> (String, oneshot::Se
     (format!("http://127.0.0.1:{port}"), tx)
 }
 
+/// 与 [`spawn_slow_worker`] 相同，但直接记录重叠的 `/server_info` 请求，
+/// 供并行注册合同测试使用。
+async fn spawn_parallel_probe_worker(
+    body: Value,
+    delay: Duration,
+    active: Arc<AtomicUsize>,
+    max_active: Arc<AtomicUsize>,
+) -> (String, oneshot::Sender<()>) {
+    let body = Arc::new(body);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let app = Router::new().route(
+        "/server_info",
+        get(move || {
+            let body = body.clone();
+            let active = Arc::clone(&active);
+            let max_active = Arc::clone(&max_active);
+            async move {
+                let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                max_active.fetch_max(current, Ordering::SeqCst);
+                tokio::time::sleep(delay).await;
+                active.fetch_sub(1, Ordering::SeqCst);
+                Json((*body).clone())
+            }
+        }),
+    );
+    let (tx, rx) = oneshot::channel::<()>();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                let _ = rx.await;
+            })
+            .await;
+    });
+    (format!("http://127.0.0.1:{port}"), tx)
+}
+
 /// Spawn a fake worker that counts each `GET /server_info` hit in the
 /// returned `AtomicUsize`.  Used to assert the manager makes exactly
 /// one round-trip per worker.
@@ -351,24 +394,31 @@ async fn spawn_counting_worker(body: Value) -> (String, Arc<AtomicUsize>, onesho
 }
 
 /// Registration must run in parallel across multiple `Added` events.
-/// Each fake worker delays its `/server_info` by 200ms; with sequential
-/// processing the manager would take ≥1000ms for 5 workers. We allow
-/// up to 600ms (3x the per-fetch delay) as a generous bound that still
-/// rejects the sequential implementation.
+/// Each fake worker keeps `/server_info` outstanding for 200ms. The test
+/// asserts an actual request overlap instead of inferring it from host timing.
 #[tokio::test]
 async fn added_events_run_in_parallel() {
     let delay = Duration::from_millis(200);
     let n = 5;
+    let active = Arc::new(AtomicUsize::new(0));
+    let max_active = Arc::new(AtomicUsize::new(0));
     let mut workers = Vec::new();
     for _ in 0..n {
-        workers.push(spawn_slow_worker(json!({"served_model_name": "m"}), delay).await);
+        workers.push(
+            spawn_parallel_probe_worker(
+                json!({"served_model_name": "m"}),
+                delay,
+                Arc::clone(&active),
+                Arc::clone(&max_active),
+            )
+            .await,
+        );
     }
 
     let (tx, rx) = mpsc::channel(16);
     let registry = Arc::new(WorkerRegistry::default());
     let h = tokio::spawn(manager::run(rx, registry.clone()));
 
-    let start = Instant::now();
     for (i, (url, _s)) in workers.iter().enumerate() {
         tx.send(DiscoveryEvent::Added(spec_for(
             &format!("w{i}"),
@@ -387,12 +437,10 @@ async fn added_events_run_in_parallel() {
         }
     })
     .await;
-    let elapsed = start.elapsed();
     assert!(registered.is_ok(), "manager failed to register {n} workers");
     assert!(
-        elapsed < Duration::from_millis(600),
-        "registration of {n} workers took {elapsed:?}; sequential per-worker /server_info \
-         fetches would take ≥1000ms — parallel spawn is required"
+        max_active.load(Ordering::SeqCst) > 1,
+        "manager issued no overlapping /server_info requests"
     );
 
     drop(tx);
