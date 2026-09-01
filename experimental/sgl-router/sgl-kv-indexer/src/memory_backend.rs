@@ -219,7 +219,7 @@ impl InMemoryKvIndexerBackend {
                 .collect();
         } else {
             for hashes in reported_chains {
-                if report_chain_requires_subtree_recompute(&state, &hashes) {
+                if report_chain_requires_subtree_recompute(&state, &worker_id, &hashes) {
                     dirty_roots.push(hashes[0]);
                 } else {
                     refresh_linear_report_chain_prefix_completeness(
@@ -636,16 +636,21 @@ fn recompute_worker_subtrees(
     }
 }
 
-/// 判断本次 REPORT 链是否已有分叉子节点。分叉时继续沿用子树重算，
-/// 避免线性快速路径遗漏此前乱序或独立上报的后代。
-fn report_chain_requires_subtree_recompute(state: &State, hashes: &[i64]) -> bool {
+/// 判断本次 REPORT 链是否已有被当前 worker 持有的分叉子节点。只有这类
+/// 分叉的派生前缀状态会受本次上报影响；其他 worker 的共享分叉无需重算。
+fn report_chain_requires_subtree_recompute(state: &State, worker_id: &str, hashes: &[i64]) -> bool {
     let reported_hashes: HashSet<i64> = hashes.iter().copied().collect();
     hashes.iter().any(|hash| {
         state.blocks.get(hash).is_some_and(|block| {
-            block
-                .children
-                .iter()
-                .any(|child| !reported_hashes.contains(child))
+            block.children.iter().any(|child| {
+                !reported_hashes.contains(child)
+                    && state.blocks.get(child).is_some_and(|child| {
+                        child
+                            .placements
+                            .keys()
+                            .any(|(worker, _)| worker == worker_id)
+                    })
+            })
         })
     })
 }
@@ -860,13 +865,39 @@ mod tests {
     }
 
     #[test]
-    fn closed_report_chain_skips_subtree_recompute_but_branch_requires_it() {
+    fn report_chain_only_recomputes_for_a_branch_held_by_the_same_worker() {
         let mut state = State::default();
 
         link_report_chain(&mut state, None, &[1, 2, 3]).unwrap();
-        assert!(!report_chain_requires_subtree_recompute(&state, &[1, 2, 3]));
+        assert!(!report_chain_requires_subtree_recompute(
+            &state,
+            "worker-a",
+            &[1, 2, 3]
+        ));
 
         link_report_chain(&mut state, Some(1), &[4]).unwrap();
-        assert!(report_chain_requires_subtree_recompute(&state, &[1, 2, 3]));
+        state
+            .blocks
+            .get_mut(&4)
+            .unwrap()
+            .placements
+            .insert(("worker-b".into(), TierType::TierHbm as i32), 0);
+        assert!(!report_chain_requires_subtree_recompute(
+            &state,
+            "worker-a",
+            &[1, 2, 3]
+        ));
+
+        state
+            .blocks
+            .get_mut(&4)
+            .unwrap()
+            .placements
+            .insert(("worker-a".into(), TierType::TierHbm as i32), 0);
+        assert!(report_chain_requires_subtree_recompute(
+            &state,
+            "worker-a",
+            &[1, 2, 3]
+        ));
     }
 }
