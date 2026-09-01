@@ -4,30 +4,30 @@
 use crate::config::{PolicyKind, SessionAffinityMode};
 use crate::discovery::{ModelId, WorkerMode};
 use crate::policies::admission::{
-    CandidateDomain, CandidateRange, DecisionReason, resolve_cache_candidates, resolve_decode,
-    resolve_prefill, resolve_shortest_ttft_candidates,
+    resolve_cache_candidates, resolve_decode, resolve_prefill, resolve_shortest_ttft_candidates,
+    CandidateDomain, CandidateRange, DecisionReason,
 };
 use crate::policies::buckets::BucketRequest;
-use crate::policies::decode::{DecodeSelectionContext, build_decode_policy};
+use crate::policies::decode::{build_decode_policy, DecodeSelectionContext};
 use crate::policies::engine_load::EngineLoadSnapshot;
 use crate::policies::kv_events::{compute_block_hashes, compute_block_hashes_bigram};
 use crate::policies::registry::{PdPoolResolver, PdResolveError};
 use crate::policies::{
-    ExternalPrefixSignal, PrefillProposal, ProposalKind, RequestTokens, SelectionContext,
-    request_tokens_for,
+    request_tokens_for, ExternalPrefixSignal, PrefillProposal, ProposalKind, RequestTokens,
+    SelectionContext,
 };
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
 use crate::server::metrics::{
-    MetricsRegistry, RequestOutcome, StaleRequestOutcome, WorkerModeLabel,
+    KvIndexerQueryOutcome, MetricsRegistry, RequestOutcome, StaleRequestOutcome, WorkerModeLabel,
 };
 use crate::workers::{LoadGuard, Worker};
 use axum::body::Body;
 use axum::extract::State;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Response};
 use bytes::Bytes;
-use serde::Deserialize;
 use serde::de::IgnoredAny;
+use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -304,7 +304,13 @@ pub async fn chat_completions(
             if hashes.is_empty() {
                 None
             } else {
-                resolve_prefix_query(index.match_prefix(hashes).await, &model_str)?.map(|outcome| {
+                let query_started = std::time::Instant::now();
+                let query_result = index.match_prefix(hashes).await;
+                ctx.metrics.observe_kv_indexer_query(
+                    kv_indexer_query_outcome(&query_result),
+                    query_started.elapsed().as_secs_f64(),
+                );
+                resolve_prefix_query(query_result, &model_str)?.map(|outcome| {
                     ExternalPrefixSignal {
                         outcome,
                         query_blocks,
@@ -1107,6 +1113,22 @@ fn resolve_prefix_query(
     }
 }
 
+/// 将真实 KV Indexer RPC 结果映射为低基数观测标签。该映射位于
+/// fail-open 决策之前，因此 timeout/unreachable 不会被请求成功掩盖。
+fn kv_indexer_query_outcome(
+    result: &Result<sgl_kv_indexer::PrefixOutcome, sgl_kv_indexer::PrefixIndexError>,
+) -> KvIndexerQueryOutcome {
+    use sgl_kv_indexer::PrefixIndexError;
+    match result {
+        Ok(_) => KvIndexerQueryOutcome::Success,
+        Err(PrefixIndexError::Overloaded) => KvIndexerQueryOutcome::Overloaded,
+        Err(PrefixIndexError::Timeout) => KvIndexerQueryOutcome::Timeout,
+        Err(PrefixIndexError::Unreachable) => KvIndexerQueryOutcome::Unreachable,
+        Err(PrefixIndexError::QueryTooLarge) => KvIndexerQueryOutcome::TooLarge,
+        Err(PrefixIndexError::Rejected(_)) => KvIndexerQueryOutcome::Rejected,
+    }
+}
+
 fn parse_optional_positive_u64_header(
     headers: &HeaderMap,
     name: &HeaderName,
@@ -1462,6 +1484,28 @@ mod tests {
                 "{error} should degrade"
             );
         }
+    }
+
+    #[test]
+    fn kv_indexer_query_outcome_keeps_fail_open_categories_visible() {
+        use sgl_kv_indexer::{PrefixIndexError, PrefixOutcome, RpcCode};
+
+        assert!(matches!(
+            kv_indexer_query_outcome(&Ok(PrefixOutcome::Empty)),
+            KvIndexerQueryOutcome::Success
+        ));
+        assert!(matches!(
+            kv_indexer_query_outcome(&Err(PrefixIndexError::Timeout)),
+            KvIndexerQueryOutcome::Timeout
+        ));
+        assert!(matches!(
+            kv_indexer_query_outcome(&Err(PrefixIndexError::Unreachable)),
+            KvIndexerQueryOutcome::Unreachable
+        ));
+        assert!(matches!(
+            kv_indexer_query_outcome(&Err(PrefixIndexError::Rejected(RpcCode::InvalidArgument))),
+            KvIndexerQueryOutcome::Rejected
+        ));
     }
 
     #[test]
