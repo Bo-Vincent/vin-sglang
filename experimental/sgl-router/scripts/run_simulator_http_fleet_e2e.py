@@ -349,11 +349,12 @@ def simulator_environment(
 ) -> dict[str, str]:
     """返回只覆盖 Simulator worker 的运行时环境及其显式依赖根目录。"""
     inherited = os.environ.get("PYTHONPATH")
+    runtime_python_root = source_root / "python"
     paths = [
         str(simulator_site),
         str(simulator_dependency_root),
         str(source_root / "tools" / "sglang-simulator" / "src"),
-        str(source_root / "python"),
+        str(runtime_python_root),
     ]
     if inherited:
         paths.append(inherited)
@@ -363,20 +364,52 @@ def simulator_environment(
         "SGLANG_SIMULATOR_CONFIG_PATH": str(simulator_config),
         "SGLANG_SIMULATOR_OUTPUT_MODE": "BLOCKING",
         "SGLANG_USE_CPU_ENGINE": "1",
+        "SGLANG_ROUTER_RUNTIME_PYTHON_ROOT": str(runtime_python_root),
     }
 
 
 def simulator_runtime_probe_command(python: str) -> list[str]:
-    """返回可在启动 worker 前验证 Simulator 依赖闭包的命令。"""
+    """返回验证 Simulator 依赖和 V4 native monitor wire 的命令。"""
     return [
         python,
         "-c",
-        "import aiconfigurator.sdk.models, transformers.image_processing_backends, sglang_simulator",
+        (
+            "import os; from pathlib import Path; import msgspec; "
+            "import aiconfigurator.sdk.models, transformers.image_processing_backends, "
+            "sglang, sglang_simulator; "
+            "from sglang.srt.managers.scheduler_components.load_publisher import LoadStat; "
+            "runtime_root = Path(os.environ['SGLANG_ROUTER_RUNTIME_PYTHON_ROOT']).resolve(); "
+            "module_path = Path(sglang.__file__).resolve(); "
+            "assert module_path.is_relative_to(runtime_root), "
+            "f'loaded sglang outside V4 runtime root: {module_path}'; "
+            "payload = msgspec.msgpack.encode(LoadStat("
+            "num_running_reqs=1, num_waiting_reqs=2, num_tokens=3, "
+            "max_total_num_tokens=4, attn_dp_rank=0, "
+            "num_waiting_uncached_tokens=5, num_total_tokens=6, "
+            "max_running_requests=7, total_prefill_uncached_tokens=8, "
+            "total_prefill_busy_us=9)); "
+            "assert len(msgspec.msgpack.decode(payload)) == 11, "
+            "'LoadStat does not carry V3 native cache-aware monitor fields'"
+        ),
     ]
 
 
 def validate_simulator_runtime(args: argparse.Namespace) -> None:
     """在创建 fleet 或结果目录前验证显式 PYTHONPATH 中的 Simulator 依赖。"""
+    runtime_python_root = args.source_root / "python"
+    publisher = (
+        runtime_python_root
+        / "sglang"
+        / "srt"
+        / "managers"
+        / "scheduler_components"
+        / "load_publisher.py"
+    )
+    if not publisher.is_file():
+        raise RuntimeError(
+            "Simulator runtime source must contain V4 "
+            f"load_publisher.py: {publisher}"
+        )
     environment = os.environ.copy()
     environment.update(
         simulator_environment(
@@ -1464,6 +1497,7 @@ def execution_artifact_contract(
     python: str,
     simulator_config: Path,
     simulator_dependency_root: Path,
+    simulator_runtime_python_root: Path,
     argv: Sequence[str],
 ) -> dict[str, object]:
     """锁定一次 Simulator 执行真正消费的脚本、解释器和配置文件。"""
@@ -1479,6 +1513,18 @@ def execution_artifact_contract(
         "simulator_config_sha256": sha256_file(simulator_config),
         "simulator_dependency_root": str(simulator_dependency_root),
         "simulator_dependency_root_sha256": sha256_tree(simulator_dependency_root),
+        "simulator_runtime_python_root": str(simulator_runtime_python_root),
+        "simulator_runtime_python_root_sha256": sha256_tree(
+            simulator_runtime_python_root
+        ),
+        "simulator_load_publisher_sha256": sha256_file(
+            simulator_runtime_python_root
+            / "sglang"
+            / "srt"
+            / "managers"
+            / "scheduler_components"
+            / "load_publisher.py"
+        ),
     }
 
 

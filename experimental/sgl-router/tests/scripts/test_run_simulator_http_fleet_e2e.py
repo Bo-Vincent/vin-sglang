@@ -297,19 +297,52 @@ class SimulatorHttpFleetContractTest(unittest.TestCase):
     def test_execution_contract_hashes_the_actual_runner_interpreter_and_config(self):
         runner = load_runner()
 
-        contract = runner.execution_artifact_contract(
-            runner_script=SCRIPT,
-            python=sys.executable,
-            simulator_config=SCRIPT,
-            simulator_dependency_root=SCRIPT.parent,
-            argv=("--policies", "cache_aware"),
-        )
+        with tempfile.TemporaryDirectory() as directory:
+            runtime_python_root = Path(directory) / "python"
+            publisher = (
+                runtime_python_root
+                / "sglang"
+                / "srt"
+                / "managers"
+                / "scheduler_components"
+                / "load_publisher.py"
+            )
+            publisher.parent.mkdir(parents=True)
+            publisher.write_text("# V4 monitor publisher\n")
+            contract = runner.execution_artifact_contract(
+                runner_script=SCRIPT,
+                python=sys.executable,
+                simulator_config=SCRIPT,
+                simulator_dependency_root=SCRIPT.parent,
+                simulator_runtime_python_root=runtime_python_root,
+                argv=("--policies", "cache_aware"),
+            )
 
-        self.assertEqual(contract["runner_script_sha256"], runner.sha256_file(SCRIPT))
-        self.assertEqual(contract["simulator_config_sha256"], runner.sha256_file(SCRIPT))
-        self.assertEqual(contract["simulator_dependency_root_sha256"], runner.sha256_tree(SCRIPT.parent))
-        self.assertEqual(contract["runner_argv"], ["--policies", "cache_aware"])
-        self.assertTrue(Path(contract["python_executable"]).is_file())
+            self.assertEqual(contract["runner_script_sha256"], runner.sha256_file(SCRIPT))
+            self.assertEqual(contract["simulator_config_sha256"], runner.sha256_file(SCRIPT))
+            self.assertEqual(
+                contract["simulator_dependency_root_sha256"],
+                runner.sha256_tree(SCRIPT.parent),
+            )
+            self.assertEqual(
+                contract["simulator_runtime_python_root_sha256"],
+                runner.sha256_tree(runtime_python_root),
+            )
+            self.assertEqual(
+                contract["simulator_load_publisher_sha256"],
+                runner.sha256_file(publisher),
+            )
+            self.assertEqual(contract["runner_argv"], ["--policies", "cache_aware"])
+            self.assertTrue(Path(contract["python_executable"]).is_file())
+
+    def test_runtime_probe_requires_v4_native_loadstat_extension(self):
+        runner = load_runner()
+
+        command = runner.simulator_runtime_probe_command("python")
+
+        self.assertIn("load_publisher", command[-1])
+        self.assertIn("num_waiting_uncached_tokens", command[-1])
+        self.assertIn("SGLANG_ROUTER_RUNTIME_PYTHON_ROOT", command[-1])
 
     def test_cache_aware_control_summary_reports_admission_and_guard_deltas(self):
         runner = load_runner()
