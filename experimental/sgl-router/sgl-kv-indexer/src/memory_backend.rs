@@ -219,13 +219,9 @@ impl InMemoryKvIndexerBackend {
                 .collect();
         } else {
             for hashes in reported_chains {
-                if report_chain_requires_subtree_recompute(&state, &worker_id, &hashes) {
-                    dirty_roots.push(hashes[0]);
-                } else {
-                    refresh_linear_report_chain_prefix_completeness(
-                        &mut state, &worker_id, &hashes,
-                    );
-                }
+                dirty_roots.extend(refresh_linear_report_chain_prefix_completeness(
+                    &mut state, &worker_id, &hashes,
+                ));
             }
         }
         recompute_worker_subtrees(&mut state, &worker_id, dirty_roots);
@@ -636,23 +632,29 @@ fn recompute_worker_subtrees(
     }
 }
 
-/// 判断本次 REPORT 链是否已有被当前 worker 持有的分叉子节点。只有这类
-/// 分叉的派生前缀状态会受本次上报影响；其他 worker 的共享分叉无需重算。
-fn report_chain_requires_subtree_recompute(state: &State, worker_id: &str, hashes: &[i64]) -> bool {
-    let reported_hashes: HashSet<i64> = hashes.iter().copied().collect();
-    hashes.iter().any(|hash| {
-        state.blocks.get(hash).is_some_and(|block| {
-            block.children.iter().any(|child| {
-                !reported_hashes.contains(child)
-                    && state.blocks.get(child).is_some_and(|child| {
-                        child
-                            .placements
-                            .keys()
-                            .any(|(worker, _)| worker == worker_id)
-                    })
-            })
+/// 找到当前 REPORT 链以外、但仍由当前 worker 持有的直接 child。只有这些
+/// 节点会在父节点完整性改变后继承新的前缀状态。
+fn external_children_held_by_worker(
+    state: &State,
+    worker_id: &str,
+    reported_hashes: &HashSet<i64>,
+    parent: i64,
+) -> Vec<i64> {
+    state
+        .blocks
+        .get(&parent)
+        .into_iter()
+        .flat_map(|block| block.children.iter().copied())
+        .filter(|child| {
+            !reported_hashes.contains(child)
+                && state.blocks.get(child).is_some_and(|child| {
+                    child
+                        .placements
+                        .keys()
+                        .any(|(worker, _)| worker == worker_id)
+                })
         })
-    })
+        .collect()
 }
 
 /// 仅刷新闭合线性 REPORT 链上的派生前缀状态，避免每个大批上报都遍历
@@ -661,8 +663,10 @@ fn refresh_linear_report_chain_prefix_completeness(
     state: &mut State,
     worker_id: &str,
     hashes: &[i64],
-) {
+) -> Vec<i64> {
     let kind = state.workers.get(worker_id).and_then(fast_path_kind);
+    let reported_hashes: HashSet<i64> = hashes.iter().copied().collect();
+    let mut external_dirty_roots = Vec::new();
     let mut parent_complete = hashes
         .first()
         .and_then(|hash| state.blocks.get(hash))
@@ -676,8 +680,20 @@ fn refresh_linear_report_chain_prefix_completeness(
         });
 
     for hash in hashes {
+        let was_complete = state
+            .blocks
+            .get(hash)
+            .is_some_and(|block| block.prefix_complete_workers.contains(worker_id));
         let complete = kind
             .is_some_and(|kind| parent_complete && block_servable(state, *hash, worker_id, kind));
+        if was_complete != complete {
+            external_dirty_roots.extend(external_children_held_by_worker(
+                state,
+                worker_id,
+                &reported_hashes,
+                *hash,
+            ));
+        }
         let Some(block) = state.blocks.get_mut(hash) else {
             continue;
         };
@@ -688,6 +704,7 @@ fn refresh_linear_report_chain_prefix_completeness(
         }
         parent_complete = complete;
     }
+    external_dirty_roots
 }
 
 /// Returns the length of the longest leading request chain already known to the
@@ -865,16 +882,10 @@ mod tests {
     }
 
     #[test]
-    fn report_chain_only_recomputes_for_a_branch_held_by_the_same_worker() {
+    fn external_children_only_include_the_reporting_workers_branch() {
         let mut state = State::default();
 
         link_report_chain(&mut state, None, &[1, 2, 3]).unwrap();
-        assert!(!report_chain_requires_subtree_recompute(
-            &state,
-            "worker-a",
-            &[1, 2, 3]
-        ));
-
         link_report_chain(&mut state, Some(1), &[4]).unwrap();
         state
             .blocks
@@ -882,11 +893,10 @@ mod tests {
             .unwrap()
             .placements
             .insert(("worker-b".into(), TierType::TierHbm as i32), 0);
-        assert!(!report_chain_requires_subtree_recompute(
-            &state,
-            "worker-a",
-            &[1, 2, 3]
-        ));
+        let reported_hashes: HashSet<i64> = [1, 2, 3].into_iter().collect();
+        assert!(
+            external_children_held_by_worker(&state, "worker-a", &reported_hashes, 1,).is_empty()
+        );
 
         state
             .blocks
@@ -894,10 +904,9 @@ mod tests {
             .unwrap()
             .placements
             .insert(("worker-a".into(), TierType::TierHbm as i32), 0);
-        assert!(report_chain_requires_subtree_recompute(
-            &state,
-            "worker-a",
-            &[1, 2, 3]
-        ));
+        assert_eq!(
+            external_children_held_by_worker(&state, "worker-a", &reported_hashes, 1,),
+            vec![4]
+        );
     }
 }
