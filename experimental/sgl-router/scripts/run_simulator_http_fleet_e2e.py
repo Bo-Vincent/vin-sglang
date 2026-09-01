@@ -580,9 +580,9 @@ def require_native_cache_audit(
             raise RuntimeError(f"{key} must be positive for native cache-aware")
     if audit.get("monitor_decisions") != audit.get("cache_candidate_decisions"):
         raise RuntimeError("monitor_decisions must cover every cache_candidate_decisions")
+    if audit.get("cache_candidate_decisions", 0) > expected_decisions:
+        raise RuntimeError("native Cache-Aware audit has more candidates than requests")
     fallback_decisions = audit.get("fallback_power_of_two_decisions", 0)
-    if audit.get("cache_candidate_decisions", 0) + fallback_decisions != expected_decisions:
-        raise RuntimeError("native Cache-Aware audit does not cover every request")
     fallback_proposals = audit.get("fallback_power_of_two_proposals", 0)
     if fallback_proposals < fallback_decisions:
         raise RuntimeError("native Cache-Aware fallback has no P2 proposal")
@@ -594,6 +594,22 @@ def require_native_cache_audit(
     for key in ("fallback_router_local_decisions", "fallback_zero_snapshot_decisions"):
         if audit.get(key, 0) != 0:
             raise RuntimeError(f"{key} must be zero for native Cache-Aware fallback")
+
+
+def require_policy_reason_coverage(
+    policy_reasons: Mapping[str, float], *, expected_decisions: int
+) -> None:
+    """确认每个测量请求都产生了一个 policy reason。
+
+    Cache-Aware 的部分请求可以合法没有 cache candidate；这些请求仍必须
+    被策略处理并通过 reason counter 可见。候选专属的 fresh-monitor 审计
+    由 ``require_native_cache_audit`` 单独覆盖，不能把两种计数混为一谈。
+    """
+    observed = sum(policy_reasons.values())
+    if observed != float(expected_decisions):
+        raise RuntimeError(
+            f"policy reason coverage was {observed}, expected {expected_decisions}"
+        )
 
 
 def require_shortest_ttft_audit(
