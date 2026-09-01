@@ -80,7 +80,7 @@ pub struct Cli {
     /// Multiplicative load spread gating the absolute balance check.
     #[arg(long)]
     pub balance_rel_threshold: Option<f32>,
-    /// External KV indexer gRPC endpoint used as the authoritative cache signal.
+    /// External KV indexer gRPC endpoint for policy shortest_ttft.
     /// Needs an explicit scheme, e.g. `http://10.0.0.1:50051`.
     #[arg(long)]
     pub kv_indexer_endpoint: Option<String>,
@@ -288,18 +288,15 @@ impl Cli {
                 "--kv-indexer-query-max-inflight requires --kv-indexer-endpoint"
             ));
         }
-        let external_index_policy = matches!(
-            self.policy,
-            PolicyKind::CacheAware | PolicyKind::ShortestTtft
-        );
+        let external_index_policy = self.policy == PolicyKind::ShortestTtft;
         if self.kv_indexer_endpoint.is_some() && !external_index_policy {
             return Err(anyhow!(
-                "--kv-indexer-endpoint requires --policy cache_aware or shortest_ttft"
+                "--kv-indexer-endpoint requires --policy shortest_ttft"
             ));
         }
         if external_index_policy && self.kv_indexer_endpoint.is_none() {
             return Err(anyhow!(
-                "--policy cache_aware or shortest_ttft requires --kv-indexer-endpoint"
+                "--policy shortest_ttft requires --kv-indexer-endpoint"
             ));
         }
         let tuned_cache_aware = tuned_legacy_cache_aware || self.kv_indexer_endpoint.is_some();
@@ -1132,12 +1129,12 @@ mod tests {
     }
 
     #[test]
-    fn kv_indexer_reuses_cache_aware_policy_config() {
+    fn kv_indexer_reuses_shortest_ttft_policy_config() {
         let c = into_config_owned(with_model(&[
             "--worker-urls",
             "http://x:30000",
             "--policy",
-            "cache_aware",
+            "shortest_ttft",
             "--kv-indexer-endpoint",
             "http://indexer:50051",
             "--kv-indexer-query-timeout-ms",
@@ -1159,7 +1156,7 @@ mod tests {
             "--worker-urls",
             "http://x:30000",
             "--policy",
-            "cache_aware",
+            "shortest_ttft",
             "--kv-indexer-endpoint",
             "http://indexer:50051",
         ]))
@@ -1231,7 +1228,7 @@ mod tests {
     }
 
     #[test]
-    fn kv_indexer_requires_cache_aware_policy() {
+    fn kv_indexer_requires_shortest_ttft_policy() {
         let err = into_config_owned(with_model(&[
             "--worker-urls",
             "http://x:30000",
@@ -1240,7 +1237,10 @@ mod tests {
         ]))
         .unwrap_err()
         .to_string();
-        assert!(err.contains("requires --policy cache_aware"), "got: {err}");
+        assert!(
+            err.contains("requires --policy shortest_ttft"),
+            "got: {err}"
+        );
     }
 
     #[test]
@@ -1725,12 +1725,15 @@ mod tests {
     #[test]
     fn native_cache_pressure_flags_build_the_guard_contract() {
         let config = cfg_of(
-            "--policy cache_aware --kv-indexer-endpoint http://indexer:50051 \
+            "--policy cache_aware \
              --disable-pressure-guard --pressure-abs-threshold-tokens 2048 \
              --pressure-abs-threshold-ms 3.5 --pressure-rel-threshold 2.0",
         )
         .unwrap();
-        let affinity = config.model.affinity.expect("cache-aware needs affinity config");
+        let affinity = config
+            .model
+            .affinity
+            .expect("cache-aware needs affinity config");
         assert!(!affinity.pressure_guard);
         assert_eq!(affinity.pressure_abs_threshold_tokens, 2_048);
         assert_eq!(affinity.pressure_abs_threshold_ms, Some(3.5));
@@ -1776,34 +1779,15 @@ mod tests {
     }
 
     #[test]
-    fn cache_aware_accepts_indexer_endpoint_and_rejects_affinity_knobs_elsewhere() {
+    fn cache_aware_uses_local_radix_tree_and_rejects_external_endpoint() {
         let config = cfg_of(
-            "--policy cache_aware --kv-indexer-endpoint http://indexer:50051 \
-             --kv-indexer-query-timeout-ms 40 \
+            "--policy cache_aware \
              --cache-affinity-min-matched-tokens 512 --cache-affinity-min-match-ratio 0.25 \
              --cache-candidate-min-workers 4 --cache-candidate-ratio 0.1 \
              --cache-candidate-max-workers 16 --cache-switch-margin-tokens 128",
         )
         .unwrap();
         assert_eq!(config.model.policy, PolicyKind::CacheAware);
-        assert_eq!(
-            config
-                .model
-                .cache_aware
-                .as_ref()
-                .expect("cache-aware needs indexer config")
-                .kv_indexer_endpoint
-                .as_ref()
-                .map(|indexer| indexer.url.as_str()),
-            Some("http://indexer:50051"),
-        );
-        let indexer_timeout_ms = config
-            .model
-            .cache_aware
-            .as_ref()
-            .and_then(|cache| cache.kv_indexer_endpoint.as_ref())
-            .expect("cache-aware needs indexer config")
-            .query_timeout_ms;
         let affinity = config
             .model
             .affinity
@@ -1814,66 +1798,31 @@ mod tests {
         assert_eq!(affinity.cache_candidate_ratio, 0.1);
         assert_eq!(affinity.cache_candidate_max_workers, 16);
         assert_eq!(affinity.cache_switch_margin_tokens, 128);
-        assert_eq!(indexer_timeout_ms, 40);
 
-        let defaults =
-            cfg_of("--policy cache_aware --kv-indexer-endpoint http://indexer:50051").unwrap();
-        let defaults_indexer_timeout_ms = defaults
-            .model
-            .cache_aware
-            .as_ref()
-            .and_then(|cache| cache.kv_indexer_endpoint.as_ref())
-            .expect("default indexer config")
-            .query_timeout_ms;
-        let defaults_affinity = defaults
-            .model
-            .affinity
-            .expect("default cache candidate config");
-        assert_eq!(
-            defaults_affinity.cache_affinity_min_matched_tokens,
-            Some(1_024)
-        );
-        assert_eq!(defaults_affinity.cache_affinity_min_match_ratio, None);
-        assert_eq!(
-            defaults_indexer_timeout_ms,
-            DEFAULT_KV_INDEXER_QUERY_TIMEOUT_MS
-        );
-
-        let err = cfg_of("--policy power_of_two --stable-pair")
-            .unwrap_err()
+        let err = cfg_of("--policy cache_aware --kv-indexer-endpoint http://indexer:50051")
+            .expect_err("Cache-Aware must use the local radix tree")
             .to_string();
-        assert!(
-            err.contains("--stable-pair") && err.contains("session_aware"),
-            "got: {err}"
-        );
-
-        let err =
-            cfg_of("--policy cache_aware --kv-indexer-endpoint http://indexer:50051 --stable-pair")
-                .expect_err("Cache-Aware has no stable backup")
-                .to_string();
-        assert!(err.contains("--stable-pair"), "got: {err}");
+        assert!(err.contains("--kv-indexer-endpoint"), "got: {err}");
     }
 
     #[test]
     fn cache_candidate_cli_rejects_invalid_bounds() {
         for (args, expected) in [
             (
-                "--policy cache_aware --kv-indexer-endpoint http://indexer:50051 \
-                 --cache-affinity-min-match-ratio 1.1",
+                "--policy cache_aware --cache-affinity-min-match-ratio 1.1",
                 "--cache-affinity-min-match-ratio",
             ),
             (
-                "--policy cache_aware --kv-indexer-endpoint http://indexer:50051 \
-                 --cache-candidate-min-workers 9 --cache-candidate-max-workers 8",
+                "--policy cache_aware --cache-candidate-min-workers 9 \
+                 --cache-candidate-max-workers 8",
                 "--cache-candidate-min-workers",
             ),
             (
-                "--policy cache_aware --kv-indexer-endpoint http://indexer:50051 \
-                 --cache-candidate-ratio=-0.1",
+                "--policy cache_aware --cache-candidate-ratio=-0.1",
                 "--cache-candidate-ratio",
             ),
             (
-                "--policy cache_aware --kv-indexer-endpoint http://indexer:50051 \
+                "--policy shortest_ttft --kv-indexer-endpoint http://indexer:50051 \
                  --kv-indexer-query-timeout-ms 0",
                 "--kv-indexer-query-timeout-ms",
             ),
@@ -1886,14 +1835,9 @@ mod tests {
     }
 
     #[test]
-    fn rejects_affinity_options_that_cannot_affect_the_selected_policy() {
-        let missing_indexer = cfg_of("--policy cache_aware")
-            .expect_err("cache_aware without an indexer can only behave like P2")
-            .to_string();
-        assert!(
-            missing_indexer.contains("--kv-indexer-endpoint"),
-            "got: {missing_indexer}"
-        );
+    fn cache_aware_uses_local_tree_without_external_indexer() {
+        let config = cfg_of("--policy cache_aware").unwrap();
+        assert_eq!(config.model.policy, PolicyKind::CacheAware);
     }
 
     #[test]

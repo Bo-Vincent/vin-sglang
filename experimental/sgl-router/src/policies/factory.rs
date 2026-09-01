@@ -146,6 +146,8 @@ fn build_kind(
         )),
         PolicyKind::CacheAware => Arc::new(CacheAwarePolicy::new(
             model.affinity.clone().unwrap_or_default(),
+            tree,
+            block_size_oracle,
         )),
         PolicyKind::ShortestTtft => Arc::new(ShortestTtftPolicy::new()),
         PolicyKind::Sticky => build_sticky(model),
@@ -272,6 +274,8 @@ pub fn build_policy_kind_only(kind: PolicyKind) -> Result<Arc<dyn Policy>> {
         )),
         PolicyKind::CacheAware => Arc::new(CacheAwarePolicy::new(
             crate::config::AffinityConfig::default(),
+            Arc::new(HashTree::new()),
+            BlockSizeOracle::new(),
         )),
         PolicyKind::ShortestTtft => Arc::new(ShortestTtftPolicy::new()),
         PolicyKind::Sticky => {
