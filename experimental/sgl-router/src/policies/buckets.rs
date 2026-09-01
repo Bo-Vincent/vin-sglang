@@ -118,7 +118,7 @@ impl BucketSelector {
         .collect()
     }
 
-    /// 将全局 Indexer 候选绑定到其 Prefill Bucket，使用 `E` 检查工作量。
+    /// 将全局树查询候选绑定到其 Prefill Bucket，使用 `E` 检查工作量。
     pub fn bind_prefill_cache_candidate(
         &self,
         mut candidate: CacheCandidate,

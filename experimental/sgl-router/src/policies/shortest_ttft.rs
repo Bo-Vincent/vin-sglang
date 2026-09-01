@@ -4,6 +4,9 @@
 //! 图中 Shortest-TTFT baseline 的候选排序与并发热点规避。
 
 use crate::discovery::WorkerId;
+use crate::policies::kv_events::{
+    compute_block_hashes, compute_block_hashes_bigram, BlockSizeOracle, HashTree,
+};
 use crate::policies::power_of_two::PowerOfTwoChoicesPolicy;
 use crate::policies::{
     estimate_matched_prefix_tokens, CacheCandidate, Policy, PrefillProposal, SelectionContext,
@@ -55,15 +58,51 @@ pub struct ShortestTtftSelection {
 }
 
 /// 独立顶层 Shortest-TTFT policy 的并发状态。
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ShortestTtftPolicy {
     last_selected: DashMap<WorkerId, AtomicU64>,
+    tree: Arc<HashTree>,
+    block_size_oracle: Arc<BlockSizeOracle>,
     next_selection_stamp: AtomicU64,
 }
 
 impl ShortestTtftPolicy {
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(tree: Arc<HashTree>, block_size_oracle: Arc<BlockSizeOracle>) -> Self {
+        Self {
+            tree,
+            block_size_oracle,
+            last_selected: DashMap::new(),
+            next_selection_stamp: AtomicU64::new(0),
+        }
+    }
+
+    /// 读取 ZMQ 同步的本地 radix tree；同一 URL 的 DP rank 取最深前缀。
+    /// 这只替换 KV 命中来源，Shortest-TTFT 自己的候选排序和 admission
+    /// guard 保持不变。
+    fn local_prefix_depths(
+        &self,
+        ctx: &SelectionContext<'_>,
+    ) -> Option<(usize, HashMap<String, u32>)> {
+        let tokens = ctx.request_tokens().filter(|tokens| !tokens.is_empty())?;
+        let block_size = self.block_size_oracle.get()?;
+        let hashes = if self.block_size_oracle.is_bigram() {
+            compute_block_hashes_bigram(tokens, block_size as usize)
+        } else {
+            compute_block_hashes(tokens, block_size as usize)
+        };
+        if hashes.is_empty() {
+            return None;
+        }
+
+        let mut depths: HashMap<String, u32> = HashMap::new();
+        for (worker, depth) in self.tree.prefix_depths(None, &hashes) {
+            let depth = u32::try_from(depth).unwrap_or(u32::MAX);
+            depths
+                .entry(worker.url)
+                .and_modify(|current| *current = (*current).max(depth))
+                .or_insert(depth);
+        }
+        Some((hashes.len(), depths))
     }
 
     fn candidate_proposal(
@@ -72,26 +111,18 @@ impl ShortestTtftPolicy {
         ctx: &SelectionContext<'_>,
     ) -> Option<ShortestTtftCandidateProposal> {
         let input_tokens = ctx.input_tokens()?;
-        let signal = ctx.external_prefix()?;
-        if signal.query_blocks == 0 || workers.is_empty() {
+        let (query_blocks, matched_by_url) = self.local_prefix_depths(ctx)?;
+        if workers.is_empty() {
             return None;
         }
-
-        let matched_by_address: HashMap<&str, u32> = match &signal.outcome {
-            sgl_kv_indexer::PrefixOutcome::Empty => HashMap::new(),
-            sgl_kv_indexer::PrefixOutcome::Matched { matches, .. } => matches
-                .iter()
-                .map(|entry| (entry.address.as_str(), entry.matched_prefix_blocks))
-                .collect(),
-        };
         let candidates = workers
             .iter()
             .filter_map(|worker| {
-                let matched_prefix_tokens = matched_by_address
-                    .get(worker.url.as_str())
+                let matched_prefix_tokens = matched_by_url
+                    .get(&worker.url)
                     .copied()
                     .map(|blocks| {
-                        estimate_matched_prefix_tokens(input_tokens, signal.query_blocks, blocks)
+                        estimate_matched_prefix_tokens(input_tokens, query_blocks, blocks)
                     })
                     .unwrap_or(0);
                 let candidate = CacheCandidate {
@@ -282,7 +313,7 @@ pub fn select_shortest_ttft(
 mod tests {
     use super::*;
     use crate::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
-    use crate::policies::ExternalPrefixSignal;
+    use crate::policies::kv_events::{compute_block_hashes, BlockSizeOracle, HashTree, KvWorkerId};
 
     fn worker(id: &str) -> Arc<Worker> {
         Arc::new(Worker::new(WorkerSpec {
@@ -403,23 +434,23 @@ mod tests {
     }
 
     #[test]
-    fn authoritative_empty_indexer_result_keeps_all_zero_hit_workers() {
+    fn empty_local_radix_tree_keeps_all_zero_hit_workers() {
         let model = ModelId("model".into());
+        let tokens = [11u32, 12, 13, 14];
         let workers = vec![worker("first"), worker("second")];
-        let signal = ExternalPrefixSignal {
-            outcome: sgl_kv_indexer::PrefixOutcome::Empty,
-            query_blocks: 8,
-        };
+        let tree = Arc::new(HashTree::new());
+        let oracle = BlockSizeOracle::new();
+        oracle.try_set(1).unwrap();
         let ctx = SelectionContext::new(&model, None)
             .with_input_tokens(8_000)
-            .with_external_prefix(Some(&signal));
-        let policy = ShortestTtftPolicy::new();
+            .with_request_tokens(Some(&tokens));
+        let policy = ShortestTtftPolicy::new(tree, oracle);
 
         let PrefillProposal::ShortestTtftCandidates(proposal) = policy
             .propose_prefill(&workers, &ctx)
-            .expect("an authoritative empty answer still has baseline candidates")
+            .expect("an empty local tree still has baseline candidates")
         else {
-            panic!("an authoritative empty answer must not degrade to P2");
+            panic!("an empty local tree must not degrade to P2");
         };
 
         assert_eq!(proposal.candidates.len(), 2);
@@ -434,19 +465,83 @@ mod tests {
     }
 
     #[test]
-    fn no_external_prefix_signal_degrades_to_power_of_two() {
+    fn missing_local_hash_metadata_degrades_to_power_of_two() {
         let model = ModelId("model".into());
+        let tokens = [11u32, 12, 13, 14];
         let workers = vec![worker("first"), worker("second")];
-        let ctx = SelectionContext::new(&model, None).with_input_tokens(8_000);
-        let policy = ShortestTtftPolicy::new();
+        let tree = Arc::new(HashTree::new());
+        let ctx = SelectionContext::new(&model, None)
+            .with_input_tokens(8_000)
+            .with_request_tokens(Some(&tokens));
+        let policy = ShortestTtftPolicy::new(tree, BlockSizeOracle::new());
 
         let PrefillProposal::Pair(proposal) = policy
             .propose_prefill(&workers, &ctx)
-            .expect("no external signal must retain a P2 fallback")
+            .expect("missing local hash metadata must retain a P2 fallback")
         else {
-            panic!("no external signal must not become synthetic cache candidates");
+            panic!("missing local hash metadata must not synthesize cache candidates");
         };
 
         assert_eq!(proposal.kind, crate::policies::ProposalKind::PowerOfTwo);
+    }
+
+    #[test]
+    fn local_radix_tree_assigns_each_shortest_ttft_candidate_its_prefix_depth() {
+        let model = ModelId("model".into());
+        let tokens = [11u32, 12, 13, 14];
+        let hashes = compute_block_hashes(&tokens, 1);
+        let tree = Arc::new(HashTree::new());
+        let oracle = BlockSizeOracle::new();
+        oracle.try_set(1).unwrap();
+        let cached = worker("cached");
+        let partial = worker("partial");
+        tree.insert(&KvWorkerId::new(cached.url.clone(), 0), None, &hashes);
+        tree.insert(&KvWorkerId::new(partial.url.clone(), 0), None, &hashes[..2]);
+        let policy = ShortestTtftPolicy::new(Arc::clone(&tree), oracle);
+        let ctx = SelectionContext::new(&model, None)
+            .with_input_tokens(tokens.len() as u64)
+            .with_request_tokens(Some(&tokens));
+
+        let PrefillProposal::ShortestTtftCandidates(proposal) = policy
+            .propose_prefill(&[Arc::clone(&cached), Arc::clone(&partial)], &ctx)
+            .expect("a local tree lookup must produce Shortest-TTFT candidates")
+        else {
+            panic!("expected Shortest-TTFT candidates")
+        };
+
+        assert_eq!(proposal.candidates.len(), 2);
+        assert_eq!(proposal.candidates[0].worker.id, cached.id);
+        assert_eq!(proposal.candidates[0].matched_prefix_tokens, 4);
+        assert_eq!(proposal.candidates[1].worker.id, partial.id);
+        assert_eq!(proposal.candidates[1].matched_prefix_tokens, 2);
+    }
+
+    #[test]
+    fn local_radix_tree_uses_bigram_hashes_when_worker_metadata_requires_them() {
+        let model = ModelId("model".into());
+        let tokens = [11u32, 12, 13, 14];
+        let hashes = compute_block_hashes_bigram(&tokens, 2);
+        assert!(!hashes.is_empty());
+        let tree = Arc::new(HashTree::new());
+        let oracle = BlockSizeOracle::new();
+        oracle.try_set(2).unwrap();
+        oracle.set_bigram(true);
+        let cached = worker("cached");
+        tree.insert(&KvWorkerId::new(cached.url.clone(), 0), None, &hashes);
+        let policy = ShortestTtftPolicy::new(Arc::clone(&tree), oracle);
+        let ctx = SelectionContext::new(&model, None)
+            .with_input_tokens(tokens.len() as u64)
+            .with_request_tokens(Some(&tokens));
+
+        let PrefillProposal::ShortestTtftCandidates(proposal) = policy
+            .propose_prefill(&[Arc::clone(&cached)], &ctx)
+            .expect("a bigram local tree lookup must produce Shortest-TTFT candidates")
+        else {
+            panic!("expected Shortest-TTFT candidates");
+        };
+
+        assert_eq!(proposal.candidates.len(), 1);
+        assert_eq!(proposal.candidates[0].worker.id, cached.id);
+        assert_eq!(proposal.candidates[0].matched_prefix_tokens, 4);
     }
 }

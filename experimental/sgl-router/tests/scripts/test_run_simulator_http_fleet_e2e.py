@@ -270,16 +270,16 @@ class SimulatorHttpFleetContractTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "fallback has no fresh LoadMonitor"):
             runner.require_native_cache_audit(audit, expected_decisions=2)
 
-    def test_policy_arguments_keep_native_indexer_and_monitor_paths_distinct(self):
+    def test_policy_arguments_keep_all_policies_on_the_local_monitor_path(self):
         runner = load_runner()
 
-        native = runner.policy_args("cache_aware", "http://127.0.0.1:50551")
-        shortest = runner.policy_args("shortest_ttft", "http://127.0.0.1:50551")
-        zmq = runner.policy_args("cache_aware_zmq", "http://127.0.0.1:50551")
-        power_of_two = runner.policy_args("power_of_two", "http://127.0.0.1:50551")
+        native = runner.policy_args("cache_aware")
+        shortest = runner.policy_args("shortest_ttft")
+        zmq = runner.policy_args("cache_aware_zmq")
+        power_of_two = runner.policy_args("power_of_two")
 
-        self.assertIn("--kv-indexer-endpoint", native)
-        self.assertIn("--kv-indexer-endpoint", shortest)
+        self.assertNotIn("--kv-indexer-endpoint", native)
+        self.assertNotIn("--kv-indexer-endpoint", shortest)
         self.assertNotIn("--kv-indexer-endpoint", zmq)
         self.assertNotIn("--kv-indexer-endpoint", power_of_two)
         self.assertEqual(power_of_two, ["--policy", "power_of_two"])
@@ -299,7 +299,6 @@ class SimulatorHttpFleetContractTest(unittest.TestCase):
         )
         arguments = runner.policy_args(
             "cache_aware",
-            "http://127.0.0.1:50551",
             cache_aware_tuning=tuning,
         )
 
@@ -328,7 +327,6 @@ class SimulatorHttpFleetContractTest(unittest.TestCase):
 
         arguments = runner.policy_args(
             "cache_aware",
-            "http://127.0.0.1:50551",
             cache_aware_tuning=tuning,
         )
 
@@ -413,26 +411,14 @@ class SimulatorHttpFleetContractTest(unittest.TestCase):
             },
         )
 
-    def test_indexer_query_limit_tracks_the_runner_concurrency_bound(self):
+    def test_shortest_ttft_arguments_have_no_external_indexer_knobs(self):
         runner = load_runner()
 
-        self.assertEqual(runner.indexer_query_concurrency(32), 32)
-        self.assertEqual(runner.indexer_query_concurrency(128), 128)
-        self.assertEqual(runner.indexer_query_concurrency(256), 256)
-        self.assertEqual(runner.indexer_query_concurrency(512), 256)
-        self.assertEqual(runner.indexer_query_concurrency(1024), 256)
+        self.assertEqual(runner.policy_args("shortest_ttft"), ["--policy", "shortest_ttft"])
 
-        native = runner.policy_args(
-            "cache_aware",
-            "http://127.0.0.1:50551",
-            indexer_query_max_inflight=256,
-        )
-        position = native.index("--kv-indexer-query-max-inflight")
-        self.assertEqual(native[position + 1], "256")
-
-    def test_router_command_forwards_native_indexer_timeout(self):
+    def test_router_command_has_no_external_indexer_timeout(self):
         runner = load_runner()
-        args = runner.parse_args(["--kv-indexer-query-timeout-ms", "10000"])
+        args = runner.parse_args([])
         args.router_binary = Path("/router")
         args.router_port = 30_480
         args.model_path = Path("/model")
@@ -447,11 +433,10 @@ class SimulatorHttpFleetContractTest(unittest.TestCase):
                 repeat=0,
             ),
             ("http://127.0.0.1:17000",),
-            "http://127.0.0.1:50551",
         )
 
-        position = command.index("--kv-indexer-query-timeout-ms")
-        self.assertEqual(command[position + 1], "10000")
+        self.assertNotIn("--kv-indexer-query-timeout-ms", command)
+        self.assertNotIn("--kv-indexer-endpoint", command)
 
     def test_worker_environment_keeps_the_simulator_runtime_isolated(self):
         runner = load_runner()

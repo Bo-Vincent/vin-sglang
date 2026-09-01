@@ -65,10 +65,9 @@ fn build_sticky(model: &ModelConfig) -> Arc<dyn Policy> {
 /// Construct a policy for a single model from its [`ModelConfig`] and the
 /// process-shared `HashTree` + `TokenizerRegistry` + `BlockSizeOracle`.
 ///
-/// The tree, tokenizer registry, and oracle are only consulted by the
-/// cache-aware-zmq variant; other policies ignore them. Callers building
-/// all policies for the same process pass the same instances to every
-/// model.
+/// Local-tree policies share the tree and oracle; policies needing request
+/// tokenization also share the tokenizer registry. Callers building all
+/// policies for the same process pass the same instances to every model.
 ///
 /// Returns an error for an invalid score composition.
 pub fn build_policy(
@@ -149,7 +148,7 @@ fn build_kind(
             tree,
             block_size_oracle,
         )),
-        PolicyKind::ShortestTtft => Arc::new(ShortestTtftPolicy::new()),
+        PolicyKind::ShortestTtft => Arc::new(ShortestTtftPolicy::new(tree, block_size_oracle)),
         PolicyKind::Sticky => build_sticky(model),
         PolicyKind::FusedScore => {
             build_fused(model, &tree, &tokenizers, &block_size_oracle, engine_load)?
@@ -245,10 +244,9 @@ fn build_score_composition(
     Ok(Arc::new(FusedScorePolicy::new(terms)?))
 }
 
-/// Compatibility shim used by tests + non-cache-aware code paths. Builds
-/// a policy without wiring the cache-aware dependencies; rejects
-/// `CacheAwareZmq` to keep the call sites that don't have a `HashTree` /
-/// `TokenizerRegistry` to hand from accidentally compiling.
+/// Compatibility shim used by tests. It supplies empty local-tree dependencies
+/// so policies needing cache state are constructible but naturally fall back
+/// until worker metadata and KV events arrive.
 #[cfg(test)]
 pub fn build_policy_kind_only(kind: PolicyKind) -> Result<Arc<dyn Policy>> {
     Ok(match kind {
@@ -277,7 +275,10 @@ pub fn build_policy_kind_only(kind: PolicyKind) -> Result<Arc<dyn Policy>> {
             Arc::new(HashTree::new()),
             BlockSizeOracle::new(),
         )),
-        PolicyKind::ShortestTtft => Arc::new(ShortestTtftPolicy::new()),
+        PolicyKind::ShortestTtft => Arc::new(ShortestTtftPolicy::new(
+            Arc::new(HashTree::new()),
+            BlockSizeOracle::new(),
+        )),
         PolicyKind::Sticky => {
             let s = crate::config::StickyConfig::default();
             Arc::new(StickyPolicy::new(
@@ -295,7 +296,7 @@ pub fn build_policy_kind_only(kind: PolicyKind) -> Result<Arc<dyn Policy>> {
         // The only genuinely dependency-BOUND kinds: their terms live on
         // `ModelConfig`, which this constructor by definition does not have.
         PolicyKind::FusedScore | PolicyKind::ScorePolicy => {
-            return Err(anyhow!("--policy {kind} needs --fuse terms from the model"))
+            return Err(anyhow!("--policy {kind} needs --fuse terms from the model"));
         }
     })
 }
@@ -324,9 +325,8 @@ pub fn build_registry(
 
 /// Convenience for tests + non-cache-aware callers: builds a registry with
 /// a fresh, empty `HashTree` and an empty `TokenizerRegistry`. The
-/// cache-aware-zmq policy will then degrade to min-load (no tokenizer +
-/// no worker-published block size → fallback) — which is exactly what
-/// the legacy tests assume.
+/// local-tree policies will fall back until worker metadata and KV events
+/// arrive — which is exactly what the legacy tests assume.
 ///
 /// Production callers go through [`build_registry`] with the real
 /// process-shared instances.

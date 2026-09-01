@@ -68,21 +68,15 @@ class SWEbenchProSimulatorHttpFleetContractTest(unittest.TestCase):
         self.assertEqual(arguments.request_rate, 64.0)
         self.assertEqual(arguments.output_tokens, 64)
         self.assertEqual(arguments.repeats, 3)
-        self.assertTrue(arguments.require_indexer_success)
+        self.assertEqual(arguments.worker_page_size, 1)
+        self.assertFalse(hasattr(arguments, "indexer_server"))
+        self.assertFalse(hasattr(arguments, "require_indexer_success"))
         self.assertGreaterEqual(
             runner.DEFAULT_AGENT_CONTEXT_REPETITIONS,
             16,
         )
         self.assertEqual(runner.CACHE_AWARE_MIN_MATCHED_TOKENS, 1024)
         self.assertFalse(arguments.execute)
-
-    def test_indexer_success_is_required_unless_explicitly_disabled_for_diagnosis(self):
-        runner = load_runner()
-
-        self.assertTrue(runner.parse_args([]).require_indexer_success)
-        self.assertFalse(
-            runner.parse_args(["--no-require-indexer-success"]).require_indexer_success
-        )
 
     def test_runtime_probe_checks_the_simulator_import_boundary(self):
         runner = load_runner()

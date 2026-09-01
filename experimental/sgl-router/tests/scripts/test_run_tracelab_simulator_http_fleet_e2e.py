@@ -109,34 +109,21 @@ class TraceLabSimulatorHttpFleetContractTest(unittest.TestCase):
         with self.assertRaises(SystemExit):
             runner.parse_args(["--worker-count", "128"])
 
-    def test_native_cache_policy_uses_explicit_indexer_budget(self):
+    def test_native_cache_and_shortest_use_the_local_tree_without_indexer_budget(self):
         runner = load_runner()
 
-        arguments = runner.policy_args(
-            "cache_aware",
-            "http://127.0.0.1:50551",
-            query_timeout_ms=10_000,
-            query_max_inflight=256,
-        )
+        self.assertNotIn("--kv-indexer-endpoint", runner.policy_args("cache_aware"))
+        self.assertNotIn("--kv-indexer-endpoint", runner.policy_args("shortest_ttft"))
 
-        timeout_position = arguments.index("--kv-indexer-query-timeout-ms")
-        inflight_position = arguments.index("--kv-indexer-query-max-inflight")
-        self.assertEqual(arguments[timeout_position + 1], "10000")
-        self.assertEqual(arguments[inflight_position + 1], "256")
-
-    def test_runner_defaults_to_audited_indexer_budget(self):
+    def test_runner_defaults_to_audited_local_control_plane(self):
         runner = load_runner()
 
         arguments = runner.parse_args([])
 
-        self.assertEqual(arguments.kv_indexer_query_timeout_ms, 10_000)
-        self.assertEqual(arguments.kv_indexer_query_max_inflight, 256)
-        self.assertEqual(arguments.kv_indexer_max_concurrent_streams, 512)
         self.assertEqual(arguments.warmup_request_rate, 1.0)
         self.assertEqual(arguments.pressure_guard_seed_holders, 2)
         self.assertEqual(arguments.pressure_guard_seed_request_rate, 64.0)
-        self.assertEqual(arguments.indexer_drain_quiet_seconds, 5.0)
-        self.assertFalse(arguments.require_indexer_success)
+        self.assertFalse(hasattr(arguments, "indexer_bridge"))
 
     def test_pressure_guard_seed_assigns_two_distinct_replicas_per_session(self):
         runner = load_runner()
@@ -221,81 +208,6 @@ class TraceLabSimulatorHttpFleetContractTest(unittest.TestCase):
 
         self.assertEqual(args.worker_page_size, 1)
 
-    def test_indexer_bridge_drain_requires_a_quiet_successful_apply_window(self):
-        runner = load_runner()
-        with tempfile.TemporaryDirectory() as directory:
-            bridge_log = Path(directory) / "bridge.log"
-            bridge_log.write_text(runner.BRIDGE_APPLY_LOG_MARKER + "\n")
-            clock = iter((0.0, 0.0, 5.0))
-
-            result = runner.wait_for_indexer_bridge_drain(
-                (bridge_log,),
-                quiet_seconds=5.0,
-                timeout_seconds=10.0,
-                poll_seconds=0.1,
-                sleep=lambda _: None,
-                monotonic=lambda: next(clock),
-            )
-
-        self.assertEqual(result["applied_batches"], 1)
-        self.assertEqual(result["bridge_failures"], 0)
-
-    def test_indexer_bridge_drain_rejects_bridge_reconnect(self):
-        runner = load_runner()
-        with tempfile.TemporaryDirectory() as directory:
-            bridge_log = Path(directory) / "bridge.log"
-            bridge_log.write_text(runner.BRIDGE_FAILURE_LOG_MARKER + "\n")
-
-            with self.assertRaisesRegex(RuntimeError, "bridge failure"):
-                runner.wait_for_indexer_bridge_drain(
-                    (bridge_log,),
-                    quiet_seconds=1.0,
-                    timeout_seconds=2.0,
-                    poll_seconds=0.1,
-                    sleep=lambda _: None,
-                    monotonic=lambda: 0.0,
-                )
-
-    def test_indexer_query_summary_reports_latency_and_failures(self):
-        runner = load_runner()
-        before = ""
-        after = "\n".join(
-            [
-                'sgl_router_kv_indexer_query_duration_seconds_bucket{model_id="m",outcome="success",le="0.01"} 1',
-                'sgl_router_kv_indexer_query_duration_seconds_bucket{model_id="m",outcome="success",le="0.1"} 3',
-                'sgl_router_kv_indexer_query_duration_seconds_bucket{model_id="m",outcome="success",le="+Inf"} 3',
-                'sgl_router_kv_indexer_query_duration_seconds_sum{model_id="m",outcome="success"} 0.13',
-                'sgl_router_kv_indexer_query_duration_seconds_count{model_id="m",outcome="success"} 3',
-                'sgl_router_kv_indexer_query_duration_seconds_bucket{model_id="m",outcome="timeout",le="2"} 1',
-                'sgl_router_kv_indexer_query_duration_seconds_bucket{model_id="m",outcome="timeout",le="+Inf"} 1',
-                'sgl_router_kv_indexer_query_duration_seconds_sum{model_id="m",outcome="timeout"} 2.0',
-                'sgl_router_kv_indexer_query_duration_seconds_count{model_id="m",outcome="timeout"} 1',
-            ]
-        )
-
-        summary = runner.indexer_query_summary(before, after)
-
-        self.assertEqual(summary["query_count"], 4)
-        self.assertEqual(summary["success_count"], 3)
-        self.assertEqual(summary["failure_count"], 1)
-        self.assertEqual(summary["outcomes"]["success"]["p95_ms"], 100.0)
-        self.assertEqual(summary["outcomes"]["timeout"]["mean_ms"], 2_000.0)
-
-    def test_indexer_query_success_gate_rejects_any_fail_open_outcome(self):
-        runner = load_runner()
-
-        with self.assertRaisesRegex(RuntimeError, "failed"):
-            runner.require_indexer_query_success(
-                {
-                    "query_count": 256,
-                    "success_count": 255,
-                    "failure_count": 1,
-                    "outcomes": {"success": {"count": 255}, "timeout": {"count": 1}},
-                },
-                expected_queries=256,
-                phase="warmup",
-            )
-
     def test_zmq_lookup_summary_distinguishes_matched_and_empty(self):
         runner = load_runner()
         after = "\n".join(
@@ -318,7 +230,7 @@ class TraceLabSimulatorHttpFleetContractTest(unittest.TestCase):
         self.assertEqual(summary["empty_count"], 1)
         self.assertEqual(summary["outcomes"]["matched"]["p95_ms"], 1.0)
 
-    def test_router_command_serializes_integer_timeout_flags(self):
+    def test_router_command_serializes_local_timeout_flags(self):
         runner = load_runner()
         args = SimpleNamespace(
             router_binary=Path("/router"),
@@ -327,8 +239,6 @@ class TraceLabSimulatorHttpFleetContractTest(unittest.TestCase):
             tokenizer_path=Path("/tokenizer"),
             request_timeout_seconds=360.0,
             stale_request_timeout_seconds=420.0,
-            kv_indexer_query_timeout_ms=2_000,
-            kv_indexer_query_max_inflight=32,
         )
         case = runner.TraceLabCase(policy="power_of_two", repeat=0)
 
@@ -336,13 +246,13 @@ class TraceLabSimulatorHttpFleetContractTest(unittest.TestCase):
             args,
             case,
             ("http://127.0.0.1:17000",),
-            "http://127.0.0.1:50581",
         )
 
         timeout_index = command.index("--request-timeout-secs")
         stale_timeout_index = command.index("--stale-request-timeout-secs")
         self.assertEqual(command[timeout_index + 1], "360")
         self.assertEqual(command[stale_timeout_index + 1], "420")
+        self.assertNotIn("--kv-indexer-endpoint", command)
 
 
 if __name__ == "__main__":

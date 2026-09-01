@@ -13,13 +13,9 @@ use crate::config::{
     default_cb_cool_down, default_proxy_request_timeout_secs, default_stale_request_timeout_secs,
     resolve_mode, ActiveLoadConfig, AffinityConfig, AffinityMode, CacheAwareConfig,
     CircuitBreakerConfig, Config, DecodePolicyKind, DiscoveryBackend, EligibilityConfig, FusedTerm,
-    K8sDiscoveryConfig, KvIndexerEndpointConfig, LogFormat, ModelConfig, ObservabilityConfig,
-    PolicyKind, ProxyConfig, ServerConfig, SessionAffinityMode, StaticUrlsDiscoveryConfig,
-    StickyConfig, DEFAULT_FUSE,
+    K8sDiscoveryConfig, LogFormat, ModelConfig, ObservabilityConfig, PolicyKind, ProxyConfig,
+    ServerConfig, SessionAffinityMode, StaticUrlsDiscoveryConfig, StickyConfig, DEFAULT_FUSE,
 };
-
-const DEFAULT_KV_INDEXER_QUERY_TIMEOUT_MS: u64 = 100;
-const DEFAULT_KV_INDEXER_QUERY_MAX_INFLIGHT: usize = sgl_kv_indexer::DEFAULT_QUERY_MAX_INFLIGHT;
 
 /// `sgl-router` — slim KV-aware OpenAI-compatible router for SGLang workers.
 ///
@@ -80,19 +76,6 @@ pub struct Cli {
     /// Multiplicative load spread gating the absolute balance check.
     #[arg(long)]
     pub balance_rel_threshold: Option<f32>,
-    /// External KV indexer gRPC endpoint for policy shortest_ttft.
-    /// Needs an explicit scheme, e.g. `http://10.0.0.1:50051`.
-    #[arg(long)]
-    pub kv_indexer_endpoint: Option<String>,
-    /// KV Indexer query timeout in milliseconds. Requires
-    /// `--kv-indexer-endpoint`; defaults to 100.
-    #[arg(long)]
-    pub kv_indexer_query_timeout_ms: Option<u64>,
-    /// Maximum concurrent KV Indexer queries issued by this Router. Requires
-    /// `--kv-indexer-endpoint`; defaults to 32.
-    #[arg(long)]
-    pub kv_indexer_query_max_inflight: Option<usize>,
-
     // ---- Session-Aware tuning ----
     /// Header carrying the Session-ID for `--policy session_aware`.
     #[arg(long)]
@@ -268,38 +251,7 @@ impl Cli {
                 "cache-aware tuning flags require --policy cache_aware_zmq"
             ));
         }
-        if self.kv_indexer_query_timeout_ms == Some(0) {
-            return Err(anyhow!(
-                "--kv-indexer-query-timeout-ms must be greater than zero"
-            ));
-        }
-        if self.kv_indexer_query_timeout_ms.is_some() && self.kv_indexer_endpoint.is_none() {
-            return Err(anyhow!(
-                "--kv-indexer-query-timeout-ms requires --kv-indexer-endpoint"
-            ));
-        }
-        if self.kv_indexer_query_max_inflight == Some(0) {
-            return Err(anyhow!(
-                "--kv-indexer-query-max-inflight must be greater than zero"
-            ));
-        }
-        if self.kv_indexer_query_max_inflight.is_some() && self.kv_indexer_endpoint.is_none() {
-            return Err(anyhow!(
-                "--kv-indexer-query-max-inflight requires --kv-indexer-endpoint"
-            ));
-        }
-        let external_index_policy = self.policy == PolicyKind::ShortestTtft;
-        if self.kv_indexer_endpoint.is_some() && !external_index_policy {
-            return Err(anyhow!(
-                "--kv-indexer-endpoint requires --policy shortest_ttft"
-            ));
-        }
-        if external_index_policy && self.kv_indexer_endpoint.is_none() {
-            return Err(anyhow!(
-                "--policy shortest_ttft requires --kv-indexer-endpoint"
-            ));
-        }
-        let tuned_cache_aware = tuned_legacy_cache_aware || self.kv_indexer_endpoint.is_some();
+        let tuned_cache_aware = tuned_legacy_cache_aware;
         let affinity_policy = matches!(
             self.policy,
             PolicyKind::SessionAware | PolicyKind::CacheAware
@@ -494,7 +446,9 @@ impl Cli {
             let d = AffinityConfig::default();
             let session_id_header = self.session_id_header.unwrap_or(d.session_id_header);
             axum::http::HeaderName::try_from(session_id_header.as_str()).map_err(|e| {
-                anyhow!("--session-id-header {session_id_header:?} is not a valid HTTP header name: {e}")
+                anyhow!(
+                    "--session-id-header {session_id_header:?} is not a valid HTTP header name: {e}"
+                )
             })?;
             let pressure_rel_threshold = self
                 .pressure_rel_threshold
@@ -594,19 +548,9 @@ impl Cli {
             cool_down_secs: self.cb_cool_down_secs.unwrap_or_else(default_cb_cool_down),
         });
 
-        // 旧 ZMQ tuning 与外部 Indexer transport 共用这一进程级配置载体；
-        // 后者由 Cache-Aware 和 Shortest-TTFT 共同消费，未设置的 knob 仍用默认值。
+        // ZMQ Cache-Aware tuning is process-local to the selected policy.
         let cache_aware = if tuned_cache_aware {
             let d = CacheAwareConfig::default();
-            let kv_indexer_endpoint = self.kv_indexer_endpoint.map(|url| KvIndexerEndpointConfig {
-                url,
-                query_timeout_ms: self
-                    .kv_indexer_query_timeout_ms
-                    .unwrap_or(DEFAULT_KV_INDEXER_QUERY_TIMEOUT_MS),
-                query_max_inflight: self
-                    .kv_indexer_query_max_inflight
-                    .unwrap_or(DEFAULT_KV_INDEXER_QUERY_MAX_INFLIGHT),
-            });
             Some(CacheAwareConfig {
                 cache_threshold: self.cache_threshold.unwrap_or(d.cache_threshold),
                 balance_abs_threshold: self
@@ -615,7 +559,6 @@ impl Cli {
                 balance_rel_threshold: self
                     .balance_rel_threshold
                     .unwrap_or(d.balance_rel_threshold),
-                kv_indexer_endpoint,
             })
         } else {
             None
@@ -672,13 +615,13 @@ impl Cli {
             (true, true) => {
                 return Err(anyhow!(
                     "--worker-urls and --service-discovery are mutually exclusive; pass exactly one"
-                ))
+                ));
             }
             (false, false) => {
                 return Err(anyhow!(
                     "no discovery backend selected; pass --worker-urls <URL...> (static) \
                      or --service-discovery (kubernetes)"
-                ))
+                ));
             }
             (true, false) => {
                 if self.service_discovery_namespace.is_some()
@@ -1129,84 +1072,16 @@ mod tests {
     }
 
     #[test]
-    fn kv_indexer_reuses_shortest_ttft_policy_config() {
-        let c = into_config_owned(with_model(&[
-            "--worker-urls",
-            "http://x:30000",
-            "--policy",
-            "shortest_ttft",
-            "--kv-indexer-endpoint",
-            "http://indexer:50051",
-            "--kv-indexer-query-timeout-ms",
-            "75",
-            "--kv-indexer-query-max-inflight",
-            "17",
-        ]))
-        .unwrap();
-        let cache = c.model.cache_aware.expect("cache-aware config");
-        let indexer = cache.kv_indexer_endpoint.expect("Indexer config");
-        assert_eq!(indexer.url, "http://indexer:50051");
-        assert_eq!(indexer.query_timeout_ms, 75);
-        assert_eq!(indexer.query_max_inflight, 17);
-    }
-
-    #[test]
-    fn kv_indexer_uses_safe_query_defaults() {
-        let c = into_config_owned(with_model(&[
-            "--worker-urls",
-            "http://x:30000",
-            "--policy",
-            "shortest_ttft",
-            "--kv-indexer-endpoint",
-            "http://indexer:50051",
-        ]))
-        .unwrap();
-        let indexer = c
-            .model
-            .cache_aware
-            .expect("cache-aware config")
-            .kv_indexer_endpoint
-            .expect("Indexer config");
-        assert_eq!(
-            indexer.query_timeout_ms,
-            DEFAULT_KV_INDEXER_QUERY_TIMEOUT_MS
-        );
-        assert_eq!(indexer.query_max_inflight, 32);
-    }
-
-    #[test]
-    fn shortest_ttft_requires_and_accepts_external_indexer() {
-        let err = into_config_owned(with_model(&[
-            "--worker-urls",
-            "http://x:30000",
-            "--policy",
-            "shortest_ttft",
-        ]))
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("shortest_ttft requires --kv-indexer-endpoint"));
-
+    fn shortest_ttft_builds_without_external_indexer() {
         let config = into_config_owned(with_model(&[
             "--worker-urls",
             "http://x:30000",
             "--policy",
             "shortest_ttft",
-            "--kv-indexer-endpoint",
-            "http://indexer:50051",
-            "--kv-indexer-query-timeout-ms",
-            "100",
         ]))
         .unwrap();
         assert_eq!(config.model.policy, PolicyKind::ShortestTtft);
-        assert_eq!(
-            config
-                .model
-                .cache_aware
-                .as_ref()
-                .and_then(|cache| cache.kv_indexer_endpoint.as_ref())
-                .map(|indexer| indexer.query_timeout_ms),
-            Some(100)
-        );
+        assert!(config.model.cache_aware.is_none());
         assert!(config.model.affinity.is_none());
     }
 
@@ -1217,77 +1092,12 @@ mod tests {
             "http://x:30000",
             "--policy",
             "shortest_ttft",
-            "--kv-indexer-endpoint",
-            "http://indexer:50051",
             "--cache-affinity-min-matched-tokens",
             "1024",
         ]))
         .unwrap_err()
         .to_string();
         assert!(err.contains("cache candidate tuning flags require --policy cache_aware"));
-    }
-
-    #[test]
-    fn kv_indexer_requires_shortest_ttft_policy() {
-        let err = into_config_owned(with_model(&[
-            "--worker-urls",
-            "http://x:30000",
-            "--kv-indexer-endpoint",
-            "http://indexer:50051",
-        ]))
-        .unwrap_err()
-        .to_string();
-        assert!(
-            err.contains("requires --policy shortest_ttft"),
-            "got: {err}"
-        );
-    }
-
-    #[test]
-    fn kv_indexer_timeout_requires_endpoint() {
-        let err = into_config_owned(with_model(&[
-            "--worker-urls",
-            "http://x:30000",
-            "--policy",
-            "cache_aware",
-            "--kv-indexer-query-timeout-ms",
-            "75",
-        ]))
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("requires --kv-indexer-endpoint"));
-    }
-
-    #[test]
-    fn kv_indexer_max_inflight_requires_endpoint() {
-        let err = into_config_owned(with_model(&[
-            "--worker-urls",
-            "http://x:30000",
-            "--policy",
-            "cache_aware",
-            "--kv-indexer-query-max-inflight",
-            "17",
-        ]))
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("requires --kv-indexer-endpoint"));
-    }
-
-    #[test]
-    fn kv_indexer_max_inflight_must_be_positive() {
-        let err = into_config_owned(with_model(&[
-            "--worker-urls",
-            "http://x:30000",
-            "--policy",
-            "cache_aware",
-            "--kv-indexer-endpoint",
-            "http://indexer:50051",
-            "--kv-indexer-query-max-inflight",
-            "0",
-        ]))
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("must be greater than zero"));
     }
 
     #[test]
@@ -1820,11 +1630,6 @@ mod tests {
             (
                 "--policy cache_aware --cache-candidate-ratio=-0.1",
                 "--cache-candidate-ratio",
-            ),
-            (
-                "--policy shortest_ttft --kv-indexer-endpoint http://indexer:50051 \
-                 --kv-indexer-query-timeout-ms 0",
-                "--kv-indexer-query-timeout-ms",
             ),
         ] {
             let err = cfg_of(args)
