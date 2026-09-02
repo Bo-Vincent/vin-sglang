@@ -535,6 +535,8 @@ fn link_report_chain(
     parent_block_hash: Option<i64>,
     hashes: &[i64],
 ) -> Result<(), Status> {
+    // 先完整校验，避免被拒绝的 REPORT 在图中留下半条父子链。
+    let mut planned_parents = HashMap::with_capacity(hashes.len());
     let mut parent = parent_block_hash.map_or(ParentLink::Root, ParentLink::Hash);
     for hash in hashes {
         if parent == ParentLink::Hash(*hash) {
@@ -542,16 +544,22 @@ fn link_report_chain(
                 "block hash cannot be its own parent",
             ));
         }
-        let existing = state
-            .blocks
+        let existing = planned_parents
             .get(hash)
-            .map(|block| block.parent)
+            .copied()
+            .or_else(|| state.blocks.get(hash).map(|block| block.parent))
             .unwrap_or_default();
         if existing != ParentLink::Unknown && existing != parent {
             return Err(Status::invalid_argument(format!(
                 "block hash {hash} was reported with conflicting parents"
             )));
         }
+        planned_parents.insert(*hash, parent);
+        parent = ParentLink::Hash(*hash);
+    }
+
+    let mut parent = parent_block_hash.map_or(ParentLink::Root, ParentLink::Hash);
+    for hash in hashes {
         if let ParentLink::Hash(parent_hash) = parent {
             state
                 .blocks
@@ -779,5 +787,15 @@ mod tests {
 
         assert_eq!(known_request_prefix_len(&state, &[1, 2, 3, 4, 5]), Some(3));
         assert_eq!(known_request_prefix_len(&state, &[1, 9]), None);
+    }
+
+    #[test]
+    fn conflicting_report_chain_does_not_mutate_the_graph() {
+        let mut state = State::default();
+
+        let error = link_report_chain(&mut state, None, &[1, 2, 1]).unwrap_err();
+
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert!(state.blocks.is_empty());
     }
 }
