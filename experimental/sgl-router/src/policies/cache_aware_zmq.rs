@@ -423,6 +423,13 @@ impl Policy for CacheAwareZmqPolicy {
         true
     }
 
+    /// ZMQ policy owns cache/load ranking, but its selected prefill worker
+    /// must still pass the router-wide admission gate against the frozen
+    /// fresh-load snapshot.
+    fn uses_shared_prefill_admission(&self) -> bool {
+        true
+    }
+
     fn attach_metrics(&self, metrics: Arc<MetricsRegistry>) {
         let _ = self.metrics.set(metrics);
     }
@@ -445,6 +452,18 @@ mod tests {
             balance_abs_threshold: 32,
             balance_rel_threshold: 1.1,
         }
+    }
+
+    #[test]
+    fn participates_in_shared_prefill_admission() {
+        let policy = new_policy(
+            cfg_default(),
+            Arc::new(HashTree::new()),
+            tokenizer_registry_with_tiny(),
+            oracle_for_tests(4),
+        );
+
+        assert!(policy.uses_shared_prefill_admission());
     }
 
     /// Helper: build a `BlockSizeOracle` already primed to the test's
