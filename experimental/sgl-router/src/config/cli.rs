@@ -12,10 +12,10 @@ use std::num::NonZeroU32;
 use crate::config::{
     default_cb_cool_down, default_proxy_request_timeout_secs, default_stale_request_timeout_secs,
     resolve_mode, ActiveLoadConfig, AffinityConfig, AffinityMode, CacheAwareConfig,
-    CircuitBreakerConfig, Config, DecodePolicyKind, DiscoveryBackend, EligibilityConfig, FusedTerm,
-    K8sDiscoveryConfig, KvIndexerEndpointConfig, LogFormat, ModelConfig, ObservabilityConfig,
-    PolicyKind, ProxyConfig, ServerConfig, SessionAffinityMode, StaticUrlsDiscoveryConfig,
-    StickyConfig, DEFAULT_FUSE,
+    CachePrefixProvider, CircuitBreakerConfig, Config, DecodePolicyKind, DiscoveryBackend,
+    EligibilityConfig, FusedTerm, K8sDiscoveryConfig, KvIndexerEndpointConfig, LogFormat,
+    ModelConfig, ObservabilityConfig, PolicyKind, ProxyConfig, ServerConfig, SessionAffinityMode,
+    StaticUrlsDiscoveryConfig, StickyConfig, DEFAULT_FUSE,
 };
 
 const DEFAULT_KV_INDEXER_QUERY_TIMEOUT_MS: u64 = 100;
@@ -92,6 +92,10 @@ pub struct Cli {
     /// `--kv-indexer-endpoint`; defaults to 32.
     #[arg(long)]
     pub kv_indexer_query_max_inflight: Option<usize>,
+    /// Source of Cache-Aware prefix matches. `indexer` keeps the current gRPC
+    /// path; `radix_tree` uses the Router-local KV-event radix tree.
+    #[arg(long, value_enum)]
+    pub cache_prefix_provider: Option<CachePrefixProvider>,
 
     // ---- Session-Aware tuning ----
     /// Header carrying the Session-ID for `--policy session_aware`.
@@ -268,6 +272,12 @@ impl Cli {
                 "cache-aware tuning flags require --policy cache_aware_zmq"
             ));
         }
+        let cache_prefix_provider = self.cache_prefix_provider.unwrap_or_default();
+        if self.cache_prefix_provider.is_some() && self.policy != PolicyKind::CacheAware {
+            return Err(anyhow!(
+                "--cache-prefix-provider requires --policy cache_aware"
+            ));
+        }
         if self.kv_indexer_query_timeout_ms == Some(0) {
             return Err(anyhow!(
                 "--kv-indexer-query-timeout-ms must be greater than zero"
@@ -288,21 +298,29 @@ impl Cli {
                 "--kv-indexer-query-max-inflight requires --kv-indexer-endpoint"
             ));
         }
-        let external_index_policy = matches!(
-            self.policy,
-            PolicyKind::CacheAware | PolicyKind::ShortestTtft
-        );
-        if self.kv_indexer_endpoint.is_some() && !external_index_policy {
+        let indexer_policy = self.policy == PolicyKind::ShortestTtft
+            || (self.policy == PolicyKind::CacheAware
+                && cache_prefix_provider == CachePrefixProvider::Indexer);
+        if self.kv_indexer_endpoint.is_some() && !indexer_policy {
+            if self.policy == PolicyKind::CacheAware
+                && cache_prefix_provider == CachePrefixProvider::RadixTree
+            {
+                return Err(anyhow!(
+                    "--kv-indexer-endpoint requires --cache-prefix-provider indexer"
+                ));
+            }
             return Err(anyhow!(
                 "--kv-indexer-endpoint requires --policy cache_aware or shortest_ttft"
             ));
         }
-        if external_index_policy && self.kv_indexer_endpoint.is_none() {
+        if indexer_policy && self.kv_indexer_endpoint.is_none() {
             return Err(anyhow!(
                 "--policy cache_aware or shortest_ttft requires --kv-indexer-endpoint"
             ));
         }
-        let tuned_cache_aware = tuned_legacy_cache_aware || self.kv_indexer_endpoint.is_some();
+        let tuned_cache_aware = tuned_legacy_cache_aware
+            || self.kv_indexer_endpoint.is_some()
+            || self.cache_prefix_provider.is_some();
         let affinity_policy = matches!(
             self.policy,
             PolicyKind::SessionAware | PolicyKind::CacheAware
@@ -618,6 +636,7 @@ impl Cli {
                 balance_rel_threshold: self
                     .balance_rel_threshold
                     .unwrap_or(d.balance_rel_threshold),
+                prefix_provider: cache_prefix_provider,
                 kv_indexer_endpoint,
             })
         } else {
@@ -1730,7 +1749,10 @@ mod tests {
              --pressure-abs-threshold-ms 3.5 --pressure-rel-threshold 2.0",
         )
         .unwrap();
-        let affinity = config.model.affinity.expect("cache-aware needs affinity config");
+        let affinity = config
+            .model
+            .affinity
+            .expect("cache-aware needs affinity config");
         assert!(!affinity.pressure_guard);
         assert_eq!(affinity.pressure_abs_threshold_tokens, 2_048);
         assert_eq!(affinity.pressure_abs_threshold_ms, Some(3.5));
@@ -1786,6 +1808,15 @@ mod tests {
         )
         .unwrap();
         assert_eq!(config.model.policy, PolicyKind::CacheAware);
+        assert_eq!(
+            config
+                .model
+                .cache_aware
+                .as_ref()
+                .expect("cache-aware needs provider config")
+                .prefix_provider,
+            CachePrefixProvider::Indexer,
+        );
         assert_eq!(
             config
                 .model
@@ -1852,6 +1883,18 @@ mod tests {
                 .expect_err("Cache-Aware has no stable backup")
                 .to_string();
         assert!(err.contains("--stable-pair"), "got: {err}");
+    }
+
+    #[test]
+    fn cache_aware_radix_tree_provider_needs_no_indexer_endpoint() {
+        let config = cfg_of("--policy cache_aware --cache-prefix-provider radix_tree").unwrap();
+        let cache = config
+            .model
+            .cache_aware
+            .expect("radix-tree Cache-Aware needs provider config");
+
+        assert_eq!(cache.prefix_provider, CachePrefixProvider::RadixTree);
+        assert!(cache.kv_indexer_endpoint.is_none());
     }
 
     #[test]

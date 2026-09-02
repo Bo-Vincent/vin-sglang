@@ -318,7 +318,11 @@ pub async fn chat_completions(
                 })
             }
         }
-        _ => None,
+        _ => ctx
+            .radix_tree_prefix_provider
+            .as_ref()
+            .zip(request_tokens.as_ref())
+            .and_then(|(provider, tokens)| provider.match_request_tokens(&tokens.ids)),
     };
 
     // Prefer exact ingress tokens; otherwise use the conservative estimate.

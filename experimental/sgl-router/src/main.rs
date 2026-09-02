@@ -3,7 +3,7 @@
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use sgl_router::config::{Cli, LogFormat};
+use sgl_router::config::{CachePrefixProvider, Cli, LogFormat, PolicyKind};
 use std::sync::Arc;
 use tokio::signal::unix::{signal, Signal, SignalKind};
 
@@ -98,11 +98,19 @@ async fn main() -> Result<()> {
     );
 
     let registry = Arc::new(sgl_router::workers::WorkerRegistry::default());
-    let prefix_index: Option<Arc<dyn sgl_kv_indexer::PrefixIndex>> = cfg
-        .model
-        .cache_aware
-        .as_ref()
-        .and_then(|cache| cache.kv_indexer_endpoint.as_ref())
+    let native_cache_uses_indexer = cfg.model.policy == PolicyKind::CacheAware
+        && cfg
+            .model
+            .cache_aware
+            .as_ref()
+            .map(|cache| cache.prefix_provider == CachePrefixProvider::Indexer)
+            .unwrap_or(false);
+    let indexer_config = (native_cache_uses_indexer
+        || cfg.model.policy == PolicyKind::ShortestTtft)
+        .then(|| cfg.model.cache_aware.as_ref())
+        .flatten()
+        .and_then(|cache| cache.kv_indexer_endpoint.as_ref());
+    let prefix_index: Option<Arc<dyn sgl_kv_indexer::PrefixIndex>> = indexer_config
         .map(|indexer| {
             let config = prefix_index_config(indexer);
             sgl_kv_indexer::GrpcPrefixIndex::new(config)
@@ -193,6 +201,18 @@ async fn main() -> Result<()> {
         active_load,
     );
     app_ctx.prefix_index = prefix_index;
+    app_ctx.radix_tree_prefix_provider = (cfg.model.policy == PolicyKind::CacheAware
+        && cfg
+            .model
+            .cache_aware
+            .as_ref()
+            .is_some_and(|cache| cache.prefix_provider == CachePrefixProvider::RadixTree))
+    .then(|| {
+        sgl_router::policies::prefix_provider::RadixTreePrefixProvider::new(
+            kv_index.tree(),
+            Arc::clone(&block_size_oracle),
+        )
+    });
     app_ctx.block_size_oracle = block_size_oracle;
     app_ctx.engine_load = kv_index.engine_load();
     let ctx = Arc::new(app_ctx);
