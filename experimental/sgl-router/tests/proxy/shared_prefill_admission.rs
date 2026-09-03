@@ -138,24 +138,27 @@ async fn chat_commits_the_admitted_prefill_backup() {
         registry,
         policies,
     ));
+    let now = Instant::now();
+    let native_load = |total_prefill_uncached_tokens, total_prefill_busy_us| LoadStat {
+        num_running_reqs: 1,
+        num_waiting_reqs: 0,
+        num_tokens: 100,
+        max_total_num_tokens: 100,
+        native_cache: Some(NativeCacheRankLoad {
+            num_waiting_uncached_tokens: 0,
+            num_total_tokens: 100,
+            max_running_requests: 16,
+            total_prefill_uncached_tokens,
+            total_prefill_busy_us,
+        }),
+    };
     ctx.engine_load.set(
         &primary.url,
         0,
-        LoadStat {
-            num_running_reqs: 1,
-            num_waiting_reqs: 0,
-            num_tokens: 100,
-            max_total_num_tokens: 100,
-            native_cache: Some(NativeCacheRankLoad {
-                num_waiting_uncached_tokens: 0,
-                num_total_tokens: 100,
-                max_running_requests: 16,
-                total_prefill_uncached_tokens: 1,
-                total_prefill_busy_us: 1,
-            }),
-        },
-        Instant::now(),
+        native_load(1, 1),
+        now - Duration::from_secs(1),
     );
+    ctx.engine_load.set(&primary.url, 0, native_load(2, 2), now);
 
     let response = build_router(ctx)
         .oneshot(
