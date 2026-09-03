@@ -413,20 +413,13 @@ pub async fn chat_completions(
                 .with_input_tokens(request_input_tokens)
                 .with_request_tokens(request_tokens.as_ref().map(|tokens| tokens.ids.as_slice()))
                 .with_external_prefix(external_prefix.as_ref())
-                .with_load_snapshot(&load_snapshot);
-            let PrefillProposal::CacheCandidates(mut proposal) =
+                .with_load_snapshot(&load_snapshot)
+                .with_prefill_cache_bucket(&ctx.bucket_selector, prefill_bucket_request);
+            let PrefillProposal::CacheCandidates(proposal) =
                 policy.propose_prefill(global_range.workers, &cache_ctx)?
             else {
                 return None;
             };
-            proposal.candidates = proposal
-                .candidates
-                .into_iter()
-                .filter_map(|candidate| {
-                    ctx.bucket_selector
-                        .bind_prefill_cache_candidate(candidate, prefill_bucket_request)
-                })
-                .collect();
             let bounded_candidate_count = proposal.candidates.len();
             let cache_decision =
                 resolve_cache_candidates(&proposal, request_input_tokens, &load_snapshot);
