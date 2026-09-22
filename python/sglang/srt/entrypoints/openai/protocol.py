@@ -401,6 +401,7 @@ class CompletionRequest(BaseModel):
     extra_key: Optional[Union[List[str], str]] = None
     # Cache salt for request caching
     cache_salt: Optional[Union[List[str], str]] = None
+    pin_input_kv: bool = False
     # Priority for the request
     priority: Optional[int] = None
 
@@ -960,6 +961,7 @@ class ChatCompletionRequest(BaseModel):
     extra_key: Optional[Union[List[str], str]] = None
     # Cache salt for request caching
     cache_salt: Optional[Union[List[str], str]] = None
+    pin_input_kv: bool = False
     # Priority for the request
     priority: Optional[int] = None
 
@@ -1674,6 +1676,7 @@ class ResponsesRequest(BaseModel):
     cache_salt: Optional[str] = Field(
         default=None, description="Cache salt for request caching"
     )
+    pin_input_kv: bool = False
 
     # For PD disaggregation
     bootstrap_host: Optional[Union[List[str], str]] = None

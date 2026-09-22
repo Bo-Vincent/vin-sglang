@@ -44,6 +44,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     PPPrefetchDecision,
     PrefetchOperation,
 )
+from sglang.srt.mem_cache.input_kv_pin import copy_input_tail, pin_input_prefix
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
@@ -378,6 +379,8 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def _reset_full(self) -> None:
         """Full reset: destroy entire tree and all state."""
+        self.pinned_input_prefixes = set()
+        self.pinned_input_tails = {}
         self.tree_core.reset()
         self.session_refs.reset()
 
@@ -978,6 +981,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 comp.cleanup_after_caching_req(req, is_finished=True)
             return
 
+        copy_input_tail(self, req, owned_kv_len)
         token_ids = (req.origin_input_ids + req.output_ids)[:owned_kv_len]
         kv_indices = self.req_to_token_pool.req_to_token[
             req.kv.req_pool_idx, :owned_kv_len
@@ -995,7 +999,11 @@ class UnifiedRadixCache(BasePrefixCache):
             )
 
             # components prepare insert data + return effective cache_len
-            effective_cache_len = len(token_ids)
+            effective_cache_len = (
+                min(len(token_ids), req.input_kv_len)
+                if req.disable_output_kv_cache
+                else len(token_ids)
+            )
             for comp in self._components_tuple:
                 cl = comp.prepare_for_caching_req(
                     req=req,
@@ -1068,6 +1076,8 @@ class UnifiedRadixCache(BasePrefixCache):
                     )
                 )
 
+            pin_input_prefix(self, req, len(token_ids))
+
             # Free unaligned tail (+ deferred truncation tail). A rotation
             # decline inserted nothing, so the whole span past the protected
             # prefix stayed request-owned and is released here instead.
@@ -1076,7 +1086,9 @@ class UnifiedRadixCache(BasePrefixCache):
                 # cache_len, and free_kv_row takes ascending ranges only.
                 min(req.kv.cache_protected_len, len(kv_indices))
                 if result.rotation_tail_declined
-                else page_aligned_len
+                else min(
+                    max(page_aligned_len, req.kv.cache_protected_len), len(kv_indices)
+                )
             )
             ranges = [(free_from, len(kv_indices))]
             if tail_free_start is not None:
@@ -1117,6 +1129,7 @@ class UnifiedRadixCache(BasePrefixCache):
             return
 
         token_ids = req.get_fill_ids()
+        copy_input_tail(self, req, len(token_ids))
 
         if self.disable:
             kv_indices = self.req_to_token_pool.req_to_token[
@@ -1137,7 +1150,11 @@ class UnifiedRadixCache(BasePrefixCache):
             session_id=req.session_id,
             rotation_base=req.kv_rotation_base,
         )
-        effective_cache_len = len(token_ids)
+        effective_cache_len = (
+            min(len(token_ids), req.input_kv_len)
+            if req.disable_output_kv_cache
+            else len(token_ids)
+        )
         for comp in self._components_tuple:
             cl = comp.prepare_for_caching_req(
                 req=req,
@@ -1208,6 +1225,12 @@ class UnifiedRadixCache(BasePrefixCache):
         new_indices = match_result.device_indices
         new_last_node = match_result.last_device_node
         new_prefix_len = result.prefix_len
+        if req.disable_output_kv_cache and req.kv.cache_protected_len > len(
+            new_indices
+        ):
+            req.prefix_indices = kv_indices_orig.to(dtype=torch.int64, copy=True)
+            pin_input_prefix(self, req, len(token_ids))
+            return
         assert req.kv.cache_protected_len <= len(new_indices) + self.page_size - 1, (
             f"{req.kv.cache_protected_len=}, {len(new_indices)=}, {page_aligned_len=}"
         )
@@ -1248,6 +1271,7 @@ class UnifiedRadixCache(BasePrefixCache):
         req.lock_receipt = lock_result.to_dec_params()
         # The rematch acquired a new SWA prefix lock.
         req.swa_prefix_lock_released = False
+        pin_input_prefix(self, req, len(token_ids))
 
         # cleanup
         for comp in self._components_tuple:
@@ -3566,13 +3590,19 @@ class UnifiedRadixCache(BasePrefixCache):
         return self.tree_core.evictable_size()
 
     def protected_size(self) -> int:
-        return self.tree_core.protected_size()
+        return (
+            self.tree_core.protected_size()
+            + len(self.pinned_input_tails) * self.page_size
+        )
 
     def full_evictable_size(self) -> int:
         return self.tree_core.full_evictable_size()
 
     def full_protected_size(self) -> int:
-        return self.tree_core.full_protected_size()
+        return (
+            self.tree_core.full_protected_size()
+            + len(self.pinned_input_tails) * self.page_size
+        )
 
     def swa_evictable_size(self) -> int:
         return self.tree_core.swa_evictable_size()

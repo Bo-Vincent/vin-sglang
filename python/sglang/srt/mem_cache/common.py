@@ -31,6 +31,44 @@ MAMBA_STATE_PER_REQ_NO_CACHE = 1
 logger = logging.getLogger(__name__)
 
 
+def validate_kv_cache_controls(
+    tree_cache: BasePrefixCache,
+    *,
+    pin_input_kv: bool,
+    disable_output_kv_cache: bool,
+) -> None:
+    if not pin_input_kv and not disable_output_kv_cache:
+        return
+    from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
+    from sglang.srt.mem_cache.radix_cache import RadixCache
+    from sglang.srt.mem_cache.unified_radix_cache import (
+        ComponentType,
+        UnifiedRadixCache,
+    )
+
+    if tree_cache.disable:
+        if pin_input_kv:
+            raise ValueError("Input KV pin requires an enabled radix cache")
+        return
+    if type(tree_cache) in (RadixCache, HiRadixCache):
+        supported = not tree_cache.is_eagle
+    elif type(tree_cache) is UnifiedRadixCache:
+        supported = (
+            tree_cache.tree_components == (ComponentType.FULL,)
+            and not tree_cache.tree_core.is_eagle
+        )
+    else:
+        supported = False
+    if (
+        not supported
+        or tree_cache.page_size != tree_cache.token_to_kv_pool_allocator.page_size
+    ):
+        raise ValueError(
+            "Input pin and output KV exclusion require a full-attention "
+            "RadixCache, HiRadixCache, or UnifiedRadixCache without DCP"
+        )
+
+
 class RetractionBackup(NamedTuple):
     cpu_tensors: Any = None
     host_indices: Optional[torch.Tensor] = None
@@ -297,7 +335,8 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
     if not req.kv.holds_kv:
         return
 
-    start_p, end_p = owned_kv_len, req.kv.kv_allocated_len
+    start_p = max(owned_kv_len, req.kv.cache_protected_len)
+    end_p = req.kv.kv_allocated_len
     _release_overallocated_kv_indices(req, start_p, end_p, tree_cache)
 
     # If the prefix cache doesn't manage mamba states, we must free them here.
@@ -323,7 +362,11 @@ def _release_overallocated_kv_indices(
 
     # strip_thinking_cache intentionally reports output tokens as overallocated
     # so they fall into the free path below (#22373).
-    if spec_algo is None and not get_serving().strip_thinking_cache:
+    if (
+        spec_algo is None
+        and not get_serving().strip_thinking_cache
+        and not req.disable_output_kv_cache
+    ):
         assert start_p == end_p, (
             f"Unexpected overallocated KV cache, {req.kv.kv_committed_len=}, {req.kv.kv_allocated_len=}"
         )

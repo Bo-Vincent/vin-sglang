@@ -894,9 +894,24 @@ class TokenizerControlMixin:
         self: TokenizerManager, obj: SetInternalStateReq
     ) -> List[bool]:
         self.auto_create_handle_loop()
+        if "disable_output_kv_cache" in obj.server_args:
+            value = obj.server_args["disable_output_kv_cache"]
+            if type(value) is not bool:
+                raise ValueError("disable_output_kv_cache must be a boolean")
+            if get_serving().tokenizer_worker_num != 1:
+                raise ValueError(
+                    "Updating disable_output_kv_cache requires one tokenizer worker"
+                )
         responses: List[
             SetInternalStateReqOutput
         ] = await self.set_internal_state_communicator(obj)
+        if "disable_output_kv_cache" in obj.server_args and all(
+            res.updated for res in responses
+        ):
+            self.record_config_updates(
+                "set_internal_state",
+                disable_output_kv_cache=obj.server_args["disable_output_kv_cache"],
+            )
         return [res.updated for res in responses]
 
     async def dumper_control(

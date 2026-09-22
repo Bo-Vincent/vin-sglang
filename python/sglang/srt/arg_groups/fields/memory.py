@@ -75,6 +75,12 @@ class Memory(msgspec.Struct):
             resolvable=True,
         ),
     ] = False
+    enable_input_kv_pin: A[
+        bool, "Allow requests to pin their input KV in the GPU prefix cache."
+    ] = False
+    disable_output_kv_cache: A[
+        bool, "Keep input prefixes but release output KV when requests finish."
+    ] = False
     enable_page_major_kv_layout: A[
         bool,
         "Enable the page-major KV layout: lay out the Mamba state and full/SWA "

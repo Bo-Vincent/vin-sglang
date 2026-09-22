@@ -3083,7 +3083,7 @@ class MHATokenToKVPool(KVCache):
     def _move_kv_cache_impl(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
         # Physical move strategy. Override for layouts that change buffer
         # identity (e.g. PageMajorMHATokenToKVPool always uses the native move).
-        if self.use_native_move_kv_cache:
+        if self.use_native_move_kv_cache or self._kv_copy_config is None:
             move_kv_cache_native(self.k_buffer, self.v_buffer, tgt_loc, src_loc)
             if getattr(self, "k_scale_buffer", None) is not None:
                 move_kv_cache_native(

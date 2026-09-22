@@ -122,6 +122,8 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
         user_params = req.sampling_params
         beam_width = user_params.beam_width
 
+        if req.pin_input_kv:
+            return "Beam search does not support pin_input_kv."
         if not self.spec_algorithm.is_none():
             return "Beam search is not supported with speculative decoding."
         if get_disagg().disaggregation_mode != "null":

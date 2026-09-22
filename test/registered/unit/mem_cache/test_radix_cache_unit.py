@@ -518,6 +518,8 @@ class TestRadixCache(CustomTestCase):
         )
         cache.req_to_token_pool = ReqToTokenPool(request_indices.clone())
         req = unittest.mock.Mock(
+            pin_input_kv=False,
+            disable_output_kv_cache=False,
             kv=ReqKvInfo(req_pool_idx=0, cache_protected_len=0),
             extra_key=None,
             cache_salt=None,
@@ -559,6 +561,8 @@ class TestRadixCache(CustomTestCase):
         self.assertIsNotNone(kv_indices)
         cache.req_to_token_pool = ReqToTokenPool(kv_indices)
         req = unittest.mock.Mock(
+            pin_input_kv=False,
+            disable_output_kv_cache=False,
             origin_input_ids=prompt_ids,
             output_ids=output_ids,
             kv=ReqKvInfo(req_pool_idx=0, cache_protected_len=0),

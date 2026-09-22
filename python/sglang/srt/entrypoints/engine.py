@@ -432,6 +432,7 @@ class Engine(EngineScoreMixin, EngineBase):
         session_id: Optional[str] = None,
         *,
         cache_salt: Optional[Union[List[str], str]] = None,
+        pin_input_kv: bool = False,
     ) -> Union[Dict, Iterator[Dict]]:
         """
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::GenerateReqInput`.
@@ -451,6 +452,7 @@ class Engine(EngineScoreMixin, EngineBase):
             mm_hashes=mm_hashes,
             mm_content_hashes=mm_content_hashes,
             cache_salt=cache_salt,
+            pin_input_kv=pin_input_kv,
             return_logprob=return_logprob,
             logprob_start_len=logprob_start_len,
             top_logprobs_num=top_logprobs_num,
@@ -545,6 +547,7 @@ class Engine(EngineScoreMixin, EngineBase):
         session_id: Optional[str] = None,
         *,
         cache_salt: Optional[Union[List[str], str]] = None,
+        pin_input_kv: bool = False,
     ) -> Union[Dict, AsyncIterator[Dict]]:
         """
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::GenerateReqInput`.
@@ -564,6 +567,7 @@ class Engine(EngineScoreMixin, EngineBase):
             mm_hashes=mm_hashes,
             mm_content_hashes=mm_content_hashes,
             cache_salt=cache_salt,
+            pin_input_kv=pin_input_kv,
             return_logprob=return_logprob,
             logprob_start_len=logprob_start_len,
             top_logprobs_num=top_logprobs_num,

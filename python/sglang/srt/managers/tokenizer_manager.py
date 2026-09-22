@@ -852,6 +852,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     ):
         self.auto_create_handle_loop()
 
+        if isinstance(obj, GenerateReqInput):
+            obj._disable_output_kv_cache = get_memory().disable_output_kv_cache
+            if obj.pin_input_kv and not get_memory().enable_input_kv_pin:
+                raise ValueError("pin_input_kv requires --enable-input-kv-pin")
+            if (obj.pin_input_kv or obj._disable_output_kv_cache) and (
+                obj.session_params is not None
+            ):
+                raise ValueError("KV cache controls cannot be used with session_params")
+
         # Normalize the request
         obj.normalize_batch_and_arguments()
         self._set_default_priority(obj)
@@ -1517,6 +1526,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 priority=obj.priority,
                 extra_key=obj.extra_key,
                 cache_salt=obj.cache_salt,
+                pin_input_kv=obj.pin_input_kv,
+                disable_output_kv_cache=obj._disable_output_kv_cache,
                 routing_key=obj.routing_key,
                 token_type_ids=token_type_ids,
                 need_wait_for_mm_inputs=obj.need_wait_for_mm_inputs,

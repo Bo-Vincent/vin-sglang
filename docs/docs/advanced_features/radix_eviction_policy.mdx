@@ -14,6 +14,43 @@ The policy scores each candidate and the **lowest score is evicted first**. Once
 
 A policy only scores. It does not decide how much to free, and it cannot pin KV in memory — a node protected by the policy is still evicted if reclaiming everything else is not enough.
 
+## Pin input KV in GPU memory
+
+Launch the server with `--enable-input-kv-pin`, then add `"pin_input_kv": true` to a generation request. After prefill, its input KV stays in the worker's GPU cache and is excluded from automatic eviction. Output KV is not pinned. Ordinary requests can reuse the prefix without setting the parameter again.
+
+```bash
+curl http://localhost:30000/generate \
+  -H 'Content-Type: application/json' \
+  -d '{"text": "Your shared prompt", "pin_input_kv": true,
+       "sampling_params": {"max_new_tokens": 0}}'
+```
+
+Zero output tokens are useful for prewarming a template; normal generation requests can also pin their inputs. Chat and completion clients can pass `pin_input_kv` through the OpenAI SDK's `extra_body`.
+
+Pinning the same prefix again does not accumulate references. Explicit cache flush, model reload, or worker shutdown clears pins. Pins are local to each worker and consume capacity otherwise available to inference. An unaligned input tail remains resident, but prefix matching still reuses complete cache pages only.
+
+These controls support full-attention Python radix caches. Unsupported cache layouts and session or speculative-generation combinations are rejected instead of silently ignoring the request.
+
+Beam search rejects `pin_input_kv`: its request lifecycle bypasses radix-cache insertion, so it cannot retain a pinned input prefix.
+
+## Discard output KV after generation
+
+Launch with `--disable-output-kv-cache` to keep reusable input KV while releasing request-owned output KV after generation. This option is independent of input pinning and defaults to false. Generation still uses output KV while the request is running.
+
+Update the default for subsequent requests through the existing control endpoint:
+
+```bash
+curl -X POST http://localhost:30000/set_internal_state \
+  -H 'Content-Type: application/json' \
+  -d '{"server_args": {"disable_output_kv_cache": true}}'
+```
+
+Each request captures the setting when it is received. Queued and running requests retain their setting, including after retraction. Updates do not delete historical cache entries. Set the value to false to restore normal output caching for subsequent requests; `--strip-thinking-cache`, if enabled, still applies to reasoning outputs.
+
+Runtime updates currently require one tokenizer worker. They apply to this serving instance and are not persisted across restarts.
+
+Releasing KV returns slots to SGLang's pool, so process memory reported by `nvidia-smi` need not decrease. Without input pinning, an incomplete input page shared with output is released as a whole and its input tail is recomputed on a later request.
+
 ## Available policies
 
 Select one with `--radix-eviction-policy`. All of them fall back to least-recently-used order within a tie.

@@ -351,6 +351,10 @@ class GenerateReqInput:
     # Cache namespace used to isolate otherwise-identical prefixes.
     cache_salt: Optional[Union[List[str], str]] = None
 
+    pin_input_kv: bool = False
+    # Captured by the tokenizer, never accepted as a client setting.
+    _disable_output_kv_cache: bool = field(default=False, init=False, repr=False)
+
     def regenerate_rid(self):
         """Generate a new request ID and return it."""
         if isinstance(self.rid, list):
@@ -892,6 +896,7 @@ class GenerateReqInput:
         sub = GenerateReqInput(
             rid=self.rid[i],
             session_id=self.session_id,
+            pin_input_kv=self.pin_input_kv,
             text=self.text[i] if self.text is not None else None,
             input_ids=self.input_ids[i] if self.input_ids is not None else None,
             input_embeds=(
@@ -975,6 +980,7 @@ class GenerateReqInput:
                 else None
             ),
         )
+        sub._disable_output_kv_cache = self._disable_output_kv_cache
         cache[i] = sub
         return sub
 
@@ -1079,8 +1085,11 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     cache_salt: Optional[str] = None
 
     # Internal PP control bit, set by PP0 before forwarding the request.
-    # Keep at the end to preserve the positional Rust wire schema.
+    # New optional IPC fields must follow this field to preserve Rust positions.
     pp_prefetch_ticketed: bool = False
+
+    pin_input_kv: bool = False
+    disable_output_kv_cache: bool = False
 
     def wrap_pickle_fields(self):
         self.time_stats = wrap_as_pickle(self.time_stats)
@@ -2133,8 +2142,8 @@ class GetInternalStateReqOutput(BaseReq, kw_only=True):
 
 
 class SetInternalStateReq(BaseReq, kw_only=True):
-    # Only numeric scheduler knobs are accepted (see Scheduler.set_internal_state).
-    server_args: Dict[str, Union[int, float]]
+    # Scheduler knobs accept numeric and boolean values.
+    server_args: Dict[str, Union[bool, int, float]]
 
 
 class SetInternalStateReqOutput(BaseReq, kw_only=True):

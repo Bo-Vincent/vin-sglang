@@ -889,7 +889,10 @@ async def get_load():
 async def set_internal_state(
     obj: Annotated[SetInternalStateReq, Body()], request: Request
 ):
-    res = await _global_state.tokenizer_manager.set_internal_state(obj)
+    try:
+        res = await _global_state.tokenizer_manager.set_internal_state(obj)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
     return res
 
 

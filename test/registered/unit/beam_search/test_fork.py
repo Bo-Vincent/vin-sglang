@@ -21,6 +21,59 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
+class TestBeamAdmission(CustomTestCase):
+    def test_input_pin_is_rejected_before_beam_state_is_created(self):
+        """A beam request must not silently discard a requested input pin."""
+        from array import array
+
+        from sglang.srt.beam_search.coordinator import BeamCoordinator
+        from sglang.srt.managers.schedule_batch import Req
+        from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+        from sglang.srt.mem_cache.radix_cache import RadixCache
+        from sglang.srt.runtime_context import publish, reset_context
+        from sglang.srt.sampling.sampling_params import SamplingParams
+        from sglang.srt.server_args import ServerArgs
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+        publish(ServerArgs(model_path="dummy", page_size=1), role="test")
+        self.addCleanup(reset_context)
+        coordinator = BeamCoordinator(
+            model_config=SimpleNamespace(vocab_size=100, is_encoder_decoder=False),
+            spec_algorithm=SpeculativeAlgorithm.NONE,
+            dllm_enabled=False,
+            max_req_len=64,
+            req_to_token_pool=ReqToTokenPool(4, 64, "cpu", False),
+            token_to_kv_pool_allocator=None,
+            tree_cache=RadixCache.create_simulated(),
+            future_map=None,
+        )
+        recv = SimpleNamespace(
+            session_params=None,
+            return_logprob=False,
+            return_hidden_states=False,
+            return_sampling_mask=False,
+            return_routed_experts=False,
+        )
+        for pin in (True, False):
+            req = Req(
+                "beam",
+                "",
+                array("q", [1, 2, 3, 4]),
+                SamplingParams(beam_width=2, max_new_tokens=2, ignore_eos=True),
+                pin_input_kv=pin,
+            )
+            original_params = req.sampling_params
+            error = coordinator.validate_and_init(req, recv)
+            if pin:
+                self.assertIsNotNone(error)
+                self.assertIn("pin_input_kv", error)
+                self.assertIsNone(req.beam_group)
+                self.assertIs(req.sampling_params, original_params)
+            else:
+                self.assertIsNone(error)
+                self.assertIsNotNone(req.beam_group)
+
+
 class TestRemapKvMapping(CustomTestCase):
     def setUp(self):
         # 3 rows x 10 positions; every row maps to its own distinct slots.

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache.input_kv_pin import copy_input_tail, pin_input_prefix
 
 """
 Copyright 2023-2024 SGLang Team
@@ -371,6 +372,8 @@ class RadixCache(BasePrefixCache):
     ##### Public API #####
 
     def reset(self):
+        self.pinned_input_prefixes = set()
+        self.pinned_input_tails = {}
         # Initialize root with minimum priority so any real priority overrides it
         self.root_node = TreeNode(priority=-sys.maxsize)
         self.root_node.key = RadixKey(token_ids=array("q"), extra_key=None)
@@ -502,7 +505,10 @@ class RadixCache(BasePrefixCache):
                 self.dec_lock_ref(req.last_node)
             return
 
+        copy_input_tail(self, req, owned_kv_len)
         token_ids = (req.origin_input_ids + req.output_ids)[:owned_kv_len]
+        if req.disable_output_kv_cache:
+            token_ids = token_ids[: req.input_kv_len]
         kv_indices = self.req_to_token_pool.req_to_token[
             req.kv.req_pool_idx, :owned_kv_len
         ]
@@ -546,7 +552,9 @@ class RadixCache(BasePrefixCache):
                     chunked=True,
                 )
             )
+        pin_input_prefix(self, req, len(token_ids))
         freed_end = result.prefix_len
+        tail_start = max(key_len, req.kv.cache_protected_len)
 
         # duplicates / uninserted range, then the unaligned tail
         self.token_to_kv_pool_allocator.free_segments(
@@ -555,7 +563,7 @@ class RadixCache(BasePrefixCache):
                     kv_indices[req.kv.cache_protected_len : freed_end],
                     req.kv.cache_protected_len,
                 ),
-                (kv_indices[key_len:], key_len),
+                (kv_indices[tail_start:], tail_start),
             ]
         )
 
@@ -569,9 +577,12 @@ class RadixCache(BasePrefixCache):
             return
 
         token_ids = req.get_fill_ids()
+        copy_input_tail(self, req, len(token_ids))
         kv_indices = self.req_to_token_pool.req_to_token[
             req.kv.req_pool_idx, : len(token_ids)
         ]
+        if req.disable_output_kv_cache:
+            token_ids = token_ids[: req.input_kv_len]
 
         radix_key = RadixKey(
             token_ids,
@@ -606,6 +617,13 @@ class RadixCache(BasePrefixCache):
         assert len(new_indices) == len(radix_key), (
             f"{len(new_indices)=}, {len(radix_key)=}"
         )
+        if req.disable_output_kv_cache and req.kv.cache_protected_len > len(
+            new_indices
+        ):
+            # Recompute can reuse historical output that still belongs to the tree.
+            req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
+            pin_input_prefix(self, req, len(token_ids))
+            return
 
         self.req_to_token_pool.write(
             (req.kv.req_pool_idx, slice(req.kv.cache_protected_len, len(new_indices))),
@@ -632,6 +650,7 @@ class RadixCache(BasePrefixCache):
             req.prefix_indices = new_indices
 
         req.last_node = new_last_node
+        pin_input_prefix(self, req, len(token_ids))
 
     def pretty_print(self):
         self._print_helper(self.root_node, 0)
@@ -711,7 +730,7 @@ class RadixCache(BasePrefixCache):
 
     def protected_size(self):
         # protected size refers to the size of the cache that is locked
-        return self.protected_size_
+        return self.protected_size_ + len(self.pinned_input_tails) * self.page_size
 
     def all_values_flatten(self):
         values = []

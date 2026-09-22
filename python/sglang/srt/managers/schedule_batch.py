@@ -1023,11 +1023,16 @@ class Req(ReqDllmMixin):
         multi_item_delimiter_indices: Optional[List[int]] = None,
         session_id: Optional[str] = None,
         cache_salt: Optional[str] = None,
+        pin_input_kv: bool = False,
+        disable_output_kv_cache: bool = False,
     ):
         # Input and output info
         self.rid = rid
         self.cache_request_handle = CacheRequestHandle(rid=rid, attempt_id=0)
         self.origin_input_ids = origin_input_ids
+        self.input_kv_len = len(origin_input_ids)
+        self.pin_input_kv = pin_input_kv
+        self.disable_output_kv_cache = disable_output_kv_cache
         self.origin_input_ids_unpadded = (
             origin_input_ids_unpadded
             if origin_input_ids_unpadded
@@ -1448,6 +1453,8 @@ class Req(ReqDllmMixin):
     def owned_kv_len(self) -> int:
         # Report only the prompt prefix so thinking + answer fall into the
         # overallocated range and are reclaimed by release_kv_cache. #22373.
+        if self.disable_output_kv_cache:
+            return min(self.kv.kv_committed_len, self.input_kv_len)
         if get_serving().strip_thinking_cache and self.reasoning_tokens > 0:
             return min(self.kv.kv_committed_len, len(self.origin_input_ids))
         return self.kv.kv_committed_len

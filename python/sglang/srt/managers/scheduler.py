@@ -290,6 +290,7 @@ from sglang.srt.mem_cache.common import (
     maybe_cache_unfinished_req,
     release_kv_cache,
     retraction_discard,
+    validate_kv_cache_controls,
 )
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.runner_utils.pool import prewarm_graph_pool_borrow
@@ -2785,6 +2786,8 @@ class Scheduler(
                 stream=recv_req.stream,
                 lora_id=recv_req.lora_id,
                 session_id=recv_req.session_id,
+                pin_input_kv=recv_req.pin_input_kv,
+                disable_output_kv_cache=recv_req.disable_output_kv_cache,
                 input_embeds=recv_req.input_embeds,
                 positional_embed_overrides=recv_req.positional_embed_overrides,
                 token_type_ids=recv_req.token_type_ids,
@@ -3022,6 +3025,28 @@ class Scheduler(
         )
         if error_msg:
             req.set_finish_with_abort(error_msg)
+            self._add_request_to_queue(req)
+            return
+
+        req.input_kv_len = len(req.origin_input_ids)
+        try:
+            if req.pin_input_kv and not get_memory().enable_input_kv_pin:
+                raise ValueError("pin_input_kv requires --enable-input-kv-pin")
+            if (req.pin_input_kv or req.disable_output_kv_cache) and (
+                req.session is not None
+                or self.disaggregation_mode != DisaggregationMode.NULL
+                or not self.spec_algorithm.is_none()
+            ):
+                raise ValueError(
+                    "KV cache controls require ordinary, non-speculative generation"
+                )
+            validate_kv_cache_controls(
+                self.tree_cache,
+                pin_input_kv=req.pin_input_kv,
+                disable_output_kv_cache=req.disable_output_kv_cache,
+            )
+        except ValueError as error:
+            req.set_finish_with_abort(str(error))
             self._add_request_to_queue(req)
             return
 
@@ -5271,6 +5296,7 @@ class Scheduler(
         args_allow_update = set(
             [
                 "pp_max_micro_batch_size",
+                "disable_output_kv_cache",
                 "speculative_accept_threshold_single",
                 "speculative_accept_threshold_acc",
                 "dspark_force_budget_frac",
@@ -5284,6 +5310,20 @@ class Scheduler(
                 logging.warning(f"Updating {k} is not supported.")
                 if_success = False
                 break
+            elif k == "disable_output_kv_cache":
+                if type(v) is not bool:
+                    if_success = False
+                    break
+                try:
+                    validate_kv_cache_controls(
+                        self.tree_cache,
+                        pin_input_kv=False,
+                        disable_output_kv_cache=v,
+                    )
+                except ValueError as error:
+                    logger.warning("Cannot update output KV caching: %s", error)
+                    if_success = False
+                    break
             elif k == "pp_max_micro_batch_size" and (
                 v > self.max_running_requests // get_parallel().pp_size or v < 1
             ):
