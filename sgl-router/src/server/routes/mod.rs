@@ -8,3 +8,4 @@ pub mod messages;
 pub mod metrics;
 pub mod models;
 pub mod tokenize;
+pub mod workers;

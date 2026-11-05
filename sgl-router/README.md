@@ -104,9 +104,14 @@ every flag.
 | `POST /v1/embeddings`, `/v1/classify`, `/v1/rerank` | [Embeddings, classify and rerank](#embeddings-classify-and-rerank) |
 | `POST /v1/tokenize`, `/v1/detokenize` | Tokenize with the router's tokenizer |
 | `GET /v1/models` | The served model |
+| `POST`/`GET /workers`, `GET`/`PUT`/`DELETE /workers/{id}` | Asynchronous runtime Worker management and inspection |
 | `POST /flush_cache` | Fan out a cache flush to every worker |
 | `GET /healthz`, `/readyz` | Liveness and readiness |
 | `GET /metrics` | Prometheus metrics, see [monitoring/README.md](monitoring/README.md) |
+
+Worker mutations return `202`. `GET /workers/{id}` exposes the operation and
+runtime state. `PUT` and `DELETE` require the current revision in `If-Match`;
+workers created by static or Kubernetes discovery are read-only.
 
 Both edges speak cleartext HTTP/2 where the peer does; see
 [operations](#operations). With `--grpc-port`, the router also serves the
