@@ -6,6 +6,9 @@ use crate::discovery::{DiscoveryEvent, ModelId, WorkerId, WorkerMode, WorkerSpec
 use crate::health::circuit_breaker::CircuitBreakerConfig;
 use crate::state::kv_events::KvEventIndex;
 use crate::state::load_monitor::router_inflight_load::RouterInflightLoadRegistry;
+use crate::workers::control::{
+    worker_urls_equal, WorkerControlAction, WorkerControlCommand, WorkerControlService,
+};
 use crate::workers::introspect::{
     worker_client, DisaggregationRole, WorkerIntrospector, SERVER_INFO_TIMEOUT,
 };
@@ -145,6 +148,33 @@ pub async fn run_with_config(
     .await
 }
 
+pub async fn run_with_config_and_control(
+    rx: mpsc::Receiver<DiscoveryEvent>,
+    control_rx: mpsc::Receiver<WorkerControlCommand>,
+    control: Arc<WorkerControlService>,
+    cfg: Option<Arc<Config>>,
+    kv_index: Option<Arc<KvEventIndex>>,
+    router_inflight_load: Option<Arc<RouterInflightLoadRegistry>>,
+    metrics: Option<Arc<crate::server::metrics::MetricsRegistry>>,
+) {
+    let registry = control.registry();
+    let auth = cfg.as_ref().and_then(|c| c.server.worker_auth.clone());
+    let introspector = WorkerIntrospector::with_client(worker_client(SERVER_INFO_TIMEOUT, auth));
+    run_manager(
+        rx,
+        Some(control_rx),
+        Some(control),
+        metrics,
+        registry,
+        cfg,
+        kv_index,
+        router_inflight_load,
+        Arc::new(introspector),
+        RECONCILE_INTERVAL,
+    )
+    .await
+}
+
 /// Internal entry point used by tests so they can supply a custom
 /// [`WorkerIntrospector`] (e.g. shorter timeout, fake transport).
 /// Production callers use [`run_with_config`]. Reconciles unresolved
@@ -192,7 +222,7 @@ pub async fn run_with_introspector(
 ///   re-registrations stay serialized per id against concurrent `Added` /
 ///   `Removed`.
 pub async fn run_with_introspector_and_reconcile(
-    mut rx: mpsc::Receiver<DiscoveryEvent>,
+    rx: mpsc::Receiver<DiscoveryEvent>,
     registry: Arc<WorkerRegistry>,
     cfg: Option<Arc<Config>>,
     kv_index: Option<Arc<KvEventIndex>>,
@@ -200,6 +230,36 @@ pub async fn run_with_introspector_and_reconcile(
     introspector: Arc<WorkerIntrospector>,
     reconcile_interval: Duration,
 ) {
+    run_manager(
+        rx,
+        None,
+        None,
+        None,
+        registry,
+        cfg,
+        kv_index,
+        router_inflight_load,
+        introspector,
+        reconcile_interval,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_manager(
+    rx: mpsc::Receiver<DiscoveryEvent>,
+    control_rx: Option<mpsc::Receiver<WorkerControlCommand>>,
+    control: Option<Arc<WorkerControlService>>,
+    metrics: Option<Arc<crate::server::metrics::MetricsRegistry>>,
+    registry: Arc<WorkerRegistry>,
+    cfg: Option<Arc<Config>>,
+    kv_index: Option<Arc<KvEventIndex>>,
+    router_inflight_load: Option<Arc<RouterInflightLoadRegistry>>,
+    introspector: Arc<WorkerIntrospector>,
+    reconcile_interval: Duration,
+) {
+    let mut discovery_rx = Some(rx);
+    let mut control_rx = control_rx;
     // In-flight registrations, keyed by worker id. Subsequent
     // `Removed` / `ModeChanged` events (and reconcile passes) for the
     // same id `await` the handle so they observe the registry write the
@@ -221,11 +281,12 @@ pub async fn run_with_introspector_and_reconcile(
     let mut reconcile = ticker(reconcile_interval);
     let mut port_retry = ticker(reconcile_interval.min(BOOTSTRAP_PORT_RETRY_INTERVAL));
 
-    loop {
+    while discovery_rx.is_some() || control_rx.is_some() {
         tokio::select! {
-            maybe_event = rx.recv() => {
+            maybe_event = receive_optional(&mut discovery_rx) => {
                 let Some(event) = maybe_event else {
-                    break;
+                    discovery_rx = None;
+                    continue;
                 };
                 // Opportunistically reap handles whose tasks have already
                 // completed so the map doesn't grow without bound under
@@ -235,6 +296,25 @@ pub async fn run_with_introspector_and_reconcile(
                 pending.retain(|_, h| !h.is_finished());
                 handle_discovery_event(
                     event,
+                    &registry,
+                    &cfg,
+                    &kv_index,
+                    &router_inflight_load,
+                    &introspector,
+                    &mut pending,
+                )
+                .await;
+            }
+            maybe_command = receive_optional(&mut control_rx) => {
+                let Some(command) = maybe_command else {
+                    control_rx = None;
+                    continue;
+                };
+                pending.retain(|_, handle| !handle.is_finished());
+                handle_control_command(
+                    command,
+                    control.as_ref().expect("control receiver requires service"),
+                    &metrics,
                     &registry,
                     &cfg,
                     &kv_index,
@@ -277,6 +357,94 @@ pub async fn run_with_introspector_and_reconcile(
     }
 }
 
+async fn receive_optional<T>(rx: &mut Option<mpsc::Receiver<T>>) -> Option<T> {
+    match rx {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_control_command(
+    command: WorkerControlCommand,
+    control: &Arc<WorkerControlService>,
+    metrics: &Option<Arc<crate::server::metrics::MetricsRegistry>>,
+    registry: &Arc<WorkerRegistry>,
+    cfg: &Option<Arc<Config>>,
+    kv_index: &Option<Arc<KvEventIndex>>,
+    router_inflight_load: &Option<Arc<RouterInflightLoadRegistry>>,
+    introspector: &Arc<WorkerIntrospector>,
+    pending: &mut HashMap<WorkerId, JoinHandle<()>>,
+) {
+    let worker_id = command.worker_id();
+    let kind = command.action.kind();
+    let submitted_at = command.submitted_at;
+    if let Some(previous) = pending.remove(&worker_id) {
+        let _ = previous.await;
+    }
+    control.mark_processing(&command.operation_id);
+
+    match command.action {
+        WorkerControlAction::Create(spec) | WorkerControlAction::Replace { spec, .. } => {
+            if registry
+                .all()
+                .iter()
+                .any(|worker| worker.id != spec.id && worker_urls_equal(&worker.url, &spec.url))
+            {
+                control.mark_failed(
+                    &command.operation_id,
+                    format!("worker URL {} is already registered", spec.url),
+                );
+                record_control_metric(metrics, kind, false, submitted_at);
+                return;
+            }
+            let registry = Arc::clone(registry);
+            let cfg = cfg.clone();
+            let kv_index = kv_index.clone();
+            let introspector = Arc::clone(introspector);
+            let control = Arc::clone(control);
+            let metrics = metrics.clone();
+            let operation_id = command.operation_id;
+            let task = tokio::spawn(async move {
+                match register_one(spec, registry, cfg, kv_index, introspector).await {
+                    Ok(()) => {
+                        control.mark_succeeded(&operation_id);
+                        record_control_metric(&metrics, kind, true, submitted_at);
+                    }
+                    Err(error) => {
+                        control.mark_failed(&operation_id, error.to_string());
+                        record_control_metric(&metrics, kind, false, submitted_at);
+                    }
+                }
+            });
+            pending.insert(worker_id, task);
+        }
+        WorkerControlAction::Remove { .. } => {
+            remove_worker(
+                &worker_id,
+                registry,
+                kv_index,
+                router_inflight_load,
+                "control",
+            )
+            .await;
+            control.mark_succeeded(&command.operation_id);
+            record_control_metric(metrics, kind, true, submitted_at);
+        }
+    }
+}
+
+fn record_control_metric(
+    metrics: &Option<Arc<crate::server::metrics::MetricsRegistry>>,
+    kind: crate::workers::control::WorkerControlKind,
+    succeeded: bool,
+    submitted_at: std::time::Instant,
+) {
+    if let Some(metrics) = metrics {
+        metrics.record_worker_control(kind, succeeded, submitted_at.elapsed());
+    }
+}
+
 /// Apply a single discovery event to the registry (and the optional
 /// KV-event index / active-load registry). Extracted from the manager
 /// loop so the loop can also service reconcile ticks via
@@ -308,7 +476,7 @@ async fn handle_discovery_event(
             let kv_index_t = kv_index.clone();
             let introspector_t = introspector.clone();
             let handle = tokio::spawn(async move {
-                register_one(spec, registry_t, cfg_t, kv_index_t, introspector_t).await;
+                let _ = register_one(spec, registry_t, cfg_t, kv_index_t, introspector_t).await;
             });
             pending.insert(id, handle);
         }
@@ -321,39 +489,7 @@ async fn handle_discovery_event(
                 // worker from being resurrected after it genuinely left.
                 let _ = prev.await;
             }
-            // Look up the URL before dropping the entry so the
-            // KV-event index can clear its per-(url, dp_rank) state.
-            let worker_url = registry.get(&id).map(|w| w.url.clone());
-            registry.remove(&id);
-            match (kv_index, worker_url) {
-                (Some(idx), Some(url)) => {
-                    idx.remove_worker(&url).await;
-                }
-                (Some(_), None) => {
-                    // Registry didn't know this worker but kv-events
-                    // is enabled — duplicate Removed or out-of-order
-                    // event. KvEventIndex state for this id (if any)
-                    // leaks until process shutdown; log so it's
-                    // detectable.
-                    tracing::warn!(
-                        id = %id,
-                        "discovery: Removed without a known URL; kv-events state (if any) not cleared",
-                    );
-                }
-                (None, _) => {}
-            }
-            // Drop the active-load per-worker counters slot.
-            // Idempotent on the registry side, so we call it
-            // unconditionally — a Removed for an unknown worker
-            // (duplicate event) is a no-op. In-flight guards
-            // pointing at this id are NOT invalidated; their drop
-            // still removes the per-request entry cleanly, but the
-            // per-worker counters slot will not be re-created
-            // (selectors no longer see the worker, so no new
-            // requests can register against it).
-            if let Some(al) = router_inflight_load {
-                al.forget_worker(&id);
-            }
+            remove_worker(&id, registry, kv_index, router_inflight_load, "discovery").await;
         }
         DiscoveryEvent::ServicesChanged { id, services } => {
             if let Some(prev) = pending.remove(&id) {
@@ -467,7 +603,7 @@ fn reconcile_unresolved_workers(
         let kv_index_t = kv_index.clone();
         // The upsert keeps the live load and breaker state of a routable worker.
         let handle = tokio::spawn(async move {
-            register_one(spec, registry_t, cfg_t, kv_index_t, introspector_t).await;
+            let _ = register_one(spec, registry_t, cfg_t, kv_index_t, introspector_t).await;
         });
         pending.insert(id, handle);
     }
@@ -523,13 +659,21 @@ fn log_protocol_resolution(worker_url: &str, enable_http2: Option<bool>, clearte
 /// step is logged inside the call chain; we still register the worker
 /// with empty `model_ids` so the rest of the proxy plane treats it as
 /// reachable.
+#[derive(Debug, thiserror::Error)]
+enum RegisterWorkerError {
+    #[error("prefill worker is incompatible with --decode-dispatch-limit")]
+    DecodeDispatchIncompatible,
+    #[error(transparent)]
+    Registry(#[from] crate::workers::registry::AddWorkerError),
+}
+
 async fn register_one(
     mut spec: WorkerSpec,
     registry: Arc<WorkerRegistry>,
     cfg: Option<Arc<Config>>,
     kv_index: Option<Arc<KvEventIndex>>,
     introspector: Arc<WorkerIntrospector>,
-) {
+) -> Result<(), RegisterWorkerError> {
     let worker_url = spec.url.clone();
     let info = introspector.fetch(&worker_url).await;
     if let Some(name) = info.served_model_name {
@@ -584,7 +728,7 @@ async fn register_one(
                      needs prefill engines with --optimistic-prefill-attempts above 0 or \
                      --disaggregation-decode-allocation-policy prefill_complete",
                 );
-                return;
+                return Err(RegisterWorkerError::DecodeDispatchIncompatible);
             }
             None => tracing::warn!(
                 worker_url = %worker_url,
@@ -622,7 +766,7 @@ async fn register_one(
             error = %e,
             "worker manager: refused to register worker due to mixed PD/plain configuration",
         );
-        return;
+        return Err(e.into());
     }
     // After the insert, so the log describes a worker that is actually taking
     // traffic — a spec refused above never reaches the wire at all.
@@ -639,6 +783,30 @@ async fn register_one(
         // Pass the pre-resolved EventConfig so the KvEventIndex does
         // not issue a second `/server_info` round-trip.
         idx.add_worker(&worker_url, info.event_config).await;
+    }
+    Ok(())
+}
+
+async fn remove_worker(
+    id: &WorkerId,
+    registry: &Arc<WorkerRegistry>,
+    kv_index: &Option<Arc<KvEventIndex>>,
+    router_inflight_load: &Option<Arc<RouterInflightLoadRegistry>>,
+    source: &'static str,
+) {
+    let worker_url = registry.get(id).map(|worker| worker.url.clone());
+    registry.remove(id);
+    match (kv_index, worker_url) {
+        (Some(index), Some(url)) => index.remove_worker(&url).await,
+        (Some(_), None) => tracing::warn!(
+            %source,
+            %id,
+            "worker removal had no known URL; KV-event state could not be cleared",
+        ),
+        (None, _) => {}
+    }
+    if let Some(load) = router_inflight_load {
+        load.forget_worker(id);
     }
 }
 
