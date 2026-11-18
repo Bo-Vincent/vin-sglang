@@ -9,6 +9,7 @@ discovers engines from a static URL list or Kubernetes EndpointSlices.
 
 - [Architecture](#architecture)
 - [Quick start](#quick-start)
+- [Multiple models with a global router](#multiple-models-with-a-global-router)
 - [Key interfaces](#key-interfaces)
 - [Routing policies](#routing-policies)
 - [Deployment examples](#deployment-examples)
@@ -21,6 +22,60 @@ configuration), [REFERENCE.md](REFERENCE.md) (detailed feature behavior),
 Grafana), [BENCHMARKS.md](BENCHMARKS.md),
 [sgl-kv-indexer/README.md](sgl-kv-indexer/README.md) (external KV indexer),
 [EXAMPLES.md](EXAMPLES.md) (GLM-5.3-Flash and DeepSeek-V4.1-Flash, end to end).
+
+## Multiple models with a global router
+
+`sgl-global-router` is a separate HTTP gateway in front of multiple single-model
+`sgl-router` services. Each downstream router keeps its own tokenizer, routing
+policy, workers and cache state. The gateway selects a service by the JSON
+`model` field; it does not schedule workers or tokenize requests.
+
+```bash
+cargo build --release --bin sgl-global-router
+./target/release/sgl-global-router --host 0.0.0.0 --port 30000 \
+  --model-route chat-model=http://127.0.0.1:30001 \
+  --model-route embedding-model=http://127.0.0.1:30002
+```
+
+Repeat `--model-route MODEL=URL` once per model. URLs must be HTTP(S) origins
+without credentials, paths, queries or fragments; use a service address for
+replicas. Duplicate model names and an unconfigured `--default-model` fail at
+startup. The configured name must also be accepted by its downstream router.
+`GET /v1/models` lists these static names, without querying downstream services.
+
+Forwarded endpoints are `POST /v1/chat/completions`, `/v1/completions`,
+`/v1/embeddings`, `/v1/messages`, `/v1/messages/count_tokens`, `/v1/classify`,
+`/v1/tokenize`, `/v1/detokenize`, and `POST`/`PUT /generate`, `/v1/rerank`.
+Management, worker discovery, cache flush and internal snapshot APIs are not
+exposed. `GET /healthz` and `/readyz` report that this process is serving its
+validated configuration; they do not probe downstream readiness.
+
+Requests require a JSON object and a string `model`. An unknown explicit model
+returns 404. A missing model returns 400 unless `--default-model MODEL` is set
+(useful for native `/generate` clients); the original body is still forwarded
+unchanged, so the downstream must accept the missing field. The default never
+overrides an unknown explicit model. The gateway does not rewrite aliases or
+translate protocols. Query strings and end-to-end headers, including
+`Authorization` and Anthropic headers, pass through. Hop-by-hop headers, fields
+named by `Connection`, and the inbound `Host` are removed.
+
+The request body is buffered only to inspect `model`, with
+`--max-body-bytes` (default 16777216) returning 413 when exceeded. Responses,
+including errors and SSE, stream incrementally with bounded backpressure.
+Accepted connections use `TCP_NODELAY` so small response frames are not delayed
+by Nagle buffering. Response bodies are polled directly without a worker pump.
+Dropping the client stream releases the downstream response; the gateway sends
+no worker-specific abort call. Downstream status, body and end-to-end response
+headers pass through. Redirects and automatic retries are disabled.
+
+`--ttft-timeout-secs` (default 300) bounds dispatch through the first response
+body chunk, including response headers; an empty response completes at EOF.
+`--idle-timeout-secs` (default 60) bounds silence between chunks. Neither is a
+total stream deadline: active long streams can continue indefinitely. A
+pre-response timeout returns 504 and a connection failure returns 502, using
+the existing router error envelope. After headers are committed, an idle or
+transport failure terminates the response body with a transport error. All
+limits must be positive.
 
 ## Architecture
 

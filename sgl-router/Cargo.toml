@@ -18,6 +18,10 @@ crate-type = ["rlib"]
 name = "sgl-router"
 path = "src/main.rs"
 
+[[bin]]
+name = "sgl-global-router"
+path = "src/bin/sgl-global-router.rs"
+
 [lints.rust]
 unused_qualifications = "warn"
 
