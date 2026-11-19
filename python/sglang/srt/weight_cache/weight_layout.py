@@ -53,6 +53,11 @@ def registered_tensors(model):
     )
 
 
+def _layout_storage_key(tensor):
+    # Meta tensors have no allocation and all report the same null data pointer.
+    return ("meta", id(tensor)) if tensor.is_meta else _storage_key(tensor)
+
+
 @dataclass(frozen=True)
 class WeightLayoutPlan:
     tensors: tuple[LogicalWeightTensor, ...]
@@ -69,13 +74,13 @@ class WeightLayoutPlan:
                 "registered tensor names changed after layout construction"
             )
         for name, signature in self.bindings.items():
-            if _storage_key(tensors[name]) != signature:
+            if _layout_storage_key(tensors[name]) != signature:
                 raise WeightManifestError(
                     f"weight storage changed after layout construction: {name}"
                 )
         for region in (*self.views, *self.initializations):
             if (
-                _storage_key(region.parameter)
+                _layout_storage_key(region.parameter)
                 != self.bindings[region.parameter_names[0]]
             ):
                 raise WeightManifestError(
@@ -110,12 +115,13 @@ class WeightLayoutBuilder:
     tensor transforms and per-element fragmentation are deliberately unsupported.
     """
 
-    def __init__(self, model: Any):
+    def __init__(self, model: Any, *, allow_meta: bool = False):
         self.model = model
+        self.allow_meta = allow_meta
         self.tensors = registered_tensors(model)
         self._names = {}
         for name, tensor in self.tensors.items():
-            self._names.setdefault(_storage_key(tensor), []).append(name)
+            self._names.setdefault(_layout_storage_key(tensor), []).append(name)
         self._views = []
         self._initializations = []
         self._local_buffers = set()
@@ -125,7 +131,7 @@ class WeightLayoutBuilder:
         self._declarations = {}
 
     def _parameter_names(self, tensor):
-        names = self._names.get(_storage_key(tensor))
+        names = self._names.get(_layout_storage_key(tensor))
         if names is None:
             raise WeightManifestError(
                 "layout region does not reference registered storage"
@@ -133,7 +139,7 @@ class WeightLayoutBuilder:
         if (
             tensor.is_sparse
             or not tensor.is_contiguous()
-            or tensor.device.type == "meta"
+            or (tensor.is_meta and not self.allow_meta)
         ):
             raise WeightManifestError(f"unsupported runtime storage: {names[0]}")
         return tuple(sorted(names))
@@ -293,7 +299,7 @@ class WeightLayoutBuilder:
                 names[0],
             )
             for names in self._names.values()
-            if (tensor := self.tensors[names[0]]).numel()
+            if (tensor := self.tensors[names[0]]).numel() and not tensor.is_meta
         )
         for previous, current in zip(intervals, intervals[1:]):
             if current[0] < previous[1]:
@@ -302,7 +308,7 @@ class WeightLayoutBuilder:
                 )
         grouped = {}
         for region in (*self._views, *self._initializations):
-            grouped.setdefault(_storage_key(region.parameter), []).append(region)
+            grouped.setdefault(_layout_storage_key(region.parameter), []).append(region)
         for key, names in self._names.items():
             local = set(names) & self._local_buffers
             if local:
@@ -330,7 +336,7 @@ class WeightLayoutBuilder:
             frozenset(self._local_buffers),
             tuple(self._derived_state),
             {
-                n: _storage_key(t)
+                n: _layout_storage_key(t)
                 for n, t in self.tensors.items()
                 if n not in self._local_buffers
             },
