@@ -263,6 +263,9 @@ def bind_weights(
             attention_blocks=max(1, args.dp_size // peer.dp_size),
         )
     aliases = wire.alias_names(source_plan, target_plan)
+    source_parameters = dict(old_model.named_parameters(remove_duplicate=False))
+    arena_weights.source_chunks(source_parameters, set(source_parameters) - aliases)
+    del source_parameters
     source_template, source_tensors = wire.build_wire_plan(
         old_model, source_plan, old_args, target_args, old_model.config
     ).as_meta(old_model)

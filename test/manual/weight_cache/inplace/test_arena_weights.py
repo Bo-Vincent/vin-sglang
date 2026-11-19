@@ -91,6 +91,12 @@ class TestFlushTest:
             def data_ptr(self):
                 return self.address
 
+            def untyped_storage(self):
+                return NS(data_ptr=self.data_ptr, nbytes=lambda: self.count * 2)
+
+            def storage_offset(self):
+                return 0
+
             def narrow(self, dim, offset, count):
                 return Tensor(count, self.address + offset * 2)
 

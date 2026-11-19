@@ -12,7 +12,7 @@ experts. Supported `(attention DP, expert EP)` layouts are `(1,1)`, `(1,2)`,
 context and MoE data parallel sizes must be one. DP LM-head mode must remain
 unchanged. The helper checks a single hostname, eight distinct CUDA device UUIDs
 and global-rank-ordered workers. Source parameters must share the current device,
-be contiguous and individually fit the 1 GiB arena cap. Tied/overlapping storage
+be nonempty, contiguous and individually fit the 1 GiB arena cap. Tied/overlapping storage
 and unsupported kernel layouts are rejected by the shared layout accounting.
 Both source and target resolved arguments must retain trivial expert placement,
 disabled EPLB, zero redundant experts and no elastic EP backend/join mode. Missing
@@ -93,6 +93,26 @@ one cloned parameter at a time, at most 1 GiB under the parameter cap; targets a
 source byte order are restored after transfers finish. No full host checkpoint
 or host weight copy is retained. Logical canonical metadata is local; the gather
 contains compact wire fragments and declarations only.
+
+For subsequent epochs, a source storage can contain both changed weights and
+retained aliases. Its registered parameter members form an indivisible release
+unit; retained members also move when necessary to free that old allocation.
+Changed and retained members receive separate backing arenas, with their combined
+payload bounded by the same 1 GiB cap. This prevents target aliases from retaining
+unused changed-weight bytes. Oversized registered units, invalid ranges,
+overlapping members, empty/null storage and multiple source devices are rejected
+before mutation. Unused storage capacity and legal parameter offsets are allowed;
+the cap bounds copied registered payload, not the old allocation's capacity.
+Fresh independent source allocations retain their original chunk order.
+
+The caller must still drop external hidden views and finish all readers. The
+helper cannot enumerate arbitrary external owners; an old active allocation after
+replacement and the existing GC fallback remains a fatal release failure.
+`source_arena_payload_bytes` reports total copied payload, including necessary
+alias relocation; `source_changed_payload_bytes` and
+`source_relocated_alias_payload_bytes` separate those costs. Arena count/maximum
+describe actual new arenas; `source_release_unit_max_bytes` bounds the combined
+payload of a release unit before its verified flush.
 
 The first native canonical layouts validate supported layer semantics and decide
 aliases. They are lowered to small grouped wire layout plans, then detached to

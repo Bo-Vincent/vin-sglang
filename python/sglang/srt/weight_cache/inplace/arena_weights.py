@@ -29,6 +29,55 @@ def chunks(parameters, names):
     return batches
 
 
+def source_chunks(parameters, names):
+    """Keep registered parameters of each old storage in one release unit."""
+    names = set(names)
+    if not names <= parameters.keys():
+        raise KeyError(next(iter(names - parameters.keys())))
+    if len({str(p.device) for p in parameters.values()}) > 1:
+        raise ValueError("source arenas require a single source device")
+    # Retain storage identities, not owners that would pin the old allocations.
+    groups = {}
+    for name, value in parameters.items():
+        storage = value.untyped_storage()
+        if not value.numel() or not storage.data_ptr():
+            raise ValueError("source arenas require nonempty materialized storage")
+        key = (str(value.device), storage.data_ptr())
+        groups.setdefault(key, []).append(name)
+    batches, batch, size, dtype = [], [], 0, None
+    for members in sorted(groups.values(), key=min):
+        if not names.intersection(members):
+            continue
+        intervals, payload, member_dtype = [], 0, parameters[members[0]].dtype
+        for name in members:
+            value = parameters[name]
+            nbytes = value.numel() * value.element_size()
+            offset = value.storage_offset() * value.element_size()
+            if (
+                not value.is_contiguous()
+                or value.dtype != member_dtype
+                or offset < 0
+                or offset + nbytes > value.untyped_storage().nbytes()
+            ):
+                raise ValueError("unsupported source storage member range or dtype")
+            intervals.append((offset, offset + nbytes))
+            payload += nbytes
+        intervals.sort()
+        if any(a[1] > b[0] for a, b in zip(intervals, intervals[1:])):
+            raise ValueError("overlapping source storage members")
+        if payload > CAP_BYTES:
+            raise ValueError("source storage release unit exceeds the 1 GiB arena cap")
+        if batch and (size + payload > CAP_BYTES or member_dtype != dtype):
+            batches.append((batch, size))
+            batch, size = [], 0
+        batch.extend(sorted(members))
+        size += payload
+        dtype = member_dtype
+    if batch:
+        batches.append((batch, size))
+    return batches
+
+
 def active_blocks(snapshot, pointers):
     """Find old tensor addresses still backed by active allocator blocks."""
     alive = []
@@ -46,40 +95,73 @@ def active_blocks(snapshot, pointers):
 
 def compact_source(torch, model, parameters, names, profile, owners):
     """Replace each completed chunk before allocating the next one or targets."""
-    batches = chunks(parameters, names)
+    changed = set(names)
+    batches = source_chunks(parameters, changed)
+    split_batches = [
+        [
+            (
+                selected,
+                sum(
+                    parameters[n].numel() * parameters[n].element_size()
+                    for n in selected
+                ),
+            )
+            for selected in (
+                [n for n in members if n in changed],
+                [n for n in members if n not in changed],
+            )
+            if selected
+        ]
+        for members, _ in batches
+    ]
     profile.update(
         source_arena_payload_bytes=sum(size for _, size in batches),
-        source_arena_count=len(batches),
-        source_arena_max_bytes=max((s for _, s in batches), default=0),
+        source_changed_payload_bytes=sum(
+            parameters[n].numel() * parameters[n].element_size() for n in changed
+        ),
+        source_relocated_alias_payload_bytes=sum(
+            size
+            for parts in split_batches
+            for members, size in parts
+            if members[0] not in changed
+        ),
+        source_arena_count=sum(len(parts) for parts in split_batches),
+        source_arena_max_bytes=max(
+            (s for parts in split_batches for _, s in parts), default=0
+        ),
+        source_release_unit_max_bytes=max((s for _, s in batches), default=0),
         source_release_chunks=[],
         source_empty_cache_seconds=0.0,
     )
-    for names, size in batches:
+    for (names, size), parts in zip(batches, split_batches):
         aliases = capture_tensor_aliases(model, {n: parameters[n] for n in names})
         torch.cuda.synchronize()
         before = torch.cuda.memory_allocated()
         originals = [weakref.ref(parameters[n]) for n in names]
         pointers = [parameters[n].data_ptr() for n in names]
-        dtype = parameters[names[0]].dtype
-        itemsize = parameters[names[0]].element_size()
-        arena = torch.empty(
-            size // itemsize, dtype=dtype, device=parameters[names[0]].device
-        )
-        owners.append(arena)
-        offset = 0
-        for name in names:
-            previous = parameters[name]
-            view = arena.narrow(0, offset, previous.numel()).view(previous.shape)
-            with torch.no_grad():
-                view.copy_(previous)
-            replacement = torch.nn.Parameter(view, requires_grad=previous.requires_grad)
-            replacement.__dict__.update(previous.__dict__)
-            parent_name, _, leaf = name.rpartition(".")
-            parent = model.get_submodule(parent_name) if parent_name else model
-            parent._parameters[leaf] = replacement
-            parameters[name] = replacement
-            offset += previous.numel()
-            del previous, view, replacement, parent
+        for members, payload in parts:
+            first = parameters[members[0]]
+            arena = torch.empty(
+                payload // first.element_size(), dtype=first.dtype, device=first.device
+            )
+            del first
+            owners.append(arena)
+            offset = 0
+            for name in members:
+                previous = parameters[name]
+                view = arena.narrow(0, offset, previous.numel()).view(previous.shape)
+                with torch.no_grad():
+                    view.copy_(previous)
+                replacement = torch.nn.Parameter(
+                    view, requires_grad=previous.requires_grad
+                )
+                replacement.__dict__.update(previous.__dict__)
+                parent_name, _, leaf = name.rpartition(".")
+                parent = model.get_submodule(parent_name) if parent_name else model
+                parent._parameters[leaf] = replacement
+                parameters[name] = replacement
+                offset += previous.numel()
+                del previous, view, replacement, parent
         rebind_tensor_aliases(aliases, parameters)
         del aliases
         torch.cuda.synchronize()
