@@ -275,7 +275,11 @@ class WeightLayoutBuilder:
             )
 
     def local_buffer(self, name):
-        if name not in dict(self.model.named_buffers(remove_duplicate=False)):
+        try:
+            buffer = self.model.get_buffer(name)
+        except AttributeError:
+            buffer = None
+        if buffer is None:
             raise WeightManifestError(
                 f"local initialization must name a buffer: {name}"
             )
