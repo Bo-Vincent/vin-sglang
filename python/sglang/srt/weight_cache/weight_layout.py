@@ -69,20 +69,25 @@ class WeightLayoutPlan:
 
     def validate_bindings(self, model) -> None:
         tensors = registered_tensors(model)
+        signatures = {}
+
+        def signature(tensor):
+            identity = id(tensor)
+            if identity not in signatures:
+                signatures[identity] = _layout_storage_key(tensor)
+            return signatures[identity]
+
         if set(tensors) != self.bindings.keys() | self.local_buffers:
             raise WeightManifestError(
                 "registered tensor names changed after layout construction"
             )
-        for name, signature in self.bindings.items():
-            if _layout_storage_key(tensors[name]) != signature:
+        for name, expected in self.bindings.items():
+            if signature(tensors[name]) != expected:
                 raise WeightManifestError(
                     f"weight storage changed after layout construction: {name}"
                 )
         for region in (*self.views, *self.initializations):
-            if (
-                _layout_storage_key(region.parameter)
-                != self.bindings[region.parameter_names[0]]
-            ):
+            if signature(region.parameter) != self.bindings[region.parameter_names[0]]:
                 raise WeightManifestError(
                     f"declared tensor storage changed: {region.parameter_names[0]}"
                 )
@@ -173,7 +178,7 @@ class WeightLayoutBuilder:
         ):
             raise WeightManifestError(f"invalid logical region: {tensor_id}")
         names = self._parameter_names(tensor)
-        self.declare(
+        self._declare(
             tensor,
             tensor_id,
             global_shape=global_shape,
@@ -228,6 +233,26 @@ class WeightLayoutBuilder:
     ):
         """Keep ownership even when this rank has only vocabulary padding."""
         self._parameter_names(tensor)
+        self._declare(
+            tensor,
+            tensor_id,
+            global_shape=global_shape,
+            partition=partition,
+            expert_id=expert_id,
+            layout_fingerprint=layout_fingerprint,
+        )
+
+    def _declare(
+        self,
+        tensor,
+        tensor_id,
+        *,
+        global_shape,
+        partition=WeightPartition(),
+        expert_id=None,
+        layout_fingerprint="sglang:row-major",
+    ):
+        """Declare already validated storage without repeating its lookup."""
         shape = tuple(global_shape) or (1,)
         if (
             not tensor_id
@@ -310,9 +335,12 @@ class WeightLayoutBuilder:
                 raise WeightManifestError(
                     f"overlapping registered tensor storage: {previous[2]}, {current[2]}"
                 )
-        grouped = {}
+        grouped, signatures = {}, {}
         for region in (*self._views, *self._initializations):
-            grouped.setdefault(_layout_storage_key(region.parameter), []).append(region)
+            identity = id(region.parameter)
+            if identity not in signatures:
+                signatures[identity] = _layout_storage_key(region.parameter)
+            grouped.setdefault(signatures[identity], []).append(region)
         for key, names in self._names.items():
             local = set(names) & self._local_buffers
             if local:
