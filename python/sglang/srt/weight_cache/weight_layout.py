@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from math import prod
 from typing import Any
 
@@ -66,6 +66,78 @@ class WeightLayoutPlan:
     local_buffers: frozenset[str]
     derived_state: tuple[str, ...]
     bindings: dict[str, tuple]
+
+    def _with_tensors(self, tensors):
+        return replace(
+            self,
+            views=tuple(
+                replace(v, parameter=tensors[v.parameter_names[0]]) for v in self.views
+            ),
+            initializations=tuple(
+                replace(v, parameter=tensors[v.parameter_names[0]])
+                for v in self.initializations
+            ),
+            bindings={n: _layout_storage_key(tensors[n]) for n in self.bindings},
+        )
+
+    def as_meta(self, model):
+        """Detach a stopped epoch's geometry without retaining tensor attributes."""
+        self.validate_bindings(model)
+        tensors, by_storage = {}, {}
+        for name, tensor in registered_tensors(model).items():
+            key = _layout_storage_key(tensor)
+            if key not in by_storage:
+                by_storage[key] = torch.empty_strided(
+                    tensor.shape, tensor.stride(), dtype=tensor.dtype, device="meta"
+                )
+            tensors[name] = by_storage[key]
+        return self._with_tensors(tensors), tensors
+
+    def rebind(self, model, previous_tensors):
+        """Rebind same-epoch meta geometry through all physical builder checks."""
+        builder = WeightLayoutBuilder(model)
+        if set(builder.tensors) != set(previous_tensors):
+            raise WeightManifestError("registered tensor names changed before rebind")
+        previous_names = {}
+        for name, tensor in previous_tensors.items():
+            if not tensor.is_meta:
+                raise WeightManifestError(
+                    "layout rebind requires detached meta tensors"
+                )
+            previous_names.setdefault(id(tensor), []).append(name)
+        for name, current in builder.tensors.items():
+            previous = previous_tensors[name]
+            aliases = tuple(sorted(previous_names[id(previous)]))
+            if (
+                tuple(current.shape) != tuple(previous.shape)
+                or tuple(current.stride()) != tuple(previous.stride())
+                or current.dtype != previous.dtype
+                or tuple(sorted(builder._names[_layout_storage_key(current)]))
+                != aliases
+            ):
+                raise WeightManifestError(f"layout geometry or aliases changed: {name}")
+            if name not in self.local_buffers:
+                builder._parameter_names(current)
+        for region in (*self.views, *self.initializations):
+            previous = previous_tensors[region.parameter_names[0]]
+            if region.parameter is not previous or region.parameter_names != tuple(
+                sorted(previous_names[id(previous)])
+            ):
+                raise WeightManifestError(
+                    "layout template references unexpected storage"
+                )
+        rebound = self._with_tensors(builder.tensors)
+        for region in (*rebound.views, *rebound.initializations):
+            builder._check_range(region)
+        builder._views = list(rebound.views)
+        builder._initializations = list(rebound.initializations)
+        builder._declarations = {t.tensor_id: t for t in self.tensors}
+        for name in self.local_buffers:
+            builder.local_buffer(name)
+        builder.derived(*self.derived_state)
+        result = builder.build()
+        result.validate_derived_state(model)
+        return result
 
     def validate_bindings(self, model) -> None:
         tensors = registered_tensors(model)

@@ -2,9 +2,11 @@
 """Private grouped wire manifests derived from validated canonical views."""
 
 from collections import defaultdict
+from dataclasses import replace as replace_plan
 
 from msgspec.structs import replace
 
+from ..weight_layout import WeightLayoutBuilder
 from ..weight_runtime_manifest import (
     LogicalWeightTensor,
     RuntimeWeightFragment,
@@ -39,10 +41,6 @@ def alias_names(source_plan, target_plan):
 
 
 def derive_wire_manifest(manifest, plan, args, peer_args, config, *, exclude=()):
-    groups = defaultdict(list)
-    for view in plan.views:
-        name = view.parameter_names[0]
-        groups[name].append(view)
     declarations, fragments = {}, []
 
     def emit(view, name, shape, offset, local, byte_offset, partition, expert=None):
@@ -58,7 +56,7 @@ def derive_wire_manifest(manifest, plan, args, peer_args, config, *, exclude=())
         )
         if declarations.setdefault(name, declaration) != declaration:
             raise WeightManifestError("inconsistent grouped wire declaration")
-        if parameter_name in exclude:
+        if view.parameter_names[0] in exclude:
             return
         storage = tensor.untyped_storage()
         address = tensor.data_ptr() + byte_offset
@@ -80,6 +78,87 @@ def derive_wire_manifest(manifest, plan, args, peer_args, config, *, exclude=())
             )
         )
 
+    _visit_wire_regions(plan, args, peer_args, config, emit)
+    return replace(
+        manifest, tensors=tuple(declarations.values()), fragments=tuple(fragments)
+    )
+
+
+def build_wire_plan(model, plan, args, peer_args, config):
+    """Lower validated canonical views before retaining same-epoch meta geometry."""
+    builder = WeightLayoutBuilder(
+        model,
+        allow_meta=any(
+            v.parameter.is_meta for v in (*plan.views, *plan.initializations)
+        ),
+    )
+
+    def emit(view, name, shape, offset, local, byte_offset, partition, expert=None):
+        builder.region(
+            view.parameter,
+            name,
+            global_shape=shape,
+            global_offset=offset,
+            local_shape=local,
+            byte_offset=byte_offset,
+            partition=partition,
+            expert_id=expert,
+            layout_fingerprint="sglang:inplace-grouped-block-v1",
+        )
+
+    _visit_wire_regions(plan, args, peer_args, config, emit)
+    for region in plan.initializations:
+        builder.initialize(
+            region.parameter,
+            byte_offset=region.byte_offset,
+            nbytes=region.nbytes,
+            value=region.value,
+        )
+    for name in plan.local_buffers:
+        builder.local_buffer(name)
+    builder.derived(*plan.derived_state)
+    result = builder.build()
+    represented = {v.tensor_id for v in plan.views}
+    padding = tuple(
+        replace(t, layout_fingerprint="sglang:inplace-grouped-block-v1")
+        for t in plan.tensors
+        if t.tensor_id not in represented
+    )
+    declarations = {t.tensor_id: t for t in result.tensors}
+    for tensor in padding:
+        if declarations.setdefault(tensor.tensor_id, tensor) != tensor:
+            raise WeightManifestError("conflicting padding-only wire declaration")
+    return replace_plan(
+        result, tensors=tuple(declarations[name] for name in sorted(declarations))
+    )
+
+
+def exclude_parameters(manifest, plan, names):
+    """Exclude only fragments owned by the named, already validated parameters."""
+    excluded = {
+        (
+            v.tensor_id,
+            v.global_offset,
+            v.local_shape,
+            v.parameter.data_ptr() + v.byte_offset,
+        )
+        for v in plan.views
+        if v.parameter_names[0] in names
+    }
+    return replace(
+        manifest,
+        fragments=tuple(
+            f
+            for f in manifest.fragments
+            if (f.tensor_id, f.global_offset, f.local_shape, f.address) not in excluded
+        ),
+    )
+
+
+def _visit_wire_regions(plan, args, peer_args, config, emit):
+    groups = defaultdict(list)
+    for view in plan.views:
+        groups[view.parameter_names[0]].append(view)
     for parameter_name, views in groups.items():
         view = views[0]
         if parameter_name.endswith(("experts.w13_weight", "experts.w2_weight")):
@@ -180,9 +259,6 @@ def derive_wire_manifest(manifest, plan, args, peer_args, config, *, exclude=())
                         view.partition,
                         view.expert_id,
                     )
-    return replace(
-        manifest, tensors=tuple(declarations.values()), fragments=tuple(fragments)
-    )
 
 
 def close_inventory(sources, targets):

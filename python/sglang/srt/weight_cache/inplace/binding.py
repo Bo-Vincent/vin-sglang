@@ -227,6 +227,8 @@ def bind_weights(
     drops graphs and stale views, and prevents new manifest snapshots throughout
     this call. Target parameters are meta until this stopped epoch. After success
     the caller rebuilds execution state and runtime manifests before admission.
+    Module types, configuration, backends and process-group metadata stay fixed;
+    only this helper's tensor replacements and packed weight bytes may change.
     """
     global _STATE, _EPOCH
     import torch
@@ -261,6 +263,12 @@ def bind_weights(
             attention_blocks=max(1, args.dp_size // peer.dp_size),
         )
     aliases = wire.alias_names(source_plan, target_plan)
+    source_template, source_tensors = wire.build_wire_plan(
+        old_model, source_plan, old_args, target_args, old_model.config
+    ).as_meta(old_model)
+    target_template, target_tensors = wire.build_wire_plan(
+        new_model, target_plan, target_args, old_args, new_model.config
+    ).as_meta(new_model)
     # Layout plans own tensor references and must not pin replaced allocations.
     del source_plan, target_plan
     if engine is None:
@@ -341,22 +349,19 @@ def bind_weights(
     )
     retained["allocated"] = allocated
     _install_target(torch, new_model, allocated, old_model)
-    source_plan, target_plan = _build_plan(old_model), _build_plan(new_model)
+    # Native layer semantics were validated before mutation and stay fixed during
+    # this controlled stop. Recheck materialized adapter/storage prerequisites.
+    get_weight_layout_adapter(old_model, WeightAdapterContext(old_model.config))
+    get_weight_layout_adapter(new_model, WeightAdapterContext(new_model.config))
+    source_plan = source_template.rebind(old_model, source_tensors)
+    target_plan = target_template.rebind(new_model, target_tensors)
+    del source_template, target_template, source_tensors, target_tensors
     target_plan.initialize_local_regions()
-    sm = wire.derive_wire_manifest(
-        _manifest(old_model, source_plan, old_args, rank, endpoint, epoch, "source"),
-        source_plan,
-        old_args,
-        target_args,
-        old_model.config,
-    )
-    tm = wire.derive_wire_manifest(
+    sm = _manifest(old_model, source_plan, old_args, rank, endpoint, epoch, "source")
+    tm = wire.exclude_parameters(
         _manifest(new_model, target_plan, target_args, rank, endpoint, epoch, "target"),
         target_plan,
-        target_args,
-        old_args,
-        new_model.config,
-        exclude=aliases,
+        aliases,
     )
     sent = (len(sm.fragments), len(tm.fragments))
     gathered = gather((sm, tm))

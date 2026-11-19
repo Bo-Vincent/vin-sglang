@@ -34,6 +34,10 @@ Retain the old model, rebuild the target process groups and construct the target
 model with meta parameters. Target buffers must be corresponding meta buffers or
 the same local source objects. No target GPU weights are allocated during normal
 serving. Both models must retain the correct native module group metadata.
+Module types, configuration, kernel backends and process-group metadata must stay
+fixed throughout the call. The helper only replaces registered tensors and packs
+their bytes; the caller must prevent concurrent metadata changes or hooks that
+change these semantics.
 
 ```python
 import os
@@ -89,6 +93,17 @@ one cloned parameter at a time, at most 1 GiB under the parameter cap; targets a
 source byte order are restored after transfers finish. No full host checkpoint
 or host weight copy is retained. Logical canonical metadata is local; the gather
 contains compact wire fragments and declarations only.
+
+The first native canonical layouts validate supported layer semantics and decide
+aliases. They are lowered to small grouped wire layout plans, then detached to
+plain meta tensors without copying loaders, module references or tensor
+attributes. After packing and installation, those same-epoch plans are rebound to
+current registered storage through the original byte-range, alias, physical
+overlap, complete-coverage and binding checks. Padding initializations, local
+buffers and derived-state declarations remain accounted for. Physical adapter
+prerequisites are checked again; this is not a second native layer-semantics
+validation or a persistent plan cache. Alias fragments are excluded by their
+parameter ownership only after complete physical validation.
 
 Every submitted group uses eight XOR endpoint phases with a world barrier after
 each phase, including empty phases. Mixed empty/nonempty local target groups are
