@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Repeated epochs must release complete physical source storage units."""
 
+import weakref
 from dataclasses import dataclass
 from types import SimpleNamespace
 
@@ -83,6 +84,81 @@ def _previous_target(cpu):
             allocated[name].copy_(parameter)
     binding._install_target(torch, model, allocated, model)
     return model
+
+
+@pytest.mark.parametrize("with_consumers", [False, True])
+def test_capture_once_consumes_only_completed_release_unit(
+    cpu, monkeypatch, with_consumers
+):
+    @dataclass(frozen=True)
+    class Runtime:
+        weight: torch.Tensor
+
+    monkeypatch.setattr(arena_weights, "CAP_BYTES", 32)
+    model = torch.nn.Module()
+    references = []
+    expected = {}
+    for i in range(7):
+        name = f"weight_{i}"
+        parameter = torch.nn.Parameter(torch.arange(8, dtype=torch.float32) + i)
+        model.register_parameter(name, parameter)
+        if with_consumers:
+            setattr(model, f"runtime_{i}", Runtime(parameter))
+            object.__setattr__(model, f"direct_{i}", parameter)
+        cpu.cuda.track(parameter)
+        references.append(weakref.ref(parameter))
+        expected[name] = parameter.detach().clone()
+    del parameter
+    parameters = dict(model.named_parameters())
+    capture = arena_weights.capture_tensor_aliases
+    calls = []
+
+    def counted_capture(model, registered):
+        calls.append(set(registered))
+        return capture(model, registered)
+
+    monkeypatch.setattr(arena_weights, "capture_tensor_aliases", counted_capture)
+    snapshot = cpu.cuda.memory_snapshot
+    completed = []
+
+    def checked_snapshot():
+        index = len(completed)
+        assert all(ref() is None for ref in references[: index + 1])
+        assert all(ref() is not None for ref in references[index + 1 :])
+        completed.append(index)
+        return snapshot()
+
+    monkeypatch.setattr(cpu.cuda, "memory_snapshot", checked_snapshot)
+    profile = {}
+    arena_weights.compact_source(cpu, model, parameters, parameters.keys(), profile, [])
+    assert calls == [set(parameters)]
+    assert len(completed) == 7
+    assert all(
+        row["gc_fallback_seconds"] == 0 for row in profile["source_release_chunks"]
+    )
+    for i, (name, parameter) in enumerate(parameters.items()):
+        if with_consumers:
+            assert getattr(model, f"runtime_{i}").weight is parameter
+            assert getattr(model, f"direct_{i}") is parameter
+        assert torch.equal(parameter, expected[name])
+
+
+@pytest.mark.parametrize("has_parameters", [False, True])
+def test_no_changed_names_skips_capture(cpu, monkeypatch, has_parameters):
+    model = torch.nn.Module()
+    if has_parameters:
+        model.weight = torch.nn.Parameter(torch.ones(8))
+    parameters = dict(model.named_parameters())
+
+    def unexpected_capture(*args):
+        pytest.fail("no moved storage requires no alias scan")
+
+    monkeypatch.setattr(arena_weights, "capture_tensor_aliases", unexpected_capture)
+    profile = {}
+    arena_weights.compact_source(cpu, model, parameters, set(), profile, [])
+    assert profile["source_release_chunks"] == []
+    assert profile["source_release_verified"]
+    assert cpu.cuda.events == ["flush"]
 
 
 def test_previous_target_mixed_storage_is_released_and_alias_backing_separated(

@@ -28,6 +28,8 @@ def capture_tensor_aliases(model, registered):
 
     for module in model.modules():
         visit(module)
+    # Break the recursive closure cycle so consumed aliases release immediately.
+    visit = None
     return aliases
 
 

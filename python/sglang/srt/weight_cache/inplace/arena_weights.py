@@ -133,8 +133,19 @@ def compact_source(torch, model, parameters, names, profile, owners):
         source_release_chunks=[],
         source_empty_cache_seconds=0.0,
     )
+    aliases_by_name = {}
+    for alias in (
+        capture_tensor_aliases(
+            model, {n: parameters[n] for members, _ in batches for n in members}
+        )
+        if batches
+        else ()
+    ):
+        aliases_by_name.setdefault(alias[2], []).append(alias)
+    if aliases_by_name:
+        del alias
     for (names, size), parts in zip(batches, split_batches):
-        aliases = capture_tensor_aliases(model, {n: parameters[n] for n in names})
+        aliases = [alias for n in names for alias in aliases_by_name.pop(n, ())]
         torch.cuda.synchronize()
         before = torch.cuda.memory_allocated()
         originals = [weakref.ref(parameters[n]) for n in names]

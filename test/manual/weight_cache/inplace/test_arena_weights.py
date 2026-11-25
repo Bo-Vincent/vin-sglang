@@ -55,6 +55,27 @@ class TestArenaTest:
 
 
 class TestFlushTest:
+    def test_multiple_chunks_capture_once(self, monkeypatch):
+        from sglang.srt.weight_cache.inplace import arena_weights
+
+        torch, model, parameters, events = self.fixture()
+        for i in range(2, 7):
+            name = f"extra_{i}"
+            model._parameters[name] = type(parameters["a"])(
+                (600 << 20) // 2, 1000 * (i + 1)
+            )
+            parameters[name] = model._parameters[name]
+        capture = arena_weights.capture_tensor_aliases
+        calls = []
+
+        def counted_capture(model, registered):
+            calls.append(set(registered))
+            return capture(model, registered)
+
+        monkeypatch.setattr(arena_weights, "capture_tensor_aliases", counted_capture)
+        compact_source(torch, model, parameters, parameters.keys(), {}, [])
+        assert calls == [set(parameters)]
+
     def fixture(self, retained=False):
         events = []
 
