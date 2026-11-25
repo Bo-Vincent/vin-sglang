@@ -43,6 +43,50 @@ replicas. Duplicate model names and an unconfigured `--default-model` fail at
 startup. The configured name must also be accepted by its downstream router.
 `GET /v1/models` lists these static names, without querying downstream services.
 
+To start the gateway and its downstream routers together on one machine, build
+both binaries and use the launcher:
+
+```bash
+cargo build --release --bin sgl-router --bin sgl-global-router
+python3 scripts/launch_global_router.py --config models.json --bin-dir target/release
+```
+
+For example, `models.json` can contain:
+
+```json
+{
+  "global": {"host": "0.0.0.0", "port": 30000, "default_model": "chat-model"},
+  "models": [
+    {
+      "name": "chat-model",
+      "port": 30001,
+      "args": ["--worker-urls", "http://127.0.0.1:31000", "--policy", "cache_aware"]
+    },
+    {
+      "name": "embedding-model",
+      "port": 30002,
+      "args": ["--worker-urls", "http://127.0.0.1:32000", "--no-tokenizer", "--policy", "power_of_two"]
+    }
+  ]
+}
+```
+
+Workers must already be running. Each model's `args` are passed directly to its
+router, so tokenizer, policy and bucket configuration remain independent. The
+launcher owns `--model-id`, `--host` and `--port`; downstream routers bind to
+`127.0.0.1`. Model names must not contain `=`. Port and model names must be unique.
+Relative paths in `args` are resolved from the launcher's working directory.
+
+The launcher waits for all downstream `/readyz` endpoints before starting the
+gateway. This checks Router readiness, not model warmup or worker availability.
+Use `--startup-timeout` (default 120 seconds) for slow tokenizer startup. A startup
+failure or any child exit stops the entire group with a nonzero exit status.
+`SIGINT` and `SIGTERM` stop all managed process groups; `--shutdown-timeout`
+(default 10 seconds) bounds graceful shutdown before forced termination. The
+launcher does not restart processes or manage remote hosts. Manual startup above
+remains available for independently deployed routers. The launcher requires a
+POSIX platform and Python 3.9 or newer.
+
 Forwarded endpoints are `POST /v1/chat/completions`, `/v1/completions`,
 `/v1/embeddings`, `/v1/messages`, `/v1/messages/count_tokens`, `/v1/classify`,
 `/v1/tokenize`, `/v1/detokenize`, and `POST`/`PUT /generate`, `/v1/rerank`.
