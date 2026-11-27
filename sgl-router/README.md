@@ -11,6 +11,7 @@ discovers engines from a static URL list or Kubernetes EndpointSlices.
 - [Quick start](#quick-start)
 - [Key interfaces](#key-interfaces)
 - [Routing policies](#routing-policies)
+- [Request-weighted admission](#request-weighted-admission)
 - [Deployment examples](#deployment-examples)
 - [Add a new policy](#add-a-new-policy)
 - [Other features](#other-features)
@@ -151,6 +152,57 @@ that URL, retry and create requests conflict until discovery releases it.
 Both edges speak cleartext HTTP/2 where the peer does; see
 [operations](#operations). With `--grpc-port`, the router also serves the
 engine's [native gRPC](#native-grpc) API.
+
+### Request-weighted admission
+
+Pass `--weighted-queue-config queue.json` to enable a local admission queue
+before request preparation and worker selection. Without this flag, requests
+follow the existing path and the scheduling header is ignored by the router.
+
+```json
+{
+  "max_inflight": 128,
+  "max_queued_requests": 1024,
+  "max_queued_body_bytes": 67108864,
+  "queue_timeout_ms": 30000
+}
+```
+
+`max_inflight` is required; the other fields default to the values above. All
+limits must be positive. HTTP inference and native gRPC Generate share the same
+queue. Health, management and local tokenization requests do not take a slot.
+
+A trusted gateway can set `x-sgl-request-weight` to an integer from 1 to 100.
+Missing weights default to 1. Duplicate or invalid values return 400
+(`invalid_request_weight`); the native gRPC equivalent is InvalidArgument.
+The gateway must replace client-supplied weights before forwarding them. The
+router consumes the header when enabled and does not forward it to workers.
+This header is a scheduling hint, not an authentication or authorization token.
+
+Each request receives a virtual finish position: the current virtual progress
+plus a fixed unit of work divided by its weight. The smallest position is
+admitted first, with arrival order breaking ties; each grant advances virtual
+progress to its position. A newly arriving high-weight request may overtake
+waiting work, but starts from the current progress rather than zero. Equal
+weights are FIFO. This schedules individual requests, not tenants or persistent
+task groups, and does not promise proportional GPU time or token throughput.
+
+Requests retain their admission slot through retries and until their response
+body or gRPC stream ends, errors or is cancelled. P/D uses one slot per external
+request. Existing routing policies and per-worker admission still apply; a slot
+does not reserve worker capacity. The queue does not preempt running requests.
+
+Waiting requests are bounded by count and payload bytes. The byte limit counts
+HTTP bodies or encoded gRPC messages, not total process memory. A full queue
+returns 429 (`weighted_queue_full`), waiting past the queue or original request
+deadline returns 504 (`weighted_queue_timeout`), and shutdown returns 503
+(`weighted_queue_unavailable`). Native gRPC uses ResourceExhausted,
+DeadlineExceeded and Unavailable, respectively. Queueing and retry backoff do
+not restart the original request budget. Draining rejects waiting work while
+already admitted requests follow the existing shutdown rules.
+
+State is process-local and is lost on restart. Multiple replicas do not
+coordinate scheduling, so weights do not establish fleet-wide shares.
 
 ### Key flags
 
