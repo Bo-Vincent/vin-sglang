@@ -10,4 +10,6 @@ pub mod inflight;
 pub mod metrics;
 pub mod routes;
 pub mod shutdown;
+
+mod response_guard;
 pub mod weighted_queue;

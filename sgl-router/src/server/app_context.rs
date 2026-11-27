@@ -52,6 +52,7 @@ impl ChatRouting {
 }
 
 pub struct AppContext {
+    pub weighted_queue: Option<Arc<crate::server::weighted_queue::WeightedQueue>>,
     pub config: Config,
     pub preprocessor: Preprocessor,
     pub proxy: Arc<Proxy>,
@@ -134,7 +135,12 @@ impl AppContext {
         policies.attach_metrics(Arc::clone(&metrics));
         let bucket_selector = Arc::new(BucketSelector::new(config.model.bucket_config.clone()));
         let decode_gate = DecodeGate::new(config.proxy.decode_dispatch_limit);
+        let weighted_queue = config.server.weighted_queue.clone().map(|config| {
+            crate::server::weighted_queue::WeightedQueue::new(config)
+                .expect("validated weighted queue configuration")
+        });
         Self {
+            weighted_queue,
             preprocessor: Preprocessor::new(&config.model, tokenizers, Arc::clone(&metrics)),
             config,
             proxy,
@@ -155,6 +161,17 @@ impl AppContext {
             engine_reported_load: EngineReportedLoadTable::new(),
             inflight_http: InflightHttp::new(),
             readiness: AtomicU8::new(READINESS_NOT_READY),
+        }
+    }
+
+    /// Include ingress queueing in every admission, retry, and dispatch wait.
+    /// Without weighted admission, retain the existing stale-request budget.
+    pub(crate) fn request_budget(&self) -> std::time::Duration {
+        let stale = self.router_inflight_load.stale_request_timeout();
+        if self.weighted_queue.is_some() {
+            self.proxy.request_timeout.min(stale)
+        } else {
+            stale
         }
     }
 
@@ -196,6 +213,9 @@ impl AppContext {
     /// Not the inverse of [`mark_ready`](Self::mark_ready): this transition
     /// cannot be undone, because the process it announces cannot be either.
     pub fn mark_not_ready(&self) {
+        if let Some(queue) = &self.weighted_queue {
+            queue.close();
+        }
         self.readiness.store(READINESS_DRAINING, Ordering::Relaxed);
     }
 
@@ -248,6 +268,7 @@ impl AppContext {
         };
         let metrics = MetricsRegistry::new();
         Self {
+            weighted_queue: None,
             preprocessor: Preprocessor::new(
                 &config.model,
                 Arc::new(TokenizerRegistry::default()),

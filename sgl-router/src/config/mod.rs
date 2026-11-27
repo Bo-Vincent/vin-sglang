@@ -44,6 +44,9 @@ pub fn shutdown_drain_advisory(
 impl Config {
     /// Validate invariants not enforced by the CLI parser.
     pub(crate) fn validate(&self) -> Result<()> {
+        if let Some(config) = &self.server.weighted_queue {
+            config.validate().map_err(anyhow::Error::msg)?;
+        }
         ensure!(!self.model.id.is_empty(), "model id must be non-empty");
         // Policies that read the prompt are checked against the built routing at startup.
         ensure!(

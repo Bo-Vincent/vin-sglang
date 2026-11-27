@@ -135,6 +135,7 @@ pub struct Proxy {
     /// the first token. A stream's body is not bounded by it
     /// (long generations are valid), only by the idle and stale-request limits.
     pub request_timeout: Duration,
+    pub(crate) request_deadline: Option<std::time::Instant>,
     /// Maximum silence between streamed upstream chunks; `None` waits forever.
     pub stream_idle_timeout: Option<Duration>,
 }
@@ -210,8 +211,20 @@ impl Proxy {
             default_client: build_client(WireProtocol::Http1)?,
             h2c_client: build_client(WireProtocol::H2c)?,
             request_timeout,
+            request_deadline: None,
             stream_idle_timeout: None,
         })
+    }
+
+    /// Reuse the connection pools with the original request's remaining budget.
+    pub(crate) fn with_request_budget(&self, start: std::time::Instant, budget: Duration) -> Self {
+        Self {
+            default_client: self.default_client.clone(),
+            h2c_client: self.h2c_client.clone(),
+            request_timeout: budget.saturating_sub(start.elapsed()),
+            request_deadline: start.checked_add(budget),
+            stream_idle_timeout: self.stream_idle_timeout,
+        }
     }
 
     pub fn with_stream_idle_timeout(mut self, timeout: Duration) -> Self {

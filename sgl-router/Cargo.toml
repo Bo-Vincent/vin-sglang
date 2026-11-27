@@ -22,6 +22,8 @@ path = "src/main.rs"
 unused_qualifications = "warn"
 
 [dependencies]
+# Account native Generate payload bytes before weighted admission.
+prost = "0.14"
 # Pin Dynamo versions and commit Cargo.lock so builds are reproducible.
 dynamo-tokenizers = "=4.3.1"
 # Renders the model's chat template (HF Jinja, or Dynamo's built-in encoder for
@@ -133,7 +135,6 @@ tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
 tokio = { version = "1.42", features = ["test-util"] }
 # The hand-rolled mock engine in tests/proxy/grpc_routing.rs.
-prost = "0.14"
 tonic-prost = "0.14.6"
 # Low-level msgpack encoder used to hand-construct wire bytes in
 # kv_events golden-bytes tests (decode-only path uses rmp-serde).

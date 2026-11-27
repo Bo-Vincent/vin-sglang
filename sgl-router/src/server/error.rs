@@ -26,6 +26,8 @@ pub const X_ROUTER_UPSTREAM_STATUS: HeaderName =
 enum ErrorClass {
     /// 400 — request rejected at ingress as malformed / invalid.
     BadRequest,
+    /// 429 — admission capacity is exhausted.
+    Overloaded,
     /// 401 — the request lacks a valid credential for a protected route.
     Unauthorized,
     /// 404 — requested model / resource not found.
@@ -49,6 +51,7 @@ impl ErrorClass {
     fn status(self) -> StatusCode {
         match self {
             ErrorClass::BadRequest => StatusCode::BAD_REQUEST,
+            ErrorClass::Overloaded => StatusCode::TOO_MANY_REQUESTS,
             ErrorClass::Unauthorized => StatusCode::UNAUTHORIZED,
             ErrorClass::NotFound => StatusCode::NOT_FOUND,
             ErrorClass::Conflict => StatusCode::CONFLICT,
@@ -77,6 +80,8 @@ fn grpc_error_class(code: tonic::Code) -> ErrorClass {
 
 #[derive(Debug, Error)]
 pub enum ApiError {
+    #[error("{0}")]
+    Queue(#[from] crate::server::weighted_queue::QueueError),
     #[error("bad request: {0}")]
     BadRequest(String),
 
@@ -216,6 +221,12 @@ impl ApiError {
     /// pick a different one.
     fn class(&self) -> ErrorClass {
         match self {
+            ApiError::Queue(error) => match error {
+                crate::server::weighted_queue::QueueError::Full => ErrorClass::Overloaded,
+                crate::server::weighted_queue::QueueError::Timeout => ErrorClass::Timeout,
+                crate::server::weighted_queue::QueueError::Closed => ErrorClass::NoTarget,
+                crate::server::weighted_queue::QueueError::InvalidWeight => ErrorClass::BadRequest,
+            },
             ApiError::BadRequest(_) => ErrorClass::BadRequest,
             ApiError::SamplingContract { .. } => ErrorClass::BadRequest,
             ApiError::ModelNotFound(_) => ErrorClass::NotFound,
@@ -258,6 +269,14 @@ impl ApiError {
     /// `stale_request_expired` both map to 504 but stay tellable apart here.
     fn error_code(&self) -> &'static str {
         match self {
+            ApiError::Queue(error) => match error {
+                crate::server::weighted_queue::QueueError::Full => "weighted_queue_full",
+                crate::server::weighted_queue::QueueError::Timeout => "weighted_queue_timeout",
+                crate::server::weighted_queue::QueueError::Closed => "weighted_queue_unavailable",
+                crate::server::weighted_queue::QueueError::InvalidWeight => {
+                    "invalid_request_weight"
+                }
+            },
             ApiError::BadRequest(_) => "bad_request",
             // Shares `ErrorClass::BadRequest` (and thus the 400) with
             // `BadRequest`, but keeps its own code: an operator rolling a
@@ -296,7 +315,8 @@ impl ApiError {
         match self {
             ApiError::UpstreamStatus { status } => Some(*status),
             ApiError::PrefillFailed { status } => *status,
-            ApiError::BadRequest(_)
+            ApiError::Queue(_)
+            | ApiError::BadRequest(_)
             | ApiError::SamplingContract { .. }
             | ApiError::ModelNotFound(_)
             | ApiError::UpstreamUnreachable { .. }
@@ -372,6 +392,7 @@ impl ApiError {
         }
         let code = match self.class() {
             ErrorClass::BadRequest => Code::InvalidArgument,
+            ErrorClass::Overloaded => Code::ResourceExhausted,
             ErrorClass::Unauthorized => Code::Unauthenticated,
             ErrorClass::NotFound => Code::NotFound,
             ErrorClass::Conflict => Code::FailedPrecondition,
@@ -457,7 +478,8 @@ impl ApiError {
                 );
                 "service unavailable".to_string()
             }
-            ApiError::BadRequest(_)
+            ApiError::Queue(_)
+            | ApiError::BadRequest(_)
             | ApiError::ModelNotFound(_)
             | ApiError::SamplingContract { .. }
             | ApiError::UnsupportedEndpoint { .. }
@@ -524,6 +546,37 @@ mod tests {
         let env: ErrEnv = serde_json::from_str(&body_str)
             .unwrap_or_else(|e| panic!("envelope did not match expected shape: {e}: {body_str}"));
         (status, code_header, env)
+    }
+
+    #[test]
+    fn weighted_queue_errors_preserve_http_and_grpc_contracts() {
+        use crate::server::weighted_queue::QueueError;
+        for (error, http, grpc) in [
+            (
+                QueueError::Full,
+                StatusCode::TOO_MANY_REQUESTS,
+                tonic::Code::ResourceExhausted,
+            ),
+            (
+                QueueError::Timeout,
+                StatusCode::GATEWAY_TIMEOUT,
+                tonic::Code::DeadlineExceeded,
+            ),
+            (
+                QueueError::Closed,
+                StatusCode::SERVICE_UNAVAILABLE,
+                tonic::Code::Unavailable,
+            ),
+            (
+                QueueError::InvalidWeight,
+                StatusCode::BAD_REQUEST,
+                tonic::Code::InvalidArgument,
+            ),
+        ] {
+            assert_eq!(ApiError::from(error).status_code(), http);
+            let status = ApiError::from(error).into_grpc_status();
+            assert_eq!(status.code(), grpc);
+        }
     }
 
     #[test]

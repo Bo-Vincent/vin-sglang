@@ -106,8 +106,18 @@ pub(super) async fn forward_request_grpc(
     let mut failed = None;
     let mut duration = None;
     for attempt in 0..ctx.config.proxy.max_attempts.get() {
+        if ctx.weighted_queue.is_some() && request_started_at.elapsed() >= ctx.request_budget() {
+            return failed.unwrap_or_else(|| {
+                (
+                    Err(ApiError::StaleRequestExpired {
+                        model: request.model.0.clone(),
+                    }),
+                    None,
+                )
+            });
+        }
         if attempt > 0 {
-            let deadline = ctx.router_inflight_load.stale_request_timeout();
+            let deadline = ctx.request_budget();
             let Some(remaining) = deadline.checked_sub(request_started_at.elapsed()) else {
                 break;
             };
@@ -169,6 +179,11 @@ async fn dispatch<T: Transport>(
     request_started_at: Instant,
     duration: &Arc<RequestDurationGuard>,
 ) -> Result<Dispatched<T::Response>, ApiError> {
+    if ctx.weighted_queue.is_some() && request_started_at.elapsed() >= ctx.request_budget() {
+        return Err(ApiError::StaleRequestExpired {
+            model: request.model.0.clone(),
+        });
+    }
     let SelectedWorkers {
         prefill,
         decode,
@@ -399,8 +414,7 @@ async fn admit_decode(
     prefill_failed: &CancellationToken,
 ) -> Result<(), ApiError> {
     let budget = ctx
-        .router_inflight_load
-        .stale_request_timeout()
+        .request_budget()
         .saturating_sub(request_started_at.elapsed());
     let admit = ctx.decode_gate.admit(&prefill.id, rank, slot);
     tokio::select! {
@@ -657,7 +671,10 @@ impl Transport for Grpc {
             } else {
                 (Box::new(load_guards), None, None)
             };
-        ctx.proxy
+        let budget_proxy = request_budget_proxy(ctx, metrics.request_started_at);
+        budget_proxy
+            .as_ref()
+            .unwrap_or(&ctx.proxy)
             .forward_grpc(
                 worker,
                 &self.0,
@@ -845,7 +862,9 @@ fn spawn_prefill_request<T: Transport>(
     stream_abort: CancellationToken,
     slot: Option<DecodeSlot>,
 ) -> tokio::task::JoinHandle<PrefillOutcome<T::Response>> {
-    let proxy = Arc::clone(&ctx.proxy);
+    let proxy = request_budget_proxy(ctx, metrics.request_started_at)
+        .map(Arc::new)
+        .unwrap_or_else(|| Arc::clone(&ctx.proxy));
     let (registry, model) = (Arc::clone(&metrics.registry), metrics.model.clone());
     tokio::spawn(async move {
         let _load_guards = load_guards;
@@ -991,12 +1010,14 @@ async fn forward_to_response_worker(
     stream_abort: CancellationToken,
     decode_slot: Option<DecodeSlot>,
 ) -> Result<Response<Body>, ApiError> {
+    let budget_proxy = request_budget_proxy(ctx, metrics.request_started_at);
+    let proxy = budget_proxy.as_ref().unwrap_or(&ctx.proxy);
     if metrics.streaming {
         // Load and duration guards live until the SSE pump ends, not just until headers arrive.
         let stream_guards: Box<dyn Send + 'static> =
             Box::new((load_guards, metrics.stream_duration_guard()));
         let first_byte = release_on_first_byte(decode_slot, metrics.first_byte_callback());
-        ctx.proxy
+        proxy
             .forward_streaming_to(
                 &worker.url,
                 worker.protocol(),
@@ -1015,7 +1036,7 @@ async fn forward_to_response_worker(
     } else {
         // JSON forwarding reads the full response body before releasing load guards.
         let _load_guards = load_guards;
-        ctx.proxy
+        proxy
             .forward_json_to(
                 &worker.url,
                 worker.protocol(),
@@ -1027,6 +1048,13 @@ async fn forward_to_response_worker(
             )
             .await
     }
+}
+
+fn request_budget_proxy(ctx: &AppContext, start: Instant) -> Option<Proxy> {
+    ctx.weighted_queue.as_ref().map(|_| {
+        let budget = ctx.request_budget();
+        ctx.proxy.with_request_budget(start, budget)
+    })
 }
 
 struct DispatchMetrics {

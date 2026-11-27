@@ -307,6 +307,7 @@ impl std::fmt::Display for StickyFallbackKind {
 
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
+    pub weighted_queue: Option<crate::server::weighted_queue::WeightedQueueConfig>,
     pub host: String,
     pub port: u16,
     /// Native gRPC listener on `host`; `None` disables it.
@@ -346,6 +347,7 @@ pub fn default_shutdown_drain_secs() -> u64 {
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
+            weighted_queue: None,
             host: default_host(),
             port: default_port(),
             grpc_port: None,

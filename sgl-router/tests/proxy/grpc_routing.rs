@@ -756,3 +756,120 @@ async fn errors_arrive_as_grpc_status() {
     codes.sort_by_key(|code| *code as i32);
     assert_eq!(codes, [Code::Internal, Code::Unavailable]);
 }
+
+/// Native streaming and HTTP ingress share one request-level admission budget.
+#[tokio::test]
+async fn weighted_queue_native_metadata_and_stream_share_http_capacity() {
+    use axum::body::Body;
+    use sgl_router::server::weighted_queue::{WeightedQueue, WeightedQueueConfig};
+    use tokio::sync::{mpsc, oneshot};
+    use tower::ServiceExt;
+
+    for cancel in [false, true] {
+        let (arrived, mut arrivals) = mpsc::unbounded_channel::<oneshot::Sender<()>>();
+        let port = MockEngine::default()
+            .stream(
+                "Generate",
+                move |request: tonic::Request<proto::GenerateRequest>| {
+                    assert!(request.metadata().get("x-sgl-request-weight").is_none());
+                    let (release, wait) = oneshot::channel();
+                    arrived.send(release).unwrap();
+                    stream::once(async { Ok(frame("first", false)) })
+                        .chain(stream::once(async move {
+                            let _ = wait.await;
+                            Ok(frame("last", true))
+                        }))
+                        .boxed()
+                },
+            )
+            .start()
+            .await;
+        let mut ctx = router_ctx(&[(WorkerMode::Plain, "http://127.0.0.1:1", Some(port))]);
+        let queue = WeightedQueue::new(WeightedQueueConfig {
+            max_inflight: 1,
+            max_queued_requests: 1,
+            max_queued_body_bytes: 1_000_000,
+            queue_timeout_ms: 10_000,
+        })
+        .unwrap();
+        Arc::get_mut(&mut ctx).unwrap().weighted_queue = Some(queue);
+        let mut client = serve_grpc(ctx.clone()).await;
+        for value in ["0", "101", "bad"] {
+            let mut request = tonic::Request::new(generate(true));
+            request
+                .metadata_mut()
+                .insert("x-sgl-request-weight", value.parse().unwrap());
+            assert_eq!(
+                client.generate(request).await.unwrap_err().code(),
+                Code::InvalidArgument
+            );
+        }
+        let mut duplicate = tonic::Request::new(generate(true));
+        duplicate
+            .metadata_mut()
+            .append("x-sgl-request-weight", "1".parse().unwrap());
+        duplicate
+            .metadata_mut()
+            .append("x-sgl-request-weight", "2".parse().unwrap());
+        assert_eq!(
+            client.generate(duplicate).await.unwrap_err().code(),
+            Code::InvalidArgument
+        );
+        assert!(arrivals.try_recv().is_err());
+
+        let mut request = tonic::Request::new(generate(true));
+        request
+            .metadata_mut()
+            .insert("x-sgl-request-weight", "4".parse().unwrap());
+        let mut response = client.generate(request).await.unwrap().into_inner();
+        assert!(response.message().await.unwrap().is_some());
+        let release = tokio::time::timeout(Duration::from_secs(5), arrivals.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let http = axum::http::Request::post("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({"model":"tiny","messages":[{"role":"user","content":"queued"}]}).to_string(),
+            ))
+            .unwrap();
+        let mut waiting =
+            Box::pin(sgl_router::server::app::build_router(ctx.clone()).oneshot(http));
+        let waker = futures::task::noop_waker();
+        assert!(matches!(
+            std::future::Future::poll(waiting.as_mut(), &mut Context::from_waker(&waker)),
+            Poll::Pending
+        ));
+        assert_eq!(
+            client.generate(generate(true)).await.unwrap_err().code(),
+            Code::ResourceExhausted
+        );
+        assert!(arrivals.try_recv().is_err());
+        drop(waiting);
+        if cancel {
+            drop(response);
+            let _ = release.send(());
+        } else {
+            release.send(()).unwrap();
+            while response.message().await.unwrap().is_some() {}
+        }
+        // A subsequent RPC must acquire the released permit and reach the engine.
+        let mut next_client = client.clone();
+        let next =
+            tokio::spawn(async move { collect(next_client.generate(generate(true)).await).await });
+        let release = tokio::time::timeout(Duration::from_secs(5), arrivals.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        release.send(()).unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), next)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+}

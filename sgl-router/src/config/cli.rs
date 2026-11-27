@@ -123,6 +123,9 @@ pub struct ModelArgs {
 
 #[derive(clap::Args, Debug)]
 pub struct ServerArgs {
+    /// Optional JSON configuration for request-weighted admission.
+    #[arg(long, value_name = "FILE")]
+    pub weighted_queue_config: Option<std::path::PathBuf>,
     /// Address to bind the HTTP server to.
     #[arg(long, default_value_t = default_host())]
     pub host: String,
@@ -681,8 +684,25 @@ impl Cli {
             .as_deref()
             .map(|key| bearer(key, "--worker-management-api-key"))
             .transpose()?;
+        let weighted_queue = self
+            .server
+            .weighted_queue_config
+            .as_ref()
+            .map(|path| {
+                let bytes = std::fs::read(path).map_err(|e| {
+                    anyhow::anyhow!("read --weighted-queue-config {}: {e}", path.display())
+                })?;
+                let config: crate::server::weighted_queue::WeightedQueueConfig =
+                    serde_json::from_slice(&bytes).map_err(|e| {
+                        anyhow::anyhow!("parse --weighted-queue-config {}: {e}", path.display())
+                    })?;
+                config.validate().map_err(anyhow::Error::msg)?;
+                Ok::<_, anyhow::Error>(config)
+            })
+            .transpose()?;
         let config = Config {
             server: ServerConfig {
+                weighted_queue,
                 host: self.server.host,
                 port: self.server.port,
                 grpc_port: self.server.grpc_port,
@@ -1519,6 +1539,69 @@ mod tests {
     }
 
     #[test]
+    fn weighted_queue_config_loads_defaults_and_explicit_limits() {
+        use std::io::Write;
+        for (json, expected) in [
+            (r#"{"max_inflight":2}"#, (2, 1024, 64 * 1024 * 1024, 30_000)),
+            (
+                r#"{"max_inflight":3,"max_queued_requests":4,"max_queued_body_bytes":512,"queue_timeout_ms":25}"#,
+                (3, 4, 512, 25),
+            ),
+        ] {
+            let mut file =
+                tempfile::NamedTempFile::new_in(std::env::current_dir().unwrap()).unwrap();
+            file.write_all(json.as_bytes()).unwrap();
+            let path = file.path().to_str().unwrap();
+            let config = into_config_owned(with_model(&[
+                "--worker-urls",
+                "http://10.0.0.1:30000",
+                "--weighted-queue-config",
+                path,
+            ]))
+            .unwrap();
+            let queue = config.server.weighted_queue.unwrap();
+            assert_eq!(
+                (
+                    queue.max_inflight,
+                    queue.max_queued_requests,
+                    queue.max_queued_body_bytes,
+                    queue.queue_timeout_ms
+                ),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn weighted_queue_config_rejects_invalid_files() {
+        use std::io::Write;
+        for json in [
+            r#"{"max_inflight":0}"#,
+            r#"{"max_inflight":1,"max_queued_requests":0}"#,
+            r#"{"max_inflight":1,"max_queued_body_bytes":0}"#,
+            r#"{"max_inflight":1,"queue_timeout_ms":0}"#,
+            r#"{"max_inflight":1,"unknown":true}"#,
+            "{}",
+            "not JSON",
+        ] {
+            let mut file =
+                tempfile::NamedTempFile::new_in(std::env::current_dir().unwrap()).unwrap();
+            file.write_all(json.as_bytes()).unwrap();
+            let error = into_config_owned(with_model(&[
+                "--worker-urls",
+                "http://10.0.0.1:30000",
+                "--weighted-queue-config",
+                file.path().to_str().unwrap(),
+            ]))
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("weighted") || error.to_string().contains("queue"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
     fn defaults_host_port_and_policy() {
         let c = into_config_owned(with_model(&["--worker-urls", "http://10.0.0.1:30000"])).unwrap();
         assert_eq!(c.server.host, "127.0.0.1");
@@ -1529,6 +1612,7 @@ mod tests {
         assert_eq!(c.router_inflight_load.stale_request_timeout_secs, 600);
         assert_eq!(c.server.shutdown_drain_secs, 30);
         assert!(c.server.worker_management_auth.is_none());
+        assert!(c.server.weighted_queue.is_none());
     }
 
     #[test]

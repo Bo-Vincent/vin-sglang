@@ -186,21 +186,35 @@ pub async fn rerank(
 async fn serve_http(
     ctx: Arc<AppContext>,
     endpoint: Endpoint,
-    headers: HeaderMap,
+    mut headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response<Body>, ApiError> {
     let start = Instant::now();
+    let permit = queue_admit(&ctx, &mut headers, body.len(), start).await?;
     let (request, routing) = prepare(&ctx, endpoint, &headers, body).await?;
-    routing.dispatch(&ctx, request, headers, start).await
+    let response = routing.dispatch(&ctx, request, headers, start).await?;
+    Ok(match permit {
+        Some(permit) => response.map(|body| crate::server::response_guard::body(body, permit)),
+        None => response,
+    })
 }
 
 /// Route one native Generate request without converting it through JSON.
 pub async fn route_generate(
     ctx: &AppContext,
     mut request: GenerateRequest,
-    headers: HeaderMap,
+    mut headers: HeaderMap,
 ) -> (Result<GrpcResponse, ApiError>, Option<RequestLogContext>) {
     let start = Instant::now();
+    let body_bytes = if ctx.weighted_queue.is_some() {
+        prost::Message::encoded_len(&request)
+    } else {
+        0
+    };
+    let permit = match queue_admit(ctx, &mut headers, body_bytes, start).await {
+        Ok(permit) => permit,
+        Err(error) => return (Err(error), None),
+    };
     let prepared = (|| {
         let model = ModelId(ctx.config.model.id.clone());
         let routing = ModelRouting::lookup(ctx, &model)?;
@@ -226,10 +240,57 @@ pub async fn route_generate(
     })();
     match prepared {
         Ok((mut prepared, routing)) => {
-            forward_request_grpc(request, ctx, &mut prepared, &routing, headers, start).await
+            let (result, log) =
+                forward_request_grpc(request, ctx, &mut prepared, &routing, headers, start).await;
+            let result = result.map(|mut response| {
+                if let Some(permit) = permit {
+                    response.replies = Box::pin(crate::server::response_guard::Guarded::new(
+                        response.replies,
+                        permit,
+                    ));
+                }
+                response
+            });
+            (result, log)
         }
         Err(error) => (Err(error), None),
     }
+}
+
+/// Consume the trusted gateway's scheduling header only when admission is enabled.
+async fn queue_admit(
+    ctx: &AppContext,
+    headers: &mut HeaderMap,
+    body_bytes: usize,
+    start: Instant,
+) -> Result<Option<crate::server::weighted_queue::QueuePermit>, ApiError> {
+    let Some(queue) = &ctx.weighted_queue else {
+        return Ok(None);
+    };
+    let mut values = headers.get_all("x-sgl-request-weight").iter();
+    let weight = match values.next() {
+        None => 1,
+        Some(value) => {
+            let value = value.as_bytes();
+            if values.next().is_some() || value.is_empty() || !value.iter().all(u8::is_ascii_digit)
+            {
+                return Err(crate::server::weighted_queue::QueueError::InvalidWeight.into());
+            }
+            let weight = std::str::from_utf8(value)
+                .ok()
+                .and_then(|s| s.parse::<u8>().ok())
+                .filter(|weight| (1..=100).contains(weight))
+                .ok_or(crate::server::weighted_queue::QueueError::InvalidWeight)?;
+            weight
+        }
+    };
+    headers.remove("x-sgl-request-weight");
+    let budget = ctx.request_budget();
+    let deadline = start
+        .checked_add(budget)
+        .map(tokio::time::Instant::from_std)
+        .ok_or(crate::server::weighted_queue::QueueError::Timeout)?;
+    Ok(Some(queue.acquire(weight, body_bytes, deadline).await?))
 }
 
 impl Endpoint {
@@ -381,11 +442,16 @@ impl<'a> ModelRouting<'a> {
         let mut failed = None;
         let mut duration = None;
         for attempt in 0..ctx.config.proxy.max_attempts.get() {
+            if ctx.weighted_queue.is_some() && start.elapsed() >= ctx.request_budget() {
+                return failed.ok_or_else(|| ApiError::StaleRequestExpired {
+                    model: request.model.0.clone(),
+                });
+            }
             if attempt > 0 {
-                // A retry never starts past the request's stale deadline, so the
+                // A retry never starts past the request's deadline, so the
                 // backoff is capped by what remains of it. Backing off before
                 // selecting lets the pick see fresh breaker and load state.
-                let deadline = ctx.router_inflight_load.stale_request_timeout();
+                let deadline = ctx.request_budget();
                 let Some(remaining) = deadline.checked_sub(start.elapsed()) else {
                     break;
                 };

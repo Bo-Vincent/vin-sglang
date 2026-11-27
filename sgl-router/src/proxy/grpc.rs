@@ -403,7 +403,10 @@ impl Proxy {
         };
         // A first error item can still be retried before any frame reaches the client.
         let idle = self.stream_idle_timeout.unwrap_or(Duration::MAX);
-        let (first, stream) = match tokio::time::timeout(idle, call).await {
+        let first_budget = self.request_deadline.map_or(idle, |deadline| {
+            idle.min(deadline.saturating_duration_since(std::time::Instant::now()))
+        });
+        let (first, stream) = match tokio::time::timeout(first_budget, call).await {
             Ok(result) => result.inspect_err(failed).map_err(ApiError::UpstreamGrpc)?,
             Err(_) => {
                 breaker.record_failure();
